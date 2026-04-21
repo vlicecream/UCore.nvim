@@ -2,7 +2,7 @@ use rusqlite::{Connection, ToSql};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 
-use crate::db::path::PATH_CTE;
+use crate::db::project_path::PATH_CTE;
 
 const DEFAULT_LIMIT: usize = 500;
 const STREAM_BATCH_SIZE: usize = 500;
@@ -568,5 +568,5 @@ fn is_engine_path(path: &str) -> bool {
 /// Convert a WITH CTE into a form that can append another CTE.
 /// 把已有 WITH CTE 转成可以继续追加 CTE 的形式。
 fn trim_with_prefix(path_cte: &str) -> String {
-    path_cte.trim().trim_end_matches(',')
+    path_cte.trim().trim_end_matches(',').to_string()
 }

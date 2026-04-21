@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use tree_sitter::{Node, Parser, Point};
 
-use crate::db::path::PATH_CTE;
+use crate::db::project_path::PATH_CTE;
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -315,9 +315,9 @@ pub fn infer_var_type(content: &str, var_name: &str, cursor_line: Option<u32>) -
             std::cmp::Reverse(distance)
         });
 
-        for (row, ty) in matches {
-            if row <= cursor_row {
-                return Some(ty);
+        for (row, ty) in &matches {
+            if *row <= cursor_row {
+                return Some(ty.clone());
             }
         }
     }

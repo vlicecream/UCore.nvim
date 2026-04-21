@@ -6,7 +6,7 @@ use rayon::prelude::*;
 use rusqlite::{params_from_iter, Connection, ToSql};
 use serde_json::{json, Value};
 
-use crate::db::path::PATH_CTE;
+use crate::db::project_path::PATH_CTE;
 
 const DEFAULT_FILE_LIMIT: usize = 100;
 const DEFAULT_ASYNC_FILE_LIMIT: usize = 1000;

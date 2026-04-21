@@ -97,7 +97,7 @@ pub async fn handle_setup(state: Arc<AppState>, params: &Value) -> Result<Value>
                 db_path: db_path_unix,
                 cache_db_path: cache_db_path_unix.clone(),
                 vcs_hash: req.vcs_hash.clone(),
-                _last_refresh: Instant::now(),
+                last_refresh_at: Instant::now(),
             },
         );
     }
@@ -420,7 +420,7 @@ pub async fn handle_modify_uproject_add_module(params: &Value) -> Result<Value> 
     let req: ModifyUprojectAddModuleRequest = convert_params(params)?;
 
     let result = tokio::task::spawn_blocking(move || {
-        crate::modify::uproject::add_module(
+        crate::edit::uproject::add_module(
             &req.file_path,
             &req.module_name,
             &req.module_type,
@@ -438,7 +438,7 @@ pub async fn handle_modify_target_add_module(params: &Value) -> Result<Value> {
     let req: ModifyTargetAddModuleRequest = convert_params(params)?;
 
     let result = tokio::task::spawn_blocking(move || {
-        crate::modify::target::add_module(&req.file_path, &req.module_name)
+        crate::edit::target::add_module(&req.file_path, &req.module_name)
     })
     .await?;
 
@@ -682,7 +682,7 @@ fn upsert_refresh_project_context(
                 db_path: db_path_unix.clone(),
                 cache_db_path: req.cache_db_path.as_ref().map(|p| normalize_to_unix(p)),
                 vcs_hash: req.vcs_hash.clone(),
-                _last_refresh: Instant::now(),
+                last_refresh_at: Instant::now(),
             },
         );
 

@@ -819,7 +819,7 @@ fn append_members_for_class(
         let return_type: Option<String> = row.get(2)?;
         let access: Option<String> = row.get(3)?;
         let detail: Option<String> = row.get(4)?;
-        let line: Option<usize> = row.get(5).ok();
+        let line: Option<usize> = row.get::<_, Option<i64>>(5)?.map(|v| v as usize);
         let file_path: Option<String> = row.get(6).ok().flatten();
 
         if !is_member_accessible(ctx, owner_class, accessor_class, access.as_deref())? {

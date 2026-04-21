@@ -197,7 +197,7 @@ fn insert_directory(
 
 /// Restore a directory path from directory_id.
 /// 根据 directory_id 还原目录路径。
-fn get_directory_path(conn: &Connection, directory_id: i64) -> anyhow::Result<String> {
+pub(crate) fn get_directory_path(conn: &Connection, directory_id: i64) -> anyhow::Result<String> {
     if directory_id == 0 {
         return Ok(String::new());
     }

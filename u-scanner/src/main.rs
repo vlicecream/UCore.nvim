@@ -5,8 +5,8 @@ use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
 use tree_sitter::Query;
-use unl_core::types::{ParseResult, RawRequest};
-use unl_core::{db, refresh, scanner};
+use u_scanner::types::{ParseResult, RawRequest, RefreshRequest, StdoutReporter};
+use u_scanner::{db, refresh, scanner};
 
 const DEFAULT_SERVER_PORT: u16 = 30110;
 const READ_BUFFER_SIZE: usize = 4096;
@@ -82,7 +82,7 @@ impl CliArgs {
             .and_then(|value| value.parse::<u16>().ok())
             .unwrap_or(DEFAULT_SERVER_PORT);
 
-        let command = parse_command(&args).ok();
+        let command = parse_command(&args).ok().flatten();
 
         Self {
             server_port,
@@ -266,8 +266,8 @@ fn try_take_frame(buffer: &mut Vec<u8>) -> Result<Option<Vec<u8>>> {
 /// Run refresh locally when server is not available.
 /// server 不可用时，本地执行 refresh。
 fn run_refresh_locally(json_payload: &str) -> Result<()> {
-    let request = serde_json::from_str::<unl_core::types::RefreshRequest>(json_payload)?;
-    refresh::run_refresh(request, Arc::new(unl_core::types::StdoutReporter))
+    let request = serde_json::from_str::<RefreshRequest>(json_payload)?;
+    refresh::run_refresh(request, Arc::new(StdoutReporter))
 }
 
 /// Read scan request from stdin and run or proxy it.
@@ -320,7 +320,7 @@ fn run_scan_locally(input: &str) -> Result<()> {
                     let _ = db::save_to_db(
                         &mut conn,
                         &results,
-                        Arc::new(unl_core::types::StdoutReporter),
+                        Arc::new(StdoutReporter),
                     );
                 }
             }
@@ -329,7 +329,7 @@ fn run_scan_locally(input: &str) -> Result<()> {
         }
 
         RawRequest::Refresh(req) => {
-            refresh::run_refresh(req, Arc::new(unl_core::types::StdoutReporter))?;
+            refresh::run_refresh(req, Arc::new(StdoutReporter))?;
         }
     }
 

@@ -4,14 +4,14 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use sysinfo::{Pid, System};
+use sysinfo::{Pid, ProcessesToUpdate, System};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
-use unl_core::server::handle_connection;
-use unl_core::server::state::AppState;
-use unl_core::server::utils::normalize_path_key;
-use unl_core::server::watcher::handle_file_change;
+use u_scanner::server::handle_connection;
+use u_scanner::server::state::AppState;
+use u_scanner::server::utils::normalize_path_key;
+use u_scanner::server::watcher::handle_file_change;
 
 const DEFAULT_PORT: u16 = 30110;
 const WATCH_EVENT_CHANNEL_SIZE: usize = 256;
@@ -95,9 +95,9 @@ fn init_logging(registry_path: Option<&PathBuf>) -> Result<()> {
     let log_path = if let Some(path) = registry_path {
         path.parent()
             .unwrap_or_else(|| std::path::Path::new("."))
-            .join("ucore-server.log")
+            .join("u_scanner.log")
     } else {
-        PathBuf::from("ucore-server.log")
+        PathBuf::from("u_scanner.log")
     };
 
     if let Some(parent) = log_path.parent() {
@@ -136,7 +136,7 @@ fn install_panic_hook() {
 /// 加载工程 registry，并规范化工程 key。
 fn load_initial_projects(
     registry_path: Option<&PathBuf>,
-) -> HashMap<String, unl_core::server::state::ProjectContext> {
+) -> HashMap<String, u_scanner::server::state::ProjectContext> {
     let Some(path) = registry_path else {
         return HashMap::new();
     };
@@ -214,7 +214,7 @@ fn spawn_client_lifecycle_loop(state: Arc<AppState>) {
         loop {
             tokio::time::sleep(Duration::from_secs(CLIENT_CHECK_INTERVAL_SECS)).await;
 
-            system.refresh_processes();
+            system.refresh_processes(ProcessesToUpdate::All, true);
 
             remove_dead_clients(&state, &system);
 

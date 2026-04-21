@@ -1,7 +1,7 @@
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 
-use crate::db::path::PATH_CTE;
+use crate::db::project_path::PATH_CTE;
 
 /// Search indexed symbols by name using SQLite FTS.
 /// 使用 SQLite FTS 根据符号名搜索已索引的 symbol。

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tree_sitter::Query;
 
 use crate::db;
-use crate::db::path::get_or_create_directory;
+use crate::db::project_path::get_or_create_directory;
 use crate::types::{
     ComponentDef, InputFile, ModuleDef, ParseResult, PhaseInfo, ProgressReporter, RefreshRequest,
 };
@@ -746,7 +746,7 @@ fn upsert_non_source_files(conn: &mut Connection, files: Vec<FileUpsert>) -> Res
 fn resolve_modules(modules: Vec<ModuleDef>) -> Vec<(ModuleDef, HashSet<String>)> {
     let lookup = modules
         .iter()
-        .map(|module| (module.name.clone(), module))
+        .map(|module| (module.name.clone(), module.clone()))
         .collect::<HashMap<_, _>>();
 
     let mut memo = HashMap::new();
@@ -763,9 +763,9 @@ fn resolve_modules(modules: Vec<ModuleDef>) -> Vec<(ModuleDef, HashSet<String>)>
 
 /// Recursive dependency resolver with cycle guard.
 /// 带循环保护的递归依赖解析。
-fn resolve_deep<'a>(
+fn resolve_deep(
     name: &str,
-    lookup: &HashMap<String, &'a ModuleDef>,
+    lookup: &HashMap<String, ModuleDef>,
     memo: &mut HashMap<String, HashSet<String>>,
     stack: &mut Vec<String>,
 ) -> HashSet<String> {
@@ -914,16 +914,16 @@ fn find_uproject(project_root: &Path) -> Option<PathBuf> {
 fn plugin_component(
     uplugin_path: &Path,
     project_root: &Path,
-    engine_root: Option<&PathBuf>,
+    _engine_root: Option<&Path>,
     project_name: &str,
-    engine_name: Option<&String>,
+    engine_name: Option<&str>,
 ) -> Option<ComponentDef> {
     let root = uplugin_path.parent()?.to_path_buf();
 
     let owner = if root.starts_with(project_root) {
         project_name.to_string()
     } else {
-        engine_name.cloned().unwrap_or_else(|| "Engine".to_string())
+        engine_name.unwrap_or("Engine").to_string()
     };
 
     Some(ComponentDef {
@@ -940,12 +940,12 @@ fn plugin_component(
 fn owner_name_for_path(
     path: &Path,
     project_root: &Path,
-    engine_root: Option<&PathBuf>,
+    engine_root: Option<&Path>,
     project_name: &str,
-    engine_name: Option<&String>,
+    engine_name: Option<&str>,
 ) -> String {
     if engine_root.map(|root| path.starts_with(root)).unwrap_or(false) {
-        engine_name.cloned().unwrap_or_else(|| "Engine".to_string())
+        engine_name.unwrap_or("Engine").to_string()
     } else if path.starts_with(project_root) {
         project_name.to_string()
     } else {

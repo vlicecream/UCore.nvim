@@ -1,4 +1,4 @@
-pub mod path;
+pub mod project_path;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -459,7 +459,7 @@ pub fn save_to_db(
                 .unwrap_or("")
                 .to_ascii_lowercase();
 
-            let dir_id = path::get_or_create_directory(
+            let dir_id = project_path::get_or_create_directory(
                 &tx,
                 &mut string_cache,
                 &mut dir_cache,
@@ -780,7 +780,7 @@ pub fn register_module(
     let mut dir_cache = HashMap::new();
 
     let name_id = get_or_create_string(&tx, &mut string_cache, name)?;
-    let root_dir_id = path::get_or_create_directory(
+    let root_dir_id = project_path::get_or_create_directory(
         &tx,
         &mut string_cache,
         &mut dir_cache,
@@ -816,7 +816,7 @@ pub fn get_module_id_for_path(
         let module_id: i64 = row.get(0)?;
         let root_directory_id: i64 = row.get(1)?;
 
-        let root_path = path::get_directory_path(conn, root_directory_id)?;
+        let root_path = project_path::get_directory_path(conn, root_directory_id)?;
         let root_path_norm = normalize_path_for_compare(&root_path);
 
         if file_path_norm.starts_with(&root_path_norm) && root_path_norm.len() > best_len {

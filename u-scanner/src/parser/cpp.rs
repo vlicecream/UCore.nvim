@@ -205,7 +205,7 @@ pub fn process_file(
     // 通过内容 hash 跳过未变化的文件。
     let mut hasher = Sha256::new();
     hasher.update(content_bytes);
-    let new_hash = format!("{:x}", hasher.finalize());
+    let new_hash = hex::encode(hasher.finalize());
 
     if input.old_hash.as_ref() == Some(&new_hash) {
         return Ok(ParseResult {
@@ -394,10 +394,10 @@ fn collect_symbols(
 
     while let Some((m, capture_index)) = captures.next() {
         let capture = m.captures[*capture_index];
-        let capture_name = &query.capture_names()[capture.index as usize];
+        let capture_name = query.capture_names()[capture.index as usize];
         let node = capture.node;
 
-        match capture_name.as_str() {
+        match capture_name {
             "call_name" => collect_call(node, content_bytes, calls),
 
             "class_name" | "struct_name" | "enum_name" => {

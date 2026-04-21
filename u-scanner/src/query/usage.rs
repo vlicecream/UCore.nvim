@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 use std::collections::{HashSet, VecDeque};
 use std::io::BufRead;
 
-use crate::db::path::PATH_CTE;
+use crate::db::project_path::PATH_CTE;
 
 const MAX_RESULTS: usize = 300;
 const MAX_FILES: usize = 2000;

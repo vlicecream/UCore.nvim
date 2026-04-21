@@ -81,8 +81,8 @@ pub fn process_query(conn: &Connection, request: QueryRequest) -> Result<Value> 
 
         // This branch is only needed if query/util.rs is kept.
         // 只有你保留 query/util.rs 时才需要这个分支。
-        QueryRequest::GetClassFilePath { class_name } => {
-            util::get_class_file_path(conn, &class_name)
+        QueryRequest::GetClassFilePath { .. } => {
+            Err(anyhow!("GetClassFilePath is not implemented"))
         }
 
         // ---------------------------------------------------------------------

@@ -1,7 +1,7 @@
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::{json, Value};
 
-use crate::db::path::PATH_CTE;
+use crate::db::project_path::PATH_CTE;
 
 /// Get all indexed Unreal modules.
 /// 获取所有已经索引到的 Unreal 模块。

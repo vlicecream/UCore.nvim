@@ -4,7 +4,7 @@ use anyhow::Result;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, ToSql};
 use serde_json::{json, Value};
 
-use crate::db::path::PATH_CTE;
+use crate::db::project_path::PATH_CTE;
 
 const MODULE_CHUNK_SIZE: usize = 500;
 const STREAM_BATCH_SIZE: usize = 200;
@@ -359,15 +359,19 @@ fn query_classes_in_module_chunk(
         type_clause,
     );
 
-    let mut query_params: Vec<&dyn ToSql> =
-        modules.iter().map(|module| module as &dyn ToSql).collect();
+    let mut query_params = modules.to_vec();
 
     if let Some(symbol_type) = symbol_type {
-        query_params.push(&symbol_type);
+        query_params.push(symbol_type.to_string());
     }
 
+    let query_refs: Vec<&dyn ToSql> = query_params
+        .iter()
+        .map(|value| value as &dyn ToSql)
+        .collect();
+
     let mut stmt = conn.prepare(&sql)?;
-    let mut rows = stmt.query(params_from_iter(query_params))?;
+    let mut rows = stmt.query(params_from_iter(query_refs))?;
     let mut result = Vec::new();
 
     while let Some(row) = rows.next()? {
