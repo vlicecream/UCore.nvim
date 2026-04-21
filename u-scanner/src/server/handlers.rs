@@ -1,0 +1,871 @@
+use anyhow::{anyhow, Result};
+use notify::Watcher;
+use serde::Deserialize;
+use serde_json::{json, Value};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Instant;
+use tokio::sync::mpsc;
+use tracing::{error, info, warn};
+
+use crate::server::asset::handle_asset_scan;
+use crate::server::state::{AppState, ProjectContext, RpcProgressReporter};
+use crate::server::utils::{
+    convert_params, normalize_path_key, normalize_to_native, normalize_to_unix,
+};
+use crate::types::{
+    ModifyResult, ModifyTargetAddModuleRequest, ModifyUprojectAddModuleRequest, QueryRequest,
+    RefreshRequest, ScanRequest, SetupRequest,
+};
+use crate::{db, query, refresh, scanner};
+
+// -----------------------------------------------------------------------------
+// Request types
+// -----------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct DeleteProjectRequest {
+    pub project_root: String,
+}
+
+#[derive(Deserialize)]
+pub struct PingRequest {
+    pub pid: u32,
+}
+
+#[derive(Deserialize)]
+pub struct ServerQueryRequest {
+    pub project_root: String,
+
+    #[serde(flatten)]
+    pub query: QueryRequest,
+}
+
+// -----------------------------------------------------------------------------
+// Project lifecycle handlers
+// -----------------------------------------------------------------------------
+
+/// Delete a registered project from server state.
+/// 从 server 状态里删除一个已注册工程。
+pub async fn handle_delete_project(state: &AppState, params: &Value) -> Result<Value> {
+    let req: DeleteProjectRequest = convert_params(params)?;
+    let root_key = normalize_path_key(&req.project_root);
+
+    let removed = {
+        let mut projects = state.projects.lock();
+        projects.remove(&root_key).is_some()
+    };
+
+    if !removed {
+        return Err(anyhow!("Project not found: {}", root_key));
+    }
+
+    let _ = state.save_registry();
+    info!("Deleted project: {}", root_key);
+
+    Ok(Value::String("Deleted".to_string()))
+}
+
+/// Register a Neovim client heartbeat.
+/// 注册 Neovim 客户端心跳。
+pub async fn handle_ping(state: &AppState, params: &Value) -> Result<Value> {
+    let req: PingRequest = convert_params(params)?;
+    state.register_client(req.pid);
+    Ok(Value::String("pong".to_string()))
+}
+
+/// Setup one project and open/create its database.
+/// 初始化一个工程，并打开或创建对应数据库。
+pub async fn handle_setup(state: Arc<AppState>, params: &Value) -> Result<Value> {
+    let req: SetupRequest = convert_params(params)?;
+
+    let root_key = normalize_path_key(&req.project_root);
+    let db_path_unix = normalize_to_unix(&req.db_path);
+    let db_path_native = normalize_to_native(&req.db_path);
+    let cache_db_path_unix = req.cache_db_path.as_ref().map(|p| normalize_to_unix(p));
+
+    drop_db_connections(&state, &db_path_native, cache_db_path_unix.as_deref());
+
+    let needs_full_refresh = ensure_database_ready(db_path_native.clone()).await?;
+
+    {
+        let mut projects = state.projects.lock();
+        projects.insert(
+            root_key.clone(),
+            ProjectContext {
+                db_path: db_path_unix,
+                cache_db_path: cache_db_path_unix.clone(),
+                vcs_hash: req.vcs_hash.clone(),
+                _last_refresh: Instant::now(),
+            },
+        );
+    }
+
+    let _ = state.get_connection(&db_path_native);
+
+    if let Some(cache_path) = req.cache_db_path.as_ref() {
+        let _ = state.get_persistent_cache_connection(&normalize_to_native(cache_path));
+    }
+
+    let _ = state.save_registry();
+
+    spawn_asset_scan_if_needed(state.clone(), root_key.clone(), req.project_root.clone());
+
+    Ok(json!({
+        "status": "ok",
+        "needs_full_refresh": needs_full_refresh,
+    }))
+}
+
+/// Run a full project refresh.
+/// 执行一次完整工程刷新。
+pub async fn handle_refresh(
+    state: &AppState,
+    params: &Value,
+    tx: mpsc::Sender<Vec<u8>>,
+) -> Result<Value> {
+    let mut req: RefreshRequest = convert_params(params)?;
+    let root_key = normalize_path_key(&req.project_root);
+
+    let _guard = RefreshGuard::try_new(state, root_key.clone())?;
+
+    let db_path_unix = upsert_refresh_project_context(state, &mut req, &root_key)?;
+    let db_path_native = normalize_to_native(&db_path_unix);
+
+    let cache_path = {
+        let projects = state.projects.lock();
+        projects
+            .get(&root_key)
+            .and_then(|ctx| ctx.cache_db_path.clone())
+    };
+
+    drop_db_connections(state, &db_path_native, cache_path.as_deref());
+
+    req.db_path = Some(db_path_unix.clone());
+    let _ = state.save_registry();
+
+    let reporter = Arc::new(RpcProgressReporter { tx });
+
+    tokio::task::spawn_blocking(move || refresh::run_refresh(req, reporter)).await??;
+
+    clear_completion_cache(state, &root_key);
+
+    let _ = state.get_connection(&db_path_native);
+
+    Ok(Value::String("Refresh success".to_string()))
+}
+
+/// Start filesystem watcher for a project root.
+/// 启动工程目录文件监听。
+pub async fn handle_watch(state: &AppState, params: &Value) -> Result<Value> {
+    let req: crate::types::WatchRequest = convert_params(params)?;
+    let root_native = normalize_to_native(&req.project_root);
+    let root_path = PathBuf::from(&root_native);
+
+    if !root_path.exists() {
+        return Err(anyhow!("Path does not exist: {}", root_native));
+    }
+
+    let mut watcher = state.watcher.lock();
+
+    watcher
+        .watch(&root_path, notify::RecursiveMode::Recursive)
+        .map_err(|err| {
+            error!("Watcher failed for {}: {}", root_native, err);
+            err
+        })?;
+
+    info!("Watcher started: {}", root_native);
+    Ok(Value::String("Watch started".to_string()))
+}
+
+// -----------------------------------------------------------------------------
+// Query handlers
+// -----------------------------------------------------------------------------
+
+/// Handle one query request from Neovim.
+/// 处理来自 Neovim 的一次 query 请求。
+pub async fn handle_query(
+    state: Arc<AppState>,
+    params: &Value,
+    tx: mpsc::Sender<Vec<u8>>,
+    msgid: u64,
+) -> Result<Value> {
+    let req: ServerQueryRequest = convert_params(params)?;
+    let root_key = normalize_path_key(&req.project_root);
+
+    if is_refreshing(&state, &root_key) {
+        return Ok(json!([]));
+    }
+
+    ensure_asset_scan_started(&state, &root_key, &req.project_root);
+
+    let project = get_project_context(&state, &root_key)?;
+    let db_path_native = normalize_to_native(&project.db_path);
+    let cache_db_path_native = project.cache_db_path.as_ref().map(|p| normalize_to_native(p));
+
+    let conn = state.get_read_only_connection(&db_path_native)?;
+    let persistent_cache_conn = cache_db_path_native
+        .as_deref()
+        .and_then(|path| state.get_persistent_cache_connection(path).ok());
+
+    tokio::task::spawn_blocking(move || {
+        if let Some(value) = handle_state_query(
+            state.clone(),
+            &conn,
+            &root_key,
+            &req.project_root,
+            req.query.clone(),
+            persistent_cache_conn,
+        )? {
+            return Ok(value);
+        }
+
+        if is_streaming_query(&req.query) {
+            query::process_query_streaming(&conn, req.query, move |items| {
+                send_query_partial(&tx, msgid, items)?;
+                Ok(())
+            })
+        } else {
+            query::process_query(&conn, req.query)
+        }
+    })
+    .await?
+}
+
+/// Handle queries that need AppState instead of only SQLite.
+/// 处理那些必须访问 AppState、不能只靠 SQLite 的 query。
+fn handle_state_query(
+    state: Arc<AppState>,
+    conn: &rusqlite::Connection,
+    root_key: &str,
+    project_root: &str,
+    request: QueryRequest,
+    persistent_cache_conn: Option<Arc<parking_lot::Mutex<rusqlite::Connection>>>,
+) -> Result<Option<Value>> {
+    match request {
+        QueryRequest::GetAssetUsages { asset_path } => {
+            Ok(Some(get_asset_usages(&state, root_key, &asset_path)))
+        }
+
+        QueryRequest::GetAssetDependencies { asset_path } => {
+            Ok(Some(get_asset_dependencies(project_root, &asset_path)?))
+        }
+
+        QueryRequest::FindDerivedClasses { base_class } => {
+            let mut db_results = query::process_query(
+                conn,
+                QueryRequest::FindDerivedClasses {
+                    base_class: base_class.clone(),
+                },
+            )?
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+
+            merge_asset_derived_classes(&state, root_key, &base_class, &mut db_results);
+
+            Ok(Some(json!(db_results)))
+        }
+
+        QueryRequest::GetAssets => Ok(Some(get_assets_from_graph(&state, root_key))),
+
+        QueryRequest::GetConfigData { engine_root } => {
+            let data =
+                query::config::get_config_data_with_cache(&state, project_root, engine_root.as_deref())?;
+            Ok(Some(json!(data)))
+        }
+
+        QueryRequest::GetCompletions {
+            content,
+            line,
+            character,
+            file_path,
+        } => {
+            let cache = state.get_completion_cache(root_key);
+            let value = crate::completion::process_completion(
+                conn,
+                &content,
+                line,
+                character,
+                file_path,
+                Some(cache),
+                persistent_cache_conn,
+            )?;
+
+            Ok(Some(value))
+        }
+
+        _ => Ok(None),
+    }
+}
+
+/// Return true for query variants that stream partial results.
+/// 判断 query 是否需要流式分批返回。
+fn is_streaming_query(request: &QueryRequest) -> bool {
+    matches!(
+        request,
+        QueryRequest::GetFilesInModulesAsync { .. }
+            | QueryRequest::SearchFilesInModulesAsync { .. }
+            | QueryRequest::SearchFilesByPathPartAsync { .. }
+            | QueryRequest::GetClassesInModulesAsync { .. }
+            | QueryRequest::FindSymbolUsagesAsync { .. }
+            | QueryRequest::GrepAssets { .. }
+    )
+}
+
+/// Send one query partial notification through MessagePack RPC channel.
+/// 通过 MessagePack RPC 通道发送一批 query partial 数据。
+fn send_query_partial(tx: &mpsc::Sender<Vec<u8>>, msgid: u64, items: Vec<Value>) -> Result<()> {
+    let notification = (2, "query/partial", json!({
+        "msgid": msgid,
+        "items": items,
+    }));
+
+    let payload = rmp_serde::to_vec(&notification)?;
+
+    let mut framed = Vec::with_capacity(payload.len() + 4);
+    framed.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    framed.extend_from_slice(&payload);
+
+    let _ = tx.blocking_send(framed);
+
+    Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// Scan handler
+// -----------------------------------------------------------------------------
+
+/// Scan a batch of files and save parsed symbols into SQLite.
+/// 扫描一批文件，并把解析结果保存到 SQLite。
+pub async fn handle_scan(state: &AppState, params: &Value) -> Result<Value> {
+    let req: ScanRequest = convert_params(params)?;
+
+    let db_path = req
+        .files
+        .first()
+        .and_then(|file| file.db_path.clone())
+        .ok_or_else(|| anyhow!("No DB path"))?;
+
+    let db_path_native = normalize_to_native(&db_path);
+    let conn = state.get_connection(&db_path_native)?;
+
+    tokio::task::spawn_blocking(move || {
+        let language = tree_sitter_unreal_cpp::LANGUAGE.into();
+        let query = tree_sitter::Query::new(&language, scanner::QUERY_STR)?;
+        let include_query = tree_sitter::Query::new(&language, scanner::INCLUDE_QUERY_STR)?;
+
+        let results = req
+            .files
+            .into_iter()
+            .filter_map(|input| {
+                scanner::process_file(&input, &language, &query, &include_query).ok()
+            })
+            .collect::<Vec<_>>();
+
+        let mut conn = conn.lock();
+        db::save_to_db(&mut conn, &results, Arc::new(crate::types::StdoutReporter))?;
+
+        Ok(json!(results.len()))
+    })
+    .await?
+}
+
+// -----------------------------------------------------------------------------
+// Status handlers
+// -----------------------------------------------------------------------------
+
+/// Return server status.
+/// 获取 server 当前状态。
+pub async fn get_status(state: &AppState) -> Result<Value> {
+    let projects = state.projects.lock();
+    let clients = state.active_clients.lock();
+
+    Ok(json!({
+        "status": "running",
+        "active_projects": projects.keys().cloned().collect::<Vec<_>>(),
+        "active_clients": clients.iter().copied().collect::<Vec<_>>(),
+    }))
+}
+
+/// List registered projects.
+/// 列出已注册工程。
+pub async fn list_projects(state: &AppState) -> Result<Value> {
+    let projects = state.projects.lock();
+
+    let list = projects
+        .iter()
+        .map(|(root, ctx)| {
+            json!({
+                "root": root,
+                "db_path": ctx.db_path,
+                "cache_db_path": ctx.cache_db_path,
+                "vcs_hash": ctx.vcs_hash,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(json!(list))
+}
+
+// -----------------------------------------------------------------------------
+// Modify handlers
+// -----------------------------------------------------------------------------
+
+/// Add a module to a .uproject or .uplugin file.
+/// 给 .uproject 或 .uplugin 添加模块。
+pub async fn handle_modify_uproject_add_module(params: &Value) -> Result<Value> {
+    let req: ModifyUprojectAddModuleRequest = convert_params(params)?;
+
+    let result = tokio::task::spawn_blocking(move || {
+        crate::modify::uproject::add_module(
+            &req.file_path,
+            &req.module_name,
+            &req.module_type,
+            &req.loading_phase,
+        )
+    })
+    .await?;
+
+    Ok(modify_result_to_json(result))
+}
+
+/// Add a module to a .Target.cs file.
+/// 给 .Target.cs 添加模块。
+pub async fn handle_modify_target_add_module(params: &Value) -> Result<Value> {
+    let req: ModifyTargetAddModuleRequest = convert_params(params)?;
+
+    let result = tokio::task::spawn_blocking(move || {
+        crate::modify::target::add_module(&req.file_path, &req.module_name)
+    })
+    .await?;
+
+    Ok(modify_result_to_json(result))
+}
+
+/// Convert modify result into public JSON shape.
+/// 把修改结果转换成公开 JSON 结构。
+fn modify_result_to_json(result: Result<()>) -> Value {
+    match result {
+        Ok(()) => serde_json::to_value(ModifyResult {
+            success: true,
+            message: None,
+        })
+        .unwrap_or_else(|_| json!({ "success": true })),
+
+        Err(err) => serde_json::to_value(ModifyResult {
+            success: false,
+            message: Some(err.to_string()),
+        })
+        .unwrap_or_else(|_| json!({ "success": false, "message": err.to_string() })),
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Asset query helpers
+// -----------------------------------------------------------------------------
+
+/// Get asset usages from in-memory AssetGraph.
+/// 从内存 AssetGraph 查询资产引用和派生关系。
+fn get_asset_usages(state: &AppState, root_key: &str, asset_path: &str) -> Value {
+    if is_asset_scan_active(state, root_key) {
+        return json!({
+            "status": "scanning",
+            "references": [],
+            "derived": [],
+        });
+    }
+
+    let graphs = state.asset_graphs.lock();
+    let Some(graph) = graphs.get(root_key) else {
+        return json!({
+            "status": "scanning",
+            "references": [],
+            "derived": [],
+        });
+    };
+
+    let try_names = make_asset_lookup_names(asset_path);
+    let mut references = HashSet::new();
+    let mut derived = HashSet::new();
+
+    for name in &try_names {
+        let dot_name = format!(".{}", name);
+
+        for (key, assets) in &graph.references {
+            if key.as_ref() == name || key.ends_with(&dot_name) {
+                references.extend(assets.iter().map(|item| item.to_string()));
+            }
+        }
+
+        for (key, assets) in &graph.derived {
+            if key.as_ref() == name || key.ends_with(&dot_name) {
+                derived.extend(assets.iter().map(|item| item.to_string()));
+            }
+        }
+
+        for (key, assets) in &graph.functions {
+            if key.as_ref() == name || key.ends_with(&dot_name) || key.contains(&format!(":{}", name))
+            {
+                references.extend(assets.iter().map(|item| item.to_string()));
+            }
+        }
+    }
+
+    json!({
+        "status": "ready",
+        "references": sorted_strings(references),
+        "derived": sorted_strings(derived),
+    })
+}
+
+/// Get dependencies for a single asset by parsing the asset file directly.
+/// 直接解析单个资产文件，获取它依赖的资源和父类。
+fn get_asset_dependencies(project_root: &str, asset_path: &str) -> Result<Value> {
+    if asset_path.starts_with("/Script/") {
+        return Ok(json!({
+            "dependencies": [],
+            "parent_class": Value::Null,
+        }));
+    }
+
+    let Some(file_path) = find_asset_file(project_root, asset_path) else {
+        return Ok(json!({
+            "dependencies": [],
+            "parent_class": Value::Null,
+        }));
+    };
+
+    let mut parser = crate::uasset::UAssetParser::new();
+    parser.parse(&file_path)?;
+
+    let mut deps = parser.imports;
+    deps.sort();
+    deps.dedup();
+
+    Ok(json!({
+        "dependencies": deps,
+        "parent_class": parser.parent_class,
+    }))
+}
+
+/// Merge Blueprint-derived assets into class query result.
+/// 把蓝图派生资产合并进 class 派生查询结果。
+fn merge_asset_derived_classes(
+    state: &AppState,
+    root_key: &str,
+    base_class: &str,
+    results: &mut Vec<Value>,
+) {
+    if is_asset_scan_active(state, root_key) {
+        results.push(json!({
+            "name": "Scanning...",
+            "path": "",
+            "symbol_type": "scanning",
+        }));
+        return;
+    }
+
+    let graphs = state.asset_graphs.lock();
+    let Some(graph) = graphs.get(root_key) else {
+        return;
+    };
+
+    let names = make_asset_lookup_names(base_class);
+
+    for name in names {
+        let dot_name = format!(".{}", name);
+
+        for (key, assets) in &graph.derived {
+            if key.as_ref() != name && !key.ends_with(&dot_name) {
+                continue;
+            }
+
+            for asset in assets {
+                let exists = results.iter().any(|item| {
+                    item["path"]
+                        .as_str()
+                        .map(|path| path.eq_ignore_ascii_case(asset.as_ref()))
+                        .unwrap_or(false)
+                });
+
+                if !exists {
+                    results.push(json!({
+                        "name": asset.rsplit('/').next().unwrap_or(asset.as_ref()),
+                        "path": asset.to_string(),
+                        "symbol_type": "uasset",
+                    }));
+                }
+            }
+        }
+    }
+}
+
+/// Get all assets known by the in-memory graph.
+/// 从内存资产图获取所有已知资产。
+fn get_assets_from_graph(state: &AppState, root_key: &str) -> Value {
+    let graphs = state.asset_graphs.lock();
+    let Some(graph) = graphs.get(root_key) else {
+        return json!([]);
+    };
+
+    let mut assets = HashSet::new();
+
+    for values in graph.references.values() {
+        assets.extend(values.iter().map(|item| item.to_string()));
+    }
+
+    for values in graph.derived.values() {
+        assets.extend(values.iter().map(|item| item.to_string()));
+    }
+
+    json!(sorted_strings(assets))
+}
+
+// -----------------------------------------------------------------------------
+// Shared helpers
+// -----------------------------------------------------------------------------
+
+/// Ensure SQLite database exists, version matches, and has required data.
+/// 确保 SQLite 数据库存在、版本正确，并且不是空索引。
+async fn ensure_database_ready(db_path_native: String) -> Result<bool> {
+    tokio::task::spawn_blocking(move || {
+        let reinitialized = db::ensure_correct_version(&db_path_native).unwrap_or(false);
+
+        if reinitialized {
+            return Ok(true);
+        }
+
+        let conn = rusqlite::Connection::open(&db_path_native)?;
+        let file_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+            .unwrap_or(0);
+        let class_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM classes", [], |row| row.get(0))
+            .unwrap_or(0);
+
+        Ok(file_count == 0 || class_count == 0)
+    })
+    .await?
+}
+
+/// Remove cached database connections before refresh/setup.
+/// setup 或 refresh 前移除旧 DB 连接缓存。
+fn drop_db_connections(state: &AppState, db_path_native: &str, cache_db_path_unix: Option<&str>) {
+    let mut conns = state.connections.lock();
+    conns.remove(db_path_native);
+    drop(conns);
+
+    if let Some(cache_path) = cache_db_path_unix {
+        let mut cache_conns = state.persistent_cache_connections.lock();
+        cache_conns.remove(&normalize_to_native(cache_path));
+    }
+}
+
+/// Insert or update project context for refresh.
+/// refresh 前插入或更新工程上下文。
+fn upsert_refresh_project_context(
+    state: &AppState,
+    req: &mut RefreshRequest,
+    root_key: &str,
+) -> Result<String> {
+    let mut projects = state.projects.lock();
+
+    if let Some(db_path) = &req.db_path {
+        let db_path_unix = normalize_to_unix(db_path);
+
+        projects.insert(
+            root_key.to_string(),
+            ProjectContext {
+                db_path: db_path_unix.clone(),
+                cache_db_path: req.cache_db_path.as_ref().map(|p| normalize_to_unix(p)),
+                vcs_hash: req.vcs_hash.clone(),
+                _last_refresh: Instant::now(),
+            },
+        );
+
+        return Ok(db_path_unix);
+    }
+
+    let Some(ctx) = projects.get_mut(root_key) else {
+        return Err(anyhow!("Project not found: {}", root_key));
+    };
+
+    ctx.vcs_hash = req.vcs_hash.clone();
+
+    if let Some(cache_path) = &req.cache_db_path {
+        ctx.cache_db_path = Some(normalize_to_unix(cache_path));
+    }
+
+    Ok(ctx.db_path.clone())
+}
+
+/// Clear completion cache after project refresh.
+/// 工程刷新后清空补全缓存。
+fn clear_completion_cache(state: &AppState, root_key: &str) {
+    let cache = state.get_completion_cache(root_key);
+    cache.lock().clear();
+    info!("Completion cache cleared after refresh: {}", root_key);
+}
+
+/// Check whether a refresh is active for the project.
+/// 判断工程是否正在 refresh。
+fn is_refreshing(state: &AppState, root_key: &str) -> bool {
+    state.active_refreshes.lock().contains(root_key)
+}
+
+/// Check whether asset scan is active.
+/// 判断资产扫描是否正在进行。
+fn is_asset_scan_active(state: &AppState, root_key: &str) -> bool {
+    state.active_asset_scans.lock().contains(root_key)
+}
+
+/// Start asset scan if graph is missing and no scan is active.
+/// 如果缺少资产图且当前没在扫描，则启动资产扫描。
+fn ensure_asset_scan_started(state: &Arc<AppState>, root_key: &str, project_root: &str) {
+    let has_graph = state.asset_graphs.lock().contains_key(root_key);
+    if has_graph {
+        return;
+    }
+
+    let mut active = state.active_asset_scans.lock();
+    if !active.insert(root_key.to_string()) {
+        return;
+    }
+
+    drop(active);
+
+    let state_clone = state.clone();
+    let project_root = project_root.to_string();
+
+    tokio::spawn(async move {
+        handle_asset_scan(state_clone, project_root).await;
+    });
+}
+
+/// Setup path also starts asset scanning after project registration.
+/// setup 成功注册工程后也启动资产扫描。
+fn spawn_asset_scan_if_needed(state: Arc<AppState>, root_key: String, project_root: String) {
+    let mut active = state.active_asset_scans.lock();
+
+    if !active.insert(root_key) {
+        return;
+    }
+
+    drop(active);
+
+    tokio::spawn(async move {
+        handle_asset_scan(state, project_root).await;
+    });
+}
+
+/// Guard for active_refreshes.
+/// active_refreshes 的自动清理保护对象。
+struct RefreshGuard<'a> {
+    state: &'a AppState,
+    root_key: String,
+}
+
+impl<'a> RefreshGuard<'a> {
+    /// Create guard or return early if refresh is already active.
+    /// 创建 refresh guard；如果已经在刷新则直接返回错误。
+    fn try_new(state: &'a AppState, root_key: String) -> Result<Self> {
+        let mut active = state.active_refreshes.lock();
+
+        if !active.insert(root_key.clone()) {
+            return Err(anyhow!("Refresh already in progress"));
+        }
+
+        Ok(Self { state, root_key })
+    }
+}
+
+impl Drop for RefreshGuard<'_> {
+    fn drop(&mut self) {
+        self.state.active_refreshes.lock().remove(&self.root_key);
+    }
+}
+
+/// Get registered project context by root key.
+/// 根据 root_key 获取工程上下文。
+fn get_project_context(state: &AppState, root_key: &str) -> Result<ProjectContext> {
+    let projects = state.projects.lock();
+
+    projects
+        .get(root_key)
+        .cloned()
+        .ok_or_else(|| anyhow!("Project not found: {}", root_key))
+}
+
+/// Build lookup names for class or asset references.
+/// 为 class 或 asset 引用构造多个可匹配名称。
+fn make_asset_lookup_names(input: &str) -> Vec<String> {
+    let class_name = if input.starts_with("/Script/") {
+        input.rsplit('.').next().unwrap_or(input)
+    } else {
+        input
+    };
+
+    let mut names = vec![class_name.to_ascii_lowercase()];
+
+    let prefixes = ['a', 'u', 'f', 'e', 't', 's'];
+    let mut chars = class_name.chars();
+
+    if let (Some(first), Some(second)) = (chars.next(), chars.next()) {
+        if prefixes.contains(&first.to_ascii_lowercase()) && second.is_uppercase() {
+            names.push(class_name[first.len_utf8()..].to_ascii_lowercase());
+        }
+    }
+
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Locate an asset file from an Unreal /Game path.
+/// 根据 Unreal /Game 路径定位真实资产文件。
+fn find_asset_file(project_root: &str, asset_path: &str) -> Option<PathBuf> {
+    let root = PathBuf::from(normalize_to_native(project_root));
+    let relative = asset_path.replacen("/Game/", "Content/", 1);
+    let basename = relative.rsplit('/').next().unwrap_or("");
+
+    let candidates = [
+        format!("{}.uasset", basename),
+        format!("{}.umap", basename),
+    ];
+
+    let walker = ignore::WalkBuilder::new(root)
+        .hidden(false)
+        .git_ignore(true)
+        .filter_entry(|entry| {
+            let name = entry.file_name().to_string_lossy();
+            !matches!(name.as_ref(), "Intermediate" | "Binaries" | "Build" | "Saved")
+        })
+        .build();
+
+    for entry in walker.filter_map(|entry| entry.ok()) {
+        let name = entry.file_name().to_string_lossy();
+
+        if !candidates.iter().any(|candidate| candidate == name.as_ref()) {
+            continue;
+        }
+
+        let normalized = entry.path().to_string_lossy().replace('\\', "/");
+
+        if normalized.contains(&relative) {
+            return Some(entry.path().to_path_buf());
+        }
+    }
+
+    None
+}
+
+/// Sort a string set into deterministic order.
+/// 把字符串集合排序成稳定输出。
+fn sorted_strings(values: HashSet<String>) -> Vec<String> {
+    let mut values = values.into_iter().collect::<Vec<_>>();
+    values.sort();
+    values
+}
