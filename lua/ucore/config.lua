@@ -12,6 +12,20 @@ M.values = {
 	port = 30110,
 	scanner_dir = scanner_dir,
 	db_dir_name = ".ucore",
+	-- Automatically boot UCore when opening a file inside an Unreal project.
+	-- 打开 Unreal 工程里的文件时自动启动 UCore。
+	auto_boot = false,
+
+	-- Delay auto boot slightly to avoid fighting startup/plugin loading.
+	-- 稍微延迟自动启动，避免和 nvim 启动/插件加载抢时机。
+	auto_boot_delay_ms = 300,
+
+	-- Events that may trigger auto boot.
+	-- 可能触发自动启动的事件。
+	auto_boot_events = {
+		"BufReadPost",
+		"BufNewFile",
+	},
 
 	-- Development mode: call Cargo directly so code changes are picked up.
 	-- 开发模式：直接调用 Cargo，方便 Rust 代码修改后立即生效。
