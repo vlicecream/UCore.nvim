@@ -9,19 +9,121 @@ local completion = require("ucore.completion")
 
 local M = {}
 
+-- Print the resolved Unreal Engine root for the current project.
+-- 打印当前项目解析到的 Unreal Engine 根目录。
+function M.engine()
+	local root = project.find_project_root()
+	if not root then
+		return vim.notify("Could not find .uproject", vim.log.levels.ERROR)
+	end
+
+	local engine, err = project.engine_metadata(root)
+	if not engine then
+		return vim.notify(tostring(err), vim.log.levels.ERROR)
+	end
+
+	local paths = project.build_engine_paths(engine)
+	print(vim.inspect(vim.tbl_extend("force", engine, {
+		db_path = paths.db_path,
+		cache_db_path = paths.cache_db_path,
+		needs_refresh = project.engine_needs_refresh(engine),
+	})))
+end
+
 -- Trigger manual completion through Rust completion engine.
 -- 通过 Rust 补全引擎触发手动补全。
 function M.complete()
 	completion.complete()
 end
 
--- :UCore boot
--- 一键启动 UCore：server -> setup -> refresh -> watch。
-function M.boot()
-	bootstrap.boot(function(ok, err)
-		if not ok and err then
-			vim.notify("UCore boot failed:\n" .. tostring(err), vim.log.levels.ERROR)
+-- Register the current Unreal project in the global registry.
+-- 将当前 Unreal 项目注册到全局注册表。
+function M.register_project()
+	local root = project.find_project_root()
+	if not root then
+		return vim.notify("Could not find .uproject", vim.log.levels.ERROR)
+	end
+
+	local metadata = project.register_project(root)
+	vim.notify("UCore registered project: " .. metadata.name, vim.log.levels.INFO)
+end
+
+-- Pick and open a registered Unreal project.
+-- 选择并打开一个已注册 Unreal 项目。
+function M.open_project()
+	local items = project.list_registered_projects()
+
+	if vim.tbl_isempty(items) then
+		return vim.notify(
+			"No registered UCore projects. Open a project and run :UCore register first.",
+			vim.log.levels.WARN
+		)
+	end
+
+	vim.ui.select(items, {
+		prompt = "UCore projects",
+		format_item = function(item)
+			local engine = item.engine_association and (" [" .. item.engine_association .. "]") or ""
+			return (item.name or item.root) .. engine .. "\n" .. item.root
+		end,
+	}, function(item)
+		if not item then
+			return
 		end
+
+		project.open_project(item.root)
+		M.boot()
+	end)
+end
+
+-- Print registered projects.
+-- 打印已注册项目。
+function M.projects()
+	print(vim.inspect(project.list_registered_projects()))
+end
+
+-- :UCore boot
+-- Smart entrypoint: boot current project or pick a registered one.
+-- 智能入口：启动当前项目，或选择一个已注册项目。
+function M.boot()
+	local root = project.find_project_root()
+
+	if root then
+		project.register_project(root)
+
+		return bootstrap.boot(function(ok, err)
+			if not ok and err then
+				vim.notify("UCore boot failed:\n" .. tostring(err), vim.log.levels.ERROR)
+			end
+		end)
+	end
+
+	local items = project.list_registered_projects()
+	if vim.tbl_isempty(items) then
+		return vim.notify(
+			"UCore: no Unreal project found and no registered projects.\nOpen a .uproject project once, then run :UCore.",
+			vim.log.levels.WARN
+		)
+	end
+
+	vim.ui.select(items, {
+		prompt = "UCore projects",
+		format_item = function(item)
+			local engine = item.engine_association and (" [" .. item.engine_association .. "]") or ""
+			return (item.name or item.root) .. engine .. "\n" .. item.root
+		end,
+	}, function(item)
+		if not item then
+			return
+		end
+
+		project.open_project(item.root)
+
+		bootstrap.boot(function(ok, err)
+			if not ok and err then
+				vim.notify("UCore boot failed:\n" .. tostring(err), vim.log.levels.ERROR)
+			end
+		end)
 	end)
 end
 
@@ -72,12 +174,57 @@ local function notify_result(title, result, err)
 	print(vim.inspect(result))
 end
 
+-- Force-refresh the shared Unreal Engine index for the current project.
+-- 强制刷新当前项目对应的共享 Unreal Engine 索引。
+function M.engine_refresh()
+	local root = project.find_project_root()
+	if not root then
+		return vim.notify("Could not find .uproject", vim.log.levels.ERROR)
+	end
+
+	local engine, err = project.engine_metadata(root)
+	if not engine then
+		return vim.notify(tostring(err), vim.log.levels.ERROR)
+	end
+
+	local paths = project.build_engine_paths(engine)
+	vim.notify("UCore engine refresh: " .. engine.engine_root, vim.log.levels.INFO)
+
+	client.refresh({
+		type = "refresh",
+		project_root = engine.engine_root,
+		engine_root = nil,
+		db_path = paths.db_path,
+		cache_db_path = paths.cache_db_path,
+		config = project.default_config(),
+		scope = "Game",
+		vcs_hash = nil,
+	}, function(result, refresh_err)
+		if refresh_err then
+			return notify_result("UCore engine refresh", result, refresh_err)
+		end
+
+		project.write_engine_index_metadata(engine)
+		notify_result("UCore engine refresh", {
+			engine_id = engine.engine_id,
+			engine_root = engine.engine_root,
+			db_path = paths.db_path,
+			status = "ok",
+		}, nil)
+	end)
+end
+
 -- Build a setup/refresh payload for the current Unreal project.
 -- 为当前 Unreal 工程构造 setup/refresh 请求体。
 local function current_project_payload()
 	local root = project.find_project_root()
 	if not root then
 		return nil, "Could not find .uproject"
+	end
+
+	local engine, engine_err = project.engine_metadata(root)
+	if not engine then
+		return nil, engine_err
 	end
 
 	local paths = project.build_paths(root)
@@ -87,6 +234,7 @@ local function current_project_payload()
 		db_path = paths.db_path,
 		cache_db_path = paths.cache_db_path,
 		config = project.default_config(),
+		engine_root = engine.engine_root,
 		vcs_hash = nil,
 	}
 end
@@ -129,7 +277,6 @@ function M.refresh()
 	end
 
 	payload.type = "refresh"
-	payload.engine_root = nil
 	payload.scope = "Game"
 
 	client.refresh(payload, function(result, refresh_err)
@@ -212,16 +359,10 @@ function M.help()
 	print([[
 UCore commands:
 
-  :UCore              Boot UCore for the current Unreal project
-  :UCore boot         Start server, setup project, refresh if needed, and watch
-  :UCore modules      Pick indexed modules
-  :UCore assets       Pick indexed assets
-  :UCore search-symbols <pattern>
-                      Search indexed symbols
+  :UCore              Open or boot an Unreal project
+  :UCore boot         Same as :UCore
   :UCore debug help   Show debug commands
   :UCore help         Show this help
-  :UCore complete     Trigger manual completion in Insert mode
-
 ]])
 end
 
@@ -238,6 +379,17 @@ UCore debug commands:
   :UCore debug restart      Restart Rust server
   :UCore debug setup        Register current Unreal project
   :UCore debug refresh      Refresh current Unreal project index
+  :UCore debug register     Register current project in global registry
+  :UCore debug open         Pick and open a registered project
+  :UCore debug projects     Print registered projects
+  :UCore debug engine       Show resolved Unreal Engine root/cache
+  :UCore debug engine-refresh
+                            Force refresh shared Unreal Engine index
+  :UCore debug modules      Pick indexed modules
+  :UCore debug assets       Pick indexed assets
+  :UCore debug search-symbols <pattern>
+                            Search indexed symbols
+  :UCore debug complete     Trigger manual completion in Insert mode
   :UCore debug maps         Print Lua-side component/module maps
   :UCore debug help         Show this help
 ]])

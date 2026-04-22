@@ -1,12 +1,30 @@
 local cli = require("ucore.client.cli")
+local project = require("ucore.project")
 local rpc = require("ucore.client.rpc")
 
 local M = {}
+
+-- Resolve the shared Engine DB for a project when it already exists.
+-- 当共享 Engine DB 已存在时，解析当前项目对应的 Engine DB。
+local function existing_engine_db_path(project_root)
+	local engine = project.cached_engine_metadata(project_root) or project.engine_metadata(project_root)
+	if not engine then
+		return nil
+	end
+
+	local paths = project.build_engine_paths(engine)
+	if vim.fn.filereadable(paths.db_path) ~= 1 then
+		return nil
+	end
+
+	return paths.db_path
+end
 
 -- Send a typed query with the current project root attached.
 -- 发送带 project_root 的类型化查询。
 function M.query(project_root, query, callback)
 	query.project_root = project_root
+	query.engine_db_path = existing_engine_db_path(project_root)
 
 	-- Prefer the persistent TCP RPC path for interactive queries.
 	-- 交互式查询优先走持久 TCP RPC，避免每次启动 CLI 进程。

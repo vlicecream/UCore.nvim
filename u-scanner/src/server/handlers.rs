@@ -38,6 +38,9 @@ pub struct PingRequest {
 pub struct ServerQueryRequest {
     pub project_root: String,
 
+    #[serde(default)]
+    pub engine_db_path: Option<String>,
+
     #[serde(flatten)]
     pub query: QueryRequest,
 }
@@ -216,6 +219,7 @@ pub async fn handle_query(
             &conn,
             &root_key,
             &req.project_root,
+            req.engine_db_path.clone(),
             req.query.clone(),
             persistent_cache_conn,
         )? {
@@ -241,10 +245,16 @@ fn handle_state_query(
     conn: &rusqlite::Connection,
     root_key: &str,
     project_root: &str,
+    engine_db_path: Option<String>,
     request: QueryRequest,
     persistent_cache_conn: Option<Arc<parking_lot::Mutex<rusqlite::Connection>>>,
 ) -> Result<Option<Value>> {
     match request {
+        QueryRequest::SearchSymbols { pattern, limit } => {
+            let value = search_symbols_with_engine(state, conn, engine_db_path, &pattern, limit)?;
+            Ok(Some(value))
+        }
+
         QueryRequest::GetAssetUsages { asset_path } => {
             Ok(Some(get_asset_usages(&state, root_key, &asset_path)))
         }
@@ -332,6 +342,112 @@ fn send_query_partial(tx: &mpsc::Sender<Vec<u8>>, msgid: u64, items: Vec<Value>)
     let _ = tx.blocking_send(framed);
 
     Ok(())
+}
+
+/// Search symbols in the project DB, then merge matching Engine DB results.
+/// 先查询项目 DB，再合并 Engine DB 的符号搜索结果。
+fn search_symbols_with_engine(
+    state: Arc<AppState>,
+    project_conn: &rusqlite::Connection,
+    engine_db_path: Option<String>,
+    pattern: &str,
+    limit: usize,
+) -> Result<Value> {
+    let limit = limit.clamp(1, 1000);
+    let mut results = value_array(query::search::search_symbols(project_conn, pattern, limit)?);
+    tag_source(&mut results, "project");
+
+    if results.len() >= limit {
+        results.truncate(limit);
+        return Ok(json!(results));
+    }
+
+    let Some(engine_db_path) = engine_db_path else {
+        return Ok(json!(results));
+    };
+
+    let engine_db_path = normalize_to_native(&engine_db_path);
+    if !Path::new(&engine_db_path).is_file() {
+        return Ok(json!(results));
+    }
+
+    let engine_conn = match state.get_read_only_connection(&engine_db_path) {
+        Ok(conn) => conn,
+        Err(err) => {
+            warn!("Failed to open Engine DB for symbol search: {}", err);
+            return Ok(json!(results));
+        }
+    };
+
+    let remaining = limit.saturating_sub(results.len()).max(1);
+    let mut engine_results =
+        match query::search::search_symbols(&engine_conn, pattern, remaining) {
+            Ok(value) => value_array(value),
+            Err(err) => {
+                warn!("Failed to query Engine DB symbols: {}", err);
+                return Ok(json!(results));
+            }
+        };
+
+    tag_source(&mut engine_results, "engine");
+    merge_query_results(&mut results, engine_results, limit);
+
+    Ok(json!(results))
+}
+
+/// Convert a JSON array value into a Vec.
+/// 将 JSON array value 转成 Vec。
+fn value_array(value: Value) -> Vec<Value> {
+    value.as_array().cloned().unwrap_or_default()
+}
+
+/// Add a source marker to query result objects.
+/// 给查询结果对象添加来源标记。
+fn tag_source(items: &mut [Value], source: &str) {
+    for item in items {
+        if let Some(object) = item.as_object_mut() {
+            object.entry("source").or_insert_with(|| json!(source));
+        }
+    }
+}
+
+/// Merge query results while keeping project results first and avoiding duplicates.
+/// 合并查询结果，保持项目结果优先，并去重。
+fn merge_query_results(target: &mut Vec<Value>, extra: Vec<Value>, limit: usize) {
+    let mut seen = target
+        .iter()
+        .map(result_identity)
+        .collect::<HashSet<String>>();
+
+    for item in extra {
+        if target.len() >= limit {
+            break;
+        }
+
+        let identity = result_identity(&item);
+        if seen.insert(identity) {
+            target.push(item);
+        }
+    }
+}
+
+/// Build a stable identity for de-duplicating merged query results.
+/// 为合并查询结果构造稳定去重 key。
+fn result_identity(item: &Value) -> String {
+    let name = item
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let path = item
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let line = item
+        .get("line")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+
+    format!("{}:{}:{}", name, path, line)
 }
 
 // -----------------------------------------------------------------------------

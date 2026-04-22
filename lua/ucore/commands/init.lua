@@ -30,9 +30,23 @@ end
 -- Dispatch debug-only subcommands.
 -- 分发仅用于调试的子命令。
 local function dispatch_debug(tail)
-	local sub = split_first(tail)
+	local sub, rest = split_first(tail)
 
 	local handlers = {
+		engine = actions.engine,
+		["engine-refresh"] = actions.engine_refresh,
+		enginerefresh = actions.engine_refresh,
+		open = actions.open_project,
+		register = actions.register_project,
+		projects = actions.projects,
+		modules = actions.modules,
+		assets = actions.assets,
+		["search-symbols"] = function()
+			actions.search_symbols(rest)
+		end,
+		searchsymbols = function()
+			actions.search_symbols(rest)
+		end,
 		status = actions.status,
 		["rpc-status"] = actions.rpc_status,
 		rpcstatus = actions.rpc_status,
@@ -61,15 +75,6 @@ function M.dispatch(args)
 
 	local handlers = {
 		boot = actions.boot,
-		modules = actions.modules,
-		assets = actions.assets,
-		["search-symbols"] = function()
-			actions.search_symbols(tail)
-		end,
-		searchsymbols = function()
-			actions.search_symbols(tail)
-		end,
-		complete = actions.complete,
 		debug = function()
 			dispatch_debug(tail)
 		end,
@@ -110,12 +115,8 @@ function M.register()
 		complete = function(arglead)
 			local items = {
 				"boot",
-				"modules",
-				"assets",
-				"search-symbols",
 				"debug",
 				"help",
-				"complete",
 			}
 
 			return vim.tbl_filter(function(item)

@@ -22,14 +22,31 @@ local function current_project_payload()
 	end
 
 	local paths = project.build_paths(root)
+	local engine, engine_err = project.engine_metadata(root)
+	if not engine then
+		return nil, engine_err
+	end
+	local engine_paths = project.build_engine_paths(engine)
 
 	return {
 		project_root = paths.project_root,
 		db_path = paths.db_path,
 		cache_db_path = paths.cache_db_path,
 		config = project.default_config(),
+		engine_root = engine.engine_root,
 		vcs_hash = nil,
+		_engine = engine,
+		_engine_paths = engine_paths,
 	}
+end
+
+-- Remove Lua-only fields before sending a request to Rust.
+-- 发送给 Rust 前移除 Lua 内部字段。
+local function rust_payload(payload)
+	local copy = vim.deepcopy(payload)
+	copy._engine = nil
+	copy._engine_paths = nil
+	return copy
 end
 
 -- Wait until the Rust server accepts RPC requests.
@@ -56,12 +73,47 @@ end
 -- 执行 setup，并判断是否需要 full refresh。
 local function run_setup(payload, callback)
 	notify("setup")
-	client.setup(payload, function(result, err)
+	client.setup(rust_payload(payload), function(result, err)
 		if err then
 			return callback(false, err)
 		end
 
 		callback(true, result or {})
+	end)
+end
+
+-- Refresh the shared Unreal Engine index once per Engine install.
+-- 按 Engine 安装维度刷新共享 Unreal Engine 索引。
+local function run_engine_refresh_if_needed(payload, callback)
+	local engine = payload._engine
+	local engine_paths = payload._engine_paths
+
+	if not engine or not engine_paths then
+		return callback(true)
+	end
+
+	if not project.engine_needs_refresh(engine) then
+		notify("engine refresh skipped")
+		return callback(true)
+	end
+
+	notify("engine refresh")
+	client.refresh({
+		type = "refresh",
+		project_root = engine.engine_root,
+		engine_root = nil,
+		db_path = engine_paths.db_path,
+		cache_db_path = engine_paths.cache_db_path,
+		config = project.default_config(),
+		scope = "Game",
+		vcs_hash = nil,
+	}, function(_, err)
+		if err then
+			return callback(false, err)
+		end
+
+		project.write_engine_index_metadata(engine)
+		callback(true)
 	end)
 end
 
@@ -74,9 +126,8 @@ local function run_refresh_if_needed(payload, setup_result, callback)
 	end
 
 	notify("refresh")
-	local refresh_payload = vim.deepcopy(payload)
+	local refresh_payload = rust_payload(payload)
 	refresh_payload.type = "refresh"
-	refresh_payload.engine_root = nil
 	refresh_payload.scope = "Game"
 
 	client.refresh(refresh_payload, function(_, err)
@@ -137,30 +188,38 @@ function M.boot(callback)
 				return callback(false, ready_err)
 			end
 
-			run_setup(payload, function(setup_ok, setup_result)
-				if not setup_ok then
+			run_engine_refresh_if_needed(payload, function(engine_ok, engine_err)
+				if not engine_ok then
 					booting = false
-					notify(tostring(setup_result), vim.log.levels.ERROR)
-					return callback(false, setup_result)
+					notify(tostring(engine_err), vim.log.levels.ERROR)
+					return callback(false, engine_err)
 				end
 
-				run_refresh_if_needed(payload, setup_result, function(refresh_ok, refresh_err)
-					if not refresh_ok then
+				run_setup(payload, function(setup_ok, setup_result)
+					if not setup_ok then
 						booting = false
-						notify(tostring(refresh_err), vim.log.levels.ERROR)
-						return callback(false, refresh_err)
+						notify(tostring(setup_result), vim.log.levels.ERROR)
+						return callback(false, setup_result)
 					end
 
-					run_watch(payload, function(watch_ok, watch_err)
-						booting = false
-
-						if not watch_ok then
-							notify(tostring(watch_err), vim.log.levels.ERROR)
-							return callback(false, watch_err)
+					run_refresh_if_needed(payload, setup_result, function(refresh_ok, refresh_err)
+						if not refresh_ok then
+							booting = false
+							notify(tostring(refresh_err), vim.log.levels.ERROR)
+							return callback(false, refresh_err)
 						end
 
-						notify("ready")
-						callback(true)
+						run_watch(payload, function(watch_ok, watch_err)
+							booting = false
+
+							if not watch_ok then
+								notify(tostring(watch_err), vim.log.levels.ERROR)
+								return callback(false, watch_err)
+							end
+
+							notify("ready")
+							callback(true)
+						end)
 					end)
 				end)
 			end)
