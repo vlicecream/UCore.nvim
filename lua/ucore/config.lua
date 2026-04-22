@@ -54,7 +54,11 @@ end
 M.values = {
 	port = 30110,
 	scanner_dir = scanner_dir,
-	db_dir_name = ".ucore",
+
+	-- Root directory for UCore runtime cache files.
+	-- UCore 运行时缓存文件根目录。
+	cache_dir = vim.fn.stdpath("cache") .. "/ucore",
+
 
 	-- Prefer release binaries when they exist.
 	-- release binary 存在时优先使用它们。

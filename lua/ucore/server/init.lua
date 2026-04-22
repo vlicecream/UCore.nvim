@@ -56,10 +56,9 @@ function M.start(callback)
 	end
 
 	local paths = project.build_paths(root)
-	local registry = paths.project_root .. "/" .. config.values.db_dir_name .. "/registry.json"
-	local cmd = build_cmd(config.values.port, registry)
+	local cmd = build_cmd(config.values.port, paths.registry_path)
 
-	log_file = paths.project_root .. "/" .. config.values.db_dir_name .. "/u_core_server.log"
+	log_file = paths.log_path
 
 	job = vim.system(cmd, {
 		cwd = config.values.scanner_dir,

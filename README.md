@@ -38,6 +38,7 @@ This project is still early and evolving quickly.
 ```lua
 {
   "vlicecream/UCore.nvim",
+  build = "cargo build --release --manifest-path u-scanner/Cargo.toml --bin u_core_server --bin u_scanner",
   config = function()
     require("ucore").setup({
       auto_boot = true,
@@ -52,6 +53,7 @@ This project is still early and evolving quickly.
 {
   dir = "C:/Unreal-NVIM/UCore.nvim",
   name = "UCore.nvim",
+  build = "cargo build --release --manifest-path u-scanner/Cargo.toml --bin u_core_server --bin u_scanner",
   config = function()
     require("ucore").setup({
       auto_boot = true,
@@ -134,6 +136,7 @@ Default configuration:
 require("ucore").setup({
   auto_boot = false,
   port = 30110,
+  use_release_binary = true,
 })
 ```
 
@@ -143,6 +146,7 @@ Recommended configuration:
 require("ucore").setup({
   auto_boot = true,
   port = 30110,
+  use_release_binary = true,
 })
 ```
 
@@ -151,40 +155,56 @@ Unreal project.
 
 `auto_boot = true` 会在打开 Unreal 工程内文件时自动启动 UCore。
 
+`use_release_binary = true` makes UCore prefer binaries built by lazy.nvim's
+`build` step. If release binaries do not exist, UCore falls back to `cargo run`.
+
+`use_release_binary = true` 会让 UCore 优先使用 lazy.nvim `build` 阶段构建出的
+release binary。如果 release binary 不存在，UCore 会回退到 `cargo run`。
+
 ## Rust Backend
 
 During development, UCore can run the Rust backend through `cargo run`.
 
 开发阶段，UCore 可以通过 `cargo run` 启动 Rust 后端。
 
-For faster startup, build release binaries manually:
+For faster startup, let lazy.nvim build release binaries during install/update:
+
+```lua
+{
+  "vlicecream/UCore.nvim",
+  build = "cargo build --release --manifest-path u-scanner/Cargo.toml --bin u_core_server --bin u_scanner",
+}
+```
+
+为了获得更快的启动速度，推荐让 lazy.nvim 在安装/更新插件时构建 release binary：
+
+```lua
+{
+  "vlicecream/UCore.nvim",
+  build = "cargo build --release --manifest-path u-scanner/Cargo.toml --bin u_core_server --bin u_scanner",
+}
+```
+
+You can also build manually:
 
 ```powershell
 cd u-scanner
 cargo build --release --bin u_core_server --bin u_scanner
 ```
 
-更快的启动方式是先手动构建 release binary：
+也可以手动构建：
 
 ```powershell
 cd u-scanner
 cargo build --release --bin u_core_server --bin u_scanner
 ```
-
-A future command will provide this directly:
-
-```vim
-:UCore build
-```
-
-后续会提供 `:UCore build` 直接完成这一步。
 
 ## Data Files
 
-By default, UCore stores project-local data under:
+By default, UCore stores runtime data under Neovim's cache directory:
 
 ```text
-<YourUnrealProject>/.ucore/
+stdpath("cache")/ucore/projects/<project-name>-<hash>/
 ```
 
 Typical files:
@@ -196,7 +216,7 @@ u_core_server.log
 registry.json
 ```
 
-默认情况下，UCore 会把数据库和日志放在 Unreal 工程目录下的 `.ucore/`。
+默认情况下，UCore 会把数据库和日志放在 Neovim cache 目录下，不会污染 Unreal 工程目录。
 
 ## Troubleshooting
 
