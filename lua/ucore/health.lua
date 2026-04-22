@@ -48,21 +48,38 @@ local function release_binary(name)
 	return config.values.scanner_dir .. "/target/release/" .. name .. suffix
 end
 
--- Run a quick TCP check against the configured server port.
--- 对配置的 server 端口做一次快速 TCP 检查。
-local function tcp_check(callback)
-	local uv = vim.uv or vim.loop
-	local socket = uv.new_tcp()
+-- Run a synchronous TCP check against the configured server port.
+-- 对配置的 server 端口做一次同步 TCP 检查。
+local function tcp_check()
+	local port = tostring(config.values.port)
 
-	socket:connect("127.0.0.1", config.values.port, function(err)
-		socket:close()
+	if vim.fn.has("win32") == 1 then
+		local shell = executable("pwsh") and "pwsh" or "powershell"
+		local script = table.concat({
+			"$client = [Net.Sockets.TcpClient]::new();",
+			"try {",
+			"  $async = $client.BeginConnect('127.0.0.1', " .. port .. ", $null, $null);",
+			"  if (-not $async.AsyncWaitHandle.WaitOne(1000, $false)) { exit 1 }",
+			"  $client.EndConnect($async);",
+			"  exit 0",
+			"} catch {",
+			"  exit 1",
+			"} finally {",
+			"  $client.Close()",
+			"}",
+		}, " ")
 
-		if err then
-			return callback(false, err)
-		end
+		local result = vim.system({ shell, "-NoProfile", "-Command", script }, { text = true }):wait()
+		return result.code == 0, result.stderr ~= "" and result.stderr or result.stdout
+	end
 
-		callback(true)
-	end)
+	local result = vim.system({
+		"sh",
+		"-c",
+		"timeout 1 bash -c '</dev/tcp/127.0.0.1/" .. port .. "'",
+	}, { text = true }):wait()
+
+	return result.code == 0, result.stderr ~= "" and result.stderr or result.stdout
 end
 
 -- Report static installation and project checks.
@@ -180,16 +197,15 @@ local function report_server_checks()
 
 	info("configured port: " .. tostring(config.values.port))
 
-	tcp_check(function(reachable, err)
-		if reachable then
-			ok("server accepts TCP connections on 127.0.0.1:" .. tostring(config.values.port))
-		else
-			warn("server is not reachable: " .. tostring(err), {
-				"Run :UCore to boot the server.",
-				"For debugging, run :UCore debug start and :UCore debug rpc-status.",
-			})
-		end
-	end)
+	local reachable, err = tcp_check()
+	if reachable then
+		ok("server accepts TCP connections on 127.0.0.1:" .. tostring(config.values.port))
+	else
+		warn("server is not reachable: " .. tostring(err), {
+			"Run :UCore to boot the server.",
+			"For debugging, run :UCore debug start and :UCore debug rpc-status.",
+		})
+	end
 end
 
 -- Neovim calls this function for :checkhealth ucore.
