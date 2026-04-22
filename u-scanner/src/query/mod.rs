@@ -70,6 +70,10 @@ pub fn process_query(conn: &Connection, request: QueryRequest) -> Result<Value> 
             class::get_class_members(conn, &class_name)
         }
 
+        QueryRequest::SearchClassesPrefix { prefix, limit } => {
+            class::search_classes_prefix(conn, &prefix, limit)
+        }
+
         QueryRequest::GetClassesInModules {
             modules,
             symbol_type,

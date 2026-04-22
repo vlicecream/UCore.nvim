@@ -143,6 +143,72 @@ pub fn get_class_members(conn: &Connection, class_name: &str) -> Result<Value> {
     collect_json_rows(rows)
 }
 
+/// Search class-like symbols by name prefix.
+/// 按名称前缀搜索 class/struct/enum 等类型符号。
+pub fn search_classes_prefix(
+    conn: &Connection,
+    prefix: &str,
+    limit: Option<usize>,
+) -> Result<Value> {
+    let prefix = prefix.trim();
+
+    if prefix.is_empty() {
+        return Ok(json!([]));
+    }
+
+    let limit = limit.unwrap_or(50).clamp(1, 1000) as i64;
+    let pattern = format!("{}%", prefix);
+
+    let sql = format!(
+        r#"
+        {}
+        SELECT
+            c.id,
+            sc.text AS name,
+            sb.text AS base_class,
+            c.symbol_type,
+            {} AS path,
+            sm.text AS module_name,
+            c.line_number,
+            c.end_line_number
+        FROM classes c
+        JOIN strings sc ON c.name_id = sc.id
+        LEFT JOIN strings sb ON c.base_class_id = sb.id
+        LEFT JOIN files f ON c.file_id = f.id
+        LEFT JOIN dir_paths dp ON f.directory_id = dp.id
+        LEFT JOIN strings sf ON f.filename_id = sf.id
+        LEFT JOIN modules m ON f.module_id = m.id
+        LEFT JOIN strings sm ON m.name_id = sm.id
+        WHERE sc.text LIKE ?1
+          AND sc.text NOT LIKE '(%'
+        ORDER BY sc.text ASC
+        LIMIT ?2
+        "#,
+        PATH_CTE,
+        file_path_expr("dp", "sf"),
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![pattern, limit], |row| {
+        let path = row
+            .get::<_, Option<String>>(4)?
+            .map(|value| normalize_path(&value));
+
+        Ok(json!({
+            "id": row.get::<_, i64>(0)?,
+            "name": row.get::<_, String>(1)?,
+            "base_class": row.get::<_, Option<String>>(2)?,
+            "type": row.get::<_, String>(3)?,
+            "path": path,
+            "module_name": row.get::<_, Option<String>>(5)?,
+            "line": row.get::<_, Option<i64>>(6)?,
+            "end_line": row.get::<_, Option<i64>>(7)?,
+        }))
+    })?;
+
+    collect_json_rows(rows)
+}
+
 /// Return classes grouped by file for selected modules.
 /// 返回指定模块中的类，并按文件分组。
 ///
