@@ -465,7 +465,6 @@ fn write_components_and_modules(
 ) -> Result<HashMap<String, i64>> {
     let tx = conn.transaction()?;
     tx.execute("DELETE FROM components", [])?;
-    tx.execute("DELETE FROM modules", [])?;
 
     let mut string_cache = HashMap::new();
     let mut dir_cache = HashMap::new();
@@ -501,6 +500,13 @@ fn write_components_and_modules(
             INSERT INTO modules
                 (name_id, type, scope, root_directory_id, build_cs_path, owner_name, component_name, deep_dependencies)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(name_id, root_directory_id) DO UPDATE SET
+                type = excluded.type,
+                scope = excluded.scope,
+                build_cs_path = excluded.build_cs_path,
+                owner_name = excluded.owner_name,
+                component_name = excluded.component_name,
+                deep_dependencies = excluded.deep_dependencies
             "#,
             params![
                 name_id,
@@ -514,7 +520,13 @@ fn write_components_and_modules(
             ],
         )?;
 
-        module_map.insert(normalize_path(&module.root), tx.last_insert_rowid());
+        let module_id = tx.query_row(
+            "SELECT id FROM modules WHERE name_id = ? AND root_directory_id = ?",
+            params![name_id, root_dir_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+
+        module_map.insert(normalize_path(&module.root), module_id);
     }
 
     let global_id = insert_global_module(&tx, project_root, &mut string_cache, &mut dir_cache)?;
@@ -536,11 +548,21 @@ fn insert_global_module(
     let root_dir_id = get_or_create_directory(tx, string_cache, dir_cache, project_root)?;
 
     tx.execute(
-        "INSERT INTO modules (name_id, type, scope, root_directory_id) VALUES (?, ?, ?, ?)",
+        r#"
+        INSERT INTO modules (name_id, type, scope, root_directory_id)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(name_id, root_directory_id) DO UPDATE SET
+            type = excluded.type,
+            scope = excluded.scope
+        "#,
         params![name_id, "Global", "Game", root_dir_id],
     )?;
 
-    Ok(tx.last_insert_rowid())
+    Ok(tx.query_row(
+        "SELECT id FROM modules WHERE name_id = ? AND root_directory_id = ?",
+        params![name_id, root_dir_id],
+        |row| row.get::<_, i64>(0),
+    )?)
 }
 
 // -----------------------------------------------------------------------------
