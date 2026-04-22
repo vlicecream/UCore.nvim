@@ -1,4 +1,5 @@
 local actions = require("ucore.commands.actions")
+local config = require("ucore.config")
 
 local M = {}
 
@@ -42,6 +43,7 @@ local function dispatch_debug(tail)
 		restart = actions.restart,
 		maps = actions.maps,
 		help = actions.debug_help,
+		complete = actions.complete,
 	}
 
 	local handler = handlers[sub]
@@ -67,6 +69,7 @@ function M.dispatch(args)
 		searchsymbols = function()
 			actions.search_symbols(tail)
 		end,
+		complete = actions.complete,
 		debug = function()
 			dispatch_debug(tail)
 		end,
@@ -85,6 +88,23 @@ end
 -- Register a single user command with subcommands.
 -- 注册一个带子命令的用户命令。
 function M.register()
+	-- Provide a simple manual insert-mode completion mapping.
+	-- 提供一个简单的插入模式手动补全快捷键。
+	local function complete()
+		require("ucore.completion").complete()
+	end
+
+	local completion_config = config.values.completion or {}
+	local keymap = completion_config.keymap
+
+	if completion_config.enable ~= false and keymap and keymap ~= "" then
+		-- Manual completion mapping, configurable by users.
+		-- 用户可配置的手动补全快捷键。
+		vim.keymap.set("i", keymap, complete, {
+			desc = "UCore complete",
+		})
+	end
+
 	vim.api.nvim_create_user_command("UCore", M.dispatch, {
 		nargs = "*",
 		complete = function(arglead)
@@ -95,6 +115,7 @@ function M.register()
 				"search-symbols",
 				"debug",
 				"help",
+				"complete",
 			}
 
 			return vim.tbl_filter(function(item)

@@ -5,6 +5,7 @@ local M = {}
 function M.setup(opts)
 	require("ucore.config").setup(opts)
 	require("ucore.commands").register()
+	require("ucore.completion").setup()
 	require("ucore.autocmd").setup()
 end
 

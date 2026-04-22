@@ -5,8 +5,15 @@ local remote = require("ucore.remote")
 local server = require("ucore.server")
 local ui = require("ucore.ui")
 local bootstrap = require("ucore.bootstrap")
+local completion = require("ucore.completion")
 
 local M = {}
+
+-- Trigger manual completion through Rust completion engine.
+-- 通过 Rust 补全引擎触发手动补全。
+function M.complete()
+	completion.complete()
+end
 
 -- :UCore boot
 -- 一键启动 UCore：server -> setup -> refresh -> watch。
@@ -213,6 +220,8 @@ UCore commands:
                       Search indexed symbols
   :UCore debug help   Show debug commands
   :UCore help         Show this help
+  :UCore complete     Trigger manual completion in Insert mode
+
 ]])
 end
 

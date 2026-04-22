@@ -11,6 +11,7 @@ use crate::server::state::CompletionCache;
 const MAX_COMPLETION_ITEMS: usize = 2000;
 const MAX_MEMBER_ITEMS_PER_CLASS: usize = 250;
 const MAX_TYPEDEF_DEPTH: usize = 4;
+const MIN_GLOBAL_PREFIX_LEN: usize = 2;
 
 /// Per-request cache and lookup context.
 /// 单次补全请求里的缓存和查询上下文。
@@ -204,6 +205,25 @@ pub fn process_completion(
     }
 
     if let Some(request) = member_completion_request(cursor_node, content) {
+        let receiver_text = clean_type(node_text(request.receiver, content));
+        let current_class = enclosing_class(cursor_node, content);
+
+        if receiver_text == "Super" {
+            if let Some(current_class) = current_class.as_deref() {
+                let members = fetch_super_members(
+                    &mut ctx,
+                    current_class,
+                    request.prefix,
+                    cache,
+                    persistent_cache,
+                )?;
+
+                return Ok(json!(members));
+            }
+
+            return Ok(json!([]));
+        }
+
         let ty = resolve_expression_type(
             &mut ctx,
             request.receiver,
@@ -214,7 +234,6 @@ pub fn process_completion(
 
         if let Some(ty) = ty {
             let ty = resolve_typedef(&mut ctx, &ty)?;
-            let current_class = enclosing_class(cursor_node, content);
 
             let members = fetch_members_recursive(
                 &mut ctx,
@@ -234,23 +253,67 @@ pub fn process_completion(
     let prefix = completion_prefix(cursor_node, content);
     let mut items = Vec::new();
 
-    if let Some(current_class) = enclosing_class(cursor_node, content) {
-        let members = fetch_members_recursive(
-            &mut ctx,
-            &current_class,
-            Some(prefix.clone()),
-            cache.clone(),
-            persistent_cache.clone(),
-            Some(&current_class),
-        )?;
+    if !prefix.is_empty() {
+        if let Some(current_class) = enclosing_class(cursor_node, content) {
+            let members = fetch_members_recursive(
+                &mut ctx,
+                &current_class,
+                Some(prefix.clone()),
+                cache.clone(),
+                persistent_cache.clone(),
+                Some(&current_class),
+            )?;
 
-        items.extend(members);
+            items.extend(members);
+        }
     }
 
-    items.extend(fetch_global_symbols(conn, &prefix)?);
     items.extend(ue_snippets(&prefix));
 
+    if prefix.chars().count() >= MIN_GLOBAL_PREFIX_LEN {
+        items.extend(fetch_global_symbols(conn, &prefix)?);
+    }
+
     Ok(json!(dedupe_completion_items(items)))
+}
+
+/// Complete members for the direct parent of the current class.
+/// 补全当前类直接父类的成员。
+fn fetch_super_members(
+    ctx: &mut CompletionContext,
+    current_class: &str,
+    prefix: Option<String>,
+    memory_cache: Option<Arc<Mutex<CompletionCache>>>,
+    persistent_cache: Option<Arc<Mutex<Connection>>>,
+) -> Result<Vec<Value>> {
+    let Some(parent_class) = direct_parent_class(ctx, current_class)? else {
+        return Ok(Vec::new());
+    };
+
+    fetch_members_recursive(
+        ctx,
+        &parent_class,
+        prefix,
+        memory_cache,
+        persistent_cache,
+        Some(current_class),
+    )
+}
+
+/// Return the first direct parent class name for a class.
+/// 返回某个类的第一个直接父类名。
+fn direct_parent_class(ctx: &mut CompletionContext, class_name: &str) -> Result<Option<String>> {
+    for class_id in ctx.class_ids_by_name(class_name)? {
+        for (_, parent_name) in parent_classes(ctx.conn, class_id)? {
+            let parent_name = clean_type(&parent_name);
+
+            if !parent_name.is_empty() {
+                return Ok(Some(parent_name));
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 // -----------------------------------------------------------------------------
@@ -731,7 +794,7 @@ fn fetch_members_recursive(
         append_members_for_class(
             ctx,
             class_id,
-            &class_name,
+            &current_class_name,
             &prefix,
             accessor,
             &mut seen_items,
@@ -826,7 +889,7 @@ fn append_members_for_class(
             continue;
         }
 
-        let detail_text = return_type.clone().unwrap_or_default();
+        let detail_text = member_detail(return_type.as_deref(), owner_class);
         let dedupe_key = format!("{}:{}", name, detail_text);
 
         if !seen.insert(dedupe_key) {
@@ -846,10 +909,26 @@ fn append_members_for_class(
             "detail": detail_text,
             "documentation": documentation,
             "insertText": name,
+            "sourceClass": owner_class,
         }));
     }
 
     Ok(())
+}
+
+/// Build a compact member detail string for completion menus.
+/// 构造补全菜单里紧凑的成员说明文本。
+fn member_detail(return_type: Option<&str>, owner_class: &str) -> String {
+    let return_type = return_type
+        .map(|text| text.trim())
+        .filter(|text| !text.is_empty())
+        .unwrap_or("member");
+
+    if owner_class.is_empty() {
+        return return_type.to_string();
+    }
+
+    format!("{} - {}", return_type, owner_class)
 }
 
 /// Check C++ access visibility.

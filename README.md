@@ -137,6 +137,13 @@ require("ucore").setup({
   auto_boot = false,
   port = 30110,
   use_release_binary = true,
+  completion = {
+    enable = true,
+    keymap = "<C-l>",
+    auto_trigger = false,
+    min_chars = 2,
+    debounce_ms = 180,
+  },
 })
 ```
 
@@ -147,6 +154,13 @@ require("ucore").setup({
   auto_boot = true,
   port = 30110,
   use_release_binary = true,
+  completion = {
+    enable = true,
+    keymap = "<C-l>",
+    auto_trigger = false,
+    min_chars = 2,
+    debounce_ms = 180,
+  },
 })
 ```
 
@@ -160,6 +174,49 @@ Unreal project.
 
 `use_release_binary = true` 会让 UCore 优先使用 lazy.nvim `build` 阶段构建出的
 release binary。如果 release binary 不存在，UCore 会回退到 `cargo run`。
+
+`completion.keymap` controls the insert-mode key used to trigger manual
+completion. Set `completion.enable = false` if you prefer to define your own
+mapping.
+
+`completion.keymap` 控制插入模式下触发手动补全的快捷键。如果你想自己管理映射，
+可以设置 `completion.enable = false`。
+
+`completion.auto_trigger = true` enables native Vim automatic completion while
+typing. If you use blink.cmp, keep this disabled and register UCore as a blink
+source instead.
+
+`completion.auto_trigger = true` 会在输入时触发 Vim 原生补全。如果你使用
+blink.cmp，建议保持关闭，并把 UCore 注册为 blink source。
+
+### blink.cmp Integration
+
+UCore can integrate into blink.cmp as a normal completion source, so candidates
+show up in the same menu as LSP/buffer/snippet items.
+
+UCore 可以作为普通补全源接入 blink.cmp，这样候选会显示在你现有的
+LSP/buffer/snippet 同一个补全菜单里。
+
+```lua
+{
+  "saghen/blink.cmp",
+  opts = {
+    sources = {
+      default = { "lsp", "path", "snippets", "buffer", "ucore" },
+      providers = {
+        ucore = {
+          name = "UCore",
+          module = "ucore.completion.blink",
+          async = true,
+          timeout_ms = 2000,
+          min_keyword_length = 0,
+          score_offset = 50,
+        },
+      },
+    },
+  },
+}
+```
 
 ## Rust Backend
 

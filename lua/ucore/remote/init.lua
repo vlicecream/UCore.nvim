@@ -45,6 +45,13 @@ function M.get_assets(project_root, callback)
 	}, callback)
 end
 
+-- Fetch completion candidates for the current buffer context.
+-- 根据当前 buffer 上下文获取补全候选。
+function M.get_completions(project_root, payload, callback)
+	payload.kind = "GetCompletions"
+	M.query(project_root, payload, callback)
+end
+
 -- Search symbols by text pattern.
 -- 按文本模式搜索符号。
 function M.search_symbols(project_root, pattern, callback)

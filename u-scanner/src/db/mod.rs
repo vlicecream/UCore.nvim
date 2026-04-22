@@ -16,14 +16,14 @@ use crate::types::{ParseResult, ProgressReporter};
 ///
 /// Increment this when table structures, indexes, or stored data semantics change.
 /// 当表结构、索引或存储语义变化时递增。
-pub const DB_VERSION: i32 = 18;
+pub const DB_VERSION: i32 = 19;
 
 /// Completion cache version.
 /// 补全缓存版本。
 ///
 /// Increment this when completion logic changes but the main DB schema does not.
 /// 当补全逻辑变化但主数据库 schema 不变时递增。
-pub const COMPLETION_CACHE_VERSION: i32 = 3;
+pub const COMPLETION_CACHE_VERSION: i32 = 4;
 
 /// SQLite busy timeout for normal operations.
 /// 普通数据库操作的 busy timeout。
@@ -87,6 +87,7 @@ pub fn init_db(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
 
     create_tables(conn)?;
+    create_views(conn)?;
     create_indices(conn)?;
 
     conn.execute(
@@ -261,6 +262,43 @@ fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
         )",
         [],
     );
+
+    Ok(())
+}
+
+/// Create query helper views.
+/// 创建查询辅助视图。
+fn create_views(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE VIEW IF NOT EXISTS dir_paths AS
+        WITH RECURSIVE paths(id, full_path) AS (
+            SELECT
+                d.id,
+                s.text
+            FROM directories d
+            JOIN strings s ON d.name_id = s.id
+            WHERE d.parent_id IS NULL
+
+            UNION ALL
+
+            SELECT
+                d.id,
+                CASE
+                    WHEN paths.full_path = '/'
+                        THEN '/' || s.text
+                    WHEN s.text = '/'
+                        THEN paths.full_path || '/'
+                    ELSE paths.full_path || '/' || s.text
+                END
+            FROM directories d
+            JOIN paths ON d.parent_id = paths.id
+            JOIN strings s ON d.name_id = s.id
+        )
+        SELECT id, full_path
+        FROM paths;
+        "#,
+    )?;
 
     Ok(())
 }
