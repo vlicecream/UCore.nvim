@@ -20,6 +20,14 @@ M.values = {
 	-- 稍微延迟自动启动，避免和 nvim 启动/插件加载抢时机。
 	auto_boot_delay_ms = 300,
 
+	-- Maximum number of readiness checks during boot.
+	-- boot 期间最多检查多少次 server ready。
+	boot_ready_attempts = 1200,
+
+	-- Delay between readiness checks in milliseconds.
+	-- 每次 server ready 检查之间的延迟毫秒数。
+	boot_ready_interval_ms = 100,
+
 	-- Events that may trigger auto boot.
 	-- 可能触发自动启动的事件。
 	auto_boot_events = {

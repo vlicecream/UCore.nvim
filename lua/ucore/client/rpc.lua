@@ -9,6 +9,23 @@ local read_buffer = ""
 local next_msgid = 1
 local pending = {}
 
+-- Close the current socket without touching pending callbacks.
+-- 关闭当前 socket，但不清理等待中的回调。
+local function close_socket()
+	if socket then
+		pcall(function()
+			socket:read_stop()
+		end)
+		pcall(function()
+			socket:close()
+		end)
+	end
+
+	socket = nil
+	connected = false
+	read_buffer = ""
+end
+
 -- Encode a u32 as big-endian bytes.
 -- 把 u32 编码成大端序字节。
 local function u32_be(value)
@@ -100,7 +117,7 @@ end
 local function start_read_loop()
 	socket:read_start(function(err, chunk)
 		if err then
-			connected = false
+			close_socket()
 			vim.schedule(function()
 				vim.notify("UCore RPC read error: " .. tostring(err), vim.log.levels.ERROR)
 			end)
@@ -108,7 +125,7 @@ local function start_read_loop()
 		end
 
 		if not chunk then
-			connected = false
+			close_socket()
 			return
 		end
 
@@ -138,7 +155,7 @@ function M.connect(callback)
 
 	socket:connect("127.0.0.1", config.values.port, function(err)
 		if err then
-			connected = false
+			close_socket()
 			return vim.schedule(function()
 				callback(false, err)
 			end)
@@ -186,15 +203,8 @@ end
 -- Close the RPC socket and clear pending callbacks.
 -- 关闭 RPC socket，并清理等待中的回调。
 function M.close()
-	if socket then
-		socket:read_stop()
-		socket:close()
-	end
-
-	socket = nil
-	connected = false
+	close_socket()
 	pending = {}
-	read_buffer = ""
 end
 
 return M

@@ -1,4 +1,5 @@
 local client = require("ucore.client")
+local config = require("ucore.config")
 local project = require("ucore.project")
 local server = require("ucore.server")
 
@@ -41,13 +42,13 @@ local function wait_ready(attempt, callback)
 			return callback(true, result)
 		end
 
-		if attempt >= 30 then
+		if attempt >= config.values.boot_ready_attempts then
 			return callback(false, err or "Server did not become ready")
 		end
 
 		vim.defer_fn(function()
 			wait_ready(attempt + 1, callback)
-		end, 100)
+		end, config.values.boot_ready_interval_ms)
 	end)
 end
 
@@ -132,7 +133,7 @@ function M.boot(callback)
 		wait_ready(1, function(ready, ready_err)
 			if not ready then
 				booting = false
-				notify(tostring(ready_err), vim.log.levels.ERROR)
+				notify(tostring(ready_err) .. "\nLog: " .. tostring(server.log_path()), vim.log.levels.ERROR)
 				return callback(false, ready_err)
 			end
 

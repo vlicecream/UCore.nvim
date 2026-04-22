@@ -6,17 +6,16 @@ local M = {}
 local job = nil
 local log_file = nil
 
--- Build the registry path used by the Rust server.
--- 构造 Rust server 使用的 registry 路径。
-local function registry_path()
-	local cwd = vim.loop.cwd()
-	return cwd .. "/.ucore/registry.json"
-end
-
 -- Check whether the managed server job is still running.
 -- 检查当前由 nvim 管理的 server job 是否还在运行。
 function M.is_running()
 	return job ~= nil
+end
+
+-- Return the latest server log path known to this session.
+-- 返回当前会话已知的 server 日志路径。
+function M.log_path()
+	return log_file
 end
 
 -- Build the server command.
@@ -61,12 +60,6 @@ function M.start(callback)
 	local cmd = build_cmd(config.values.port, registry)
 
 	log_file = paths.project_root .. "/" .. config.values.db_dir_name .. "/u_core_server.log"
-
-	local stdout = vim.loop.new_fs_event()
-	if stdout then
-		stdout:stop()
-		stdout:close()
-	end
 
 	job = vim.system(cmd, {
 		cwd = config.values.scanner_dir,
