@@ -1,11 +1,12 @@
--- 防止重复加载
+-- Avoid loading the plugin more than once.
+-- 避免插件被重复加载。
 if vim.g.loaded_ucore == 1 then
-    return
+	return
 end
+
 vim.g.loaded_ucore = 1
 
--- 创建一个用户命令 :UCoreHello
--- 当你输入这个命令时，它会调用我们上面写的那个函数
-vim.api.nvim_create_user_command('UCoreHello', function()
-    require('ucore').say_hello()
-end, {})
+-- Load the Lua entry point and register commands.
+-- 加载 Lua 入口并注册命令。
+require("ucore").setup()
+
