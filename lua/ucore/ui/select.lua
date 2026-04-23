@@ -248,11 +248,21 @@ function M.references(references)
 		local col = tonumber(item.col or item.column or 0) or 0
 		local context = tostring(item.context or item.text or ""):gsub("^%s+", "")
 
+		local kind = tostring(item.kind or "unknown")
+		local label = ({
+			declaration = "Declaration",
+			definition = "Definition",
+			read = "Reference",
+			write = "Assignment",
+			call = "Call",
+			unknown = "Reference",
+		})[kind] or "Reference"
+
 		if context ~= "" then
-			return string.format("%s:%d:%d - %s", path, line, col + 1, context)
+			return string.format("[%s] %s:%d:%d - %s", label, path, line, col + 1, context)
 		end
 
-		return string.format("%s:%d:%d", path, line, col + 1)
+		return string.format("[%s] %s:%d:%d", label, path, line, col + 1)
 	end, function(item)
 		local path = item.path or item.file_path
 		local line = tonumber(item.line or item.line_number or 1) or 1

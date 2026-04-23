@@ -504,13 +504,14 @@ fn get_member_declaration_results(
             find_symbol_location_near(&path, symbol_name, line as usize).unwrap_or((line as usize, 0));
         let context = read_line_context(&path, line)
             .unwrap_or_else(|| format!("{class_name}::{symbol_name}"));
+        let kind = classify_member_location(&path, &context, symbol_name);
 
         Ok(json!({
             "path": path,
             "line": line,
             "col": col,
             "context": context,
-            "kind": "declaration",
+            "kind": kind,
             "class_name": class_name,
         }))
     })?;
@@ -744,6 +745,7 @@ where
                 "line": current_line,
                 "col": col,
                 "context": line.trim(),
+                "kind": classify_usage_line(line, symbol_name, col),
             }))?;
 
             emitted += 1;
@@ -752,6 +754,53 @@ where
     }
 
     Ok(())
+}
+
+/// Classify a reference usage line into a human-friendly kind.
+/// 将一条引用行分类成更友好的类型。
+fn classify_usage_line(line: &str, symbol_name: &str, col: usize) -> &'static str {
+    let col = col.min(line.len());
+    let after_start = (col + symbol_name.len()).min(line.len());
+    let before = &line[..col];
+    let after = &line[after_start..];
+    let left = before.trim_end();
+    let right = after.trim_start();
+
+    if line.contains("UPROPERTY(") || line.contains("UFUNCTION(") {
+        return "declaration";
+    }
+
+    if left.contains("::") && right.starts_with('(') {
+        return "definition";
+    }
+
+    if right.starts_with('(') {
+        return "call";
+    }
+
+    if right.starts_with('=')
+        || right.starts_with("+=")
+        || right.starts_with("-=")
+        || right.starts_with("*=")
+        || right.starts_with("/=")
+    {
+        return "write";
+    }
+
+    "read"
+}
+
+/// Classify a member declaration row as declaration or definition.
+/// 将成员声明结果分类为 declaration 或 definition。
+fn classify_member_location(path: &str, context: &str, symbol_name: &str) -> &'static str {
+    let path = path.to_ascii_lowercase();
+    let is_cpp = path.ends_with(".cpp") || path.ends_with(".cc") || path.ends_with(".cxx");
+
+    if is_cpp && context.contains("::") && context.contains(symbol_name) {
+        return "definition";
+    }
+
+    "declaration"
 }
 
 struct FileMemberContext {
