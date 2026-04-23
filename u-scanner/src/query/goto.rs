@@ -165,7 +165,9 @@ fn get_enclosing_class(node: Node, src: &[u8]) -> Option<String> {
             "class_specifier"
             | "struct_specifier"
             | "unreal_class_declaration"
-            | "unreal_struct_declaration" => {
+            | "unreal_struct_declaration"
+            | "unreal_reflected_class_declaration"
+            | "unreal_reflected_struct_declaration" => {
                 if let Some(name_node) = n.child_by_field_name("name") {
                     let name = node_text(&name_node, src).trim();
                     if !name.is_empty() {
@@ -219,10 +221,7 @@ pub fn extract_cursor_context(content: &str, line: u32, character: u32) -> Optio
 
     let row = line as usize;
     let col = character as usize;
-    let point_start = Point::new(row, col.saturating_sub(1));
-    let point_end = Point::new(row, col);
-
-    let raw_node = root.descendant_for_point_range(point_start, point_end)?;
+    let raw_node = cursor_node_at(root, row, col)?;
     let node = normalize_symbol_node(raw_node)?;
     let symbol = symbol_text(node, src);
 
@@ -239,6 +238,23 @@ pub fn extract_cursor_context(content: &str, line: u32, character: u32) -> Optio
         qualifier_op,
         enclosing_class,
     })
+}
+
+/// Find the node under Neovim's 0-based cursor column.
+/// 根据 Neovim 传来的 0-based 光标列查找当前节点。
+fn cursor_node_at(root: Node, row: usize, col: usize) -> Option<Node> {
+    let current = Point::new(row, col);
+    let next = Point::new(row, col.saturating_add(1));
+
+    // Prefer the character under the cursor. This matters at the first
+    // character of a word: [col - 1, col] includes the separator before it.
+    // 优先取光标下的字符；如果在单词第一个字符，[col - 1, col] 会包含前面的分隔符。
+    root.descendant_for_point_range(current, next)
+        .or_else(|| {
+            let previous = Point::new(row, col.saturating_sub(1));
+            root.descendant_for_point_range(previous, current)
+        })
+        .or_else(|| root.descendant_for_point_range(current, current))
 }
 
 /// Extract qualifier from expressions like A::B, Obj.Field, Ptr->Field.
@@ -582,7 +598,7 @@ fn find_member_in_class(
         header_priority = HEADER_PRIORITY_SQL
     );
 
-    conn.query_row(&sql, params![class_id, symbol_name], |row| {
+    let mut result = conn.query_row(&sql, params![class_id, symbol_name], |row| {
         Ok(json!({
             "symbol_name": row.get::<_, String>(0)?,
             "line_number": row.get::<_, i64>(1)?,
@@ -590,8 +606,13 @@ fn find_member_in_class(
             "class_name": row.get::<_, String>(3)?,
         }))
     })
-    .optional()
-    .map_err(Into::into)
+    .optional()?;
+
+    if let Some(value) = result.as_mut() {
+        fix_symbol_location(value, symbol_name);
+    }
+
+    Ok(result)
 }
 
 /// Walk inheritance chain with BFS and find a member definition.
@@ -787,16 +808,22 @@ fn find_member_in_module(
         header_priority = HEADER_PRIORITY_SQL
     );
 
-    conn.query_row(&sql, params![module_name, symbol_name], |row| {
-        Ok(json!({
-            "symbol_name": row.get::<_, String>(0)?,
-            "line_number": row.get::<_, i64>(1)?,
-            "file_path": normalize_path(&row.get::<_, String>(2)?),
-            "class_name": row.get::<_, String>(3)?,
-        }))
-    })
-    .optional()
-    .map_err(Into::into)
+    let mut result = conn
+        .query_row(&sql, params![module_name, symbol_name], |row| {
+            Ok(json!({
+                "symbol_name": row.get::<_, String>(0)?,
+                "line_number": row.get::<_, i64>(1)?,
+                "file_path": normalize_path(&row.get::<_, String>(2)?),
+                "class_name": row.get::<_, String>(3)?,
+            }))
+        })
+        .optional()?;
+
+    if let Some(value) = result.as_mut() {
+        fix_symbol_location(value, symbol_name);
+    }
+
+    Ok(result)
 }
 
 /// Final fallback: find a member by name anywhere.
@@ -829,16 +856,22 @@ fn find_member_anywhere(conn: &Connection, symbol_name: &str) -> Result<Option<V
         header_priority = HEADER_PRIORITY_SQL
     );
 
-    conn.query_row(&sql, [symbol_name], |row| {
-        Ok(json!({
-            "symbol_name": row.get::<_, String>(0)?,
-            "line_number": row.get::<_, i64>(1)?,
-            "file_path": normalize_path(&row.get::<_, String>(2)?),
-            "class_name": row.get::<_, String>(3)?,
-        }))
-    })
-    .optional()
-    .map_err(Into::into)
+    let mut result = conn
+        .query_row(&sql, [symbol_name], |row| {
+            Ok(json!({
+                "symbol_name": row.get::<_, String>(0)?,
+                "line_number": row.get::<_, i64>(1)?,
+                "file_path": normalize_path(&row.get::<_, String>(2)?),
+                "class_name": row.get::<_, String>(3)?,
+            }))
+        })
+        .optional()?;
+
+    if let Some(value) = result.as_mut() {
+        fix_symbol_location(value, symbol_name);
+    }
+
+    Ok(result)
 }
 
 // -----------------------------------------------------------------------------
@@ -955,6 +988,7 @@ fn fix_type_definition_location(
         if let Some((header_path, line)) = find_header_type_declaration(conn, symbol_name)? {
             value["file_path"] = json!(header_path);
             value["line_number"] = json!(line as i64);
+            fix_symbol_location(value, symbol_name);
             return Ok(());
         }
     }
@@ -965,7 +999,80 @@ fn fix_type_definition_location(
         }
     }
 
+    fix_symbol_location(value, symbol_name);
+
     Ok(())
+}
+
+/// Fix a symbol/member row to the exact line and column containing the symbol name.
+/// 把符号/成员位置修正到真正包含符号名的行和列。
+fn fix_symbol_location(value: &mut Value, symbol_name: &str) {
+    let Some(file_path) = value.get("file_path").and_then(Value::as_str) else {
+        return;
+    };
+
+    let start_line = value
+        .get("line_number")
+        .and_then(Value::as_i64)
+        .unwrap_or(1)
+        .max(1) as usize;
+
+    if let Some((line, col)) = find_symbol_location_near(file_path, symbol_name, start_line) {
+        value["line_number"] = json!(line as i64);
+        value["col"] = json!(col as i64);
+    }
+}
+
+fn find_symbol_location_near(
+    file_path: &str,
+    symbol_name: &str,
+    start_line: usize,
+) -> Option<(usize, usize)> {
+    let content = fs::read_to_string(file_path).ok()?;
+    let lines = content.lines().collect::<Vec<_>>();
+
+    if lines.is_empty() {
+        return None;
+    }
+
+    let start = start_line.saturating_sub(1).min(lines.len() - 1);
+    let end = (start + 8).min(lines.len() - 1);
+
+    for (index, line) in lines.iter().enumerate().take(end + 1).skip(start) {
+        if let Some(col) = find_identifier_in_line(line, symbol_name) {
+            return Some((index + 1, col));
+        }
+    }
+
+    None
+}
+
+fn find_identifier_in_line(line: &str, symbol_name: &str) -> Option<usize> {
+    let mut start = 0usize;
+
+    while start + symbol_name.len() <= line.len() {
+        let Some(relative) = line[start..].find(symbol_name) else {
+            return None;
+        };
+
+        let absolute = start + relative;
+        let before_ok = absolute == 0
+            || !is_identifier_byte(line.as_bytes()[absolute.saturating_sub(1)]);
+        let end = absolute + symbol_name.len();
+        let after_ok = end >= line.len() || !is_identifier_byte(line.as_bytes()[end]);
+
+        if before_ok && after_ok {
+            return Some(absolute);
+        }
+
+        start = absolute + 1;
+    }
+
+    None
+}
+
+fn is_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
 /// Find a matching header in the indexed files and scan it for the real declaration.

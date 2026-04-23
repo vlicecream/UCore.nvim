@@ -541,6 +541,12 @@ pub enum QueryRequest {
         symbol_name: String,
         #[serde(default)]
         file_path: Option<String>,
+        #[serde(default)]
+        content: Option<String>,
+        #[serde(default)]
+        line: Option<u32>,
+        #[serde(default)]
+        character: Option<u32>,
     },
     FindSymbolUsagesAsync {
         symbol_name: String,

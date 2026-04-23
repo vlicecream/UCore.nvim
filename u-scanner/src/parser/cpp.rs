@@ -587,7 +587,7 @@ fn build_member(
         mem_type: if is_function { "function" } else { "property" }.to_string(),
         flags: flags.join(" "),
         access,
-        line: node.start_position().row + 1,
+        line: member_identity.line,
         end_line: node.end_position().row + 1,
         detail,
         return_type,
@@ -611,6 +611,7 @@ struct MemberIdentity {
     name: String,
     scope_name: Option<String>,
     is_function: bool,
+    line: usize,
 }
 
 /// Walk through nested declarators to find the real member name.
@@ -629,6 +630,7 @@ fn resolve_member_identity(
                     name: get_node_text(&current, content_bytes).to_string(),
                     scope_name: None,
                     is_function,
+                    line: current.start_position().row + 1,
                 });
             }
 
@@ -637,10 +639,8 @@ fn resolve_member_identity(
                     .child_by_field_name("scope")
                     .map(|scope| get_node_text(&scope, content_bytes).to_string());
 
-                let name = current
-                    .child_by_field_name("name")
-                    .map(|name| get_node_text(&name, content_bytes).to_string())
-                    .unwrap_or_default();
+                let name_node = current.child_by_field_name("name")?;
+                let name = get_node_text(&name_node, content_bytes).to_string();
 
                 if name.is_empty() {
                     return None;
@@ -650,6 +650,7 @@ fn resolve_member_identity(
                     name,
                     scope_name,
                     is_function,
+                    line: name_node.start_position().row + 1,
                 });
             }
 

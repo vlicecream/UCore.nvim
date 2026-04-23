@@ -255,7 +255,27 @@ fn handle_state_query(
             Ok(Some(value))
         }
 
-                QueryRequest::GotoDefinition {
+        QueryRequest::FindSymbolUsages {
+            symbol_name,
+            file_path,
+            content,
+            line,
+            character,
+        } => {
+            let value = find_references_with_engine(
+                state,
+                conn,
+                engine_db_path,
+                &symbol_name,
+                file_path.as_deref(),
+                content.as_deref(),
+                line,
+                character,
+            )?;
+            Ok(Some(value))
+        }
+
+        QueryRequest::GotoDefinition {
             content,
             line,
             character,
@@ -425,6 +445,122 @@ fn goto_definition_with_engine(
     Ok(engine_result)
 }
 
+/// Find references in the project DB, then merge matching Engine DB results.
+/// 先查询项目 DB 的引用，再合并共享 Engine DB 的引用结果。
+fn find_references_with_engine(
+    state: Arc<AppState>,
+    project_conn: &rusqlite::Connection,
+    engine_db_path: Option<String>,
+    symbol_name: &str,
+    file_path: Option<&str>,
+    content: Option<&str>,
+    line: Option<u32>,
+    character: Option<u32>,
+) -> Result<Value> {
+    let project_value = query::usage::find_symbol_usages_for_cursor(
+        project_conn,
+        symbol_name,
+        file_path,
+        content,
+        line,
+        character,
+    )?;
+    let mut results = nested_results_array(&project_value);
+    tag_source(&mut results, "project");
+
+    let mut searched_files = project_value
+        .get("searched_files")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let mut found_definition = project_value
+        .get("found_definition")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let scope = project_value
+        .get("scope")
+        .and_then(Value::as_str)
+        .unwrap_or("global");
+
+    // Project-local scopes should not merge Engine DB results; otherwise common member
+    // names like CameraComponent get polluted by unrelated Engine symbols.
+    // 项目内局部/成员作用域不合并 Engine DB，否则 CameraComponent 这类同名成员会被引擎源码污染。
+    if matches!(scope, "local" | "member") {
+        return Ok(json!({
+            "results": results,
+            "searched_files": searched_files,
+            "found_definition": found_definition,
+            "scope": scope,
+        }));
+    }
+
+    let Some(engine_db_path) = engine_db_path else {
+        return Ok(json!({
+            "results": results,
+            "searched_files": searched_files,
+            "found_definition": found_definition,
+            "scope": scope,
+        }));
+    };
+
+    let engine_db_path = normalize_to_native(&engine_db_path);
+    if !Path::new(&engine_db_path).is_file() {
+        return Ok(json!({
+            "results": results,
+            "searched_files": searched_files,
+            "found_definition": found_definition,
+            "scope": scope,
+        }));
+    }
+
+    let engine_conn = match state.get_read_only_connection(&engine_db_path) {
+        Ok(conn) => conn,
+        Err(err) => {
+            warn!("Failed to open Engine DB for references: {}", err);
+            return Ok(json!({
+                "results": results,
+                "searched_files": searched_files,
+                "found_definition": found_definition,
+                "scope": scope,
+            }));
+        }
+    };
+
+    match query::usage::find_symbol_usages_for_cursor(
+        &engine_conn,
+        symbol_name,
+        file_path,
+        content,
+        line,
+        character,
+    ) {
+        Ok(engine_value) => {
+            searched_files += engine_value
+                .get("searched_files")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            found_definition = found_definition
+                || engine_value
+                    .get("found_definition")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+
+            let mut engine_results = nested_results_array(&engine_value);
+            tag_source(&mut engine_results, "engine");
+            merge_query_results(&mut results, engine_results, 300);
+        }
+        Err(err) => {
+            warn!("Failed to query Engine DB references: {}", err);
+        }
+    }
+
+    Ok(json!({
+        "results": results,
+        "searched_files": searched_files,
+        "found_definition": found_definition,
+        "scope": scope,
+    }))
+}
+
 /// Add a source marker to one query result object.
 /// 给单个查询结果对象添加来源标记。
 fn tag_value_source(value: &mut Value, source: &str) {
@@ -488,6 +624,16 @@ fn search_symbols_with_engine(
 /// 将 JSON array value 转成 Vec。
 fn value_array(value: Value) -> Vec<Value> {
     value.as_array().cloned().unwrap_or_default()
+}
+
+/// Extract the `results` array from an object response.
+/// 从对象响应里提取 `results` 数组。
+fn nested_results_array(value: &Value) -> Vec<Value> {
+    value
+        .get("results")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// Add a source marker to query result objects.

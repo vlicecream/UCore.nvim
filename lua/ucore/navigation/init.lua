@@ -1,5 +1,6 @@
 local project = require("ucore.project")
 local remote = require("ucore.remote")
+local ui = require("ucore.ui")
 
 local M = {}
 
@@ -20,7 +21,9 @@ local function open_result(result)
 
 	local path = result.file_path or result.path
 	local raw_line = result.line_number or result.line or result.row
+	local raw_col = result.col or result.column or result.character
 	local line = tonumber(raw_line)
+	local col = tonumber(raw_col) or 0
 	local source = result.source and (" [" .. tostring(result.source) .. "]") or ""
 
 	if not path or path == vim.NIL or path == "" then
@@ -43,8 +46,10 @@ local function open_result(result)
 	-- Rust DB stores line numbers as 1-based in most tables.
 	-- Rust DB 大多数表里的行号是 1-based。
 	line = math.max(1, math.min(line, last_line))
+	local line_text = vim.api.nvim_buf_get_lines(0, line - 1, line, false)[1] or ""
+	col = math.max(0, math.min(col, #line_text))
 
-	vim.api.nvim_win_set_cursor(0, { line, 0 })
+	vim.api.nvim_win_set_cursor(0, { line, col })
 	vim.cmd("normal! zz")
 
 	if source ~= "" then
@@ -79,7 +84,44 @@ function M.goto_definition()
 			return vim.notify("UCore goto failed:\n" .. tostring(err), vim.log.levels.ERROR)
 		end
 
-		open_result(result)
+	open_result(result)
+	end)
+end
+
+-- Find references for the symbol under the cursor.
+-- 查找当前光标下符号的引用位置。
+function M.references()
+	local root = project.find_project_root()
+	if not root then
+		return vim.notify("Could not find .uproject", vim.log.levels.ERROR)
+	end
+
+	local symbol = vim.fn.expand("<cword>")
+	if symbol == "" then
+		return vim.notify("UCore references: no symbol under cursor", vim.log.levels.WARN)
+	end
+
+	local file_path = vim.api.nvim_buf_get_name(0)
+	local normalized_file_path = file_path ~= "" and file_path:gsub("\\", "/") or nil
+	local cursor = vim.api.nvim_win_get_cursor(0)
+
+	remote.find_references(root, {
+		symbol_name = symbol,
+		file_path = normalized_file_path,
+		content = current_content(),
+		line = cursor[1] - 1,
+		character = cursor[2],
+	}, function(result, err)
+		if err then
+			return vim.notify("UCore references failed:\n" .. tostring(err), vim.log.levels.ERROR)
+		end
+
+		local references = result and (result.results or result) or {}
+		if type(references) ~= "table" or vim.tbl_isempty(references) then
+			return vim.notify("UCore references: no references found for " .. symbol, vim.log.levels.WARN)
+		end
+
+		ui.select.references(references)
 	end)
 end
 

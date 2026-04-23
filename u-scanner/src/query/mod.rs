@@ -144,6 +144,9 @@ pub fn process_query(conn: &Connection, request: QueryRequest) -> Result<Value> 
         QueryRequest::FindSymbolUsages {
             symbol_name,
             file_path,
+            content: _,
+            line: _,
+            character: _,
         } => usage::find_symbol_usages(conn, &symbol_name, file_path.as_deref()),
 
         // ---------------------------------------------------------------------

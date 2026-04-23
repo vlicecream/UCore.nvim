@@ -58,8 +58,8 @@ local function dispatch_debug(tail)
 		maps = actions.maps,
 		help = actions.debug_help,
 		complete = actions.complete,
-    goto = actions.goto_definition,
-    gd = actions.goto_definition,
+		goto = actions.goto_definition,
+		references = actions.references,
 	}
 
 	local handler = handlers[sub]
@@ -78,7 +78,7 @@ function M.dispatch(args)
   local handlers = {
     boot = actions.boot,
     goto = actions.goto_definition,
-    gd = actions.goto_definition,
+    references = actions.references,
     debug = function()
       dispatch_debug(tail)
     end,
@@ -119,8 +119,8 @@ function M.register()
 		complete = function(arglead)
 			local items = {
 				"boot",
-          "goto",
-  "gd",
+				"goto",
+				"references",
 				"debug",
 				"help",
 			}

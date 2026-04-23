@@ -1,10 +1,12 @@
 use anyhow::Result;
 use rusqlite::{Connection, ToSql};
 use serde_json::{json, Value};
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::io::BufRead;
+use tree_sitter::{Node, Parser, Point};
 
 use crate::db::project_path::PATH_CTE;
+use crate::query::goto;
 
 const MAX_RESULTS: usize = 300;
 const MAX_FILES: usize = 2000;
@@ -18,6 +20,35 @@ pub fn find_symbol_usages(
     symbol_name: &str,
     current_file: Option<&str>,
 ) -> Result<Value> {
+    find_symbol_usages_inner(conn, symbol_name, current_file, None)
+}
+
+/// Find symbol usages with cursor context for member-aware filtering.
+/// 带光标上下文查找引用，用于更精确地区分类成员和同名局部变量。
+pub fn find_symbol_usages_for_cursor(
+    conn: &Connection,
+    symbol_name: &str,
+    current_file: Option<&str>,
+    content: Option<&str>,
+    line: Option<u32>,
+    character: Option<u32>,
+) -> Result<Value> {
+    let scope = match (content, line, character) {
+        (Some(content), Some(line), Some(character)) => {
+            resolve_usage_scope(conn, symbol_name, content, line, character)?
+        }
+        _ => None,
+    };
+
+    find_symbol_usages_inner(conn, symbol_name, current_file, scope.as_ref())
+}
+
+fn find_symbol_usages_inner(
+    conn: &Connection,
+    symbol_name: &str,
+    current_file: Option<&str>,
+    scope: Option<&UsageScope>,
+) -> Result<Value> {
     let symbol_name = symbol_name.trim();
 
     if symbol_name.is_empty() {
@@ -28,16 +59,23 @@ pub fn find_symbol_usages(
         }));
     }
 
-    let candidates = collect_candidate_files(conn, symbol_name, current_file)?;
-    let mut results = Vec::new();
+    let candidates = collect_candidate_files(conn, symbol_name, current_file, scope)?;
+    let mut results = match scope {
+        Some(UsageScope::Member(member_scope)) => get_member_declaration_results(
+            conn,
+            symbol_name,
+            &member_scope.member_owner_class,
+        )?,
+        _ => Vec::new(),
+    };
 
     for path in &candidates.file_paths {
         if results.len() >= MAX_RESULTS {
             break;
         }
 
-        search_in_file(path, symbol_name, MAX_RESULTS - results.len(), |item| {
-            results.push(item);
+        search_in_file(path, symbol_name, MAX_RESULTS - results.len(), scope, |item| {
+            push_unique_result(&mut results, item);
             Ok(())
         })?;
     }
@@ -46,7 +84,236 @@ pub fn find_symbol_usages(
         "results": results,
         "searched_files": candidates.file_paths.len(),
         "found_definition": candidates.found_definition,
+        "scope": scope.map(UsageScope::name).unwrap_or("unresolved"),
     }))
+}
+
+#[derive(Debug, Clone)]
+enum UsageScope {
+    Local(LocalScope),
+    Member(MemberScope),
+}
+
+#[derive(Debug, Clone)]
+struct LocalScope {
+    start_line: usize,
+    end_line: usize,
+}
+
+#[derive(Debug, Clone)]
+struct MemberScope {
+    member_owner_class: String,
+    context_class: Option<String>,
+}
+
+impl MemberScope {
+    fn candidate_classes(&self) -> Vec<&str> {
+        let mut classes = vec![self.member_owner_class.as_str()];
+
+        if let Some(context_class) = self.context_class.as_deref() {
+            if context_class != self.member_owner_class {
+                classes.push(context_class);
+            }
+        }
+
+        classes
+    }
+}
+
+impl UsageScope {
+    fn name(&self) -> &'static str {
+        match self {
+            UsageScope::Local(_) => "local",
+            UsageScope::Member(_) => "member",
+        }
+    }
+}
+
+/// Resolve whether the cursor target is a class member.
+/// 判断当前光标目标是否是类成员。
+fn resolve_usage_scope(
+    conn: &Connection,
+    fallback_symbol: &str,
+    content: &str,
+    line: u32,
+    character: u32,
+) -> Result<Option<UsageScope>> {
+    let Some(ctx) = goto::extract_cursor_context(content, line, character) else {
+        return Ok(None);
+    };
+
+    let symbol = if ctx.symbol.trim().is_empty() {
+        fallback_symbol.trim()
+    } else {
+        ctx.symbol.trim()
+    };
+
+    if symbol.is_empty() {
+        return Ok(None);
+    }
+
+    if let Some(local_scope) = resolve_local_scope(content, symbol, line, character) {
+        return Ok(Some(UsageScope::Local(local_scope)));
+    }
+
+    let target_class = match ctx.qualifier.as_deref() {
+        Some("this") => ctx.enclosing_class.clone(),
+        Some("Super") if ctx.qualifier_op.as_deref() == Some("::") => ctx.enclosing_class.clone(),
+        Some(qualifier) if matches!(ctx.qualifier_op.as_deref(), Some(".") | Some("->")) => {
+            goto::infer_var_type(content, qualifier, Some(line)).or_else(|| Some(qualifier.to_string()))
+        }
+        Some(qualifier) if ctx.qualifier_op.as_deref() == Some("::") => {
+            Some(qualifier.to_string())
+        }
+        _ => ctx.enclosing_class.clone(),
+    };
+
+    let Some(target_class) = target_class else {
+        return Ok(None);
+    };
+
+    let Some(member) = goto::find_symbol_in_inheritance_chain(conn, &target_class, symbol)? else {
+        return Ok(None);
+    };
+
+    let Some(member_owner_class) = member.get("class_name").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+
+    Ok(Some(UsageScope::Member(MemberScope {
+        member_owner_class: member_owner_class.to_string(),
+        context_class: ctx.enclosing_class,
+    })))
+}
+
+/// Resolve a local variable or parameter scope inside the current function.
+/// 解析当前函数内的局部变量或参数作用域。
+fn resolve_local_scope(
+    content: &str,
+    symbol_name: &str,
+    line: u32,
+    character: u32,
+) -> Option<LocalScope> {
+    let language: tree_sitter::Language = tree_sitter_unreal_cpp::LANGUAGE.into();
+    let mut parser = Parser::new();
+    parser.set_language(&language).ok()?;
+
+    let tree = parser.parse(content, None)?;
+    let root = tree.root_node();
+    let row = line as usize;
+    let col = character as usize;
+    let current = Point::new(row, col);
+    let next = Point::new(row, col.saturating_add(1));
+    let raw_node = root
+        .descendant_for_point_range(current, next)
+        .or_else(|| {
+            let previous = Point::new(row, col.saturating_sub(1));
+            root.descendant_for_point_range(previous, current)
+        })
+        .or_else(|| root.descendant_for_point_range(current, current))?;
+    let function = enclosing_function(raw_node)?;
+
+    if has_local_declaration(function, content.as_bytes(), symbol_name, line as usize) {
+        return Some(LocalScope {
+            start_line: function.start_position().row + 1,
+            end_line: function.end_position().row + 1,
+        });
+    }
+
+    None
+}
+
+fn enclosing_function<'a>(node: Node<'a>) -> Option<Node<'a>> {
+    let mut current = Some(node);
+
+    while let Some(node) = current {
+        if matches!(
+            node.kind(),
+            "function_definition" | "unreal_function_definition" | "lambda_expression"
+        ) {
+            return Some(node);
+        }
+
+        current = node.parent();
+    }
+
+    None
+}
+
+fn has_local_declaration(
+    node: Node,
+    src: &[u8],
+    symbol_name: &str,
+    cursor_row: usize,
+) -> bool {
+    if node.start_position().row > cursor_row {
+        return false;
+    }
+
+    if matches!(node.kind(), "declaration" | "parameter_declaration") {
+        if declaration_names(node, src)
+            .into_iter()
+            .any(|name| name == symbol_name)
+        {
+            return true;
+        }
+    }
+
+    for child in children_of(node) {
+        if has_local_declaration(child, src, symbol_name, cursor_row) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn declaration_names(node: Node, src: &[u8]) -> Vec<String> {
+    let mut names = Vec::new();
+
+    if let Some(declarator) = node.child_by_field_name("declarator") {
+        collect_decl_names(declarator, src, &mut names);
+    }
+
+    names
+}
+
+fn collect_decl_names(node: Node, src: &[u8], names: &mut Vec<String>) {
+    match node.kind() {
+        "identifier" | "field_identifier" => {
+            let name = node_text(node, src).trim();
+            if !name.is_empty() {
+                names.push(name.to_string());
+            }
+        }
+
+        "function_declarator" => {
+            if let Some(declarator) = node.child_by_field_name("declarator") {
+                collect_decl_names(declarator, src, names);
+            }
+        }
+
+        "init_declarator" | "pointer_declarator" | "reference_declarator" | "array_declarator" => {
+            if let Some(declarator) = node.child_by_field_name("declarator") {
+                collect_decl_names(declarator, src, names);
+            }
+        }
+
+        _ => {
+            for child in children_of(node) {
+                collect_decl_names(child, src, names);
+            }
+        }
+    }
+}
+
+fn node_text<'a>(node: Node, src: &'a [u8]) -> &'a str {
+    node.utf8_text(src).unwrap_or("")
+}
+
+fn children_of<'a>(node: Node<'a>) -> Vec<Node<'a>> {
+    let mut cursor = node.walk();
+    node.children(&mut cursor).collect()
 }
 
 /// Find symbol usages and stream results in small batches.
@@ -70,7 +337,7 @@ where
         }));
     }
 
-    let candidates = collect_candidate_files(conn, symbol_name, current_file)?;
+    let candidates = collect_candidate_files(conn, symbol_name, current_file, None)?;
     let mut total_results = 0usize;
     let mut batch = Vec::new();
 
@@ -79,7 +346,7 @@ where
             break;
         }
 
-        search_in_file(path, symbol_name, MAX_RESULTS - total_results, |item| {
+        search_in_file(path, symbol_name, MAX_RESULTS - total_results, None, |item| {
             batch.push(item);
             total_results += 1;
 
@@ -111,14 +378,33 @@ struct CandidateFiles {
     found_definition: bool,
 }
 
-/// Collect likely files where the symbol may be used.
-/// 收集 symbol 可能出现的候选文件。
+/// Collect exact-scope files where the symbol may be used.
+/// 只收集精确作用域内 symbol 可能出现的候选文件。
 fn collect_candidate_files(
     conn: &Connection,
     symbol_name: &str,
     current_file: Option<&str>,
+    scope: Option<&UsageScope>,
 ) -> Result<CandidateFiles> {
-    let def_ids = find_definition_file_ids(conn, symbol_name)?;
+    if let Some(UsageScope::Local(_)) = scope {
+        let file_paths = current_file
+            .map(|path| vec![normalize_path(path)])
+            .unwrap_or_default();
+
+        return Ok(CandidateFiles {
+            file_paths,
+            found_definition: true,
+        });
+    }
+
+    let Some(UsageScope::Member(member_scope)) = scope else {
+        return Ok(CandidateFiles {
+            file_paths: Vec::new(),
+            found_definition: false,
+        });
+    };
+
+    let def_ids = find_member_definition_file_ids(conn, symbol_name, &member_scope.member_owner_class)?;
     let found_definition = !def_ids.is_empty();
 
     let mut candidate_ids = HashSet::new();
@@ -137,10 +423,6 @@ fn collect_candidate_files(
         }
     }
 
-    if candidate_ids.is_empty() {
-        candidate_ids.extend(find_files_from_symbol_calls(conn, symbol_name, MAX_FILES)?);
-    }
-
     let mut ids = candidate_ids.into_iter().collect::<Vec<_>>();
     ids.sort_unstable();
     ids.truncate(MAX_FILES);
@@ -155,42 +437,90 @@ fn collect_candidate_files(
     })
 }
 
-/// Find file ids where the symbol is defined as class or member.
-/// 从 classes / members 表中查找 symbol 定义所在文件。
-fn find_definition_file_ids(conn: &Connection, symbol_name: &str) -> Result<Vec<i64>> {
+/// Find definition file ids for a member owned by a specific class.
+/// 查找指定类成员定义所在的文件 id。
+fn find_member_definition_file_ids(
+    conn: &Connection,
+    symbol_name: &str,
+    owner_class: &str,
+) -> Result<Vec<i64>> {
     let mut ids = Vec::new();
     let mut seen = HashSet::new();
 
     collect_ids(
         conn,
         r#"
-        SELECT DISTINCT c.file_id
-        FROM classes c
-        JOIN strings s ON c.name_id = s.id
-        WHERE s.text = ?
-          AND c.file_id IS NOT NULL
-        "#,
-        symbol_name,
-        &mut seen,
-        &mut ids,
-    )?;
-
-    collect_ids(
-        conn,
-        r#"
         SELECT DISTINCT COALESCE(m.file_id, c.file_id)
         FROM members m
-        JOIN strings s ON m.name_id = s.id
+        JOIN strings sm ON m.name_id = sm.id
         JOIN classes c ON m.class_id = c.id
-        WHERE s.text = ?
+        JOIN strings sc ON c.name_id = sc.id
+        WHERE sm.text = ?
+          AND sc.text = ?
           AND COALESCE(m.file_id, c.file_id) IS NOT NULL
         "#,
-        symbol_name,
+        &[symbol_name, owner_class],
         &mut seen,
         &mut ids,
     )?;
 
     Ok(ids)
+}
+
+/// Return declaration rows for a member owned by a specific class.
+/// 返回指定类成员的声明行。
+fn get_member_declaration_results(
+    conn: &Connection,
+    symbol_name: &str,
+    owner_class: &str,
+) -> Result<Vec<Value>> {
+    let sql = format!(
+        r#"
+        {}
+        SELECT dp.full_path || '/' || sf.text,
+               m.line_number,
+               sc.text
+        FROM members m
+        JOIN strings sm ON m.name_id = sm.id
+        JOIN classes c ON m.class_id = c.id
+        JOIN strings sc ON c.name_id = sc.id
+        JOIN files f ON COALESCE(m.file_id, c.file_id) = f.id
+        JOIN dir_paths dp ON f.directory_id = dp.id
+        JOIN strings sf ON f.filename_id = sf.id
+        WHERE sm.text = ?
+          AND sc.text = ?
+          AND COALESCE(m.file_id, c.file_id) IS NOT NULL
+        ORDER BY m.line_number
+        "#,
+        PATH_CTE
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([symbol_name, owner_class], |row| {
+        let path = normalize_path(&row.get::<_, String>(0)?);
+        let line = row.get::<_, i64>(1)?;
+        let class_name = row.get::<_, String>(2)?;
+        let (line, col) =
+            find_symbol_location_near(&path, symbol_name, line as usize).unwrap_or((line as usize, 0));
+        let context = read_line_context(&path, line)
+            .unwrap_or_else(|| format!("{class_name}::{symbol_name}"));
+
+        Ok(json!({
+            "path": path,
+            "line": line,
+            "col": col,
+            "context": context,
+            "kind": "declaration",
+            "class_name": class_name,
+        }))
+    })?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        push_unique_result(&mut results, row?);
+    }
+
+    Ok(results)
 }
 
 /// Find files that include the definition files.
@@ -224,35 +554,6 @@ fn find_including_file_ids(conn: &Connection, def_ids: &[i64]) -> Result<Vec<i64
                 results.push(id);
             }
         }
-    }
-
-    Ok(results)
-}
-
-/// Fallback: find files from symbol_calls table.
-/// 兜底：从 symbol_calls 表里找出现过这个 symbol 的文件。
-fn find_files_from_symbol_calls(
-    conn: &Connection,
-    symbol_name: &str,
-    limit: usize,
-) -> Result<Vec<i64>> {
-    let mut stmt = conn.prepare(
-        r#"
-        SELECT DISTINCT sc.file_id
-        FROM symbol_calls sc
-        JOIN strings s ON sc.name_id = s.id
-        WHERE s.text = ?
-        LIMIT ?
-        "#,
-    )?;
-
-    let rows = stmt.query_map(rusqlite::params![symbol_name, limit as i64], |row| {
-        row.get::<_, i64>(0)
-    })?;
-
-    let mut results = Vec::new();
-    for row in rows {
-        results.push(row?);
     }
 
     Ok(results)
@@ -309,12 +610,16 @@ fn find_file_id(conn: &Connection, file_path: &str) -> Result<Option<i64>> {
 fn collect_ids(
     conn: &Connection,
     sql: &str,
-    symbol_name: &str,
+    params: &[&str],
     seen: &mut HashSet<i64>,
     ids: &mut Vec<i64>,
 ) -> Result<()> {
     let mut stmt = conn.prepare(sql)?;
-    let mut rows = stmt.query([symbol_name])?;
+    let sql_params = params
+        .iter()
+        .map(|param| &*param as &dyn ToSql)
+        .collect::<Vec<_>>();
+    let mut rows = stmt.query(rusqlite::params_from_iter(sql_params))?;
 
     while let Some(row) = rows.next()? {
         let id = row.get::<_, i64>(0)?;
@@ -374,6 +679,7 @@ fn search_in_file<F>(
     path: &str,
     symbol_name: &str,
     remaining_limit: usize,
+    scope: Option<&UsageScope>,
     mut on_match: F,
 ) -> Result<()>
 where
@@ -383,23 +689,31 @@ where
         return Ok(());
     }
 
-    let file = match std::fs::File::open(path) {
-        Ok(file) => file,
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
         Err(_) => return Ok(()),
     };
 
-    let reader = std::io::BufReader::new(file);
     let mut emitted = 0usize;
+    let member_context = match scope {
+        Some(UsageScope::Member(member_scope)) => {
+            Some(FileMemberContext::new(&content, member_scope))
+        }
+        _ => None,
+    };
 
-    for (line_index, line_result) in reader.lines().enumerate() {
+    for (line_index, line) in content.lines().enumerate() {
         if emitted >= remaining_limit {
             break;
         }
 
-        let line = match line_result {
-            Ok(line) => line,
-            Err(_) => continue,
-        };
+        let current_line = line_index + 1;
+
+        if let Some(UsageScope::Local(local_scope)) = scope {
+            if current_line < local_scope.start_line || current_line > local_scope.end_line {
+                continue;
+            }
+        }
 
         let mut search_start = 0usize;
 
@@ -408,9 +722,26 @@ where
                 break;
             };
 
+            if !is_code_occurrence(line, col) {
+                search_start = col + symbol_name.len();
+                continue;
+            }
+
+            if !should_emit_match(
+                &content,
+                line,
+                current_line,
+                col,
+                scope,
+                member_context.as_ref(),
+            ) {
+                search_start = col + symbol_name.len();
+                continue;
+            }
+
             on_match(json!({
                 "path": normalize_path(path),
-                "line": line_index + 1,
+                "line": current_line,
                 "col": col,
                 "context": line.trim(),
             }))?;
@@ -421,6 +752,315 @@ where
     }
 
     Ok(())
+}
+
+struct FileMemberContext {
+    methods: Vec<MethodRange>,
+    candidate_classes: Vec<String>,
+}
+
+struct MethodRange {
+    class_name: String,
+    start_line: usize,
+    end_line: usize,
+}
+
+impl FileMemberContext {
+    fn new(content: &str, member_scope: &MemberScope) -> Self {
+        let candidate_classes = member_scope
+            .candidate_classes()
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let methods = collect_method_ranges(content, &candidate_classes);
+
+        Self {
+            methods,
+            candidate_classes,
+        }
+    }
+
+    fn method_class_at(&self, line: usize) -> Option<&str> {
+        self.methods
+            .iter()
+            .find(|range| line >= range.start_line && line <= range.end_line)
+            .map(|range| range.class_name.as_str())
+    }
+
+    fn is_candidate_class(&self, class_name: &str) -> bool {
+        self.candidate_classes
+            .iter()
+            .any(|candidate| candidate == class_name)
+    }
+}
+
+fn collect_method_ranges(content: &str, candidate_classes: &[String]) -> Vec<MethodRange> {
+    let mut ranges = Vec::new();
+    let mut pending: Option<(String, usize)> = None;
+    let mut active: Option<(String, usize, i32)> = None;
+
+    for (index, line) in content.lines().enumerate() {
+        let current_line = index + 1;
+
+        if active.is_none() && pending.is_none() {
+            if let Some(class_name) = detect_method_class(line, candidate_classes) {
+                pending = Some((class_name.to_string(), current_line));
+            }
+        }
+
+        if active.is_none() {
+            if let Some((class_name, start_line)) = pending.take() {
+                if line.contains('{') {
+                    active = Some((class_name, start_line, 0));
+                } else {
+                    pending = Some((class_name, start_line));
+                }
+            }
+        }
+
+        if let Some((class_name, start_line, depth)) = active.as_mut() {
+            *depth += count_char(line, '{') as i32;
+            *depth -= count_char(line, '}') as i32;
+
+            if *depth <= 0 && line.contains('}') {
+                ranges.push(MethodRange {
+                    class_name: class_name.clone(),
+                    start_line: *start_line,
+                    end_line: current_line,
+                });
+                active = None;
+            }
+        }
+    }
+
+    let total_lines = content.lines().count();
+    if let Some((class_name, start_line, _)) = active {
+        ranges.push(MethodRange {
+            class_name,
+            start_line,
+            end_line: total_lines,
+        });
+    }
+
+    ranges
+}
+
+/// Decide whether a text match is likely the target member reference.
+/// 判断一次文本匹配是否像目标成员引用。
+fn should_emit_match(
+    content: &str,
+    line: &str,
+    line_number: usize,
+    col: usize,
+    scope: Option<&UsageScope>,
+    member_context: Option<&FileMemberContext>,
+) -> bool {
+    let Some(scope) = scope else {
+        return true;
+    };
+
+    let UsageScope::Member(member_scope) = scope else {
+        return true;
+    };
+
+    let Some(member_context) = member_context else {
+        return false;
+    };
+
+    if let Some((qualifier, op)) = explicit_qualifier_before(line, col) {
+        if op == "::" {
+            return member_context.is_candidate_class(&qualifier);
+        }
+
+        if qualifier == "this" {
+            return member_context
+                .method_class_at(line_number)
+                .map(|class_name| member_context.is_candidate_class(class_name))
+                .unwrap_or(false);
+        }
+
+        return goto::infer_var_type(content, &qualifier, Some(line_number.saturating_sub(1) as u32))
+            .map(|ty| member_context.is_candidate_class(&ty))
+            .unwrap_or(false);
+    }
+
+    if let Some(active_class) = member_context.method_class_at(line_number) {
+        return member_context.is_candidate_class(active_class);
+    }
+
+    let _ = member_scope;
+    false
+}
+
+fn is_code_occurrence(line: &str, col: usize) -> bool {
+    if line
+        .find("//")
+        .map(|comment_start| col >= comment_start)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+
+    !is_inside_double_quoted_string(line, col)
+}
+
+fn is_inside_double_quoted_string(line: &str, col: usize) -> bool {
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (index, ch) in line.char_indices() {
+        if index >= col {
+            break;
+        }
+
+        if escaped {
+            escaped = false;
+            continue;
+        }
+
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+
+        if ch == '"' {
+            in_string = !in_string;
+        }
+    }
+
+    in_string
+}
+
+fn explicit_qualifier_before(line: &str, col: usize) -> Option<(String, &'static str)> {
+    let before = &line[..col];
+    let trimmed = before.trim_end();
+
+    let (prefix, op) = if let Some(prefix) = trimmed.strip_suffix("->") {
+        (prefix, "->")
+    } else if let Some(prefix) = trimmed.strip_suffix('.') {
+        (prefix, ".")
+    } else if let Some(prefix) = trimmed.strip_suffix("::") {
+        (prefix, "::")
+    } else {
+        return None;
+    };
+
+    let qualifier = prefix
+        .rsplit(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .next()
+        .unwrap_or("")
+        .trim();
+
+    if qualifier.is_empty() {
+        return None;
+    }
+
+    Some((qualifier.to_string(), op))
+}
+
+fn detect_method_class<'a>(line: &str, candidate_classes: &'a [String]) -> Option<&'a str> {
+    if line.trim_start().starts_with("//") {
+        return None;
+    }
+
+    candidate_classes
+        .iter()
+        .map(String::as_str)
+        .find(|class_name| line.contains(&format!("{class_name}::")) && line.contains('('))
+}
+
+fn count_char(line: &str, target: char) -> usize {
+    line.chars().filter(|ch| *ch == target).count()
+}
+
+fn push_unique_result(results: &mut Vec<Value>, item: Value) {
+    let identity = usage_identity(&item);
+
+    if results.iter().any(|existing| usage_identity(existing) == identity) {
+        return;
+    }
+
+    results.push(item);
+}
+
+fn usage_identity(item: &Value) -> String {
+    let path = item
+        .get("path")
+        .or_else(|| item.get("file_path"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let line = item
+        .get("line")
+        .or_else(|| item.get("line_number"))
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    let col = item
+        .get("col")
+        .or_else(|| item.get("column"))
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+
+    format!("{}:{}:{}", normalize_path(path), line, col)
+}
+
+fn read_line_context(path: &str, line_number: usize) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+
+    reader
+        .lines()
+        .nth(line_number.saturating_sub(1))?
+        .ok()
+        .map(|line| line.trim().to_string())
+}
+
+fn find_symbol_location_near(
+    path: &str,
+    symbol_name: &str,
+    start_line: usize,
+) -> Option<(usize, usize)> {
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    let lines = reader.lines().collect::<Result<Vec<_>, _>>().ok()?;
+
+    if lines.is_empty() {
+        return None;
+    }
+
+    let start = start_line.saturating_sub(1).min(lines.len() - 1);
+    let end = (start + 8).min(lines.len() - 1);
+
+    for (index, line) in lines.iter().enumerate().take(end + 1).skip(start) {
+        if let Some(col) = find_identifier_in_line(line, symbol_name) {
+            return Some((index + 1, col));
+        }
+    }
+
+    None
+}
+
+fn find_identifier_in_line(line: &str, symbol_name: &str) -> Option<usize> {
+    let mut start = 0usize;
+
+    while start + symbol_name.len() <= line.len() {
+        let Some(relative) = line[start..].find(symbol_name) else {
+            return None;
+        };
+
+        let absolute = start + relative;
+        let before_ok = absolute == 0
+            || !is_word_char(line.as_bytes()[absolute.saturating_sub(1)]);
+        let end = absolute + symbol_name.len();
+        let after_ok = end >= line.len() || !is_word_char(line.as_bytes()[end]);
+
+        if before_ok && after_ok {
+            return Some(absolute);
+        }
+
+        start = absolute + 1;
+    }
+
+    None
 }
 
 /// Find a whole-word symbol occurrence in one line from an offset.

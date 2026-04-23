@@ -77,6 +77,13 @@ function M.goto_definition(project_root, payload, callback)
 	M.query(project_root, payload, callback)
 end
 
+-- Find references/usages for one symbol.
+-- 查找某个符号的引用/使用位置。
+function M.find_references(project_root, payload, callback)
+	payload.kind = "FindSymbolUsages"
+	M.query(project_root, payload, callback)
+end
+
 -- Search symbols by text pattern.
 -- 按文本模式搜索符号。
 function M.search_symbols(project_root, pattern, callback)

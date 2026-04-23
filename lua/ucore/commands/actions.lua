@@ -16,6 +16,12 @@ function M.goto_definition()
 	navigation.goto_definition()
 end
 
+-- Find references for the symbol at the current cursor.
+-- 查找当前光标下符号的引用。
+function M.references()
+	navigation.references()
+end
+
 -- Print the resolved Unreal Engine root for the current project.
 -- 打印当前项目解析到的 Unreal Engine 根目录。
 function M.engine()
@@ -363,7 +369,7 @@ UCore commands:
   :UCore debug help   Show debug commands
   :UCore help         Show this help
   :UCore goto         Go to definition at cursor
-  :UCore gd           Alias of :UCore goto
+  :UCore references   Find references at cursor
 ]])
 end
 
@@ -390,10 +396,11 @@ UCore debug commands:
   :UCore debug assets       Pick indexed assets
   :UCore debug search-symbols <pattern>
                             Search indexed symbols
+  :UCore debug goto         Go to definition at cursor
+  :UCore debug references   Find references at cursor
   :UCore debug complete     Trigger manual completion in Insert mode
   :UCore debug maps         Print Lua-side component/module maps
   :UCore debug help         Show this help
-    :UCore debug goto   Go to definition at cursor
 ]])
 end
 

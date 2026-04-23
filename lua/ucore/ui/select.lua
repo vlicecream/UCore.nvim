@@ -239,4 +239,37 @@ function M.symbols(symbols)
 	end)
 end
 
+-- Pick a reference result and open its source location.
+-- 选择一个引用结果，并打开对应源码位置。
+function M.references(references)
+	pick("UCore references", references, function(item)
+		local path = tostring(item.path or item.file_path or "")
+		local line = tonumber(item.line or item.line_number or 1) or 1
+		local col = tonumber(item.col or item.column or 0) or 0
+		local context = tostring(item.context or item.text or ""):gsub("^%s+", "")
+
+		if context ~= "" then
+			return string.format("%s:%d:%d - %s", path, line, col + 1, context)
+		end
+
+		return string.format("%s:%d:%d", path, line, col + 1)
+	end, function(item)
+		local path = item.path or item.file_path
+		local line = tonumber(item.line or item.line_number or 1) or 1
+		local col = tonumber(item.col or item.column or 0) or 0
+
+		if path and path ~= vim.NIL and vim.fn.filereadable(path) == 1 then
+			vim.cmd.edit(vim.fn.fnameescape(path))
+			local last_line = vim.api.nvim_buf_line_count(0)
+			line = math.max(1, math.min(line, last_line))
+			local line_text = vim.api.nvim_buf_get_lines(0, line - 1, line, false)[1] or ""
+			col = math.max(0, math.min(col, #line_text))
+			vim.api.nvim_win_set_cursor(0, { line, col })
+			vim.cmd("normal! zz")
+		else
+			print(vim.inspect(item))
+		end
+	end)
+end
+
 return M
