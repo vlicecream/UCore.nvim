@@ -60,13 +60,7 @@ function M.open_project()
 		)
 	end
 
-	vim.ui.select(items, {
-		prompt = "UCore projects",
-		format_item = function(item)
-			local engine = item.engine_association and (" [" .. item.engine_association .. "]") or ""
-			return (item.name or item.root) .. engine .. "\n" .. item.root
-		end,
-	}, function(item)
+	ui.select.projects(items, function(item)
 		if not item then
 			return
 		end
@@ -108,13 +102,7 @@ function M.boot()
 		)
 	end
 
-	vim.ui.select(items, {
-		prompt = "UCore projects",
-		format_item = function(item)
-			local engine = item.engine_association and (" [" .. item.engine_association .. "]") or ""
-			return (item.name or item.root) .. engine .. "\n" .. item.root
-		end,
-	}, function(item)
+	ui.select.projects(items, function(item)
 		if not item then
 			return
 		end

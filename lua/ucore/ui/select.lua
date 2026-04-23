@@ -1,4 +1,143 @@
+local config = require("ucore.config")
+
 local M = {}
+
+-- Check whether a Lua module can be required.
+-- 检查某个 Lua 模块是否可用。
+local function has_module(name)
+	local ok = pcall(require, name)
+	return ok
+end
+
+-- Pick the best available picker backend.
+-- 选择当前可用的最佳 picker 后端。
+local function picker_backend()
+	local ui_config = config.values.ui or {}
+	local requested = ui_config.picker or "auto"
+
+	if requested == "vim" then
+		return "vim"
+	end
+
+	if requested == "fzf-lua" and has_module("fzf-lua") then
+		return "fzf-lua"
+	end
+
+	if requested == "telescope" and has_module("telescope.pickers") then
+		return "telescope"
+	end
+
+	if requested == "auto" then
+		if has_module("fzf-lua") then
+			return "fzf-lua"
+		end
+
+		if has_module("telescope.pickers") then
+			return "telescope"
+		end
+	end
+
+	return "vim"
+end
+
+-- Build stable display entries for picker backends.
+-- 为 picker 后端构造稳定展示项。
+local function build_entries(items, format_item)
+	local entries = {}
+
+	for index, item in ipairs(items or {}) do
+		local display = format_item and format_item(item) or tostring(item)
+		display = tostring(display):gsub("\n", "  ")
+
+		table.insert(entries, {
+			index = index,
+			item = item,
+			display = string.format("%04d  %s", index, display),
+			ordinal = display,
+		})
+	end
+
+	return entries
+end
+
+-- Open the built-in vim.ui.select picker.
+-- 打开内置 vim.ui.select 选择器。
+local function pick_vim(title, items, format_item, on_choice)
+	vim.ui.select(items, {
+		prompt = title,
+		format_item = format_item,
+	}, function(choice)
+		if choice then
+			on_choice(choice)
+		end
+	end)
+end
+
+-- Open fzf-lua picker.
+-- 打开 fzf-lua 选择器。
+local function pick_fzf(title, items, format_item, on_choice)
+	local fzf = require("fzf-lua")
+	local entries = build_entries(items, format_item)
+	local lines = vim.tbl_map(function(entry)
+		return entry.display
+	end, entries)
+
+	fzf.fzf_exec(lines, {
+		prompt = title .. "> ",
+		actions = {
+			["default"] = function(selected)
+				local line = selected and selected[1]
+				local index = line and tonumber(line:match("^(%d+)"))
+				local entry = index and entries[index]
+
+				if entry then
+					on_choice(entry.item)
+				end
+			end,
+		},
+	})
+end
+
+-- Open telescope picker.
+-- 打开 telescope 选择器。
+local function pick_telescope(title, items, format_item, on_choice)
+	local pickers = require("telescope.pickers")
+	local finders = require("telescope.finders")
+	local conf = require("telescope.config").values
+	local actions = require("telescope.actions")
+	local action_state = require("telescope.actions.state")
+
+	local entries = build_entries(items, format_item)
+
+	pickers
+		.new({}, {
+			prompt_title = title,
+			finder = finders.new_table({
+				results = entries,
+				entry_maker = function(entry)
+					return {
+						value = entry,
+						display = entry.display,
+						ordinal = entry.ordinal,
+					}
+				end,
+			}),
+			sorter = conf.generic_sorter({}),
+			attach_mappings = function(prompt_bufnr)
+				actions.select_default:replace(function()
+					local selection = action_state.get_selected_entry()
+					actions.close(prompt_bufnr)
+
+					if selection and selection.value then
+						on_choice(selection.value.item)
+					end
+				end)
+
+				return true
+			end,
+		})
+		:find()
+end
 
 -- Open a generic selection UI with a label formatter.
 -- 打开一个通用选择 UI，并支持自定义显示文本。
@@ -8,16 +147,26 @@ local function pick(title, items, format_item, on_choice)
 		return
 	end
 
-	vim.ui.select(items, {
-		prompt = title,
-		format_item = format_item,
-	}, function(choice)
-		if not choice then
-			return
-		end
+	local backend = picker_backend()
 
-		on_choice(choice)
-	end)
+	if backend == "fzf-lua" then
+		return pick_fzf(title, items, format_item, on_choice)
+	end
+
+	if backend == "telescope" then
+		return pick_telescope(title, items, format_item, on_choice)
+	end
+
+	return pick_vim(title, items, format_item, on_choice)
+end
+
+-- Pick a registered Unreal project.
+-- 选择一个已注册 Unreal 项目。
+function M.projects(items, on_choice)
+	pick("UCore projects", items, function(item)
+		local engine = item.engine_association and (" [" .. item.engine_association .. "]") or ""
+		return string.format("%s%s - %s", item.name or item.root, engine, item.root)
+	end, on_choice)
 end
 
 -- Pick a module and open its Build.cs or module root.
@@ -41,8 +190,6 @@ function M.modules(modules)
 			return
 		end
 
-		-- Prefer opening files directly; directories are shown as a path for now.
-		-- 优先直接打开文件；目录路径先只打印，后面可以接文件树/picker。
 		if vim.fn.filereadable(target) == 1 then
 			vim.cmd.edit(vim.fn.fnameescape(target))
 		else
@@ -71,13 +218,14 @@ function M.symbols(symbols)
 	pick("UCore symbols", symbols, function(item)
 		local name = tostring(item.name or "<unknown>")
 		local kind = tostring(item.symbol_type or item.type or "")
+		local source = item.source and (" [" .. tostring(item.source) .. "]") or ""
 		local path = tostring(item.path or "")
 
 		if path ~= "" then
-			return string.format("%s [%s] - %s", name, kind, path)
+			return string.format("%s%s [%s] - %s", name, source, kind, path)
 		end
 
-		return string.format("%s [%s]", name, kind)
+		return string.format("%s%s [%s]", name, source, kind)
 	end, function(item)
 		local path = item.path
 		local line = tonumber(item.line or item.line_number or 1) or 1

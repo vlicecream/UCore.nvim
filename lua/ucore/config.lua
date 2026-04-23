@@ -103,6 +103,14 @@ M.values = {
 		notify_every_percent = 10,
 	},
 
+	-- UI integration options.
+	-- UI 集成配置。
+	ui = {
+		-- Picker backend: "auto", "vim", "fzf-lua", or "telescope".
+		-- 选择器后端："auto"、"vim"、"fzf-lua" 或 "telescope"。
+		picker = "auto",
+	},
+
 	-- Completion integration options.
 	-- 补全集成配置。
 	completion = {
