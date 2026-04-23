@@ -1,4 +1,5 @@
 local config = require("ucore.config")
+local progress = require("ucore.progress")
 
 local uv = vim.uv or vim.loop
 local M = {}
@@ -107,6 +108,20 @@ local function handle_frame(frame)
 		local params = msg[3]
 
 		vim.schedule(function()
+			if method == "progress_plan" then
+				progress.handle_plan(params)
+				return
+			end
+
+			if method == "progress" then
+				progress.handle_progress(params)
+				return
+			end
+
+			if method == "query/partial" then
+				return
+			end
+
 			vim.notify("UCore notification: " .. tostring(method) .. "\n" .. vim.inspect(params))
 		end)
 	end

@@ -95,7 +95,9 @@ function M.boot()
 			if not ok and err then
 				vim.notify("UCore boot failed:\n" .. tostring(err), vim.log.levels.ERROR)
 			end
-		end)
+		end, {
+			project_root = root,
+		})
 	end
 
 	local items = project.list_registered_projects()
@@ -123,7 +125,9 @@ function M.boot()
 			if not ok and err then
 				vim.notify("UCore boot failed:\n" .. tostring(err), vim.log.levels.ERROR)
 			end
-		end)
+		end, {
+			project_root = item.root,
+		})
 	end)
 end
 

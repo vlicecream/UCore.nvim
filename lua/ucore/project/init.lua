@@ -68,7 +68,8 @@ function M.build_paths(project_root)
 		cache_dir = project_cache_dir,
 		db_path = project_cache_dir .. "/ucore.db",
 		cache_db_path = project_cache_dir .. "/ucore-cache.db",
-		registry_path = M.global_registry_path(),
+		project_registry_path = M.global_registry_path(),
+		registry_path = M.server_registry_path(),
 		log_path = project_cache_dir .. "/u_core_server.log",
 	}
 end
@@ -171,6 +172,14 @@ function M.global_registry_path()
 	local cache_dir = normalize(config.values.cache_dir)
 	vim.fn.mkdir(cache_dir, "p")
 	return cache_dir .. "/registry.json"
+end
+
+-- Return the Rust server runtime registry path.
+-- 返回 Rust server 运行态 registry 路径。
+function M.server_registry_path()
+	local cache_dir = normalize(config.values.cache_dir)
+	vim.fn.mkdir(cache_dir, "p")
+	return cache_dir .. "/server-registry.json"
 end
 
 -- Read the global project registry.

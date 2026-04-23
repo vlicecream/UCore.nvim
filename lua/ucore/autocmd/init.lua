@@ -31,7 +31,9 @@ local function schedule_boot(project_root)
 			end
 
 			vim.notify("UCore auto boot failed:\n" .. tostring(err), vim.log.levels.WARN)
-		end)
+		end, {
+			project_root = project_root,
+		})
 	end, config.values.auto_boot_delay_ms)
 end
 
@@ -64,6 +66,11 @@ function M.setup()
 		group = group,
 		callback = try_auto_boot,
 	})
+
+	-- Lazy-loaded plugins can miss the initial BufReadPost event, so check the
+	-- current buffer once after setup too.
+	-- lazy 加载时可能已经错过初始 BufReadPost，所以 setup 后也检查一次当前 buffer。
+	vim.defer_fn(try_auto_boot, config.values.auto_boot_delay_ms)
 end
 
 -- Clear auto boot state, mostly useful for debugging.

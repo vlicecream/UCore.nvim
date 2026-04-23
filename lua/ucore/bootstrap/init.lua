@@ -6,6 +6,7 @@ local server = require("ucore.server")
 local M = {}
 
 local booting = false
+local engine_refreshing = {}
 
 -- Notify with a consistent UCore prefix.
 -- 使用统一的 UCore 前缀提示消息。
@@ -15,11 +16,13 @@ end
 
 -- Build a setup/refresh/watch payload for the current Unreal project.
 -- 为当前 Unreal 工程构造 setup/refresh/watch 请求体。
-local function current_project_payload()
-	local root = project.find_project_root()
+local function current_project_payload(project_root)
+	local root = project_root or project.find_project_root()
 	if not root then
 		return nil, "Could not find .uproject"
 	end
+
+	project.register_project(root)
 
 	local paths = project.build_paths(root)
 	local engine, engine_err = project.engine_metadata(root)
@@ -97,6 +100,12 @@ local function run_engine_refresh_if_needed(payload, callback)
 		return callback(true)
 	end
 
+	if engine_refreshing[engine.engine_id] then
+		notify("engine refresh already running")
+		return callback(true)
+	end
+
+	engine_refreshing[engine.engine_id] = true
 	notify("engine refresh")
 	client.refresh({
 		type = "refresh",
@@ -108,12 +117,27 @@ local function run_engine_refresh_if_needed(payload, callback)
 		scope = "Game",
 		vcs_hash = nil,
 	}, function(_, err)
+		engine_refreshing[engine.engine_id] = nil
+
 		if err then
 			return callback(false, err)
 		end
 
 		project.write_engine_index_metadata(engine)
 		callback(true)
+	end)
+end
+
+-- Refresh the shared Engine index after the project is already usable.
+-- 在项目已经可用后，后台刷新共享 Engine 索引。
+local function run_engine_refresh_in_background(payload)
+	run_engine_refresh_if_needed(payload, function(ok, err)
+		if ok then
+			notify("engine ready")
+			return
+		end
+
+		notify("engine refresh failed: " .. tostring(err), vim.log.levels.WARN)
 	end)
 end
 
@@ -157,15 +181,16 @@ end
 
 -- Boot the whole UCore stack for the current Unreal project.
 -- 为当前 Unreal 工程一键启动完整 UCore 流程。
-function M.boot(callback)
+function M.boot(callback, opts)
 	callback = callback or function() end
+	opts = opts or {}
 
 	if booting then
 		notify("already booting", vim.log.levels.WARN)
 		return callback(false, "already booting")
 	end
 
-	local payload, err = current_project_payload()
+	local payload, err = current_project_payload(opts.project_root)
 	if err then
 		notify(err, vim.log.levels.ERROR)
 		return callback(false, err)
@@ -188,38 +213,31 @@ function M.boot(callback)
 				return callback(false, ready_err)
 			end
 
-			run_engine_refresh_if_needed(payload, function(engine_ok, engine_err)
-				if not engine_ok then
+			run_setup(payload, function(setup_ok, setup_result)
+				if not setup_ok then
 					booting = false
-					notify(tostring(engine_err), vim.log.levels.ERROR)
-					return callback(false, engine_err)
+					notify(tostring(setup_result), vim.log.levels.ERROR)
+					return callback(false, setup_result)
 				end
 
-				run_setup(payload, function(setup_ok, setup_result)
-					if not setup_ok then
+				run_refresh_if_needed(payload, setup_result, function(refresh_ok, refresh_err)
+					if not refresh_ok then
 						booting = false
-						notify(tostring(setup_result), vim.log.levels.ERROR)
-						return callback(false, setup_result)
+						notify(tostring(refresh_err), vim.log.levels.ERROR)
+						return callback(false, refresh_err)
 					end
 
-					run_refresh_if_needed(payload, setup_result, function(refresh_ok, refresh_err)
-						if not refresh_ok then
-							booting = false
-							notify(tostring(refresh_err), vim.log.levels.ERROR)
-							return callback(false, refresh_err)
+					run_watch(payload, function(watch_ok, watch_err)
+						booting = false
+
+						if not watch_ok then
+							notify(tostring(watch_err), vim.log.levels.ERROR)
+							return callback(false, watch_err)
 						end
 
-						run_watch(payload, function(watch_ok, watch_err)
-							booting = false
-
-							if not watch_ok then
-								notify(tostring(watch_err), vim.log.levels.ERROR)
-								return callback(false, watch_err)
-							end
-
-							notify("ready")
-							callback(true)
-						end)
+						notify("ready")
+						callback(true)
+						run_engine_refresh_in_background(payload)
 					end)
 				end)
 			end)

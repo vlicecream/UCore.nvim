@@ -243,8 +243,14 @@ fn discover_project(ctx: &RefreshContext, reporter: Arc<dyn ProgressReporter>) -
             };
 
             let count = seen_count.fetch_add(1, Ordering::Relaxed) + 1;
-            if count % 5000 == 0 {
-                reporter.report("discovery", 10, 100, &format!("Discovery: {} files seen", count));
+            if count % 1000 == 0 {
+                let current = (count / 1000).clamp(1, 69);
+                reporter.report(
+                    "discovery",
+                    current,
+                    100,
+                    &format!("Discovery: {} files seen", count),
+                );
             }
 
             let path = entry.path();
@@ -688,6 +694,7 @@ fn parse_changed_sources(
 
     let total = files.len();
     let processed = AtomicUsize::new(0);
+    let reported_percent = AtomicUsize::new(0);
 
     let results = files
         .into_par_iter()
@@ -702,9 +709,21 @@ fn parse_changed_sources(
                 });
 
             let current = processed.fetch_add(1, Ordering::Relaxed) + 1;
+            let percent = (current * 100 / total).min(100);
+            let previous = reported_percent.load(Ordering::Relaxed);
 
-            if current % 50 == 0 || current == total {
-                reporter.report("analysis", current, total, &format!("Analyzing: {}/{}", current, total));
+            if current == total
+                || (percent > previous
+                    && reported_percent
+                        .compare_exchange(previous, percent, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok())
+            {
+                reporter.report(
+                    "analysis",
+                    current,
+                    total,
+                    &format!("Analyzing: {}/{}", current, total),
+                );
             }
 
             result

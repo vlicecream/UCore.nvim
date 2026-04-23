@@ -70,7 +70,7 @@ M.values = {
 
 	-- Automatically boot UCore when opening a file inside an Unreal project.
 	-- 打开 Unreal 工程里的文件时自动启动 UCore。
-	auto_boot = false,
+	auto_boot = true,
 
 	-- Delay auto boot slightly to avoid fighting startup/plugin loading.
 	-- 稍微延迟自动启动，避免和 nvim 启动/插件加载抢时机。
@@ -89,6 +89,18 @@ M.values = {
 	auto_boot_events = {
 		"BufReadPost",
 		"BufNewFile",
+	},
+
+	-- Refresh progress notification options.
+	-- refresh 进度通知配置。
+	progress = {
+		-- Show refresh progress notifications from the Rust server.
+		-- 显示 Rust server 返回的 refresh 进度通知。
+		enable = true,
+
+		-- Notify when the current refresh stage crosses this percentage step.
+		-- 当前 refresh 阶段每跨过多少百分比提示一次。
+		notify_every_percent = 10,
 	},
 
 	-- Completion integration options.
