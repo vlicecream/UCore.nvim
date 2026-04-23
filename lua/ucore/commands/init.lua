@@ -58,6 +58,8 @@ local function dispatch_debug(tail)
 		maps = actions.maps,
 		help = actions.debug_help,
 		complete = actions.complete,
+    goto = actions.goto_definition,
+    gd = actions.goto_definition,
 	}
 
 	local handler = handlers[sub]
@@ -70,24 +72,26 @@ local function dispatch_debug(tail)
 end
 
 function M.dispatch(args)
-	local sub = normalize_subcommand(args)
-	local tail = command_tail(args)
+  local sub = normalize_subcommand(args)
+  local tail = command_tail(args)
 
-	local handlers = {
-		boot = actions.boot,
-		debug = function()
-			dispatch_debug(tail)
-		end,
-		help = actions.help,
-	}
+  local handlers = {
+    boot = actions.boot,
+    goto = actions.goto_definition,
+    gd = actions.goto_definition,
+    debug = function()
+      dispatch_debug(tail)
+    end,
+    help = actions.help,
+  }
 
-	local handler = handlers[sub]
-	if not handler then
-		vim.notify("Unknown UCore command: " .. sub, vim.log.levels.ERROR)
-		return actions.help()
-	end
+  local handler = handlers[sub]
+  if not handler then
+    vim.notify("Unknown UCore command: " .. sub, vim.log.levels.ERROR)
+    return actions.help()
+  end
 
-	handler()
+  handler()
 end
 
 -- Register a single user command with subcommands.
@@ -115,6 +119,8 @@ function M.register()
 		complete = function(arglead)
 			local items = {
 				"boot",
+          "goto",
+  "gd",
 				"debug",
 				"help",
 			}

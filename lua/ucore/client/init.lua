@@ -1,4 +1,5 @@
 local cli = require("ucore.client.cli")
+local progress = require("ucore.progress")
 local rpc = require("ucore.client.rpc")
 
 local M = {
@@ -12,7 +13,24 @@ local M = {
 M.request = cli.request
 M.status = cli.status
 M.setup = cli.setup
-function M.refresh(payload, callback)
+
+-- Pick a user-facing progress title for refresh requests.
+-- 为 refresh 请求选择面向用户的进度标题。
+local function refresh_progress_title(payload, opts)
+	if opts and opts.label then
+		return opts.label
+	end
+
+	if payload and payload.engine_root == nil then
+		return "UCore engine index"
+	end
+
+	return "UCore project index"
+end
+
+function M.refresh(payload, callback, opts)
+	progress.start(refresh_progress_title(payload, opts))
+
 	rpc.request("refresh", payload, function(result, err)
 		if not err then
 			return callback(result, nil)

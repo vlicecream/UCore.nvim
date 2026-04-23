@@ -6,8 +6,15 @@ local server = require("ucore.server")
 local ui = require("ucore.ui")
 local bootstrap = require("ucore.bootstrap")
 local completion = require("ucore.completion")
+local navigation = require("ucore.navigation")
 
 local M = {}
+
+-- Jump to definition at the current cursor.
+-- 跳转当前光标下符号的定义。
+function M.goto_definition()
+	navigation.goto_definition()
+end
 
 -- Print the resolved Unreal Engine root for the current project.
 -- 打印当前项目解析到的 Unreal Engine 根目录。
@@ -355,6 +362,8 @@ UCore commands:
   :UCore boot         Same as :UCore
   :UCore debug help   Show debug commands
   :UCore help         Show this help
+  :UCore goto         Go to definition at cursor
+  :UCore gd           Alias of :UCore goto
 ]])
 end
 
@@ -384,6 +393,7 @@ UCore debug commands:
   :UCore debug complete     Trigger manual completion in Insert mode
   :UCore debug maps         Print Lua-side component/module maps
   :UCore debug help         Show this help
+    :UCore debug goto   Go to definition at cursor
 ]])
 end
 

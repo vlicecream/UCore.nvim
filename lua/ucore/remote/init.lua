@@ -70,6 +70,13 @@ function M.get_completions(project_root, payload, callback)
 	M.query(project_root, payload, callback)
 end
 
+-- Fetch go-to-definition target for the current buffer context.
+-- 根据当前 buffer 上下文获取跳转定义目标。
+function M.goto_definition(project_root, payload, callback)
+	payload.kind = "GotoDefinition"
+	M.query(project_root, payload, callback)
+end
+
 -- Search symbols by text pattern.
 -- 按文本模式搜索符号。
 function M.search_symbols(project_root, pattern, callback)

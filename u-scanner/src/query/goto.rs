@@ -2,6 +2,7 @@ use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs;
 use tree_sitter::{Node, Parser, Point};
 
 use crate::db::project_path::PATH_CTE;
@@ -662,17 +663,25 @@ fn find_type_definition(conn: &Connection, name: &str) -> Result<Option<Value>> 
         header_priority = HEADER_PRIORITY_SQL
     );
 
-    conn.query_row(&sql, [name.as_str()], |row| {
-        Ok(json!({
-            "symbol_name": row.get::<_, String>(0)?,
-            "line_number": row.get::<_, i64>(1)?,
-            "file_path": normalize_path(&row.get::<_, String>(2)?),
-            "class_name": row.get::<_, String>(0)?,
-            "kind": row.get::<_, String>(3)?,
-        }))
-    })
-    .optional()
-    .map_err(Into::into)
+    let mut result = conn
+        .query_row(&sql, [name.as_str()], |row| {
+            let symbol_name = row.get::<_, String>(0)?;
+
+            Ok(json!({
+                "symbol_name": symbol_name.clone(),
+                "line_number": row.get::<_, i64>(1)?,
+                "file_path": normalize_path(&row.get::<_, String>(2)?),
+                "class_name": symbol_name,
+                "kind": row.get::<_, String>(3)?,
+            }))
+        })
+        .optional()?;
+
+    if let Some(value) = result.as_mut() {
+        fix_type_definition_location(conn, value, &name)?;
+    }
+
+    Ok(result)
 }
 
 /// Find a symbol in a specific Unreal module.
@@ -723,16 +732,22 @@ fn find_type_in_module(
         header_priority = HEADER_PRIORITY_SQL
     );
 
-    conn.query_row(&sql, params![module_name, symbol_name], |row| {
-        Ok(json!({
-            "symbol_name": row.get::<_, String>(0)?,
-            "line_number": row.get::<_, i64>(1)?,
-            "file_path": normalize_path(&row.get::<_, String>(2)?),
-            "kind": row.get::<_, String>(3)?,
-        }))
-    })
-    .optional()
-    .map_err(Into::into)
+    let mut result = conn
+        .query_row(&sql, params![module_name, symbol_name], |row| {
+            Ok(json!({
+                "symbol_name": row.get::<_, String>(0)?,
+                "line_number": row.get::<_, i64>(1)?,
+                "file_path": normalize_path(&row.get::<_, String>(2)?),
+                "kind": row.get::<_, String>(3)?,
+            }))
+        })
+        .optional()?;
+
+    if let Some(value) = result.as_mut() {
+        fix_type_definition_location(conn, value, symbol_name)?;
+    }
+
+    Ok(result)
 }
 
 /// Find a member inside a module.
@@ -915,4 +930,247 @@ pub fn goto_definition(
 /// 统一路径分隔符，方便 Neovim/UI 使用。
 fn normalize_path(path: &str) -> String {
     path.replace('\\', "/").replace("//", "/")
+}
+
+/// Fix DB rows that point at implementation files or miss the exact declaration line.
+/// 修正 DB 里指向实现文件，或缺少精确声明行的类型定义结果。
+fn fix_type_definition_location(
+    conn: &Connection,
+    value: &mut Value,
+    symbol_name: &str,
+) -> Result<()> {
+    let line_number = value
+        .get("line_number")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+
+    let Some(file_path) = value.get("file_path").and_then(Value::as_str) else {
+        return Ok(());
+    };
+
+    // Class definitions should prefer headers. DB rows can currently point at helper
+    // classes in .cpp files when the same symbol appears in member fields.
+    // 类型定义优先跳 header；当前 DB 可能因为 .cpp 里的字段类型误指到实现文件。
+    if !is_header_file(file_path) {
+        if let Some((header_path, line)) = find_header_type_declaration(conn, symbol_name)? {
+            value["file_path"] = json!(header_path);
+            value["line_number"] = json!(line as i64);
+            return Ok(());
+        }
+    }
+
+    if line_number <= 1 {
+        if let Some(line) = find_type_declaration_line(file_path, symbol_name) {
+            value["line_number"] = json!(line as i64);
+        }
+    }
+
+    Ok(())
+}
+
+/// Find a matching header in the indexed files and scan it for the real declaration.
+/// 在已索引文件里寻找匹配 header，并扫描真正的类型声明。
+fn find_header_type_declaration(
+    conn: &Connection,
+    symbol_name: &str,
+) -> Result<Option<(String, usize)>> {
+    let stem = unreal_type_file_stem(symbol_name);
+    let exact_h = format!("{stem}.h");
+    let exact_hpp = format!("{stem}.hpp");
+    let like_h = format!("%{stem}%.h");
+    let like_hpp = format!("%{stem}%.hpp");
+
+    let sql = format!(
+        r#"
+        {}
+        SELECT dp.full_path || '/' || sf.text
+        FROM files f
+        JOIN strings sf ON f.filename_id = sf.id
+        JOIN dir_paths dp ON f.directory_id = dp.id
+        WHERE sf.text NOT LIKE '%.generated.h'
+          AND (
+            sf.text = ?
+            OR sf.text = ?
+            OR sf.text LIKE ?
+            OR sf.text LIKE ?
+          )
+        ORDER BY
+          CASE
+            WHEN dp.full_path LIKE '%/Classes/%' THEN 0
+            WHEN dp.full_path LIKE '%/Public/%' THEN 1
+            WHEN dp.full_path LIKE '%/Private/%' THEN 2
+            ELSE 3
+          END,
+          LENGTH(dp.full_path || '/' || sf.text)
+        LIMIT 50
+        "#,
+        PATH_CTE
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![exact_h, exact_hpp, like_h, like_hpp], |row| {
+        row.get::<_, String>(0)
+    })?;
+
+    for row in rows {
+        let path = normalize_path(&row?);
+        if let Some(line) = find_type_declaration_line(&path, symbol_name) {
+            return Ok(Some((path, line)));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Return true when a path is a C++ header-ish file.
+/// 判断路径是否是 C++ 头文件类文件。
+fn is_header_file(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".h") || lower.ends_with(".hpp") || lower.ends_with(".hh")
+}
+
+/// Convert an Unreal type name into the most likely file stem.
+/// 把 Unreal 类型名转换成最可能的文件名主体。
+fn unreal_type_file_stem(symbol_name: &str) -> String {
+    strip_unreal_type_prefix(symbol_name).unwrap_or_else(|| symbol_name.to_string())
+}
+
+/// Remove common Unreal type prefixes for file-name lookup, e.g. UWidget -> Widget.
+/// 为文件名查找去掉常见 Unreal 类型前缀，比如 UWidget -> Widget。
+fn strip_unreal_type_prefix(symbol_name: &str) -> Option<String> {
+    let mut chars = symbol_name.chars();
+    let first = chars.next()?;
+    let second = chars.next()?;
+
+    if matches!(first, 'A' | 'U' | 'F' | 'E' | 'T' | 'S') && second.is_ascii_uppercase() {
+        Some(symbol_name[first.len_utf8()..].to_string())
+    } else {
+        None
+    }
+}
+
+/// Find the real class/struct/enum declaration line inside a source file.
+/// 在源码文件里查找真正的 class/struct/enum 声明行。
+fn find_type_declaration_line(file_path: &str, symbol_name: &str) -> Option<usize> {
+    let content = fs::read_to_string(file_path).ok()?;
+    let lines: Vec<&str> = content.lines().collect();
+
+    for index in 0..lines.len() {
+        let current = strip_line_comment(lines[index]);
+
+        if !has_type_keyword(&current) {
+            continue;
+        }
+
+        // Some declarations split the API macro and type name across lines.
+        // 有些声明会把 API macro 和类型名拆到多行，所以向后拼几行一起判断。
+        let mut window = current;
+        for offset in 1..=2 {
+            if let Some(next_line) = lines.get(index + offset) {
+                window.push(' ');
+                window.push_str(&strip_line_comment(next_line));
+            }
+        }
+
+        if is_type_declaration_text(&window, symbol_name) {
+            return Some(index + 1);
+        }
+    }
+
+    None
+}
+
+/// Return true when a line has C++ type declaration keywords.
+/// 判断这一行是否包含 C++ 类型声明关键字。
+fn has_type_keyword(line: &str) -> bool {
+    tokens(line)
+        .iter()
+        .any(|token| matches!(*token, "class" | "struct" | "enum"))
+}
+
+/// Return true when text looks like a definition/declaration for this type.
+/// 判断文本是否像目标类型的 class/struct/enum 定义或声明。
+fn is_type_declaration_text(text: &str, symbol_name: &str) -> bool {
+    let trimmed = text.trim();
+
+    // Skip plain forward declarations like `class AActor;`.
+    // 跳过 `class AActor;` 这种纯前置声明。
+    if trimmed.ends_with(';') && !trimmed.contains('{') && !trimmed.contains(':') {
+        return false;
+    }
+
+    let head = declaration_head(trimmed);
+    let token_list = tokens(head);
+
+    for (index, token) in token_list.iter().enumerate() {
+        if !matches!(*token, "class" | "struct" | "enum") {
+            continue;
+        }
+
+        if declared_type_name_after_keyword(&token_list, index)
+            .is_some_and(|candidate| candidate == symbol_name)
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Keep only the declaration head before inheritance/body/forward-decl markers.
+/// 只保留继承列表、函数体、前置声明标记之前的声明头。
+fn declaration_head(text: &str) -> &str {
+    text.find([':', '{', ';'])
+        .map_or(text, |boundary| &text[..boundary])
+}
+
+/// Extract the declared type name after class/struct/enum.
+/// 提取 class/struct/enum 后真正被声明的类型名。
+fn declared_type_name_after_keyword<'a>(tokens: &'a [&str], keyword_index: usize) -> Option<&'a str> {
+    let keyword = tokens.get(keyword_index)?;
+    let mut index = keyword_index + 1;
+
+    if *keyword == "enum" && matches!(tokens.get(index), Some(&"class" | &"struct")) {
+        index += 1;
+    }
+
+    while let Some(token) = tokens.get(index) {
+        if !is_type_declaration_modifier(token) {
+            return Some(token);
+        }
+
+        index += 1;
+    }
+
+    None
+}
+
+/// Return true for tokens that can appear between `class` and the real name.
+/// 判断哪些 token 可能出现在 `class` 和真实类型名之间。
+fn is_type_declaration_modifier(token: &str) -> bool {
+    token.ends_with("_API")
+        || matches!(
+            token,
+            "NO_API"
+                | "final"
+                | "abstract"
+                | "alignas"
+                | "__declspec"
+                | "dllexport"
+                | "dllimport"
+        )
+}
+
+/// Strip single-line comments while keeping declaration text.
+/// 去掉单行注释，保留声明本体。
+fn strip_line_comment(line: &str) -> String {
+    line.split_once("//").map_or(line, |(head, _)| head).to_string()
+}
+
+/// Tokenize C++ text into identifier-like tokens.
+/// 把 C++ 文本切成近似 identifier 的 token。
+fn tokens(text: &str) -> Vec<&str> {
+    text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .filter(|token| !token.is_empty())
+        .collect()
 }
