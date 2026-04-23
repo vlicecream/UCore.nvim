@@ -1,4 +1,5 @@
 local config = require("ucore.config")
+local status = require("ucore.status")
 
 local M = {}
 
@@ -44,6 +45,26 @@ end
 function M.start(next_title)
 	title = next_title or "UCore refresh"
 	reset()
+	status.progress(title, string.format("%s 0%%", title))
+end
+
+-- Finish the visible progress run and let it disappear shortly after.
+-- 完成当前进度展示，并在短暂显示后自动消失。
+function M.finish(message)
+	if not active then
+		return
+	end
+
+	active = false
+	last_percent = 100
+	status.progress_finish(title, message or string.format("%s 100%%", title))
+end
+
+-- Mark the current progress run as failed.
+-- 标记当前进度展示失败。
+function M.fail(message)
+	active = false
+	status.progress_fail(title, message or string.format("%s failed", title))
 end
 
 -- Clamp one numeric value into a safe range.
@@ -179,12 +200,11 @@ function M.handle_progress(event)
 	end
 
 	local overall = overall_percent(event)
-	local step = progress_config.notify_every_percent or 1
 	local is_complete = overall >= 100 or event.stage == "complete"
 
-	-- Keep internal Rust stages hidden from users; report only big-picture progress.
-	-- 隐藏 Rust 内部阶段，只向用户展示整体刷新进度。
-	if not is_complete and overall < last_percent + step then
+	-- Rust owns progress throttling; Lua only ignores duplicate or stale events.
+	-- Rust 负责进度节流；Lua 只忽略重复或过期事件。
+	if not is_complete and overall <= last_percent then
 		return
 	end
 
@@ -192,14 +212,10 @@ function M.handle_progress(event)
 
 	local message = string.format("%s %d%%", title, overall)
 	if is_complete then
-		message = string.format("%s complete", title)
+		return M.finish(string.format("%s 100%%", title))
 	end
 
-	vim.notify(message, vim.log.levels.INFO)
-
-	if is_complete then
-		active = false
-	end
+	status.progress(title, message)
 end
 
 return M

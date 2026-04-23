@@ -467,13 +467,19 @@ pub fn save_to_db(
              VALUES (?1, ?2, ?3)",
         )?;
 
+        let mut last_reported_percent = 0usize;
+
         for (index, result) in results.iter().enumerate() {
-            if index % 500 == 0 {
+            let current = index + 1;
+            let percent = progress_percent(current, total);
+
+            if current == total || percent > last_reported_percent {
+                last_reported_percent = percent;
                 reporter.report(
                     "db_sync",
-                    index,
+                    current,
                     total,
-                    &format!("Saving results ({}/{})", index, total),
+                    &format!("Saving results ({}/{})", current, total),
                 );
             }
 
@@ -553,6 +559,16 @@ pub fn save_to_db(
 
     finalize_bulk_write(conn, reporter)?;
     Ok(())
+}
+
+/// Convert item progress into a 0-100 percentage.
+/// 将条目进度换算成 0-100 百分比。
+fn progress_percent(current: usize, total: usize) -> usize {
+    if total == 0 {
+        return 100;
+    }
+
+    (current * 100 / total).min(100)
 }
 
 /// Configure SQLite for fast bulk insertion.

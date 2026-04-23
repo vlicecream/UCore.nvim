@@ -97,10 +97,6 @@ M.values = {
 		-- Show refresh progress notifications from the Rust server.
 		-- 显示 Rust server 返回的 refresh 进度通知。
 		enable = true,
-
-		-- Notify when overall refresh progress crosses this percentage step.
-		-- 整体 refresh 进度每跨过多少百分比提示一次。
-		notify_every_percent = 10,
 	},
 
 	-- UI integration options.

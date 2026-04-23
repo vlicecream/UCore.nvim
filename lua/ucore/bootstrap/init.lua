@@ -2,16 +2,26 @@ local client = require("ucore.client")
 local config = require("ucore.config")
 local project = require("ucore.project")
 local server = require("ucore.server")
+local status = require("ucore.status")
 
 local M = {}
 
 local booting = false
 local engine_refreshing = {}
 
--- Notify with a consistent UCore prefix.
--- 使用统一的 UCore 前缀提示消息。
-local function notify(message, level)
-	vim.notify("UCore boot: " .. message, level or vim.log.levels.INFO)
+-- Report boot failures through the persistent initialization status.
+-- 通过持久初始化状态报告 boot 错误。
+local function fail(message, detail)
+	status.fail("UCore initialization failed", detail or message)
+end
+
+-- Update the non-indexing part of boot progress.
+-- 更新非索引部分的初始化进度。
+local function other_progress(percent)
+	status.progress(
+		"UCore other initialization",
+		string.format("UCore other initialization %d%%", percent)
+	)
 end
 
 -- Build a setup/refresh/watch payload for the current Unreal project.
@@ -75,7 +85,6 @@ end
 -- Run setup and decide whether a full refresh is required.
 -- 执行 setup，并判断是否需要 full refresh。
 local function run_setup(payload, callback)
-	notify("setup")
 	client.setup(rust_payload(payload), function(result, err)
 		if err then
 			return callback(false, err)
@@ -92,21 +101,21 @@ local function run_engine_refresh_if_needed(payload, callback)
 	local engine_paths = payload._engine_paths
 
 	if not engine or not engine_paths then
+		status.progress_finish("UCore engine index", "UCore engine index 100%")
 		return callback(true)
 	end
 
 	if not project.engine_needs_refresh(engine) then
-		notify("engine refresh skipped")
+		status.progress_finish("UCore engine index", "UCore engine index 100%")
 		return callback(true)
 	end
 
 	if engine_refreshing[engine.engine_id] then
-		notify("engine refresh already running")
+		status.progress_finish("UCore engine index", "UCore engine index 100%")
 		return callback(true)
 	end
 
 	engine_refreshing[engine.engine_id] = true
-	notify("engine refresh")
 	client.refresh({
 		type = "refresh",
 		project_root = engine.engine_root,
@@ -133,11 +142,11 @@ end
 local function run_engine_refresh_in_background(payload)
 	run_engine_refresh_if_needed(payload, function(ok, err)
 		if ok then
-			notify("engine ready")
+			status.finish("UCore READY - initialization complete")
 			return
 		end
 
-		notify("engine refresh failed: " .. tostring(err), vim.log.levels.WARN)
+		status.fail("UCore engine index failed", tostring(err))
 	end)
 end
 
@@ -145,11 +154,10 @@ end
 -- 当 setup 判断数据库缺失或过期时执行 refresh。
 local function run_refresh_if_needed(payload, setup_result, callback)
 	if not setup_result.needs_full_refresh then
-		notify("refresh skipped")
+		status.progress_finish("UCore project index", "UCore project index 100%")
 		return callback(true)
 	end
 
-	notify("refresh")
 	local refresh_payload = rust_payload(payload)
 	refresh_payload.type = "refresh"
 	refresh_payload.scope = "Game"
@@ -166,7 +174,6 @@ end
 -- Start watcher after setup/refresh.
 -- setup/refresh 后启动 watcher。
 local function run_watch(payload, callback)
-	notify("watch")
 	client.watch({
 		project_root = payload.project_root,
 		db_path = payload.db_path,
@@ -186,44 +193,48 @@ function M.boot(callback, opts)
 	opts = opts or {}
 
 	if booting then
-		notify("already booting", vim.log.levels.WARN)
+		status.start("UCore initializing...")
 		return callback(false, "already booting")
 	end
 
 	local payload, err = current_project_payload(opts.project_root)
 	if err then
-		notify(err, vim.log.levels.ERROR)
+		fail(err)
 		return callback(false, err)
 	end
 
 	booting = true
-	notify("starting server")
+	status.start("UCore initializing...")
+	other_progress(0)
 
 	server.start(function(ok, start_message)
 		if not ok then
 			booting = false
-			notify(start_message, vim.log.levels.ERROR)
+			fail(start_message)
 			return callback(false, start_message)
 		end
+		other_progress(25)
 
 		wait_ready(1, function(ready, ready_err)
 			if not ready then
 				booting = false
-				notify(tostring(ready_err) .. "\nLog: " .. tostring(server.log_path()), vim.log.levels.ERROR)
+				fail(tostring(ready_err), "Log: " .. tostring(server.log_path()))
 				return callback(false, ready_err)
 			end
+			other_progress(40)
 
 			run_setup(payload, function(setup_ok, setup_result)
 				if not setup_ok then
 					booting = false
-					notify(tostring(setup_result), vim.log.levels.ERROR)
+					fail(tostring(setup_result))
 					return callback(false, setup_result)
 				end
+				other_progress(60)
 
 				run_refresh_if_needed(payload, setup_result, function(refresh_ok, refresh_err)
 					if not refresh_ok then
 						booting = false
-						notify(tostring(refresh_err), vim.log.levels.ERROR)
+						fail(tostring(refresh_err))
 						return callback(false, refresh_err)
 					end
 
@@ -231,11 +242,11 @@ function M.boot(callback, opts)
 						booting = false
 
 						if not watch_ok then
-							notify(tostring(watch_err), vim.log.levels.ERROR)
+							fail(tostring(watch_err))
 							return callback(false, watch_err)
 						end
+						other_progress(100)
 
-						notify("ready")
 						callback(true)
 						run_engine_refresh_in_background(payload)
 					end)

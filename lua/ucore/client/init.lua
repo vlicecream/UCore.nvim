@@ -33,14 +33,17 @@ function M.refresh(payload, callback, opts)
 
 	rpc.request("refresh", payload, function(result, err)
 		if not err then
+			progress.finish()
 			return callback(result, nil)
 		end
 
 		local text = tostring(err)
 		if text:find("ECONNREFUSED", 1, true) or text:lower():find("connection refused", 1, true) then
+			progress.finish()
 			return cli.refresh(payload, callback)
 		end
 
+		progress.fail("UCore index failed: " .. text)
 		callback(nil, err)
 	end)
 end
