@@ -777,13 +777,18 @@ fn fetch_members_recursive(
         }
     }
 
-    let mut queue = VecDeque::from(class_ids);
+    let mut queue = VecDeque::from(
+        class_ids
+            .into_iter()
+            .map(|class_id| (class_id, 0usize))
+            .collect::<Vec<_>>(),
+    );
     let mut visited_ids = HashSet::new();
     let mut visited_names = HashSet::new();
     let mut seen_items = HashSet::new();
     let mut items = Vec::new();
 
-    while let Some(class_id) = queue.pop_front() {
+    while let Some((class_id, class_rank)) = queue.pop_front() {
         if !visited_ids.insert(class_id) {
             continue;
         }
@@ -795,13 +800,21 @@ fn fetch_members_recursive(
             ctx,
             class_id,
             &current_class_name,
+            class_rank,
             &prefix,
             accessor,
             &mut seen_items,
             &mut items,
         )?;
 
-        append_enum_items(ctx.conn, class_id, &prefix, &mut seen_items, &mut items)?;
+        append_enum_items(
+            ctx.conn,
+            class_id,
+            class_rank,
+            &prefix,
+            &mut seen_items,
+            &mut items,
+        )?;
 
         for (parent_id, parent_name) in parent_classes(ctx.conn, class_id)? {
             if !parent_name.is_empty() && !visited_names.insert(parent_name.clone()) {
@@ -809,11 +822,11 @@ fn fetch_members_recursive(
             }
 
             if let Some(parent_id) = parent_id {
-                queue.push_back(parent_id);
+                queue.push_back((parent_id, class_rank + 1));
             }
 
             for id in ctx.class_ids_by_name(&parent_name)? {
-                queue.push_back(id);
+                queue.push_back((id, class_rank + 1));
             }
         }
 
@@ -833,6 +846,7 @@ fn append_members_for_class(
     ctx: &mut CompletionContext,
     class_id: i64,
     owner_class: &str,
+    class_rank: usize,
     prefix: &str,
     accessor_class: &str,
     seen: &mut HashSet<String>,
@@ -902,15 +916,24 @@ fn append_members_for_class(
             .unwrap_or_default();
 
         let documentation = merge_docs(documentation, detail);
+        let kind = completion_kind(&member_type);
+        let sort_text = completion_sort_text(class_rank, kind, &name);
 
         items.push(json!({
             "label": name,
-            "kind": completion_kind(&member_type),
+            "kind": kind,
             "detail": detail_text,
             "documentation": documentation,
             "insertText": name,
+            "filterText": name,
+            "sortText": sort_text,
+            "labelDetails": {
+                "detail": format!(" {}", detail_text),
+                "description": owner_class,
+            },
             "sourceClass": owner_class,
         }));
+
     }
 
     Ok(())
@@ -965,6 +988,7 @@ fn is_member_accessible(
 fn append_enum_items(
     conn: &Connection,
     class_id: i64,
+    class_rank: usize,
     prefix: &str,
     seen: &mut HashSet<String>,
     items: &mut Vec<Value>,
@@ -991,10 +1015,13 @@ fn append_enum_items(
         let name: String = row.get(0)?;
 
         if seen.insert(format!("enum:{}", name)) {
+            let kind = 20;
             items.push(json!({
                 "label": name,
-                "kind": 20,
+                "kind": kind,
                 "detail": "enum item",
+                "filterText": name,
+                "sortText": completion_sort_text(class_rank, kind, &name),
                 "insertText": name,
             }));
         }
@@ -1223,15 +1250,23 @@ fn fetch_global_symbols(conn: &Connection, prefix: &str) -> Result<Vec<Value>> {
     let rows = stmt.query_map([format!("{}%", prefix)], |row| {
         let name: String = row.get(0)?;
         let symbol_type: String = row.get(1)?;
+        let kind = if matches!(symbol_type.as_str(), "enum" | "UENUM") {
+            13
+        } else {
+            7
+        };
 
         Ok(json!({
             "label": name,
-            "kind": match symbol_type.as_str() {
-                "enum" | "UENUM" => 13,
-                _ => 7,
-            },
+            "kind": kind,
             "detail": symbol_type,
+            "filterText": name,
+            "sortText": completion_sort_text(100, kind, &name),
             "insertText": name,
+            "labelDetails": {
+                "detail": format!(" {}", symbol_type),
+                "description": "UCore",
+            },
         }))
     })?;
 
@@ -1313,11 +1348,89 @@ fn ue_snippets(prefix: &str) -> Vec<Value> {
         snippet("UCLASS", "UCLASS($1)", "Unreal class macro"),
         snippet("USTRUCT", "USTRUCT($1)", "Unreal struct macro"),
         snippet("UENUM", "UENUM($1)", "Unreal enum macro"),
+        snippet("UINTERFACE", "UINTERFACE($1)", "Unreal interface macro"),
         snippet("UPROPERTY", "UPROPERTY($1)", "Unreal property macro"),
         snippet("UFUNCTION", "UFUNCTION($1)", "Unreal function macro"),
         snippet("GENERATED_BODY", "GENERATED_BODY()", "Unreal generated body"),
+        snippet("GENERATED_UCLASS_BODY", "GENERATED_UCLASS_BODY()", "Legacy generated body"),
+        snippet("DECLARE_LOG_CATEGORY_EXTERN", "DECLARE_LOG_CATEGORY_EXTERN($1, Log, All)", "Declare log category"),
+        snippet("DEFINE_LOG_CATEGORY", "DEFINE_LOG_CATEGORY($1)", "Define log category"),
+        snippet("UE_DEFINE_GAME_MODULE", "UE_DEFINE_GAME_MODULE($1, $2, $3)", "Define Unreal game module"),
+        snippet("IMPLEMENT_PRIMARY_GAME_MODULE", "IMPLEMENT_PRIMARY_GAME_MODULE($1, $2, $3)", "Implement primary game module"),
+        snippet("IMPLEMENT_MODULE", "IMPLEMENT_MODULE($1, $2)", "Implement Unreal module"),
         snippet("Super::", "Super::", "Parent class scope"),
         snippet("GetWorld()", "GetWorld()", "Get current world"),
+        snippet("CreateDefaultSubobject", "CreateDefaultSubobject<$1>($2)", "Create default subobject"),
+        snippet("NewObject", "NewObject<$1>($2)", "Create a new UObject"),
+        snippet("DuplicateObject", "DuplicateObject<$1>($2, $3)", "Duplicate an object"),
+        snippet("GetDefault", "GetDefault<$1>()", "Get class default object"),
+        snippet("Cast", "Cast<$1>($2)", "Unreal safe cast"),
+        snippet("CastChecked", "CastChecked<$1>($2)", "Checked Unreal cast"),
+        snippet("CastField", "CastField<$1>($2)", "Unreal field cast"),
+        snippet("StaticClass", "$1::StaticClass()", "Get Unreal UClass"),
+        snippet("FindObject", "FindObject<$1>($2, $3)", "Find an existing UObject"),
+        snippet("LoadObject", "LoadObject<$1>($2, $3)", "Load a UObject"),
+        snippet("StaticLoadObject", "StaticLoadObject($1, $2, $3)", "Load a UObject by path"),
+        snippet("LoadClass", "LoadClass<$1>($2, $3)", "Load a UClass"),
+        snippet("StaticLoadClass", "StaticLoadClass($1, $2, $3)", "Load a UClass by path"),
+        snippet("CreateWidget", "CreateWidget<$1>($2, $3)", "Create a widget"),
+        snippet("TSubclassOf", "TSubclassOf<$1>", "Class reference wrapper"),
+        snippet("TObjectPtr", "TObjectPtr<$1>", "Strong UObject pointer"),
+        snippet("TWeakObjectPtr", "TWeakObjectPtr<$1>", "Weak UObject pointer"),
+        snippet("TSoftObjectPtr", "TSoftObjectPtr<$1>", "Soft UObject pointer"),
+        snippet("TSoftClassPtr", "TSoftClassPtr<$1>", "Soft class pointer"),
+        snippet("TArray", "TArray<$1>", "Unreal dynamic array"),
+        snippet("TMap", "TMap<$1, $2>", "Unreal map container"),
+        snippet("TSet", "TSet<$1>", "Unreal set container"),
+        snippet("TQueue", "TQueue<$1>", "Unreal queue container"),
+        snippet("TOptional", "TOptional<$1>", "Optional value wrapper"),
+        snippet("TArrayView", "TArrayView<$1>", "Array view wrapper"),
+        snippet("TConstArrayView", "TConstArrayView<$1>", "Const array view wrapper"),
+        snippet("TUniquePtr", "TUniquePtr<$1>", "Unique pointer"),
+        snippet("TSharedPtr", "TSharedPtr<$1>", "Shared pointer"),
+        snippet("TSharedRef", "TSharedRef<$1>", "Shared reference"),
+        snippet("TWeakPtr", "TWeakPtr<$1>", "Weak shared pointer"),
+        snippet("TScriptInterface", "TScriptInterface<$1>", "Script interface wrapper"),
+        snippet("MakeShared", "MakeShared<$1>($2)", "Create a shared pointer"),
+        snippet("MakeUnique", "MakeUnique<$1>($2)", "Create a unique pointer"),
+        snippet("MakeShareable", "MakeShareable(new $1($2))", "Create a shared pointer from raw object"),
+        snippet("MoveTemp", "MoveTemp($1)", "Move semantics helper"),
+        snippet("Forward", "Forward<$1>($2)", "Perfect forwarding helper"),
+        snippet("UE_LOG", "UE_LOG($1)", "Unreal logging macro"),
+        snippet("UE_CLOG", "UE_CLOG($1)", "Conditional Unreal logging macro"),
+        snippet("UE_LOGFMT", "UE_LOGFMT($1)", "Formatted Unreal logging macro"),
+        snippet("check", "check($1)", "Debug assertion"),
+        snippet("checkf", "checkf($1)", "Debug assertion with message"),
+        snippet("ensure", "ensure($1)", "Runtime assertion"),
+        snippet("ensureMsgf", "ensureMsgf($1)", "Runtime assertion with message"),
+        snippet("ensureAlways", "ensureAlways($1)", "Always-on runtime assertion"),
+        snippet("ensureAlwaysMsgf", "ensureAlwaysMsgf($1)", "Always-on runtime assertion with message"),
+        snippet("verify", "verify($1)", "Assertion that keeps evaluating"),
+        snippet("verifyf", "verifyf($1)", "Assertion that keeps evaluating with message"),
+        snippet("TEXT", "TEXT($1)", "Wide text macro"),
+        snippet("LOCTEXT", "LOCTEXT($1, $2)", "Localized text macro"),
+        snippet("NSLOCTEXT", "NSLOCTEXT($1, $2, $3)", "Namespace localized text macro"),
+        snippet("INVTEXT", "INVTEXT($1)", "Invariant text macro"),
+        snippet("FString", "FString(TEXT($1))", "Unreal string type"),
+        snippet("FName", "FName(TEXT($1))", "Unreal name type"),
+        snippet("FText", "FText::FromString(TEXT($1))", "Localized text wrapper"),
+        snippet("IsValid", "IsValid($1)", "Unreal validity helper"),
+        snippet("IsValidLowLevel", "IsValidLowLevel($1)", "Low-level validity check"),
+        snippet("GetName", "GetName()", "Get object name"),
+        snippet("GetPathName", "GetPathName()", "Get object path name"),
+        snippet("GetOuter", "GetOuter()", "Get outer object"),
+        snippet("GetOwner", "GetOwner()", "Get actor owner"),
+        snippet("GetActorLocation", "GetActorLocation()", "Get actor location"),
+        snippet("GetActorRotation", "GetActorRotation()", "Get actor rotation"),
+        snippet("GetComponentByClass", "GetComponentByClass<$1>()", "Get component by class"),
+        snippet("AddDynamic", "AddDynamic(this, &$1::$2)", "Bind a dynamic delegate"),
+        snippet("AddUObject", "AddUObject(this, &$1::$2)", "Bind a UObject delegate"),
+        snippet("BindUObject", "BindUObject(this, &$1::$2)", "Bind a UObject delegate"),
+        snippet("BindLambda", "BindLambda([&]($1) {\n\t$2\n})", "Bind a lambda"),
+        snippet("Add", "Add($1)", "Add an item"),
+        snippet("AddUnique", "AddUnique($1)", "Add an item if missing"),
+        snippet("Emplace", "Emplace($1)", "Construct in place"),
+        snippet("Reserve", "Reserve($1)", "Reserve container capacity"),
     ];
 
     if !prefix.is_empty() {
@@ -1341,7 +1454,8 @@ fn snippet(label: &str, insert_text: &str, detail: &str) -> Value {
         "kind": 15,
         "detail": detail,
         "insertText": insert_text,
-        "sortText": "00",
+        "filterText": label,
+        "sortText": completion_sort_text(200, 15, label),
     })
 }
 
@@ -1696,6 +1810,17 @@ fn completion_kind(kind: &str) -> i64 {
         "enum_item" => 20,
         _ => 1,
     }
+}
+
+/// Build a stable sort text for completion items.
+/// 为补全项构造稳定的排序文本。
+fn completion_sort_text(rank: usize, kind: i64, label: &str) -> String {
+    format!(
+        "{:04}_{:04}_{}",
+        rank,
+        kind,
+        label.to_ascii_lowercase()
+    )
 }
 
 /// Remove duplicate completion labels.
