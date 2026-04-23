@@ -118,13 +118,6 @@ M.values = {
 		-- 触发 UCore 补全的插入模式快捷键。
 		keymap = "<C-l>",
 
-		-- Automatically trigger native Vim completion while typing.
-		-- 输入时自动触发 Vim 原生补全。
-		--
-		-- Keep this disabled when using blink.cmp/nvim-cmp integration.
-		-- 使用 blink.cmp/nvim-cmp 集成时保持关闭。
-		auto_trigger = false,
-
 		-- Minimum identifier prefix length before global completion starts.
 		-- 触发全局补全所需的最短标识符前缀长度。
 		min_chars = 2,

@@ -49,22 +49,24 @@ end
 -- Convert Vim complete-item shape into LSP/blink completion item shape.
 -- 把 Vim complete-item 结构转换成 LSP/blink completion item 结构。
 local function to_blink_item(item)
-	local label = item.abbr or item.word or item.label or item.insertText or item.insert_text
-	if not label or label == "" then
+	local label = item.label or item.name or item.word or item.insert_text or item.insertText or item.text or ""
+	if label == "" then
 		return nil
 	end
 
-	local insert_text = item.word or item.insertText or item.insert_text or label
+	local insert_text = item.insert_text or item.insertText or item.word or item.name or label
 	local kind = tonumber(item.kind) or item.kind
 
 	return {
 		label = tostring(label),
 		kind = kind,
-		detail = item.menu or item.detail,
-		documentation = item.info or item.documentation,
+		detail = item.detail or item.menu,
+		labelDetails = item.labelDetails,
+		documentation = item.documentation or item.info,
+		filterText = tostring(item.filterText or item.filter_text or label),
 		insertText = tostring(insert_text),
 		insertTextFormat = vim.lsp.protocol.InsertTextFormat.PlainText,
-		sortText = item.sortText or item.sort_text,
+		sortText = tostring(item.sortText or item.sort_text or label),
 	}
 end
 

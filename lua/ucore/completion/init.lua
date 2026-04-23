@@ -228,10 +228,6 @@ end
 local function schedule_auto_complete()
 	local completion_config = config.values.completion or {}
 
-	if completion_config.enable == false or completion_config.auto_trigger == false then
-		return
-	end
-
 	if vim.fn.pumvisible() == 1 then
 		return
 	end
@@ -262,12 +258,6 @@ function M.setup()
 	local group = vim.api.nvim_create_augroup("UCoreCompletion", {
 		clear = true,
 	})
-
-	local completion_config = config.values.completion or {}
-
-	if completion_config.enable == false or completion_config.auto_trigger == false then
-		return
-	end
 
 	vim.api.nvim_create_autocmd({ "TextChangedI", "TextChangedP" }, {
 		group = group,

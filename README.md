@@ -130,23 +130,6 @@ Health check:
 
 ## Configuration
 
-Default configuration:
-
-```lua
-require("ucore").setup({
-  auto_boot = false,
-  port = 30110,
-  use_release_binary = true,
-  completion = {
-    enable = true,
-    keymap = "<C-l>",
-    auto_trigger = false,
-    min_chars = 2,
-    debounce_ms = 180,
-  },
-})
-```
-
 Recommended configuration:
 
 ```lua
@@ -157,45 +140,30 @@ require("ucore").setup({
   completion = {
     enable = true,
     keymap = "<C-l>",
-    auto_trigger = false,
     min_chars = 2,
     debounce_ms = 180,
   },
 })
 ```
 
-`auto_boot = true` starts UCore automatically when opening a file inside an
-Unreal project.
+`auto_boot = true` starts UCore automatically when you open an Unreal project file.
 
-`auto_boot = true` 会在打开 Unreal 工程内文件时自动启动 UCore。
+`use_release_binary = true` prefers binaries built by lazy.nvim's `build` step, and
+falls back to `cargo run` if release binaries are missing.
 
-`use_release_binary = true` makes UCore prefer binaries built by lazy.nvim's
-`build` step. If release binaries do not exist, UCore falls back to `cargo run`.
+`completion.enable = true` only controls the manual insert-mode mapping.
+Native automatic completion is always enabled.
 
-`use_release_binary = true` 会让 UCore 优先使用 lazy.nvim `build` 阶段构建出的
-release binary。如果 release binary 不存在，UCore 会回退到 `cargo run`。
+`auto_boot = true` 会在打开 Unreal 工程文件时自动启动 UCore。
 
-`completion.keymap` controls the insert-mode key used to trigger manual
-completion. Set `completion.enable = false` if you prefer to define your own
-mapping.
+`use_release_binary = true` 会优先使用 lazy.nvim `build` 阶段构建的 release
+binary；如果不存在，则回退到 `cargo run`。
 
-`completion.keymap` 控制插入模式下触发手动补全的快捷键。如果你想自己管理映射，
-可以设置 `completion.enable = false`。
-
-`completion.auto_trigger = true` enables native Vim automatic completion while
-typing. If you use blink.cmp, keep this disabled and register UCore as a blink
-source instead.
-
-`completion.auto_trigger = true` 会在输入时触发 Vim 原生补全。如果你使用
-blink.cmp，建议保持关闭，并把 UCore 注册为 blink source。
+`completion.enable = true` 只控制手动插入模式快捷键。原生自动补全始终开启。
 
 ### blink.cmp Integration
 
-UCore can integrate into blink.cmp as a normal completion source, so candidates
-show up in the same menu as LSP/buffer/snippet items.
-
-UCore 可以作为普通补全源接入 blink.cmp，这样候选会显示在你现有的
-LSP/buffer/snippet 同一个补全菜单里。
+UCore can integrate into blink.cmp as a normal completion source.
 
 ```lua
 {
@@ -221,19 +189,7 @@ LSP/buffer/snippet 同一个补全菜单里。
 ## Rust Backend
 
 During development, UCore can run the Rust backend through `cargo run`.
-
-开发阶段，UCore 可以通过 `cargo run` 启动 Rust 后端。
-
-For faster startup, let lazy.nvim build release binaries during install/update:
-
-```lua
-{
-  "vlicecream/UCore.nvim",
-  build = "cargo build --release --manifest-path u-scanner/Cargo.toml --bin u_core_server --bin u_scanner",
-}
-```
-
-为了获得更快的启动速度，推荐让 lazy.nvim 在安装/更新插件时构建 release binary：
+For faster startup, let lazy.nvim build release binaries during install/update.
 
 ```lua
 {
