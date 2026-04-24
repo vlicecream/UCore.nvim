@@ -77,11 +77,21 @@ function M.dispatch(args)
 
   local handlers = {
     boot = actions.boot,
+    build = function()
+      actions.build(tail)
+    end,
+    ["build-cancel"] = actions.build_cancel,
+    buildcancel = actions.build_cancel,
+    editor = function()
+      actions.editor(tail)
+    end,
     find = function()
       actions.find(tail)
     end,
     goto = actions.goto_definition,
     references = actions.references,
+    logs = actions.logs,
+    status = actions.status,
     debug = function()
       dispatch_debug(tail)
     end,
@@ -122,9 +132,14 @@ function M.register()
 		complete = function(arglead)
 			local items = {
 				"boot",
+				"build",
+				"build-cancel",
+				"editor",
 				"find",
 				"goto",
 				"references",
+				"logs",
+				"status",
 				"debug",
 				"help",
 			}

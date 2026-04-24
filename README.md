@@ -2,281 +2,383 @@
 
 UCore.nvim is a Neovim plugin for Unreal Engine projects.
 
-UCore.nvim 是一个面向 Unreal Engine 工程的 Neovim 插件。
-
 It uses a Rust backend, `u-scanner`, to index Unreal C++ source files, modules,
-assets, configs, and symbols. The Lua frontend then exposes those results inside
-Neovim through commands, pickers, and RPC.
+assets, config files, symbols, definitions, references, and project metadata.
+The Lua frontend exposes that index inside Neovim through commands, Telescope
+pickers, completion sources, semantic highlights, and health checks.
 
-它使用 Rust 后端 `u-scanner` 索引 Unreal C++ 源码、模块、资产、配置和符号。
-Lua 前端再通过命令、选择器和 RPC 在 Neovim 中使用这些数据。
+> Status: early and evolving. The core workflow is usable, but APIs may still
+> change while the plugin matures.
 
-## Status
+## Features
 
-This project is still early and evolving quickly.
-
-当前项目还处于早期阶段，接口和功能仍在快速迭代。
+- One-command Unreal project boot: `:UCore`
+- Build the current Unreal Editor target with live logs: `:UCore build`
+- Open the current project in Unreal Editor: `:UCore editor`
+- Shared project and Unreal Engine indexes
+- Find indexed code, modules, assets, and config values with `:UCore find`
+- Go to definition with `:UCore goto`
+- Find references with `:UCore references`
+- Unreal C++ Tree-sitter parser registration and highlight defaults
+- Optional Telescope picker integration
+- Optional blink.cmp completion source
+- Runtime status and logs with `:UCore status` and `:UCore logs`
+- Environment diagnostics through `:checkhealth ucore`
 
 ## Requirements
 
 - Neovim 0.10+
 - Rust toolchain with `cargo`
 - An Unreal Engine project with a `.uproject` file
-- Windows is the current primary development target
+- `nvim-treesitter` if you want Unreal C++ Tree-sitter highlighting
+- `telescope.nvim` or `fzf-lua` if you want a richer picker UI
+- `blink.cmp` if you want UCore as a completion source
 
-依赖：
-
-- Neovim 0.10+
-- Rust 工具链和 `cargo`
-- 一个带 `.uproject` 文件的 Unreal Engine 工程
-- 当前主要开发目标是 Windows
+Windows is the primary development target today.
 
 ## Installation
 
-### lazy.nvim from GitHub
+### lazy.nvim
 
 ```lua
-{
-  "vlicecream/UCore.nvim",
-  build = "cargo build --release --manifest-path u-scanner/Cargo.toml --bin u_core_server --bin u_scanner",
-  config = function()
-    require("ucore").setup({
-      auto_boot = true,
-    })
-  end,
+return {
+  {
+    "vlicecream/UCore.nvim",
+    build = "cargo build --release --manifest-path u-scanner/Cargo.toml --bin u_core_server --bin u_scanner",
+    dependencies = {
+      {
+        "nvim-telescope/telescope.nvim",
+        dependencies = {
+          "nvim-lua/plenary.nvim",
+          "nvim-tree/nvim-web-devicons",
+        },
+      },
+      {
+        "saghen/blink.cmp",
+        opts = function(_, opts)
+          opts.sources = opts.sources or {}
+          opts.sources.default = opts.sources.default or { "lsp", "path", "snippets", "buffer" }
+
+          if not vim.tbl_contains(opts.sources.default, "ucore") then
+            table.insert(opts.sources.default, "ucore")
+          end
+
+          opts.sources.providers = opts.sources.providers or {}
+          opts.sources.providers.ucore = {
+            name = "UCore",
+            module = "ucore.completion.blink",
+            async = true,
+            timeout_ms = 2000,
+            min_keyword_length = 0,
+            score_offset = 50,
+          }
+
+          return opts
+        end,
+      },
+      {
+        "nvim-treesitter/nvim-treesitter",
+        build = ":TSUpdate",
+        opts = function(_, opts)
+          opts = opts or {}
+          opts.ensure_installed = opts.ensure_installed or {}
+
+          if type(opts.ensure_installed) == "table" and not vim.tbl_contains(opts.ensure_installed, "unreal_cpp") then
+            table.insert(opts.ensure_installed, "unreal_cpp")
+          end
+
+          opts.auto_install = true
+          return opts
+        end,
+      },
+    },
+    config = function()
+      require("ucore").setup({
+        auto_boot = true,
+        ui = {
+          picker = "telescope",
+        },
+        completion = {
+          enable = true,
+          keymap = "<C-l>",
+        },
+      })
+    end,
+  },
 }
 ```
 
-### lazy.nvim local development
+### Local development
+
+Use `dir` only for a real local checkout:
 
 ```lua
-{
-  dir = "C:/Unreal-NVIM/UCore.nvim",
-  name = "UCore.nvim",
-  build = "cargo build --release --manifest-path u-scanner/Cargo.toml --bin u_core_server --bin u_scanner",
-  config = function()
-    require("ucore").setup({
-      auto_boot = true,
-    })
-  end,
+return {
+  {
+    dir = "C:/Unreal-NVIM/UCore.nvim",
+    name = "UCore.nvim",
+    build = "cargo build --release --manifest-path u-scanner/Cargo.toml --bin u_core_server --bin u_scanner",
+    config = function()
+      require("ucore").setup({
+        auto_boot = true,
+        ui = {
+          picker = "telescope",
+        },
+      })
+    end,
+  },
 }
 ```
 
-Use `dir` only for a real local path. Do not use `dir = "vlicecream/UCore.nvim"`.
+Do not use `dir = "vlicecream/UCore.nvim"` unless that is an actual local path.
 
-`dir` 只能写真实本地路径，不要写 `dir = "vlicecream/UCore.nvim"`。
+## First Run
 
-## Quick Start
-
-Open a file inside your Unreal project, then run:
+Open any file inside an Unreal project and run:
 
 ```vim
 :UCore
 ```
 
-This is the same as:
+This will:
 
-```vim
-:UCore boot
-```
+1. Register the current Unreal project in UCore's global registry.
+2. Resolve the project's Unreal Engine root from `EngineAssociation`.
+3. Start the Rust server.
+4. Create or reuse project databases under Neovim's cache directory.
+5. Refresh the project index if needed.
+6. Start file watching.
+7. Refresh the shared Unreal Engine index if needed.
 
-It will:
-
-1. Start the Rust server.
-2. Register the current Unreal project.
-3. Refresh the database if needed.
-4. Start file watching.
-
-打开 Unreal 工程里的任意文件，然后运行：
-
-```vim
-:UCore
-```
-
-它会自动启动 Rust server、注册工程、按需刷新索引，并启动文件监听。
+With `auto_boot = true`, this also happens automatically when opening files in an
+Unreal project.
 
 ## Commands
 
-User-facing commands:
+User commands:
 
 ```vim
-:UCore
-:UCore boot
-:UCore find
-:UCore goto
-:UCore references
-:UCore help
+:UCore              " Boot current project, or choose a registered project
+:UCore boot         " Same as :UCore
+:UCore build        " Build <ProjectName>Editor Win64 Development with live logs
+:UCore build-cancel " Cancel the currently running Unreal build
+:UCore editor       " Build, then open the current .uproject in Unreal Editor
+:UCore find         " Find symbols, modules, assets, and config entries
+:UCore goto         " Go to definition at cursor
+:UCore references   " Find references at cursor
+:UCore status       " Open a readable UCore runtime status report
+:UCore logs         " Open the latest UCore server log
+:UCore help         " Show user commands
 ```
 
-Debug commands:
-
-```vim
-:UCore debug status
-:UCore debug rpc-status
-:UCore debug start
-:UCore debug stop
-:UCore debug restart
-:UCore debug setup
-:UCore debug refresh
-:UCore debug maps
-:UCore debug help
-```
-
-Health check:
+Diagnostics:
 
 ```vim
 :checkhealth ucore
 ```
 
+Debug commands:
+
+```vim
+:UCore debug help
+:UCore debug start
+:UCore debug stop
+:UCore debug restart
+:UCore debug status
+:UCore debug rpc-status
+:UCore debug setup
+:UCore debug refresh
+:UCore debug maps
+```
+
 ## Configuration
 
-Recommended configuration:
+Default configuration:
 
 ```lua
 require("ucore").setup({
   auto_boot = true,
   port = 30110,
   use_release_binary = true,
+  ui = {
+    picker = "auto", -- "auto", "telescope", "fzf-lua", or "vim"
+  },
   completion = {
     enable = true,
     keymap = "<C-l>",
     min_chars = 2,
     debounce_ms = 180,
   },
+  semantic = {
+    enable = true,
+    debounce_ms = 120,
+  },
 })
 ```
 
-`auto_boot = true` starts UCore automatically when you open an Unreal project file.
-
-`use_release_binary = true` prefers binaries built by lazy.nvim's `build` step, and
-falls back to `cargo run` if release binaries are missing.
-
-`completion.enable = true` only controls the manual insert-mode mapping.
-Native automatic completion is always enabled.
-
-`auto_boot = true` 会在打开 Unreal 工程文件时自动启动 UCore。
-
-`use_release_binary = true` 会优先使用 lazy.nvim `build` 阶段构建的 release
-binary；如果不存在，则回退到 `cargo run`。
-
-`completion.enable = true` 只控制手动插入模式快捷键。原生自动补全始终开启。
-
-### blink.cmp Integration
-
-UCore can integrate into blink.cmp as a normal completion source.
-
-```lua
-{
-  "saghen/blink.cmp",
-  opts = {
-    sources = {
-      default = { "lsp", "path", "snippets", "buffer", "ucore" },
-      providers = {
-        ucore = {
-          name = "UCore",
-          module = "ucore.completion.blink",
-          async = true,
-          timeout_ms = 2000,
-          min_keyword_length = 0,
-          score_offset = 50,
-        },
-      },
-    },
-  },
-}
-```
+`use_release_binary = true` prefers binaries built by lazy.nvim's `build` step.
+If release binaries are missing, UCore falls back to `cargo run`.
 
 ## Rust Backend
 
-During development, UCore can run the Rust backend through `cargo run`.
-For faster startup, let lazy.nvim build release binaries during install/update.
+lazy.nvim can build the Rust backend automatically:
 
 ```lua
-{
-  "vlicecream/UCore.nvim",
-  build = "cargo build --release --manifest-path u-scanner/Cargo.toml --bin u_core_server --bin u_scanner",
+build = "cargo build --release --manifest-path u-scanner/Cargo.toml --bin u_core_server --bin u_scanner"
+```
+
+Manual build:
+
+```powershell
+cd u-scanner
+cargo build --release --bin u_core_server --bin u_scanner
+```
+
+The two backend binaries are:
+
+```text
+u_scanner       CLI bridge for setup, refresh, watch, and queries
+u_core_server   long-running RPC server used by interactive features
+```
+
+## Unreal Build and Editor
+
+Build the current project's default editor target:
+
+```vim
+:UCore build
+```
+
+Cancel a running build:
+
+```vim
+:UCore build-cancel
+```
+
+By default this runs:
+
+```text
+<EngineRoot>/Engine/Build/BatchFiles/Build.bat <ProjectName>Editor Win64 Development -Project="<Project.uproject>" -WaitMutex
+```
+
+The build output is streamed live into a Neovim log buffer.
+
+Optional arguments:
+
+```vim
+:UCore build Development Win64
+:UCore build DebugGame Win64
+:UCore build Development Win64 MyProjectEditor
+```
+
+Build, then open the current project in Unreal Editor:
+
+```vim
+:UCore editor
+```
+
+UCore first runs the same default editor target build. If the build succeeds, it
+launches `UnrealEditor.exe` or `UE4Editor.exe` with the current `.uproject`. If
+the build fails, UCore keeps the build log open and does not launch the editor.
+
+## Tree-sitter
+
+UCore registers a custom `unreal_cpp` parser backed by:
+
+```text
+https://github.com/vlicecream/UTreeSitter
+```
+
+`require("ucore").setup()` registers:
+
+- the `unreal_cpp` parser config
+- Unreal project filetype detection for `.cpp`, `.h`, `.hpp`, `.inl`, etc.
+- default highlight groups for Unreal C++
+
+If `:TSInstall unreal_cpp` says the language is unsupported, make sure UCore is
+loaded before running the install command, then run:
+
+```vim
+:checkhealth ucore
+```
+
+## Completion
+
+Manual completion is available through the configured insert-mode keymap:
+
+```lua
+completion = {
+  enable = true,
+  keymap = "<C-l>",
 }
 ```
 
-You can also build manually:
+blink.cmp integration is provided by:
 
-```powershell
-cd u-scanner
-cargo build --release --bin u_core_server --bin u_scanner
+```lua
+module = "ucore.completion.blink"
 ```
 
-也可以手动构建：
+## Runtime Data
 
-```powershell
-cd u-scanner
-cargo build --release --bin u_core_server --bin u_scanner
-```
+UCore stores runtime data under Neovim's cache directory. It does not write
+databases into your Unreal project by default.
 
-## Data Files
-
-By default, UCore stores runtime data under Neovim's cache directory:
+Typical paths:
 
 ```text
-stdpath("cache")/ucore/projects/<project-name>-<hash>/
+stdpath("cache")/ucore/registry.json
+stdpath("cache")/ucore/server-registry.json
+stdpath("cache")/ucore/projects/<project-name>-<hash>/ucore.db
+stdpath("cache")/ucore/projects/<project-name>-<hash>/ucore-cache.db
+stdpath("cache")/ucore/projects/<project-name>-<hash>/u_core_server.log
+stdpath("cache")/ucore/engines/<engine-id>/engine.db
+stdpath("cache")/ucore/engines/<engine-id>/engine-cache.db
 ```
 
-Typical files:
+Use this to inspect the current paths:
 
-```text
-ucore.db
-ucore-cache.db
-u_core_server.log
-registry.json
+```vim
+:UCore status
 ```
-
-默认情况下，UCore 会把数据库和日志放在 Neovim cache 目录下，不会污染 Unreal 工程目录。
 
 ## Troubleshooting
 
-Run:
+Start with:
 
 ```vim
 :checkhealth ucore
 ```
 
-If the server is not reachable:
+Then inspect runtime state:
 
 ```vim
-:UCore
+:UCore status
 ```
 
-or debug manually:
+Then inspect backend logs:
 
 ```vim
-:UCore debug start
-:UCore debug rpc-status
+:UCore logs
 ```
 
-If Rust is not installed, install it from:
+Common fixes:
 
-```text
-https://rustup.rs/
-```
-
-如果遇到问题，优先运行：
-
-```vim
-:checkhealth ucore
-```
-
-它会检查 Rust/Cargo、u-scanner、当前 Unreal 工程、数据库和 server 连接状态。
+- If Rust is missing, install it from `https://rustup.rs/`.
+- If the server is offline, run `:UCore`.
+- If the project database is missing, run `:UCore` inside the project and wait for indexing.
+- If the Engine database is missing, keep Neovim open until the background Engine index finishes.
+- If `unreal_cpp` is unsupported, load UCore first, then run `:TSInstall unreal_cpp`.
 
 ## Development Notes
 
 The Lua frontend talks to the Rust backend in two ways:
 
 1. CLI bridge through `u_scanner`.
-2. Direct TCP + MessagePack RPC for interactive queries.
+2. TCP + MessagePack RPC through `u_core_server`.
 
-Lua 前端和 Rust 后端有两条通信路径：
-
-1. 通过 `u_scanner` CLI 桥接。
-2. 通过 TCP + MessagePack RPC 直连，用于交互式查询。
+Interactive features prefer RPC. CLI is still used for lifecycle and fallback
+paths.
 
 ## License
 

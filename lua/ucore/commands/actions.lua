@@ -1,9 +1,11 @@
 local client = require("ucore.client")
+local config = require("ucore.config")
 local maps = require("ucore.maps")
 local project = require("ucore.project")
 local remote = require("ucore.remote")
 local server = require("ucore.server")
 local ui = require("ucore.ui")
+local unreal = require("ucore.unreal")
 local bootstrap = require("ucore.bootstrap")
 local completion = require("ucore.completion")
 local navigation = require("ucore.navigation")
@@ -27,6 +29,94 @@ local function show_find_results(pattern, items)
 	})
 end
 
+local function yes_no(value)
+	return value and "yes" or "no"
+end
+
+local function file_state(path)
+	if not path or path == "" then
+		return "missing"
+	end
+
+	if vim.fn.filereadable(path) == 1 then
+		return "ok"
+	end
+
+	return "missing"
+end
+
+local function dir_state(path)
+	if not path or path == "" then
+		return "missing"
+	end
+
+	if vim.fn.isdirectory(path) == 1 then
+		return "ok"
+	end
+
+	return "missing"
+end
+
+local function format_cmd(cmd)
+	if type(cmd) ~= "table" then
+		return tostring(cmd or "")
+	end
+
+	return table.concat(vim.tbl_map(tostring, cmd), " ")
+end
+
+local function open_scratch(title, lines)
+	vim.cmd("botright new")
+	local buf = vim.api.nvim_get_current_buf()
+	vim.bo[buf].buftype = "nofile"
+	vim.bo[buf].bufhidden = "wipe"
+	vim.bo[buf].swapfile = false
+	vim.bo[buf].filetype = "ucore-status"
+	pcall(vim.api.nvim_buf_set_name, buf, "ucore://" .. title:gsub("%s+", "-"):lower() .. "/" .. tostring(buf))
+	vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+	vim.bo[buf].modified = false
+	return buf
+end
+
+local function latest_server_log()
+	local candidates = {}
+	local session_log = server.log_path()
+	local fallback
+
+	if session_log and session_log ~= "" then
+		table.insert(candidates, session_log)
+		fallback = session_log
+	end
+
+	local root = project.find_project_root()
+	if root then
+		local path = project.build_paths(root).log_path
+		table.insert(candidates, path)
+		fallback = fallback or path
+	end
+
+	for _, path in ipairs(vim.fn.glob(config.values.cache_dir .. "/**/u_core_server.log", false, true)) do
+		table.insert(candidates, path)
+	end
+
+	local best
+	local best_time = -1
+	local seen = {}
+	for _, path in ipairs(candidates) do
+		path = tostring(path or "")
+		if path ~= "" and not seen[path] and vim.fn.filereadable(path) == 1 then
+			seen[path] = true
+			local modified = vim.fn.getftime(path)
+			if modified > best_time then
+				best = path
+				best_time = modified
+			end
+		end
+	end
+
+	return best or fallback
+end
+
 -- Jump to definition at the current cursor.
 -- 跳转当前光标下符号的定义。
 function M.goto_definition()
@@ -37,6 +127,24 @@ end
 -- 查找当前光标下符号的引用。
 function M.references()
 	navigation.references()
+end
+
+-- Build the current Unreal Editor target and stream logs into a buffer.
+-- 构建当前 Unreal Editor target，并实时输出日志到 buffer。
+function M.build(args)
+	unreal.build(args)
+end
+
+-- Cancel the currently running Unreal build.
+-- 取消当前正在运行的 Unreal build。
+function M.build_cancel()
+	unreal.cancel_build()
+end
+
+-- Open the current Unreal project with its resolved Unreal Editor.
+-- 使用解析到的 Unreal Editor 打开当前 Unreal 工程。
+function M.editor(args)
+	unreal.open_editor(args)
 end
 
 -- Print the resolved Unreal Engine root for the current project.
@@ -262,11 +370,115 @@ local function current_project_payload()
 end
 
 -- Check server status through the CLI bridge.
--- 通过 CLI 桥查询 server 状态。
+-- 打开用户可读的 UCore 状态面板。
 function M.status()
-	client.status(function(result, err)
-		notify_result("UCore status", result, err)
+	local root = project.find_project_root()
+	local registry = project.read_registry()
+	local lines = {
+		"UCore Status",
+		"",
+		"Server",
+		"  managed by this nvim: " .. yes_no(server.is_running()),
+		"  port: " .. tostring(config.values.port),
+		"  backend mode: " .. tostring(config.values.backend_mode),
+		"  scanner command: " .. format_cmd(config.values.scanner_cmd),
+		"  server command: " .. format_cmd(config.values.server_cmd),
+		"",
+		"Cache",
+		"  cache dir: " .. tostring(config.values.cache_dir),
+		"  cache dir state: " .. dir_state(config.values.cache_dir),
+		"  registry: " .. project.global_registry_path(),
+		"  server registry: " .. project.server_registry_path(),
+		"  registered projects: " .. tostring(vim.tbl_count(registry.projects or {})),
+		"  registered engines: " .. tostring(vim.tbl_count(registry.engines or {})),
+	}
+
+	if root then
+		local paths = project.build_paths(root)
+		local metadata = registry.projects and registry.projects[root]
+		local engine, engine_err = project.engine_metadata(root)
+
+		vim.list_extend(lines, {
+			"",
+			"Current Project",
+			"  root: " .. root,
+			"  registered: " .. yes_no(type(metadata) == "table"),
+			"  db: " .. paths.db_path .. " [" .. file_state(paths.db_path) .. "]",
+			"  cache db: " .. paths.cache_db_path .. " [" .. file_state(paths.cache_db_path) .. "]",
+			"  server log: " .. paths.log_path .. " [" .. file_state(paths.log_path) .. "]",
+		})
+
+		if engine then
+			local engine_paths = project.build_engine_paths(engine)
+			vim.list_extend(lines, {
+				"",
+				"Unreal Engine",
+				"  association: " .. tostring(engine.engine_association or ""),
+				"  root: " .. tostring(engine.engine_root or ""),
+				"  id: " .. tostring(engine.engine_id or ""),
+				"  needs refresh: " .. yes_no(project.engine_needs_refresh(engine)),
+				"  db: " .. engine_paths.db_path .. " [" .. file_state(engine_paths.db_path) .. "]",
+				"  cache db: " .. engine_paths.cache_db_path .. " [" .. file_state(engine_paths.cache_db_path) .. "]",
+			})
+		else
+			vim.list_extend(lines, {
+				"",
+				"Unreal Engine",
+				"  error: " .. tostring(engine_err),
+			})
+		end
+	else
+		vim.list_extend(lines, {
+			"",
+			"Current Project",
+			"  root: not inside an Unreal project",
+			"  tip: run :UCore to choose a registered project",
+		})
+	end
+
+	local buf = open_scratch("UCore Status", lines)
+
+	client.rpc.request("status", {}, function(result, err)
+		if not vim.api.nvim_buf_is_valid(buf) then
+			return
+		end
+
+		local rpc_lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+		vim.list_extend(rpc_lines, {
+			"",
+			"RPC",
+			err and ("  status: offline [" .. tostring(err) .. "]") or "  status: online",
+		})
+
+		if not err then
+			vim.list_extend(rpc_lines, vim.split(vim.inspect(result), "\n", { plain = true }))
+		end
+
+		vim.api.nvim_buf_set_lines(buf, 0, -1, false, rpc_lines)
+		vim.bo[buf].modified = false
 	end)
+end
+
+-- Open the latest known UCore server log.
+-- 打开最近的 UCore server 日志。
+function M.logs()
+	local path = latest_server_log()
+
+	if not path then
+		return vim.notify("UCore logs: no server log found yet", vim.log.levels.WARN)
+	end
+
+	if vim.fn.filereadable(path) ~= 1 then
+		vim.fn.mkdir(vim.fn.fnamemodify(path, ":p:h"), "p")
+		vim.fn.writefile({
+			"UCore server log",
+			"Log file created by :UCore logs.",
+			"Start UCore with :UCore to collect server output here.",
+			"",
+		}, path)
+	end
+
+	vim.cmd.edit(vim.fn.fnameescape(path))
 end
 
 -- Check server status through the direct TCP RPC client.
@@ -485,11 +697,16 @@ UCore commands:
 
   :UCore              Open or boot an Unreal project
   :UCore boot         Same as :UCore
+  :UCore build        Build current Unreal Editor target
+  :UCore build-cancel Cancel the currently running Unreal build
+  :UCore editor       Open current project in Unreal Editor
   :UCore debug help   Show debug commands
   :UCore help         Show this help
   :UCore find         Find indexed symbols
   :UCore goto         Go to definition at cursor
+  :UCore logs         Open the latest UCore server log
   :UCore references   Find references at cursor
+  :UCore status       Open a readable UCore status report
 ]])
 end
 

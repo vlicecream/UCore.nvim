@@ -59,6 +59,12 @@ function M.start(callback)
 	local cmd = build_cmd(config.values.port, paths.registry_path)
 
 	log_file = paths.log_path
+	vim.fn.writefile({
+		"UCore server log",
+		"Started at: " .. os.date("%Y-%m-%d %H:%M:%S"),
+		"Command: " .. table.concat(vim.tbl_map(tostring, cmd), " "),
+		"",
+	}, log_file, "a")
 
 	job = vim.system(cmd, {
 		cwd = config.values.scanner_dir,
