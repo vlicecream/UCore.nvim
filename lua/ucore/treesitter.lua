@@ -57,11 +57,12 @@ local function apply_highlight_links()
 	local hl = vim.api.nvim_set_hl
 
 	local styles = {
-		["@keyword.directive.unreal_cpp"] = { fg = "#4FC1FF", bold = true },
+		["@keyword.unreal_cpp"] = { fg = "#6EA6FF" },
+		["@keyword.directive.unreal_cpp"] = { fg = "#5AA8FF", bold = true },
 		["@keyword.function.unreal_cpp"] = { fg = "#C792EA", bold = true },
 
-		["@type.unreal_cpp"] = { fg = "#C586C0" },
-		["@type.enum.unreal_cpp"] = { fg = "#C586C0", bold = true },
+		["@type.unreal_cpp"] = { fg = "#D18CFF" },
+		["@type.enum.unreal_cpp"] = { fg = "#D18CFF", bold = true },
 		["@type.builtin.unreal_cpp"] = { fg = "#4FC1FF" },
 		["@type.qualifier.unreal_cpp"] = { fg = "#4FC1FF", italic = true },
 
@@ -78,6 +79,7 @@ local function apply_highlight_links()
 		["@string.unreal_cpp"] = { fg = "#CE9178" },
 		["@string.special.unreal_cpp"] = { fg = "#D7BA7D" },
 		["@number.unreal_cpp"] = { fg = "#F78C6C" },
+		["@comment.unreal_cpp"] = { fg = "#6A9955", italic = true },
 
 		["@constant.unreal_cpp"] = { fg = "#C678DD" },
 		["@constant.enum.unreal_cpp"] = { fg = "#F78C6C", bold = true },
