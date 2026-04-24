@@ -323,27 +323,31 @@ function M.assets()
 	end)
 end
 
--- Search symbols and show them in a selection UI.
--- 搜索符号，并在选择 UI 中展示。
-function M.search_symbols(pattern)
+-- Find indexed project items and show them in a selection UI.
+-- 搜索已索引的项目内容，并在选择 UI 中展示。
+function M.find(pattern)
 	pattern = vim.trim(pattern or "")
-
-	if pattern == "" then
-		return vim.notify("Usage: :UCore search-symbols <pattern>", vim.log.levels.WARN)
-	end
 
 	local root = project.find_project_root()
 	if not root then
 		return vim.notify("Could not find .uproject", vim.log.levels.ERROR)
 	end
 
-	remote.search_symbols(root, pattern, function(result, err)
+	remote.search_symbols(root, "", function(result, err)
 		if err then
-			return vim.notify("UCore search-symbols failed:\n" .. tostring(err), vim.log.levels.ERROR)
+			return vim.notify("UCore find failed:\n" .. tostring(err), vim.log.levels.ERROR)
 		end
 
-		ui.select.symbols(result or {})
-	end)
+		ui.select.find(result or {}, {
+			default_text = pattern ~= "" and pattern or nil,
+		})
+	end, 5000)
+end
+
+-- Backward-compatible debug alias for the old command name.
+-- 旧命令名保留为 debug 兼容入口。
+function M.search_symbols(pattern)
+	M.find(pattern)
 end
 
 -- Print Lua-side component/module lookup maps.
@@ -368,6 +372,7 @@ UCore commands:
   :UCore boot         Same as :UCore
   :UCore debug help   Show debug commands
   :UCore help         Show this help
+  :UCore find         Find indexed symbols
   :UCore goto         Go to definition at cursor
   :UCore references   Find references at cursor
 ]])

@@ -9,10 +9,10 @@ pub fn search_symbols(conn: &Connection, pattern: &str, limit: usize) -> anyhow:
     let pattern = pattern.trim();
 
     if pattern.is_empty() {
-        return Ok(json!([]));
+        return list_symbols(conn, limit);
     }
 
-    let limit = limit.clamp(1, 1000) as i64;
+    let limit = limit.clamp(1, 10_000) as i64;
     let query = build_fts_query(pattern);
 
     let sql = format!(
@@ -45,6 +45,55 @@ pub fn search_symbols(conn: &Connection, pattern: &str, limit: usize) -> anyhow:
             "name": row.get::<_, String>(0)?,
             "type": row.get::<_, String>(1)?,
             "class_name": row.get::<_, String>(2)?,
+            "path": normalize_path(&row.get::<_, String>(3)?),
+            "line": row.get::<_, Option<i64>>(4)?,
+            "module_name": row.get::<_, Option<String>>(5)?,
+        }))
+    })?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+
+    Ok(json!(results))
+}
+
+/// Return indexed symbols for interactive picker-side fuzzy filtering.
+/// 返回索引符号，供前端 picker 做本地模糊过滤。
+fn list_symbols(conn: &Connection, limit: usize) -> anyhow::Result<Value> {
+    let limit = limit.clamp(1, 10_000) as i64;
+
+    let sql = format!(
+        r#"
+        {}
+        SELECT
+            sc.text AS name,
+            c.symbol_type,
+            NULL AS class_name,
+            dp.full_path || '/' || sn.text AS path,
+            c.line_number,
+            sm.text AS module_name
+        FROM classes c
+        JOIN strings sc ON c.name_id = sc.id
+        JOIN files f ON c.file_id = f.id
+        JOIN dir_paths dp ON f.directory_id = dp.id
+        JOIN strings sn ON f.filename_id = sn.id
+        LEFT JOIN modules m ON f.module_id = m.id
+        LEFT JOIN strings sm ON m.name_id = sm.id
+        WHERE sc.text NOT LIKE '(%'
+        ORDER BY sc.text ASC
+        LIMIT ?
+        "#,
+        PATH_CTE
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([limit], |row| {
+        Ok(json!({
+            "name": row.get::<_, String>(0)?,
+            "type": row.get::<_, String>(1)?,
+            "class_name": row.get::<_, Option<String>>(2)?,
             "path": normalize_path(&row.get::<_, String>(3)?),
             "line": row.get::<_, Option<i64>>(4)?,
             "module_name": row.get::<_, Option<String>>(5)?,

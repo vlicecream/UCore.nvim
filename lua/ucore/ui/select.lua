@@ -143,6 +143,24 @@ local function open_reference(item)
 	end
 end
 
+local function open_source_item(item)
+	local path = item.path or item.file_path
+	local line = tonumber(item.line or item.line_number or 1) or 1
+	local col = tonumber(item.col or item.column or 0) or 0
+
+	if path and path ~= vim.NIL and vim.fn.filereadable(path) == 1 then
+		vim.cmd.edit(vim.fn.fnameescape(path))
+		local last_line = vim.api.nvim_buf_line_count(0)
+		line = math.max(1, math.min(line, last_line))
+		local line_text = vim.api.nvim_buf_get_lines(0, line - 1, line, false)[1] or ""
+		col = math.max(0, math.min(col, #line_text))
+		vim.api.nvim_win_set_cursor(0, { line, col })
+		vim.cmd("normal! zz")
+	else
+		print(vim.inspect(item))
+	end
+end
+
 -- Open the built-in vim.ui.select picker.
 -- 打开内置 vim.ui.select 选择器。
 local function pick_vim(title, items, format_item, on_choice)
@@ -276,6 +294,65 @@ local function pick_telescope_references(references)
 		:find()
 end
 
+-- Open project-wide find using a Telescope grep-style file preview.
+-- 使用 Telescope grep 风格预览打开项目全局查找。
+local function pick_telescope_find(items, default_text)
+	local pickers = require("telescope.pickers")
+	local finders = require("telescope.finders")
+	local conf = require("telescope.config").values
+	local actions = require("telescope.actions")
+	local action_state = require("telescope.actions.state")
+
+	pickers
+		.new({}, {
+			prompt_title = "UCore find",
+			default_text = default_text,
+			finder = finders.new_table({
+				results = items,
+				entry_maker = function(item)
+					local name = tostring(item.name or item.symbol_name or "<unknown>")
+					local kind = tostring(item.symbol_type or item.type or "")
+					local source = item.source and (" [" .. tostring(item.source) .. "]") or ""
+					local path = tostring(item.path or item.file_path or "")
+					local line = tonumber(item.line or item.line_number or 1) or 1
+					local display = string.format("%s%s [%s] %s:%d", name, source, kind, display_path(path), line)
+
+					return {
+						value = item,
+						display = display,
+						ordinal = table.concat({
+							name,
+							kind,
+							tostring(item.class_name or ""),
+							tostring(item.module_name or ""),
+							display_path(path),
+						}, " "),
+						filename = path,
+						path = path,
+						lnum = line,
+						col = 1,
+						text = name,
+					}
+				end,
+			}),
+			previewer = conf.grep_previewer({}),
+			sorter = conf.generic_sorter({}),
+			attach_mappings = function(prompt_bufnr)
+				actions.select_default:replace(function()
+					local selection = action_state.get_selected_entry()
+					actions.close(prompt_bufnr)
+
+					if selection and selection.value then
+						open_source_item(selection.value)
+					end
+				end)
+
+				return true
+			end,
+		})
+		:find()
+end
+
 -- Open a generic selection UI with a label formatter.
 -- 打开一个通用选择 UI，并支持自定义显示文本。
 local function pick(title, items, format_item, on_choice)
@@ -351,8 +428,14 @@ end
 
 -- Pick a symbol and open its source file when possible.
 -- 选择一个符号，并尽量打开它所在的源码文件。
-function M.symbols(symbols)
-	pick("UCore symbols", symbols, function(item)
+function M.find(items, opts)
+	opts = opts or {}
+
+	if picker_backend() == "telescope" then
+		return pick_telescope_find(items, opts.default_text)
+	end
+
+	pick("UCore find", items, function(item)
 		local name = tostring(item.name or "<unknown>")
 		local kind = tostring(item.symbol_type or item.type or "")
 		local source = item.source and (" [" .. tostring(item.source) .. "]") or ""
@@ -363,17 +446,13 @@ function M.symbols(symbols)
 		end
 
 		return string.format("%s%s [%s]", name, source, kind)
-	end, function(item)
-		local path = item.path
-		local line = tonumber(item.line or item.line_number or 1) or 1
+	end, open_source_item)
+end
 
-		if path and path ~= vim.NIL and vim.fn.filereadable(path) == 1 then
-			vim.cmd.edit(vim.fn.fnameescape(path))
-			vim.api.nvim_win_set_cursor(0, { line, 0 })
-		else
-			print(vim.inspect(item))
-		end
-	end)
+-- Backward-compatible alias for older callers.
+-- 兼容旧调用方。
+function M.symbols(symbols)
+	M.find(symbols)
 end
 
 -- Pick a reference result and open its source location.

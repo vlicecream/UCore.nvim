@@ -102,9 +102,9 @@ User-facing commands:
 ```vim
 :UCore
 :UCore boot
-:UCore modules
-:UCore assets
-:UCore search-symbols <pattern>
+:UCore find
+:UCore goto
+:UCore references
 :UCore help
 ```
 

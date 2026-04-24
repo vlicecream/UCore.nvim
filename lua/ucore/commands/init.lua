@@ -77,6 +77,9 @@ function M.dispatch(args)
 
   local handlers = {
     boot = actions.boot,
+    find = function()
+      actions.find(tail)
+    end,
     goto = actions.goto_definition,
     references = actions.references,
     debug = function()
@@ -119,6 +122,7 @@ function M.register()
 		complete = function(arglead)
 			local items = {
 				"boot",
+				"find",
 				"goto",
 				"references",
 				"debug",

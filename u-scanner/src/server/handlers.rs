@@ -578,7 +578,7 @@ fn search_symbols_with_engine(
     pattern: &str,
     limit: usize,
 ) -> Result<Value> {
-    let limit = limit.clamp(1, 1000);
+    let limit = limit.clamp(1, 10_000);
     let mut results = value_array(query::search::search_symbols(project_conn, pattern, limit)?);
     tag_source(&mut results, "project");
 

@@ -86,11 +86,11 @@ end
 
 -- Search symbols by text pattern.
 -- 按文本模式搜索符号。
-function M.search_symbols(project_root, pattern, callback)
+function M.search_symbols(project_root, pattern, callback, limit)
 	M.query(project_root, {
 		kind = "SearchSymbols",
 		pattern = pattern,
-		limit = 50,
+		limit = limit or 50,
 	}, callback)
 end
 
