@@ -106,19 +106,27 @@ local function parse_build_args(args, ctx)
 end
 
 local function create_log_buffer(title)
+	local previous_win = vim.api.nvim_get_current_win()
 	vim.cmd("botright 15new")
 	local buf = vim.api.nvim_get_current_buf()
 	vim.bo[buf].buftype = "nofile"
 	vim.bo[buf].bufhidden = "hide"
 	vim.bo[buf].swapfile = false
+	vim.bo[buf].buflisted = false
 	vim.bo[buf].filetype = "ucore-build"
-	pcall(vim.api.nvim_buf_set_name, buf, "ucore://build/" .. tostring(buf))
+	local name = title:gsub("^UCore build:%s*", "UCore build - ") .. " #" .. tostring(buf)
+	pcall(vim.api.nvim_buf_set_name, buf, name)
 	vim.api.nvim_buf_set_lines(buf, 0, -1, false, {
 		title,
 		string.rep("=", vim.fn.strdisplaywidth(title)),
 		"",
 	})
 	vim.bo[buf].modified = false
+
+	if vim.api.nvim_win_is_valid(previous_win) then
+		vim.api.nvim_set_current_win(previous_win)
+	end
+
 	return buf
 end
 
