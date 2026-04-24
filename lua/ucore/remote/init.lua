@@ -63,6 +63,17 @@ function M.get_assets(project_root, callback)
 	}, callback)
 end
 
+-- Fetch resolved Unreal config values.
+-- 获取解析后的 Unreal 配置数据。
+function M.get_config_data(project_root, callback)
+	local engine = project.cached_engine_metadata(project_root) or project.engine_metadata(project_root)
+
+	M.query(project_root, {
+		kind = "GetConfigData",
+		engine_root = engine and engine.engine_root or nil,
+	}, callback)
+end
+
 -- Fetch completion candidates for the current buffer context.
 -- 根据当前 buffer 上下文获取补全候选。
 function M.get_completions(project_root, payload, callback)

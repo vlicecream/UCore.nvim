@@ -96,6 +96,10 @@ local function pad_right(text, width)
 	return text .. string.rep(" ", padding)
 end
 
+local function normalize_path(path)
+	return tostring(path or ""):gsub("\\", "/"):lower()
+end
+
 -- Prefer a cwd-relative path in picker displays.
 -- picker 里优先显示相对当前工作目录的路径。
 local function display_path(path)
@@ -110,6 +114,233 @@ local function display_path(path)
 	end
 
 	return path
+end
+
+local function compact_path(path, width)
+	return truncate_left(display_path(path), width)
+end
+
+local function current_buffer_path()
+	return normalize_path(vim.api.nvim_buf_get_name(0))
+end
+
+local function normalize_source(source)
+	source = tostring(source or "")
+
+	if source == "" then
+		return ""
+	end
+
+	return source:lower()
+end
+
+local function normalize_kind(kind)
+	kind = tostring(kind or "")
+
+	local lowered = kind:lower()
+	if lowered == "uclass" then
+		return "class"
+	end
+	if lowered == "ustruct" then
+		return "struct"
+	end
+	if lowered == "uenum" then
+		return "enum"
+	end
+
+	return kind
+end
+
+local function find_category(item)
+	local kind = normalize_kind(item.symbol_type or item.type):lower()
+
+	if item.asset_path or kind == "asset" then
+		return "asset"
+	end
+	if kind == "config" then
+		return "config"
+	end
+	if kind == "module" then
+		return "module"
+	end
+	if kind == "class" or kind == "struct" or kind == "enum" then
+		return kind
+	end
+	if kind:find("function", 1, true) or kind:find("method", 1, true) then
+		return "function"
+	end
+	if kind:find("property", 1, true) or kind:find("member", 1, true) then
+		return "member"
+	end
+
+	return "symbol"
+end
+
+local function find_category_label(item)
+	return ({
+		asset = "[asset]",
+		class = "[class]",
+		config = "[config]",
+		enum = "[enum]",
+		["function"] = "[func]",
+		member = "[member]",
+		module = "[module]",
+		struct = "[struct]",
+		symbol = "[symbol]",
+	})[find_category(item)] or "[symbol]"
+end
+
+local function find_group(item)
+	local category = find_category(item)
+
+	if category == "module" then
+		return "Modules"
+	end
+	if category == "asset" then
+		return "Assets"
+	end
+	if category == "config" then
+		return "Config"
+	end
+
+	return "Code"
+end
+
+local function find_group_order(item)
+	return ({
+		Code = 1,
+		Modules = 2,
+		Assets = 3,
+		Config = 4,
+	})[find_group(item)] or 9
+end
+
+local function find_display_location(item, path, line)
+	path = tostring(path or "")
+
+	if path == "" then
+		return ""
+	end
+
+	if item.asset_path then
+		return vim.fn.fnamemodify(path, ":t")
+	end
+
+	local filename = vim.fn.fnamemodify(path:gsub("\\", "/"), ":t")
+	if filename == "" then
+		filename = path
+	end
+
+	if item.type == "config" and item.config_section then
+		return string.format("%s [%s]", filename, tostring(item.config_section))
+	end
+
+	return string.format("%s:%d", filename, line)
+end
+
+local function find_search_text(item, name, kind, label, path)
+	path = tostring(path or "")
+	local normalized_path = path:gsub("\\", "/")
+
+	return table.concat({
+		name,
+		kind,
+		label,
+		find_group(item),
+		tostring(item.class_name or ""),
+		tostring(item.module_name or ""),
+		tostring(item.config_section or ""),
+		tostring(item.config_value or ""),
+		tostring(item.config_file or ""),
+		tostring(item.asset_path or ""),
+		vim.fn.fnamemodify(normalized_path, ":t"),
+		display_path(normalized_path),
+		normalized_path,
+		path,
+	}, " ")
+end
+
+local function find_item_key(item)
+	local path = normalize_path(item.path or item.file_path or item.asset_path or "")
+	local line = tonumber(item.line or item.line_number or 1) or 1
+	local name = tostring(item.name or item.symbol_name or "")
+	local kind = tostring(item.symbol_type or item.type or "")
+
+	return table.concat({ path, line, name, kind }, "\t")
+end
+
+local function find_item_score(item)
+	local source = normalize_source(item.source)
+	local kind = normalize_kind(item.symbol_type or item.type):lower()
+	local path = normalize_path(item.path or item.file_path or item.asset_path or "")
+	local current = current_buffer_path()
+	local score = 0
+
+	if source == "project" then
+		score = score - 300
+	elseif source == "engine" then
+		score = score + 300
+	end
+
+	score = score + (find_group_order(item) * 100)
+
+	if current ~= "" and path == current then
+		score = score - 120
+	end
+
+	if kind == "class" or kind == "struct" or kind == "enum" then
+		score = score - 80
+	elseif kind == "module" then
+		score = score - 60
+	elseif kind:find("function", 1, true) or kind:find("method", 1, true) then
+		score = score - 40
+	elseif kind == "config" then
+		score = score + 40
+	elseif kind == "asset" then
+		score = score + 60
+	elseif kind:find("property", 1, true) or kind:find("member", 1, true) then
+		score = score + 20
+	end
+
+	return score
+end
+
+local function prepare_find_items(items)
+	local seen = {}
+	local result = {}
+
+	for _, item in ipairs(items or {}) do
+		local key = find_item_key(item)
+		if not seen[key] then
+			seen[key] = true
+			table.insert(result, item)
+		end
+	end
+
+	table.sort(result, function(left, right)
+		local left_score = find_item_score(left)
+		local right_score = find_item_score(right)
+
+		if left_score ~= right_score then
+			return left_score < right_score
+		end
+
+		local left_group = find_group(left)
+		local right_group = find_group(right)
+		if left_group ~= right_group then
+			return left_group < right_group
+		end
+
+		local left_name = tostring(left.name or left.symbol_name or "")
+		local right_name = tostring(right.name or right.symbol_name or "")
+		if left_name ~= right_name then
+			return left_name < right_name
+		end
+
+		return display_path(left.path or left.file_path or left.asset_path or "") < display_path(right.path or right.file_path or right.asset_path or "")
+	end)
+
+	return result
 end
 
 local function reference_label(kind)
@@ -144,6 +375,13 @@ local function open_reference(item)
 end
 
 local function open_source_item(item)
+	if item.type == "asset" or item.asset_path then
+		local asset_path = tostring(item.asset_path or item.path or "")
+		vim.fn.setreg("+", asset_path)
+		vim.notify("Copied asset path: " .. asset_path)
+		return
+	end
+
 	local path = item.path or item.file_path
 	local line = tonumber(item.line or item.line_number or 1) or 1
 	local col = tonumber(item.col or item.column or 0) or 0
@@ -159,6 +397,45 @@ local function open_source_item(item)
 	else
 		print(vim.inspect(item))
 	end
+end
+
+local function preview_find_item(entry, bufnr)
+	local item = entry.value or {}
+	local path = item.path or item.file_path
+
+	if path and path ~= vim.NIL and vim.fn.filereadable(path) == 1 then
+		local ok, lines = pcall(vim.fn.readfile, path, "", 500)
+		if ok then
+			vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
+			vim.bo[bufnr].filetype = vim.filetype.match({ filename = path }) or ""
+			return
+		end
+	end
+
+	local lines = {}
+	if item.asset_path then
+		lines = {
+			"UCore asset",
+			"",
+			tostring(item.asset_path),
+			"",
+			"Press <CR> to copy the asset path.",
+		}
+	elseif item.type == "config" then
+		lines = {
+			"UCore config",
+			"",
+			"Section: " .. tostring(item.config_section or ""),
+			"Key:     " .. tostring(item.name or ""),
+			"Value:   " .. tostring(item.config_value or ""),
+			"Source:  " .. tostring(item.config_file or item.source or ""),
+		}
+	else
+		lines = vim.split(vim.inspect(item), "\n", { plain = true })
+	end
+
+	vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
+	vim.bo[bufnr].filetype = "text"
 end
 
 -- Open the built-in vim.ui.select picker.
@@ -300,8 +577,11 @@ local function pick_telescope_find(items, default_text)
 	local pickers = require("telescope.pickers")
 	local finders = require("telescope.finders")
 	local conf = require("telescope.config").values
+	local previewers = require("telescope.previewers")
 	local actions = require("telescope.actions")
 	local action_state = require("telescope.actions.state")
+
+	items = prepare_find_items(items)
 
 	pickers
 		.new({}, {
@@ -311,22 +591,27 @@ local function pick_telescope_find(items, default_text)
 				results = items,
 				entry_maker = function(item)
 					local name = tostring(item.name or item.symbol_name or "<unknown>")
-					local kind = tostring(item.symbol_type or item.type or "")
-					local source = item.source and (" [" .. tostring(item.source) .. "]") or ""
-					local path = tostring(item.path or item.file_path or "")
+					local kind = normalize_kind(item.symbol_type or item.type)
+					local source = normalize_source(item.source)
+					local path = tostring(item.path or item.file_path or item.asset_path or "")
 					local line = tonumber(item.line or item.line_number or 1) or 1
-					local display = string.format("%s%s [%s] %s:%d", name, source, kind, display_path(path), line)
+					local label = find_category_label(item)
+					local group = find_group(item)
+					local source_label = source ~= "" and source or "index"
+					local location = find_display_location(item, path, line)
+					local display = string.format(
+						"%s  %s  %s  %s  %s",
+						pad_right(group, 7),
+						pad_right(label, 9),
+						pad_right(truncate_left(name, 34), 34),
+						pad_right(source_label, 7),
+						location
+					)
 
 					return {
 						value = item,
 						display = display,
-						ordinal = table.concat({
-							name,
-							kind,
-							tostring(item.class_name or ""),
-							tostring(item.module_name or ""),
-							display_path(path),
-						}, " "),
+						ordinal = find_search_text(item, name, kind, label, path),
 						filename = path,
 						path = path,
 						lnum = line,
@@ -335,7 +620,11 @@ local function pick_telescope_find(items, default_text)
 					}
 				end,
 			}),
-			previewer = conf.grep_previewer({}),
+			previewer = previewers.new_buffer_previewer({
+				define_preview = function(self, entry)
+					preview_find_item(entry, self.state.bufnr)
+				end,
+			}),
 			sorter = conf.generic_sorter({}),
 			attach_mappings = function(prompt_bufnr)
 				actions.select_default:replace(function()

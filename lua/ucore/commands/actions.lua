@@ -10,6 +10,23 @@ local navigation = require("ucore.navigation")
 
 local M = {}
 
+local FIND_CACHE_TTL_MS = 10000
+local find_cache = {
+	root = nil,
+	items = nil,
+	expires_at = 0,
+}
+
+local function now_ms()
+	return vim.loop.hrtime() / 1000000
+end
+
+local function show_find_results(pattern, items)
+	ui.select.find(items, {
+		default_text = pattern ~= "" and pattern or nil,
+	})
+end
+
 -- Jump to definition at the current cursor.
 -- 跳转当前光标下符号的定义。
 function M.goto_definition()
@@ -333,15 +350,113 @@ function M.find(pattern)
 		return vim.notify("Could not find .uproject", vim.log.levels.ERROR)
 	end
 
-	remote.search_symbols(root, "", function(result, err)
-		if err then
-			return vim.notify("UCore find failed:\n" .. tostring(err), vim.log.levels.ERROR)
+	if find_cache.root == root and find_cache.items and find_cache.expires_at > now_ms() then
+		return show_find_results(pattern, find_cache.items)
+	end
+
+	local pending = 4
+	local items = {}
+	local errors = {}
+
+	local function append_many(values)
+		for _, item in ipairs(values or {}) do
+			table.insert(items, item)
+		end
+	end
+
+	local function finish()
+		pending = pending - 1
+		if pending > 0 then
+			return
 		end
 
-		ui.select.find(result or {}, {
-			default_text = pattern ~= "" and pattern or nil,
-		})
+		if vim.tbl_isempty(items) and not vim.tbl_isempty(errors) then
+			return vim.notify("UCore find failed:\n" .. table.concat(errors, "\n"), vim.log.levels.ERROR)
+		end
+
+		find_cache = {
+			root = root,
+			items = items,
+			expires_at = now_ms() + FIND_CACHE_TTL_MS,
+		}
+		show_find_results(pattern, items)
+	end
+
+	remote.search_symbols(root, "", function(result, err)
+		if err then
+			table.insert(errors, tostring(err))
+		else
+			append_many(result or {})
+		end
+		finish()
 	end, 5000)
+
+	remote.get_modules(root, function(result, err)
+		if err then
+			table.insert(errors, tostring(err))
+		else
+			for _, module in ipairs(result or {}) do
+				local path = module.build_cs_path or module.path
+				if path and path ~= vim.NIL and path ~= "" then
+					table.insert(items, {
+						name = module.name,
+						type = "module",
+						source = "project",
+						path = path,
+						module_name = module.name,
+						class_name = module.owner_name or module.component_name,
+					})
+				end
+			end
+		end
+		finish()
+	end)
+
+	remote.get_assets(root, function(result, err)
+		if err then
+			table.insert(errors, tostring(err))
+		else
+			for _, asset in ipairs(result or {}) do
+				local asset_path = type(asset) == "table" and (asset.path or asset.asset_path) or asset
+				asset_path = tostring(asset_path or "")
+				if asset_path ~= "" then
+					table.insert(items, {
+						name = vim.fn.fnamemodify(asset_path, ":t"),
+						type = "asset",
+						source = "project",
+						asset_path = asset_path,
+					})
+				end
+			end
+		end
+		finish()
+	end)
+
+	remote.get_config_data(root, function(result, err)
+		if err then
+			table.insert(errors, tostring(err))
+		else
+			for _, platform in ipairs(result or {}) do
+				for _, section in ipairs(platform.sections or {}) do
+					for _, param in ipairs(section.parameters or {}) do
+						local history = param.history or {}
+						local latest = history[#history] or {}
+						table.insert(items, {
+							name = tostring(param.key or ""),
+							type = "config",
+							source = tostring(platform.platform or platform.name or "config"),
+							path = latest.full_path,
+							line = latest.line,
+							config_section = section.name,
+							config_value = param.value,
+							config_file = latest.file,
+						})
+					end
+				end
+			end
+		end
+		finish()
+	end)
 end
 
 -- Backward-compatible debug alias for the old command name.
