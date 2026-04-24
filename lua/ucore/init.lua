@@ -9,6 +9,7 @@ function M.setup(opts)
 	end)
 	require("ucore.commands").register()
 	require("ucore.completion").setup()
+	require("ucore.semantic").setup()
 	require("ucore.autocmd").setup()
 end
 

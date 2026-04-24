@@ -127,6 +127,18 @@ M.values = {
 		debounce_ms = 180,
 	},
 
+	-- Semantic highlight overlay powered by the UCore index.
+	-- 基于 UCore 索引的语义高亮覆盖层。
+	semantic = {
+		-- Enable semantic extmark highlights for indexed declarations.
+		-- 是否启用已索引声明的语义 extmark 高亮。
+		enable = true,
+
+		-- Debounce delay for buffer semantic refresh.
+		-- buffer 语义高亮刷新的防抖延迟。
+		debounce_ms = 120,
+	},
+
 	-- Development mode: call Cargo directly so code changes are picked up.
 	-- 开发模式：直接调用 Cargo，方便 Rust 代码修改后立即生效。
 	scanner_cmd = cargo_scanner_cmd(),

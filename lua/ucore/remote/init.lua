@@ -84,6 +84,24 @@ function M.find_references(project_root, payload, callback)
 	M.query(project_root, payload, callback)
 end
 
+-- Fetch indexed symbols declared in one source file.
+-- 获取某个源码文件中声明的已索引符号。
+function M.get_file_symbols(project_root, file_path, callback)
+	M.query(project_root, {
+		kind = "GetFileSymbols",
+		file_path = file_path,
+	}, callback)
+end
+
+-- Fetch members declared on a class.
+-- 获取指定类声明的成员。
+function M.get_class_members(project_root, class_name, callback)
+	M.query(project_root, {
+		kind = "GetClassMembers",
+		class_name = class_name,
+	}, callback)
+end
+
 -- Search symbols by text pattern.
 -- 按文本模式搜索符号。
 function M.search_symbols(project_root, pattern, callback, limit)
