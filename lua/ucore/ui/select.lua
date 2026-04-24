@@ -60,6 +60,89 @@ local function build_entries(items, format_item)
 	return entries
 end
 
+-- Trim a string to a display width while keeping the useful tail.
+-- 按显示宽度裁剪字符串，并保留更有用的尾部路径信息。
+local function truncate_left(text, max_width)
+	text = tostring(text or "")
+
+	if vim.fn.strdisplaywidth(text) <= max_width then
+		return text
+	end
+
+	local marker = "..."
+	local target = math.max(1, max_width - vim.fn.strdisplaywidth(marker))
+	local result = ""
+
+	for index = #text, 1, -1 do
+		local candidate = text:sub(index)
+		if vim.fn.strdisplaywidth(candidate) >= target then
+			result = candidate
+			break
+		end
+	end
+
+	while vim.fn.strdisplaywidth(result) > target do
+		result = result:sub(2)
+	end
+
+	return marker .. result
+end
+
+-- Pad a string on the right using display width instead of byte length.
+-- 按显示宽度右侧补空格，避免中文或宽字符导致列错位。
+local function pad_right(text, width)
+	text = tostring(text or "")
+	local padding = math.max(0, width - vim.fn.strdisplaywidth(text))
+	return text .. string.rep(" ", padding)
+end
+
+-- Prefer a cwd-relative path in picker displays.
+-- picker 里优先显示相对当前工作目录的路径。
+local function display_path(path)
+	path = tostring(path or ""):gsub("\\", "/")
+	local cwd = vim.loop.cwd()
+
+	if cwd and cwd ~= "" then
+		cwd = cwd:gsub("\\", "/")
+		if path:lower():sub(1, #cwd) == cwd:lower() then
+			path = path:sub(#cwd + 2)
+		end
+	end
+
+	return path
+end
+
+local function reference_label(kind)
+	kind = tostring(kind or "unknown")
+
+	return ({
+		declaration = "Declaration",
+		definition = "Definition",
+		read = "Reference",
+		write = "Assignment",
+		call = "Call",
+		unknown = "Reference",
+	})[kind] or "Reference"
+end
+
+local function open_reference(item)
+	local path = item.path or item.file_path
+	local line = tonumber(item.line or item.line_number or 1) or 1
+	local col = tonumber(item.col or item.column or 0) or 0
+
+	if path and path ~= vim.NIL and vim.fn.filereadable(path) == 1 then
+		vim.cmd.edit(vim.fn.fnameescape(path))
+		local last_line = vim.api.nvim_buf_line_count(0)
+		line = math.max(1, math.min(line, last_line))
+		local line_text = vim.api.nvim_buf_get_lines(0, line - 1, line, false)[1] or ""
+		col = math.max(0, math.min(col, #line_text))
+		vim.api.nvim_win_set_cursor(0, { line, col })
+		vim.cmd("normal! zz")
+	else
+		print(vim.inspect(item))
+	end
+end
+
 -- Open the built-in vim.ui.select picker.
 -- 打开内置 vim.ui.select 选择器。
 local function pick_vim(title, items, format_item, on_choice)
@@ -130,6 +213,60 @@ local function pick_telescope(title, items, format_item, on_choice)
 
 					if selection and selection.value then
 						on_choice(selection.value.item)
+					end
+				end)
+
+				return true
+			end,
+		})
+		:find()
+end
+
+-- Open references using a grep-like Telescope layout:
+-- left side lists locations, right side previews the whole file.
+-- 使用类似全局搜索的 Telescope 布局：
+-- 左侧列出定位信息，右侧预览整个文件内容。
+local function pick_telescope_references(references)
+	local pickers = require("telescope.pickers")
+	local finders = require("telescope.finders")
+	local conf = require("telescope.config").values
+	local actions = require("telescope.actions")
+	local action_state = require("telescope.actions.state")
+
+	pickers
+		.new({}, {
+			prompt_title = "UCore references",
+			finder = finders.new_table({
+				results = references,
+				entry_maker = function(item)
+					local path = tostring(item.path or item.file_path or "")
+					local line = tonumber(item.line or item.line_number or 1) or 1
+					local col = tonumber(item.col or item.column or 0) or 0
+					local context = tostring(item.context or item.text or ""):gsub("^%s+", "")
+					local label = reference_label(item.kind)
+					local location = string.format("[%s] %s:%d:%d", label, display_path(path), line, col + 1)
+
+					return {
+						value = item,
+						display = location,
+						ordinal = location .. " " .. context,
+						filename = path,
+						path = path,
+						lnum = line,
+						col = col + 1,
+						text = context,
+					}
+				end,
+			}),
+			previewer = conf.grep_previewer({}),
+			sorter = conf.generic_sorter({}),
+			attach_mappings = function(prompt_bufnr)
+				actions.select_default:replace(function()
+					local selection = action_state.get_selected_entry()
+					actions.close(prompt_bufnr)
+
+					if selection and selection.value then
+						open_reference(selection.value)
 					end
 				end)
 
@@ -242,44 +379,31 @@ end
 -- Pick a reference result and open its source location.
 -- 选择一个引用结果，并打开对应源码位置。
 function M.references(references)
+	if type(references) ~= "table" or vim.tbl_isempty(references) then
+		vim.notify("UCore references: no results", vim.log.levels.WARN)
+		return
+	end
+
+	if picker_backend() == "telescope" then
+		return pick_telescope_references(references)
+	end
+
 	pick("UCore references", references, function(item)
 		local path = tostring(item.path or item.file_path or "")
 		local line = tonumber(item.line or item.line_number or 1) or 1
 		local col = tonumber(item.col or item.column or 0) or 0
 		local context = tostring(item.context or item.text or ""):gsub("^%s+", "")
+		local label = reference_label(item.kind)
 
-		local kind = tostring(item.kind or "unknown")
-		local label = ({
-			declaration = "Declaration",
-			definition = "Definition",
-			read = "Reference",
-			write = "Assignment",
-			call = "Call",
-			unknown = "Reference",
-		})[kind] or "Reference"
+		local location = string.format("[%s] %s:%d:%d", label, display_path(path), line, col + 1)
+		location = pad_right(truncate_left(location, 72), 72)
 
 		if context ~= "" then
-			return string.format("[%s] %s:%d:%d - %s", label, path, line, col + 1, context)
+			return string.format("%s │ %s", location, context)
 		end
 
-		return string.format("[%s] %s:%d:%d", label, path, line, col + 1)
-	end, function(item)
-		local path = item.path or item.file_path
-		local line = tonumber(item.line or item.line_number or 1) or 1
-		local col = tonumber(item.col or item.column or 0) or 0
-
-		if path and path ~= vim.NIL and vim.fn.filereadable(path) == 1 then
-			vim.cmd.edit(vim.fn.fnameescape(path))
-			local last_line = vim.api.nvim_buf_line_count(0)
-			line = math.max(1, math.min(line, last_line))
-			local line_text = vim.api.nvim_buf_get_lines(0, line - 1, line, false)[1] or ""
-			col = math.max(0, math.min(col, #line_text))
-			vim.api.nvim_win_set_cursor(0, { line, col })
-			vim.cmd("normal! zz")
-		else
-			print(vim.inspect(item))
-		end
-	end)
+		return location
+	end, open_reference)
 end
 
 return M
