@@ -53,23 +53,6 @@ local function current_project_payload(project_root)
 	}
 end
 
-local function wait_project_payload(project_root, attempt, callback)
-	attempt = attempt or 1
-
-	local payload, err = current_project_payload(project_root)
-	if payload or err ~= "Could not find .uproject" then
-		return callback(payload, err)
-	end
-
-	if attempt >= (config.values.project_detect_attempts or 1) then
-		return callback(nil, err)
-	end
-
-	vim.defer_fn(function()
-		wait_project_payload(project_root, attempt + 1, callback)
-	end, config.values.project_detect_interval_ms or 100)
-end
-
 -- Remove Lua-only fields before sending a request to Rust.
 -- 发送给 Rust 前移除 Lua 内部字段。
 local function rust_payload(payload)
@@ -214,60 +197,58 @@ function M.boot(callback, opts)
 		return callback(false, "already booting")
 	end
 
+	local payload, err = current_project_payload(opts.project_root)
+	if err then
+		fail(err)
+		return callback(false, err)
+	end
+
 	booting = true
 	status.start("UCore initializing...")
 	other_progress(0)
 
-	wait_project_payload(opts.project_root, 1, function(payload, err)
-		if err then
+	server.start(function(ok, start_message)
+		if not ok then
 			booting = false
-			fail(err)
-			return callback(false, err)
+			fail(start_message)
+			return callback(false, start_message)
 		end
+		other_progress(25)
 
-		server.start(function(ok, start_message)
-			if not ok then
+		wait_ready(1, function(ready, ready_err)
+			if not ready then
 				booting = false
-				fail(start_message)
-				return callback(false, start_message)
+				fail(tostring(ready_err), "Log: " .. tostring(server.log_path()))
+				return callback(false, ready_err)
 			end
-			other_progress(25)
+			other_progress(40)
 
-			wait_ready(1, function(ready, ready_err)
-				if not ready then
+			run_setup(payload, function(setup_ok, setup_result)
+				if not setup_ok then
 					booting = false
-					fail(tostring(ready_err), "Log: " .. tostring(server.log_path()))
-					return callback(false, ready_err)
+					fail(tostring(setup_result))
+					return callback(false, setup_result)
 				end
-				other_progress(40)
+				other_progress(60)
 
-				run_setup(payload, function(setup_ok, setup_result)
-					if not setup_ok then
+				run_refresh_if_needed(payload, setup_result, function(refresh_ok, refresh_err)
+					if not refresh_ok then
 						booting = false
-						fail(tostring(setup_result))
-						return callback(false, setup_result)
+						fail(tostring(refresh_err))
+						return callback(false, refresh_err)
 					end
-					other_progress(60)
 
-					run_refresh_if_needed(payload, setup_result, function(refresh_ok, refresh_err)
-						if not refresh_ok then
-							booting = false
-							fail(tostring(refresh_err))
-							return callback(false, refresh_err)
+					run_watch(payload, function(watch_ok, watch_err)
+						booting = false
+
+						if not watch_ok then
+							fail(tostring(watch_err))
+							return callback(false, watch_err)
 						end
+						other_progress(100)
 
-						run_watch(payload, function(watch_ok, watch_err)
-							booting = false
-
-							if not watch_ok then
-								fail(tostring(watch_err))
-								return callback(false, watch_err)
-							end
-							other_progress(100)
-
-							callback(true)
-							run_engine_refresh_in_background(payload)
-						end)
+						callback(true)
+						run_engine_refresh_in_background(payload)
 					end)
 				end)
 			end)

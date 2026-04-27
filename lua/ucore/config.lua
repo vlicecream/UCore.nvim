@@ -76,11 +76,6 @@ M.values = {
 	-- 稍微延迟自动启动，避免和 nvim 启动/插件加载抢时机。
 	auto_boot_delay_ms = 300,
 
-	-- Retry project discovery during first-run startup while buffers/cwd settle.
-	-- 首次启动时 buffer/cwd 可能还没稳定，允许短时间重试项目发现。
-	project_detect_attempts = 40,
-	project_detect_interval_ms = 100,
-
 	-- Maximum number of readiness checks during boot.
 	-- boot 期间最多检查多少次 server ready。
 	boot_ready_attempts = 1200,
