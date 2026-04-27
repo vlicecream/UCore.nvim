@@ -32,7 +32,20 @@ function M.find_project_file(start_path)
 		start_path = vim.loop.cwd()
 	end
 
-	local dir = vim.fn.fnamemodify(start_path, ":p:h")
+	local full_path = vim.fn.fnamemodify(start_path, ":p")
+	local dir
+
+	if vim.fn.isdirectory(full_path) == 1 then
+		dir = full_path
+	else
+		dir = vim.fn.fnamemodify(full_path, ":p:h")
+	end
+
+	local direct = vim.fn.glob(vim.fn.fnameescape(dir) .. "/*.uproject", false, true)[1]
+	if direct then
+		return normalize(direct)
+	end
+
 	local found = vim.fs.find(function(name)
 		return name:match("%.uproject$")
 	end, {

@@ -89,6 +89,8 @@ M.values = {
 	auto_boot_events = {
 		"BufReadPost",
 		"BufNewFile",
+		"BufEnter",
+		"VimEnter",
 	},
 
 	-- Refresh progress notification options.

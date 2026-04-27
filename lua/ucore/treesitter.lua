@@ -98,6 +98,33 @@ local function unreal_filetype(path)
 	end
 end
 
+local function ensure_buffer_unreal_cpp(bufnr)
+	bufnr = bufnr or vim.api.nvim_get_current_buf()
+
+	if not vim.api.nvim_buf_is_valid(bufnr) then
+		return
+	end
+
+	local path = vim.api.nvim_buf_get_name(bufnr)
+	if path == "" or not is_unreal_project(path) then
+		return
+	end
+
+	register_parser()
+
+	if vim.bo[bufnr].filetype ~= parser_name then
+		vim.bo[bufnr].filetype = parser_name
+	end
+
+	pcall(vim.treesitter.start, bufnr, parser_name)
+end
+
+local function ensure_visible_buffers()
+	for _, win in ipairs(vim.api.nvim_list_wins()) do
+		ensure_buffer_unreal_cpp(vim.api.nvim_win_get_buf(win))
+	end
+end
+
 function M.setup()
 	package.preload["nvim-treesitter.parsers"] = function()
 		if type(package.loaded["nvim-treesitter.parsers"]) == "table" then
@@ -133,6 +160,37 @@ function M.setup()
 			inl = unreal_filetype,
 		},
 	})
+
+	local group = vim.api.nvim_create_augroup("UCoreUnrealTreeSitter", { clear = true })
+
+	vim.api.nvim_create_autocmd({
+		"BufEnter",
+		"BufReadPost",
+		"VimEnter",
+	}, {
+		group = group,
+		callback = function(args)
+			vim.schedule(function()
+				ensure_buffer_unreal_cpp(args.buf ~= 0 and args.buf or nil)
+			end)
+		end,
+	})
+
+	vim.api.nvim_create_autocmd("User", {
+		group = group,
+		pattern = {
+			"LazyDone",
+			"VeryLazy",
+		},
+		callback = function()
+			vim.schedule(function()
+				register_parser()
+				ensure_visible_buffers()
+			end)
+		end,
+	})
+
+	vim.schedule(ensure_visible_buffers)
 end
 
 return M
