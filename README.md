@@ -44,7 +44,7 @@ Windows is the primary development target today.
 return {
   {
     "vlicecream/UCore.nvim",
-    build = "cargo build --release --manifest-path u-scanner/Cargo.toml --bin u_core_server --bin u_scanner",
+    build = "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1",
     dependencies = {
       {
         "nvim-telescope/telescope.nvim",
@@ -117,7 +117,7 @@ return {
   {
     dir = "C:/Unreal-NVIM/UCore.nvim",
     name = "UCore.nvim",
-    build = "cargo build --release --manifest-path u-scanner/Cargo.toml --bin u_core_server --bin u_scanner",
+    build = "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1",
     config = function()
       require("ucore").setup({
         auto_boot = true,
@@ -224,8 +224,12 @@ If release binaries are missing, UCore falls back to `cargo run`.
 lazy.nvim can build the Rust backend automatically:
 
 ```lua
-build = "cargo build --release --manifest-path u-scanner/Cargo.toml --bin u_core_server --bin u_scanner"
+build = "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1"
 ```
+
+On Windows, the build script loads the MSVC C++ toolchain before building C
+dependencies such as SQLite and tree-sitter. It also retries once after
+`cargo clean` if it detects stale MinGW/GCC-built objects.
 
 Manual build:
 
@@ -369,6 +373,19 @@ Common fixes:
 - If the project database is missing, run `:UCore` inside the project and wait for indexing.
 - If the Engine database is missing, keep Neovim open until the background Engine index finishes.
 - If `unreal_cpp` is unsupported, load UCore first, then run `:TSInstall unreal_cpp`.
+- If Windows release build fails with `__mingw_vfprintf` or `___chkstk_ms`, stale C objects were probably built with MinGW/GCC and then linked with MSVC. Use the bundled build script, or clean the backend once and rebuild:
+
+```powershell
+cd path\to\UCore.nvim
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build.ps1 -Clean
+
+# Or manually:
+cd u-scanner
+cargo clean
+cargo build --release --bin u_core_server --bin u_scanner
+```
+
+After that, run `:Lazy build UCore.nvim` again if you installed through lazy.nvim.
 
 ## Development Notes
 
