@@ -27,7 +27,7 @@ end
 -- Build a setup/refresh/watch payload for the current Unreal project.
 -- 为当前 Unreal 工程构造 setup/refresh/watch 请求体。
 local function current_project_payload(project_root)
-	local root = project.find_project_root_from_context(project_root)
+	local root = project_root or project.find_project_root()
 	if not root then
 		return nil, "Could not find .uproject"
 	end

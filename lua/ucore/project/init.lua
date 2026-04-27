@@ -69,46 +69,6 @@ function M.find_project_root(start_path)
 	return normalize(vim.fn.fnamemodify(project_file, ":p:h"))
 end
 
-local function add_candidate(candidates, seen, path)
-	path = normalize(path)
-	if not path or path == "" or seen[path] then
-		return
-	end
-
-	seen[path] = true
-	table.insert(candidates, path)
-end
-
--- Find a project root from the current Neovim startup/editing context.
--- 从当前 Neovim 启动/编辑上下文里兜底寻找项目根目录。
-function M.find_project_root_from_context(start_path)
-	local candidates = {}
-	local seen = {}
-
-	add_candidate(candidates, seen, start_path)
-	add_candidate(candidates, seen, vim.api.nvim_buf_get_name(0))
-	add_candidate(candidates, seen, vim.loop.cwd())
-
-	for index = 0, math.max(vim.fn.argc() - 1, -1) do
-		add_candidate(candidates, seen, vim.fn.argv(index))
-	end
-
-	for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
-		if vim.api.nvim_buf_is_valid(bufnr) and vim.api.nvim_buf_is_loaded(bufnr) then
-			add_candidate(candidates, seen, vim.api.nvim_buf_get_name(bufnr))
-		end
-	end
-
-	for _, candidate in ipairs(candidates) do
-		local root = M.find_project_root(candidate)
-		if root then
-			return root
-		end
-	end
-
-	return nil
-end
-
 -- Build default database paths under Neovim's cache directory.
 -- 在 Neovim cache 目录下构造默认数据库路径。
 function M.build_paths(project_root)
