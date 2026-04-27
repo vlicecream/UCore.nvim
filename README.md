@@ -44,15 +44,9 @@ Windows is the primary development target today.
 return {
   {
     "vlicecream/UCore.nvim",
+    lazy = false,
     build = "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1",
     dependencies = {
-      {
-        "nvim-telescope/telescope.nvim",
-        dependencies = {
-          "nvim-lua/plenary.nvim",
-          "nvim-tree/nvim-web-devicons",
-        },
-      },
       {
         "saghen/blink.cmp",
         opts = function(_, opts)
@@ -77,19 +71,11 @@ return {
         end,
       },
       {
-        "nvim-treesitter/nvim-treesitter",
-        build = ":TSUpdate",
-        opts = function(_, opts)
-          opts = opts or {}
-          opts.ensure_installed = opts.ensure_installed or {}
-
-          if type(opts.ensure_installed) == "table" and not vim.tbl_contains(opts.ensure_installed, "unreal_cpp") then
-            table.insert(opts.ensure_installed, "unreal_cpp")
-          end
-
-          opts.auto_install = true
-          return opts
-        end,
+        "nvim-telescope/telescope.nvim",
+        dependencies = {
+          "nvim-lua/plenary.nvim",
+          "nvim-tree/nvim-web-devicons",
+        },
       },
     },
     config = function()
@@ -105,6 +91,26 @@ return {
       })
     end,
   },
+  {
+    "vlicecream/UTreeSitter",
+    lazy = false,
+  },
+  {
+    "nvim-treesitter/nvim-treesitter",
+    lazy = false,
+    build = ":TSUpdate",
+    opts = function(_, opts)
+      opts = opts or {}
+      opts.auto_install = true
+      opts.ensure_installed = opts.ensure_installed or {}
+
+      if not vim.tbl_contains(opts.ensure_installed, "unreal_cpp") then
+        table.insert(opts.ensure_installed, "unreal_cpp")
+      end
+
+      return opts
+    end,
+  },
 }
 ```
 
@@ -117,6 +123,7 @@ return {
   {
     dir = "C:/Unreal-NVIM/UCore.nvim",
     name = "UCore.nvim",
+    lazy = false,
     build = "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1",
     config = function()
       require("ucore").setup({
@@ -126,6 +133,11 @@ return {
         },
       })
     end,
+  },
+  {
+    dir = "C:/Unreal-NVIM/UTreeSitter",
+    name = "UTreeSitter",
+    lazy = false,
   },
 }
 ```
