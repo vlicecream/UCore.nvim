@@ -3,6 +3,9 @@ local M = {}
 local parser_name = "unreal_cpp"
 local parser_repo = "https://github.com/vlicecream/UTreeSitter"
 local parser_retry_timers = {}
+local parser_installing = false
+local parser_install_attempted = false
+local parser_install_callbacks = {}
 
 local function is_unreal_project(path)
 	local markers = vim.fs.find(function(name)
@@ -52,6 +55,49 @@ local function register_parser()
 		augment_parsers(parsers)
 		package.loaded["nvim-treesitter.parsers"] = parsers
 	end
+end
+
+local function flush_parser_install_callbacks()
+	local callbacks = parser_install_callbacks
+	parser_install_callbacks = {}
+
+	for _, callback in ipairs(callbacks) do
+		pcall(callback)
+	end
+end
+
+local function install_parser(callback)
+	if callback then
+		table.insert(parser_install_callbacks, callback)
+	end
+
+	if parser_installing then
+		return true
+	end
+
+	if parser_install_attempted then
+		flush_parser_install_callbacks()
+		return false
+	end
+
+	if vim.fn.exists(":TSInstallSync") ~= 2 then
+		return false
+	end
+
+	parser_installing = true
+	parser_install_attempted = true
+
+	vim.schedule(function()
+		register_parser()
+		local ok = pcall(vim.cmd, "TSInstallSync " .. parser_name)
+		parser_install_attempted = ok
+
+		parser_installing = false
+		register_parser()
+		flush_parser_install_callbacks()
+	end)
+
+	return true
 end
 
 local function apply_highlight_links()
@@ -118,7 +164,15 @@ local function ensure_buffer_unreal_cpp(bufnr)
 	end
 
 	local ok = pcall(vim.treesitter.start, bufnr, parser_name)
-	if ok or parser_retry_timers[bufnr] then
+	if ok then
+		return
+	end
+
+	install_parser(function()
+		ensure_buffer_unreal_cpp(bufnr)
+	end)
+
+	if parser_retry_timers[bufnr] then
 		return
 	end
 
@@ -139,6 +193,12 @@ local function ensure_buffer_unreal_cpp(bufnr)
 
 			register_parser()
 			local started = pcall(vim.treesitter.start, bufnr, parser_name)
+			if not started and vim.fn.exists(":TSInstallSync") == 2 then
+				install_parser(function()
+					ensure_buffer_unreal_cpp(bufnr)
+				end)
+			end
+
 			if started or attempts >= 40 then
 				timer:stop()
 				timer:close()
