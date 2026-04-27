@@ -354,7 +354,7 @@ impl UAssetParser {
 #[derive(Debug, Clone)]
 struct PackageSummary {
     file_size: u64,
-    legacy_version: i32,
+    _legacy_version: i32,
     ue4_version: i32,
     ue5_version: i32,
     has_unversioned_properties: bool,
@@ -458,7 +458,7 @@ impl PackageSummary {
 
         Ok(Self {
             file_size,
-            legacy_version,
+            _legacy_version: legacy_version,
             ue4_version,
             ue5_version,
             has_unversioned_properties,

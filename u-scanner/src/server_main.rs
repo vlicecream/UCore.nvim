@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use sysinfo::{Pid, ProcessesToUpdate, System};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use u_scanner::server::handle_connection;
 use u_scanner::server::state::AppState;
 use u_scanner::server::utils::normalize_path_key;

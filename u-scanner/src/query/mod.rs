@@ -188,7 +188,7 @@ pub fn process_query(conn: &Connection, request: QueryRequest) -> Result<Value> 
 pub fn process_query_streaming<F>(
     conn: &Connection,
     request: QueryRequest,
-    mut on_items: F,
+    on_items: F,
 ) -> Result<Value>
 where
     F: FnMut(Vec<Value>) -> Result<()>,

@@ -1,6 +1,6 @@
 use std::fs::File;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::Result;
 use memmap2::Mmap;
 use rayon::prelude::*;
 use rusqlite::{params_from_iter, Connection, ToSql};
