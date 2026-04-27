@@ -49,7 +49,7 @@ local function try_auto_boot()
 		return
 	end
 
-	local project_root = project.find_project_root(buffer_path)
+	local project_root = project.find_project_root_from_context(buffer_path)
 	if not project_root then
 		return
 	end

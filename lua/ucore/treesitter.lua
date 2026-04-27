@@ -2,6 +2,7 @@ local M = {}
 
 local parser_name = "unreal_cpp"
 local parser_repo = "https://github.com/vlicecream/UTreeSitter"
+local parser_retry_timers = {}
 
 local function is_unreal_project(path)
 	local markers = vim.fs.find(function(name)
@@ -116,7 +117,35 @@ local function ensure_buffer_unreal_cpp(bufnr)
 		vim.bo[bufnr].filetype = parser_name
 	end
 
-	pcall(vim.treesitter.start, bufnr, parser_name)
+	local ok = pcall(vim.treesitter.start, bufnr, parser_name)
+	if ok or parser_retry_timers[bufnr] then
+		return
+	end
+
+	local attempts = 0
+	local timer = vim.loop.new_timer()
+	parser_retry_timers[bufnr] = timer
+
+	timer:start(500, 500, function()
+		attempts = attempts + 1
+
+		vim.schedule(function()
+			if not vim.api.nvim_buf_is_valid(bufnr) then
+				timer:stop()
+				timer:close()
+				parser_retry_timers[bufnr] = nil
+				return
+			end
+
+			register_parser()
+			local started = pcall(vim.treesitter.start, bufnr, parser_name)
+			if started or attempts >= 40 then
+				timer:stop()
+				timer:close()
+				parser_retry_timers[bufnr] = nil
+			end
+		end)
+	end)
 end
 
 local function ensure_visible_buffers()
@@ -181,6 +210,8 @@ function M.setup()
 		pattern = {
 			"LazyDone",
 			"VeryLazy",
+			"TSUpdate",
+			"TSInstall",
 		},
 		callback = function()
 			vim.schedule(function()
