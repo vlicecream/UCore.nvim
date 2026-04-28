@@ -7,7 +7,7 @@ local M = {}
 -- 把子命令转成小写，从而支持大小写不敏感。
 local function normalize_subcommand(args)
 	local sub = (args.args or ""):match("^%s*(%S+)")
-	return sub and sub:lower() or "dashboard"
+	return sub and sub:lower() or "smart_entry"
 end
 
 -- Return the rest of the command line after the subcommand.
@@ -33,6 +33,7 @@ local function dispatch_debug(tail)
 	local sub, rest = split_first(tail)
 
 	local handlers = {
+		logs = actions.logs,
 		engine = actions.engine,
 		["engine-refresh"] = actions.engine_refresh,
 		enginerefresh = actions.engine_refresh,
@@ -76,6 +77,7 @@ function M.dispatch(args)
   local tail = command_tail(args)
 
   local handlers = {
+    smart_entry = actions.smart_entry,
     dashboard = actions.dashboard,
     boot = actions.boot,
     build = function()
@@ -91,8 +93,6 @@ function M.dispatch(args)
     end,
     goto = actions.goto_definition,
     references = actions.references,
-    logs = actions.logs,
-    status = actions.status,
     debug = function()
       dispatch_debug(tail)
     end,
@@ -132,7 +132,6 @@ function M.register()
 		nargs = "*",
 		complete = function(arglead)
 			local items = {
-				"dashboard",
 				"boot",
 				"build",
 				"build-cancel",
@@ -140,8 +139,6 @@ function M.register()
 				"find",
 				"goto",
 				"references",
-				"logs",
-				"status",
 				"debug",
 				"help",
 			}

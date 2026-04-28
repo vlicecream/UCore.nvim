@@ -32,7 +32,17 @@ function M.find_project_file(start_path)
 		start_path = vim.loop.cwd()
 	end
 
-	local dir = vim.fn.fnamemodify(start_path, ":p:h")
+	if start_path == "" then
+		return nil
+	end
+
+	local dir
+	if vim.fn.isdirectory(start_path) == 1 then
+		dir = start_path
+	else
+		dir = vim.fn.fnamemodify(start_path, ":p:h")
+	end
+
 	local found = vim.fs.find(function(name)
 		return name:match("%.uproject$")
 	end, {
@@ -54,6 +64,66 @@ function M.find_project_root(start_path)
 	end
 
 	return normalize(vim.fn.fnamemodify(project_file, ":p:h"))
+end
+
+-- Search for an Unreal project root from multiple context sources.
+-- 从多个上下文来源搜索 Unreal 项目根目录。
+function M.find_project_root_from_context(opts)
+	opts = opts or {}
+
+	-- 1. Current buffer file path
+	local buf_path = vim.api.nvim_buf_get_name(0)
+	if buf_path and buf_path ~= "" then
+		local root = M.find_project_root(buf_path)
+		if root then
+			return root
+		end
+	end
+
+	-- 2. Current working directory
+	local cwd = vim.loop.cwd()
+	if cwd then
+		local root = M.find_project_root(cwd)
+		if root then
+			return root
+		end
+	end
+
+	-- 3. Alternate buffer
+	local alt = vim.fn.bufnr("#")
+	if alt and alt > 0 then
+		local alt_path = vim.api.nvim_buf_get_name(alt)
+		if alt_path and alt_path ~= "" then
+			local root = M.find_project_root(alt_path)
+			if root then
+				return root
+			end
+		end
+	end
+
+	-- 4. All listed normal file buffers
+	for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+		local bo = vim.bo[bufnr]
+		if bo.buflisted and bo.buftype == "" and bo.modifiable then
+			local path = vim.api.nvim_buf_get_name(bufnr)
+			if path and path ~= "" then
+				local root = M.find_project_root(path)
+				if root then
+					return root
+				end
+			end
+		end
+	end
+
+	-- 5. Registered projects fallback
+	if opts.registered_fallback ~= false then
+		local items = M.list_registered_projects()
+		if not vim.tbl_isempty(items) then
+			return items[1].root
+		end
+	end
+
+	return nil
 end
 
 -- Build default database paths under Neovim's cache directory.

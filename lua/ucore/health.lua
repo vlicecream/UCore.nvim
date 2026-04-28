@@ -178,30 +178,26 @@ local function report_project_checks()
 	start("Current Unreal project")
 
 	local buffer_path = vim.api.nvim_buf_get_name(0)
-	if buffer_path == "" then
-		warn("Current buffer has no file path")
-		return
+	if buffer_path:match("^health://") then
+		info("current buffer is health check (" .. buffer_path .. "), ignored for project detection")
+	elseif buffer_path ~= "" then
+		info("Current buffer: " .. buffer_path)
 	end
 
-	info("Current buffer: " .. buffer_path)
-
-	local project_file = project.find_project_file(buffer_path)
-	if not project_file then
-		warn("No .uproject found upward from current buffer", {
+	local project_root = project.find_project_root_from_context()
+	if not project_root then
+		warn("No Unreal project detected from current context", {
 			"Open a file inside an Unreal project.",
 			"Then run :UCore or :checkhealth ucore again.",
 		})
 		return
 	end
 
-	ok(".uproject found: " .. project_file)
+	ok("project root: " .. project_root)
 
-	local project_root = project.find_project_root(buffer_path)
-	if project_root then
-		ok("project root: " .. project_root)
-	else
-		error("failed to derive project root from .uproject")
-		return
+	local project_file = project.find_project_file_in_root(project_root)
+	if project_file then
+		ok(".uproject: " .. project_file)
 	end
 
 	local paths = project.build_paths(project_root)
@@ -345,10 +341,6 @@ end
 local function report_treesitter_checks()
 	start("UCore Treesitter")
 
-	local buffer = vim.api.nvim_get_current_buf()
-	local filetype = vim.bo[buffer].filetype
-	info("current buffer filetype: " .. tostring(filetype))
-
 	local ok_parsers, parsers = pcall(require, "nvim-treesitter.parsers")
 	if not ok_parsers then
 		warn("nvim-treesitter.parsers cannot be required", {
@@ -366,27 +358,34 @@ local function report_treesitter_checks()
 		})
 	end
 
-	local parser_dir = vim.fn.stdpath("data") .. "/site/parser"
-	local parser_file = parser_dir .. "/unreal_cpp.so"
-	if vim.fn.has("win32") == 1 then
-		parser_file = parser_dir .. "/unreal_cpp.dll"
-	end
+	local buffer = vim.api.nvim_get_current_buf()
+	local filetype = vim.bo[buffer].filetype
+	info("current buffer filetype: " .. tostring(filetype))
 
-	if readable(parser_file) then
-		ok("unreal_cpp parser installed: " .. parser_file)
-	else
-		warn("unreal_cpp parser binary not found: " .. parser_file, {
-			"Run :TSInstall unreal_cpp after registering the parser.",
-		})
-	end
-
-	if filetype == "unreal_cpp" then
-		local ok_parser, parser_or_err = pcall(vim.treesitter.get_parser, buffer, "unreal_cpp")
-		if ok_parser and parser_or_err then
-			ok("unreal_cpp parser can attach to current buffer")
-		else
-			warn("unreal_cpp parser cannot attach: " .. tostring(parser_or_err))
+	-- Try to attach on any real unreal_cpp buffer in the session.
+	-- 尝试在当前会话中找到真实 unreal_cpp buffer 并 attach。
+	local found_unreal_buf
+	for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+		if vim.bo[bufnr].filetype == "unreal_cpp" and vim.api.nvim_buf_get_name(bufnr) ~= "" then
+			found_unreal_buf = bufnr
+			break
 		end
+	end
+
+	if found_unreal_buf then
+		local ok_parser, parser_or_err = pcall(vim.treesitter.get_parser, found_unreal_buf, "unreal_cpp")
+		if ok_parser and parser_or_err then
+			ok("unreal_cpp parser can attach to buffer " .. found_unreal_buf)
+		else
+			warn("unreal_cpp parser binary may be missing or outdated", {
+				"Run :TSInstallSync unreal_cpp to install or update the parser.",
+				"Error: " .. tostring(parser_or_err),
+			})
+		end
+	else
+		info("Open a file inside an Unreal project to validate tree-sitter attach.", {
+			"Without an unreal_cpp buffer, attach cannot be tested.",
+		})
 	end
 end
 

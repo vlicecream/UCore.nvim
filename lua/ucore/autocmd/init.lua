@@ -7,6 +7,23 @@ local M = {}
 local group_name = "UCoreAutoBoot"
 local booted_projects = {}
 local pending_projects = {}
+local attempts_scheduled = false
+
+local function buffer_allows_auto_boot(bufnr)
+	local bo = vim.bo[bufnr]
+	local path = vim.api.nvim_buf_get_name(bufnr)
+	local filetype = bo.filetype
+
+	if bo.buftype ~= "" or path == "" then
+		return false
+	end
+
+	if filetype == "lazy" or filetype == "noice" or filetype == "checkhealth" then
+		return false
+	end
+
+	return true
+end
 
 -- Schedule auto boot once per Unreal project root.
 -- 对每个 Unreal 工程根目录只调度一次自动启动。
@@ -27,34 +44,56 @@ local function schedule_boot(project_root)
 		bootstrap.boot(function(ok, err)
 			if ok then
 				booted_projects[project_root] = true
-				return
 			end
-
-			vim.notify("UCore auto boot failed:\n" .. tostring(err), vim.log.levels.WARN)
 		end, {
 			project_root = project_root,
 		})
 	end, config.values.auto_boot_delay_ms)
 end
 
--- Try to auto boot when the current buffer belongs to an Unreal project.
--- 当当前 buffer 属于 Unreal 工程时尝试自动启动。
-local function try_auto_boot()
+-- Try to auto boot from context. Retries up to 3 times with delays.
+-- 从上下文尝试自动启动。最多重试 3 次，静默跳过。
+local function try_auto_boot(args)
 	if not config.values.auto_boot then
 		return
 	end
 
-	local buffer_path = vim.api.nvim_buf_get_name(0)
-	if buffer_path == "" then
+	local bufnr = args and args.buf or vim.api.nvim_get_current_buf()
+	if not buffer_allows_auto_boot(bufnr) then
 		return
 	end
 
-	local project_root = project.find_project_root(buffer_path)
-	if not project_root then
+	if attempts_scheduled then
 		return
 	end
 
-	schedule_boot(project_root)
+	attempts_scheduled = true
+	local delays = { 0, 100, 300, 700 }
+	local idx = 0
+
+	local function tick()
+		idx = idx + 1
+		if idx > #delays then
+			attempts_scheduled = false
+			return
+		end
+
+		local buffer_path = vim.api.nvim_buf_get_name(bufnr)
+		local root = project.find_project_root(buffer_path)
+		if root then
+			attempts_scheduled = false
+			schedule_boot(root)
+			return
+		end
+
+		if idx < #delays then
+			vim.defer_fn(tick, delays[idx + 1] - delays[idx])
+		else
+			attempts_scheduled = false
+		end
+	end
+
+	tick()
 end
 
 -- Register auto boot autocmds.
@@ -67,9 +106,6 @@ function M.setup()
 		callback = try_auto_boot,
 	})
 
-	-- Lazy-loaded plugins can miss the initial BufReadPost event, so check the
-	-- current buffer once after setup too.
-	-- lazy 加载时可能已经错过初始 BufReadPost，所以 setup 后也检查一次当前 buffer。
 	vim.defer_fn(try_auto_boot, config.values.auto_boot_delay_ms)
 end
 
@@ -78,6 +114,7 @@ end
 function M.reset()
 	booted_projects = {}
 	pending_projects = {}
+	attempts_scheduled = false
 end
 
 return M

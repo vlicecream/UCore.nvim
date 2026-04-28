@@ -1,10 +1,10 @@
 local M = {}
 
-local buf = nil
-local win = nil
 local items = {}
 local boot_active = false
 local state = "running"
+local notify_handle = nil
+local notify_id = "ucore.status"
 
 local ordered_keys = {
 	"boot",
@@ -12,18 +12,6 @@ local ordered_keys = {
 	"progress:UCore project index",
 	"progress:UCore engine index",
 }
-
--- Return true when the floating status window is still valid.
--- 判断顶部状态浮窗是否仍然有效。
-local function win_valid()
-	return win and vim.api.nvim_win_is_valid(win)
-end
-
--- Return true when the backing buffer is still valid.
--- 判断状态浮窗使用的 buffer 是否仍然有效。
-local function buf_valid()
-	return buf and vim.api.nvim_buf_is_valid(buf)
-end
 
 -- Collect visible status lines in stable user-facing order.
 -- 按稳定的用户可见顺序收集状态行。
@@ -47,99 +35,54 @@ local function collect_lines()
 	return lines
 end
 
--- Create the scratch buffer used by the floating status window.
--- 创建状态浮窗使用的临时 buffer。
-local function ensure_buf()
-	if buf_valid() then
-		return
-	end
-
-	buf = vim.api.nvim_create_buf(false, true)
-	vim.bo[buf].bufhidden = "wipe"
-	vim.bo[buf].buftype = "nofile"
-	vim.bo[buf].swapfile = false
-end
-
--- Compute a compact top-right window size.
--- 计算紧凑的右上角窗口尺寸。
-local function window_config(lines)
-	local max_width = 0
-	for _, line in ipairs(lines) do
-		max_width = math.max(max_width, vim.fn.strdisplaywidth(line))
-	end
-
-	local columns = vim.o.columns
-	local width = math.min(math.max(max_width + 4, 42), math.max(columns - 8, 20))
-	local height = math.max(#lines, 1)
-
-	return {
-		relative = "editor",
-		anchor = "NW",
-		row = 1,
-		col = math.max(columns - width - 2, 0),
-		width = width,
-		height = height,
-		style = "minimal",
-		border = "rounded",
-		title = state == "complete" and " UCore Ready " or " UCore ",
-		title_pos = "center",
-		focusable = false,
-		zindex = 250,
-	}
-end
-
--- Apply visual styling for the current state.
--- 根据当前状态应用浮窗样式。
-local function apply_window_style()
-	if not win_valid() then
-		return
-	end
-
+local function notify_level()
 	if state == "complete" then
-		vim.wo[win].winhl = "Normal:NormalFloat,FloatBorder:DiagnosticOk,FloatTitle:DiagnosticOk"
-	elseif state == "failed" then
-		vim.wo[win].winhl = "Normal:NormalFloat,FloatBorder:DiagnosticError,FloatTitle:DiagnosticError"
-	else
-		vim.wo[win].winhl = "Normal:NormalFloat,FloatBorder:FloatBorder,FloatTitle:FloatTitle"
+		return vim.log.levels.INFO
 	end
+
+	if state == "failed" then
+		return vim.log.levels.ERROR
+	end
+
+	return vim.log.levels.INFO
 end
 
--- Close the floating status window if there is nothing to show.
--- 没有任何状态需要展示时关闭浮窗。
-local function close_if_empty(lines)
-	if #lines > 0 then
-		return false
+local function notify_title()
+	if state == "complete" then
+		return "UCore Ready"
 	end
 
-	if win_valid() then
-		vim.api.nvim_win_close(win, true)
-	end
-
-	win = nil
-	return true
+	return "UCore"
 end
 
--- Render the current status lines into one reusable top floating window.
--- 将当前状态渲染到一个可复用的顶部浮窗里。
+-- Render the current status lines as one replaceable notification.
+-- 将当前状态渲染成一条可替换的通知，交给 noice/notify 管理位置。
 local function render()
 	local lines = collect_lines()
-	if close_if_empty(lines) then
+
+	if #lines == 0 then
+		if notify_handle then
+			pcall(vim.notify, "", vim.log.levels.INFO, {
+				id = notify_id,
+				title = notify_title(),
+				replace = notify_handle,
+				timeout = 1,
+			})
+		end
+		notify_handle = nil
 		return
 	end
 
-	ensure_buf()
-	vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+	local ok, handle = pcall(vim.notify, table.concat(lines, "\n"), notify_level(), {
+		id = notify_id,
+		title = notify_title(),
+		replace = notify_handle,
+		timeout = false,
+	})
 
-	local config = window_config(lines)
-	if win_valid() then
-		vim.api.nvim_win_set_config(win, config)
-	else
-		win = vim.api.nvim_open_win(buf, false, config)
-		vim.wo[win].winblend = 0
-		vim.wo[win].wrap = false
+	if ok and handle then
+		notify_handle = handle
 	end
-
-	apply_window_style()
 end
 
 -- Set or replace one status line.
@@ -188,7 +131,7 @@ function M.finish(message)
 end
 
 -- Mark initialization as failed and keep the error visible.
--- 标记初始化失败，并保留错误方便排查。
+-- 标记初始化失败，并保留方便排查。
 function M.fail(message, detail)
 	boot_active = false
 	state = "failed"

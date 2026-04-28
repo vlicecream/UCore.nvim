@@ -30,7 +30,7 @@ local function show_find_results(pattern, items)
 end
 
 local function current_project_label()
-	local root = project.find_project_root()
+	local root = project.find_project_root_from_context()
 	if not root then
 		return "No Unreal project detected"
 	end
@@ -227,7 +227,7 @@ end
 -- Collect current UCore state for dashboard display.
 -- 收集当前 UCore 状态供 Dashboard 展示。
 function M.collect_dashboard_state()
-	local root = project.find_project_root()
+	local root = project.find_project_root_from_context()
 	local registry = project.read_registry()
 	local registered_count = vim.tbl_count(registry.projects or {})
 	local engine_count = vim.tbl_count(registry.engines or {})
@@ -316,10 +316,6 @@ local function editor_label(state)
 	return "[build first]"
 end
 
-local function server_label(state)
-	return state.server_running and "[server online]" or "[server offline]"
-end
-
 local function log_label(state)
 	return (state.log_exists == "ok") and "[available]" or "[missing]"
 end
@@ -352,7 +348,7 @@ end
 -- Guard：操作需要当前在 Unreal 项目中。
 local function project_guard(fn)
 	return function()
-		local root = project.find_project_root()
+		local root = project.find_project_root_from_context()
 		if root then
 			return fn()
 		end
@@ -364,7 +360,7 @@ end
 -- Guard：操作需要项目根目录和已存在的索引数据库。
 local function index_guard(fn)
 	return function()
-		local root = project.find_project_root()
+		local root = project.find_project_root_from_context()
 		if not root then
 			notify_no_project()
 			return
@@ -392,6 +388,39 @@ local function dashboard_format(item)
 		pad_right(item.badge, 18),
 		item.description
 	)
+end
+
+-- Smart entry: boot new project, pick registered, or open Dashboard.
+-- 三段式智能入口：新项目 boot，有注册项目选择，已注册项目打开 Dashboard。
+function M.smart_entry()
+	local root = project.find_project_root_from_context()
+	if not root then
+		local items = project.list_registered_projects()
+		if vim.tbl_isempty(items) then
+			vim.notify(
+				"Not inside an Unreal project.\nOpen a .uproject file and run :UCore boot first.",
+				vim.log.levels.WARN
+			)
+			return
+		end
+		ui.select.projects(items, function(item)
+			if not item then
+				return
+			end
+			project.open_project(item.root)
+			M.boot()
+		end)
+		return
+	end
+
+	local registry = project.read_registry()
+	local registered = registry.projects and registry.projects[root]
+	if type(registered) ~= "table" then
+		M.boot()
+		return
+	end
+
+	M.dashboard()
 end
 
 -- Open the main UCore project dashboard.
@@ -443,18 +472,6 @@ function M.dashboard()
 			end),
 		},
 		{
-			label = "Open status",
-			badge = server_label(s),
-			description = "Inspect runtime state",
-			run = M.status,
-		},
-		{
-			label = "Open logs",
-			badge = log_label(s),
-			description = "Open latest server log",
-			run = M.logs,
-		},
-		{
 			label = "Open registered project",
 			badge = registered_label(s),
 			description = "Pick a known Unreal project",
@@ -476,7 +493,7 @@ end
 -- Smart entrypoint: boot current project or pick a registered one.
 -- 智能入口：启动当前项目，或选择一个已注册项目。
 function M.boot()
-	local root = project.find_project_root()
+	local root = project.find_project_root_from_context()
 
 	if root then
 		project.register_project(root)
@@ -953,18 +970,16 @@ function M.help()
 	print([[
 UCore commands:
 
-  :UCore              Open or boot an Unreal project
-  :UCore boot         Same as :UCore
+  :UCore              Smart entry: boot, pick, or Dashboard
+  :UCore boot         Boot current project, or pick a registered one
   :UCore build        Build current Unreal Editor target
   :UCore build-cancel Cancel the currently running Unreal build
   :UCore editor       Open current project in Unreal Editor
-  :UCore debug help   Show debug commands
-  :UCore help         Show this help
-  :UCore find         Find indexed symbols
+  :UCore find         Find indexed symbols, modules, assets, config
   :UCore goto         Go to definition at cursor
-  :UCore logs         Open the latest UCore server log
   :UCore references   Find references at cursor
-  :UCore status       Open a readable UCore status report
+  :UCore debug        Debug and lifecycle subcommands
+  :UCore help         Show this help
 ]])
 end
 
@@ -974,6 +989,7 @@ function M.debug_help()
 	print([[
 UCore debug commands:
 
+  :UCore debug logs         Open the latest UCore server log
   :UCore debug status       Check server status through CLI bridge
   :UCore debug rpc-status   Check server status through direct TCP RPC
   :UCore debug start        Start Rust server

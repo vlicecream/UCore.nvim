@@ -1,7 +1,12 @@
+local config = require("ucore.config")
+
 local M = {}
 
 local parser_name = "unreal_cpp"
 local parser_repo = "https://github.com/vlicecream/UTreeSitter"
+local installing = false
+local install_attempted = false
+local pending_buffers = {}
 
 local function is_unreal_project(path)
 	local markers = vim.fs.find(function(name)
@@ -98,6 +103,101 @@ local function unreal_filetype(path)
 	end
 end
 
+local function status_progress(msg)
+	pcall(function()
+		require("ucore.status").progress("UCore treesitter", msg)
+	end)
+end
+
+local function status_progress_finish()
+	pcall(function()
+		require("ucore.status").progress_finish("UCore treesitter", "UCore treesitter 100%")
+	end)
+end
+
+-- Retry pending buffers after install finishes.
+-- 安装完成后重试所有等待中的 buffer。
+local function retry_pending()
+	local pending = pending_buffers
+	pending_buffers = {}
+	for bufnr, _ in pairs(pending) do
+		if vim.api.nvim_buf_is_valid(bufnr) then
+			M.activate_buffer(bufnr)
+		end
+	end
+end
+
+-- Auto-install the unreal_cpp parser via nvim-treesitter.
+-- 通过 nvim-treesitter 自动安装 unreal_cpp parser。
+local function ensure_parser_installed()
+	if installing or install_attempted then
+		return
+	end
+
+	local ok_ts, _ = pcall(require, "nvim-treesitter")
+	if not ok_ts then
+		return
+	end
+
+	local parser_dir = vim.fn.stdpath("data") .. "/site/parser"
+	local suffix = vim.fn.has("win32") == 1 and ".dll" or ".so"
+	local parser_file = parser_dir .. "/" .. parser_name .. suffix
+
+	if vim.fn.filereadable(parser_file) == 1 then
+		install_attempted = true
+		return
+	end
+
+	installing = true
+	status_progress("installing unreal_cpp parser")
+
+	pcall(vim.cmd, "TSInstallSync " .. parser_name)
+
+	installing = false
+	install_attempted = true
+
+	if vim.fn.filereadable(parser_file) == 1 then
+		status_progress_finish()
+		retry_pending()
+	else
+		status_progress_finish()
+		vim.notify(
+			"UCore: unreal_cpp parser installation failed.\nRun :TSInstallSync unreal_cpp manually.",
+			vim.log.levels.WARN
+		)
+	end
+end
+
+-- Activate treesitter highlighting on a buffer using the unreal_cpp parser.
+-- Sets filetype, ensures parser is installed, then starts highlighting.
+-- 在 buffer 上激活 unreal_cpp treesitter 高亮。
+-- 设置 filetype，确保 parser 已安装，然后启动高亮。
+function M.activate_buffer(bufnr)
+	bufnr = bufnr or vim.api.nvim_get_current_buf()
+
+	if not vim.api.nvim_buf_is_valid(bufnr) then
+		return
+	end
+
+	if vim.bo[bufnr].filetype ~= parser_name then
+		return
+	end
+
+	local ok, parser = pcall(vim.treesitter.get_parser, bufnr, parser_name)
+	if ok and parser then
+		pcall(vim.treesitter.start, bufnr, parser_name)
+		return
+	end
+
+	-- Parser not yet available — queue this buffer for retry after install.
+	-- parser 还不可用 — 把 buffer 加入等待队列。
+	pending_buffers[bufnr] = true
+
+	if not installing and not install_attempted then
+		ensure_parser_installed()
+	end
+end
+
 function M.setup()
 	package.preload["nvim-treesitter.parsers"] = function()
 		if type(package.loaded["nvim-treesitter.parsers"]) == "table" then
@@ -132,6 +232,23 @@ function M.setup()
 			cxx = unreal_filetype,
 			inl = unreal_filetype,
 		},
+	})
+
+	-- When an unreal_cpp buffer appears, auto-install parser and activate highlighting.
+	-- 当 unreal_cpp buffer 出现时，自动安装 parser 并激活高亮。
+	vim.api.nvim_create_autocmd("FileType", {
+		pattern = parser_name,
+		group = vim.api.nvim_create_augroup("UCoreUnrealCppActivate", { clear = true }),
+		callback = function(ev)
+			if config.values.treesitter.auto_install then
+				ensure_parser_installed()
+			end
+			if config.values.treesitter.auto_start then
+				vim.schedule(function()
+					M.activate_buffer(ev.buf)
+				end)
+			end
+		end,
 	})
 end
 

@@ -43,14 +43,17 @@ end
 
 -- Start the Rust server as a background job.
 -- 以后台 job 的方式启动 Rust server。
-function M.start(callback)
+function M.start(callback, opts)
 	callback = callback or function() end
+	opts = opts or {}
 
 	if M.is_running() then
 		return callback(true, "Server already running")
 	end
 
-	local root = project.find_project_root()
+	local root = opts.project_root or project.find_project_root_from_context({
+		registered_fallback = false,
+	})
 	if not root then
 		return callback(false, "Could not find .uproject")
 	end

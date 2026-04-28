@@ -183,15 +183,14 @@ User commands:
 :UCore goto         " Go to definition at cursor
 :UCore references   " Find references at cursor
 :UCore status       " Open a readable UCore runtime status report
-:UCore logs         " Open the latest UCore server log
 :UCore help         " Show user commands
 ```
 
 The Dashboard (`:UCore`) shows state badges and descriptions on every item —
 project name, index readiness (`ready` / `needs boot` / `no project`), server
-status, log availability, and registered project count. Items are laid out in
-fixed-width columns for easy scanning. Actions that need a project or an index
-show a helpful redirect when the prerequisite is missing.
+status, and registered project count. Items are laid out in fixed-width columns
+for easy scanning. Actions that need a project or an index show a helpful
+redirect when the prerequisite is missing.
 
 Diagnostics:
 
@@ -199,18 +198,27 @@ Diagnostics:
 :checkhealth ucore
 ```
 
-Debug commands:
+Debug commands (internal lifecycle, logs, and diagnostics):
 
 ```vim
 :UCore debug help
+:UCore debug logs         " Open the latest UCore server log
+:UCore debug status
+:UCore debug rpc-status
 :UCore debug start
 :UCore debug stop
 :UCore debug restart
-:UCore debug status
-:UCore debug rpc-status
 :UCore debug setup
 :UCore debug refresh
+:UCore debug register
+:UCore debug open
+:UCore debug projects
+:UCore debug engine
+:UCore debug engine-refresh
+:UCore debug modules
+:UCore debug assets
 :UCore debug maps
+:UCore debug complete
 ```
 
 ## Configuration
@@ -336,6 +344,15 @@ https://github.com/vlicecream/UTreeSitter
 - the `unreal_cpp` parser config
 - Unreal project filetype detection for `.cpp`, `.h`, `.hpp`, `.inl`, etc.
 - default highlight groups for Unreal C++
+
+When you open an Unreal C++ file inside a project, UCore will:
+
+1. Detect the file belongs to an Unreal project.
+2. Set the filetype to `unreal_cpp`.
+3. Auto-install the parser if missing (via `:TSInstallSync unreal_cpp`).
+4. Start tree-sitter highlighting on the current buffer immediately.
+
+No restart or manual `:TSInstall` needed — the first open Just Works.
 
 If `:TSInstall unreal_cpp` says the language is unsupported, make sure UCore is
 loaded before running the install command, then run:

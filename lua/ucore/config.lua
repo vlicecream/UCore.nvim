@@ -89,6 +89,9 @@ M.values = {
 	auto_boot_events = {
 		"BufReadPost",
 		"BufNewFile",
+		"BufEnter",
+		"VimEnter",
+		"DirChanged",
 	},
 
 	-- Refresh progress notification options.
@@ -125,6 +128,18 @@ M.values = {
 		-- Debounce delay for automatic completion requests.
 		-- 自动补全请求的防抖延迟。
 		debounce_ms = 180,
+	},
+
+	-- Tree-sitter parser auto-install and activation options.
+	-- Treesitter parser 自动安装与激活配置。
+	treesitter = {
+		-- Auto-install unreal_cpp when first opening an Unreal file.
+		-- 首次打开 Unreal 文件时自动安装 unreal_cpp parser。
+		auto_install = true,
+
+		-- Auto-start treesitter highlighting on unreal_cpp buffers.
+		-- 自动对 unreal_cpp buffer 启动 treesitter 高亮。
+		auto_start = true,
 	},
 
 	-- Build diagnostics and quickfix options.
