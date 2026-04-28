@@ -224,66 +224,137 @@ function M.projects()
 	print(vim.inspect(project.list_registered_projects()))
 end
 
+-- Collect current UCore state for dashboard display.
+-- 收集当前 UCore 状态供 Dashboard 展示。
+function M.collect_dashboard_state()
+	local root = project.find_project_root()
+	local registry = project.read_registry()
+	local registered_count = vim.tbl_count(registry.projects or {})
+	local engine_count = vim.tbl_count(registry.engines or {})
+
+	local state = {
+		project_root = root,
+		project_name = nil,
+		registered = false,
+		server_running = server.is_running(),
+		registered_count = registered_count,
+		engine_count = engine_count,
+		project_db_state = nil,
+		cache_db_state = nil,
+		engine_root = nil,
+		engine_db_state = nil,
+		log_exists = nil,
+	}
+
+	if root then
+		local metadata = registry.projects and registry.projects[root]
+		state.registered = type(metadata) == "table"
+		state.project_name = vim.fn.fnamemodify(root, ":t")
+
+		local paths = project.build_paths(root)
+		state.project_db_state = file_state(paths.db_path)
+		state.cache_db_state = file_state(paths.cache_db_path)
+		state.log_exists = file_state(paths.log_path)
+
+		local engine, _ = project.engine_metadata(root)
+		if engine then
+			state.engine_root = engine.engine_root
+			local engine_paths = project.build_engine_paths(engine)
+			state.engine_db_state = file_state(engine_paths.db_path)
+		end
+	end
+
+	return state
+end
+
+-- Build a guard that shows a helpful message when no Unreal project is active.
+-- 构造一个 guard，当不在 Unreal 工程中时显示友好提示。
+local function dashboard_guard(run_fn)
+	return function()
+		local root = project.find_project_root()
+		if root then
+			return run_fn()
+		end
+
+		local items = project.list_registered_projects()
+		if vim.tbl_isempty(items) then
+			vim.notify(
+				"Not inside an Unreal project.\nOpen a .uproject file and run :UCore boot first.",
+				vim.log.levels.WARN
+			)
+		else
+			vim.notify(
+				"Not inside an Unreal project.\nUse 'Open registered project' below or open a .uproject file.",
+				vim.log.levels.WARN
+			)
+		end
+	end
+end
+
 -- Open the main UCore project dashboard.
 -- 打开 UCore 项目主面板。
 function M.dashboard()
+	local s = M.collect_dashboard_state()
+
+	local server_state = s.server_running and "online" or "offline"
+
 	local items = {
 		{
 			label = "Boot current project",
-			detail = current_project_label(),
+			detail = s.project_name and ("[" .. s.project_name .. "]") or "[no project]",
 			run = M.boot,
 		},
 		{
 			label = "Find indexed items",
-			detail = "Symbols, modules, assets, and config values",
-			run = function()
+			detail = s.project_root and "[ready]" or "[no project]",
+			run = dashboard_guard(function()
 				M.find("")
-			end,
+			end),
 		},
 		{
 			label = "Go to definition",
-			detail = "Jump from the symbol under cursor",
-			run = M.goto_definition,
+			detail = s.project_root and "[cursor symbol]" or "[no project]",
+			run = dashboard_guard(M.goto_definition),
 		},
 		{
 			label = "Find references",
-			detail = "Find references for the symbol under cursor",
-			run = M.references,
+			detail = s.project_root and "[cursor symbol]" or "[no project]",
+			run = dashboard_guard(M.references),
 		},
 		{
 			label = "Build editor target",
-			detail = "<ProjectName>Editor Win64 Development",
-			run = function()
+			detail = s.project_root and "[Win64 Development]" or "[no project]",
+			run = dashboard_guard(function()
 				M.build("")
-			end,
+			end),
 		},
 		{
 			label = "Open Unreal Editor",
-			detail = "Build first, then launch the current .uproject",
-			run = function()
+			detail = s.project_root and "[build first]" or "[no project]",
+			run = dashboard_guard(function()
 				M.editor("")
-			end,
+			end),
 		},
 		{
 			label = "Open status",
-			detail = "Runtime paths, server, project, and engine state",
+			detail = "[server " .. server_state .. "]",
 			run = M.status,
 		},
 		{
 			label = "Open logs",
-			detail = "Latest UCore server log",
+			detail = (s.log_exists == "ok") and "[available]" or "[missing]",
 			run = M.logs,
 		},
 		{
 			label = "Open registered project",
-			detail = "Pick a project from the UCore registry",
+			detail = s.registered_count > 0 and ("[" .. s.registered_count .. " registered]") or "[none registered]",
 			run = M.open_project,
 		},
 	}
 
 	ui.select.items("UCore dashboard", items, {
 		format_item = function(item)
-			return string.format("%s - %s", item.label, item.detail)
+			return string.format("%s  %s", item.label, item.detail)
 		end,
 		on_choice = function(item)
 			if item and item.run then

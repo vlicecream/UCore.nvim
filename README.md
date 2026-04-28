@@ -152,7 +152,11 @@ Open any file inside an Unreal project and run:
 :UCore
 ```
 
-This will:
+This opens the **Dashboard** — a smart project console that shows your current
+project, server status, and available actions. From the Dashboard you can boot,
+find symbols, build, open the editor, or inspect runtime state.
+
+When you select `Boot current project`, the full boot sequence runs:
 
 1. Register the current Unreal project in UCore's global registry.
 2. Resolve the project's Unreal Engine root from `EngineAssociation`.
@@ -162,16 +166,16 @@ This will:
 6. Start file watching.
 7. Refresh the shared Unreal Engine index if needed.
 
-With `auto_boot = true`, this also happens automatically when opening files in an
-Unreal project.
+With `auto_boot = true`, booting also happens automatically when opening files
+in an Unreal project.
 
 ## Commands
 
 User commands:
 
 ```vim
-:UCore              " Boot current project, or choose a registered project
-:UCore boot         " Same as :UCore
+:UCore              " Open project Dashboard with live state per item
+:UCore boot         " Boot current project, or choose a registered project
 :UCore build        " Build <ProjectName>Editor Win64 Development with live logs
 :UCore build-cancel " Cancel the currently running Unreal build
 :UCore editor       " Build, then open the current .uproject in Unreal Editor
@@ -182,6 +186,10 @@ User commands:
 :UCore logs         " Open the latest UCore server log
 :UCore help         " Show user commands
 ```
+
+The Dashboard (`:UCore`) shows state badges on every item — project name,
+index readiness, server status, log availability, and registered project count.
+Actions that need a project show a helpful redirect when none is active.
 
 Diagnostics:
 
