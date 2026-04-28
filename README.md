@@ -231,6 +231,11 @@ require("ucore").setup({
     min_chars = 2,
     debounce_ms = 180,
   },
+  build = {
+    open_quickfix_on_error = true,  -- auto-open quickfix when build has errors
+    include_warnings = true,         -- include warnings in the quickfix list
+    color_log = true,                -- colorize build log with extmarks
+  },
   semantic = {
     enable = true,
     debounce_ms = 120,
@@ -287,7 +292,18 @@ By default this runs:
 <EngineRoot>/Engine/Build/BatchFiles/Build.bat <ProjectName>Editor Win64 Development -Project="<Project.uproject>" -WaitMutex
 ```
 
-The build output is streamed live into a Neovim log buffer.
+The build output is streamed live into a Neovim log buffer with color-coded
+lines — errors in red, warnings in yellow, success in green, commands in cyan.
+
+On completion, diagnostics are parsed from the build output and populate the
+quickfix list. If the build has errors, the quickfix window opens automatically
+so you can jump directly to the failing line.
+
+```
+:copen          " Open the quickfix window
+:cn             " Jump to next error
+:cp             " Jump to previous error
+```
 
 Optional arguments:
 

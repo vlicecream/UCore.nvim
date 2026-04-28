@@ -127,6 +127,22 @@ M.values = {
 		debounce_ms = 180,
 	},
 
+	-- Build diagnostics and quickfix options.
+	-- 构建诊断与 quickfix 配置。
+	build = {
+		-- Auto-open quickfix when the build has errors.
+		-- 构建有 error 时自动打开 quickfix。
+		open_quickfix_on_error = true,
+
+		-- Include warnings in the quickfix list.
+		-- warning 是否也加入 quickfix 列表。
+		include_warnings = true,
+
+		-- Colorize the build log buffer with extmarks.
+		-- 是否给 build log buffer 加颜色高亮。
+		color_log = true,
+	},
+
 	-- Semantic highlight overlay powered by the UCore index.
 	-- 基于 UCore 索引的语义高亮覆盖层。
 	semantic = {
