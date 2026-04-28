@@ -55,9 +55,9 @@ M.values = {
 	port = 30110,
 	scanner_dir = scanner_dir,
 
-	-- Root directory for UCore runtime cache files.
-	-- UCore 运行时缓存文件根目录。
-	cache_dir = vim.fn.stdpath("cache") .. "/ucore",
+	-- Root directory for UCore registry, databases, and runtime logs.
+	-- UCore 注册表、数据库和运行时日志的根目录。
+	cache_dir = vim.fn.stdpath("data") .. "/ucore",
 
 
 	-- Prefer release binaries when they exist.
