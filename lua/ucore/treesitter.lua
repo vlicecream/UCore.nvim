@@ -10,8 +10,8 @@ local install_notified = false
 local pending_buffers = {}
 local retry_timer = nil
 
-local MAX_INSTALL_RETRIES = 20
-local INSTALL_RETRY_DELAY_MS = 300
+local MAX_INSTALL_RETRIES = 120
+local INSTALL_RETRY_DELAY_MS = 500
 
 local function is_unreal_project(path)
 	local markers = vim.fs.find(function(name)
@@ -189,6 +189,16 @@ local function retry_pending()
 	end
 end
 
+local function any_pending_can_attach()
+	for bufnr, _ in pairs(pending_buffers) do
+		if parser_can_attach(bufnr) then
+			return true
+		end
+	end
+
+	return false
+end
+
 -- Attempt to install the parser. Retries if nvim-treesitter is not ready yet.
 -- 尝试安装 parser。如果 nvim-treesitter 未就绪则重试。
 local function install_with_retry(remaining)
@@ -197,16 +207,11 @@ local function install_with_retry(remaining)
 		if not install_notified then
 			install_notified = true
 			status_progress_finish()
-			vim.notify(
-				"UCore: unreal_cpp parser is not ready yet.\n"
-					.. "Run :checkhealth ucore or :TSInstallSync unreal_cpp if highlighting is still missing.",
-				vim.log.levels.WARN
-			)
 		end
 		return
 	end
 
-	if parser_can_attach(vim.api.nvim_get_current_buf()) then
+	if any_pending_can_attach() then
 		installing = false
 		install_attempted = true
 		status_progress_finish()
@@ -226,7 +231,7 @@ local function install_with_retry(remaining)
 
 	pcall(vim.cmd, "TSInstallSync " .. parser_name)
 
-	if parser_installed() or parser_can_attach(vim.api.nvim_get_current_buf()) then
+	if parser_installed() or any_pending_can_attach() then
 		installing = false
 		install_attempted = true
 		status_progress_finish()
@@ -265,6 +270,16 @@ function M.activate_buffer(bufnr)
 
 	installing = true
 	install_with_retry(MAX_INSTALL_RETRIES)
+end
+
+local function activate_existing_buffers()
+	register_parser()
+
+	for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+		if vim.api.nvim_buf_is_valid(bufnr) and vim.bo[bufnr].filetype == parser_name then
+			M.activate_buffer(bufnr)
+		end
+	end
 end
 
 function M.setup()
@@ -316,6 +331,15 @@ function M.setup()
 					M.activate_buffer(ev.buf)
 				end)
 			end
+		end,
+	})
+
+	vim.api.nvim_create_autocmd("User", {
+		pattern = { "LazyDone", "VeryLazy" },
+		group = vim.api.nvim_create_augroup("UCoreUnrealCppLazyRetry", { clear = true }),
+		callback = function()
+			vim.defer_fn(activate_existing_buffers, 100)
+			vim.defer_fn(activate_existing_buffers, 500)
 		end,
 	})
 end
