@@ -115,6 +115,23 @@ local function status_progress_finish()
 	end)
 end
 
+local function parser_installed()
+	local parser_dir = vim.fn.stdpath("data") .. "/site/parser"
+	local candidates = {
+		parser_dir .. "/" .. parser_name .. ".so",
+		parser_dir .. "/" .. parser_name .. ".dll",
+		parser_dir .. "/" .. parser_name .. ".dylib",
+	}
+
+	for _, path in ipairs(candidates) do
+		if vim.fn.filereadable(path) == 1 then
+			return true
+		end
+	end
+
+	return false
+end
+
 -- Retry pending buffers after install finishes.
 -- 安装完成后重试所有等待中的 buffer。
 local function retry_pending()
@@ -139,11 +156,7 @@ local function ensure_parser_installed()
 		return
 	end
 
-	local parser_dir = vim.fn.stdpath("data") .. "/site/parser"
-	local suffix = vim.fn.has("win32") == 1 and ".dll" or ".so"
-	local parser_file = parser_dir .. "/" .. parser_name .. suffix
-
-	if vim.fn.filereadable(parser_file) == 1 then
+	if parser_installed() then
 		install_attempted = true
 		return
 	end
@@ -156,7 +169,7 @@ local function ensure_parser_installed()
 	installing = false
 	install_attempted = true
 
-	if vim.fn.filereadable(parser_file) == 1 then
+	if parser_installed() then
 		status_progress_finish()
 		retry_pending()
 	else
@@ -240,9 +253,6 @@ function M.setup()
 		pattern = parser_name,
 		group = vim.api.nvim_create_augroup("UCoreUnrealCppActivate", { clear = true }),
 		callback = function(ev)
-			if config.values.treesitter.auto_install then
-				ensure_parser_installed()
-			end
 			if config.values.treesitter.auto_start then
 				vim.schedule(function()
 					M.activate_buffer(ev.buf)
