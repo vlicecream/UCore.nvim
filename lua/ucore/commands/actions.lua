@@ -267,9 +267,25 @@ function M.collect_dashboard_state()
 	return state
 end
 
--- Return a display label for project index readiness.
--- 返回项目索引就绪状态的显示标签。
-local function project_index_label(state)
+-- Pad a string on the right using display width.
+-- 按显示宽度右侧补空格。
+local function pad_right(text, width)
+	text = tostring(text or "")
+	local padding = math.max(0, width - vim.fn.strdisplaywidth(text))
+	return text .. string.rep(" ", padding)
+end
+
+-- Badge helpers — each returns a bracket label for one dashboard item.
+-- Badge 辅助函数——每个返回一个方括号标签。
+
+local function project_label(state)
+	if not state.project_name then
+		return "[no project]"
+	end
+	return "[" .. state.project_name .. "]"
+end
+
+local function index_label(state)
 	if not state.project_root then
 		return "[no project]"
 	end
@@ -279,47 +295,103 @@ local function project_index_label(state)
 	return "[ready]"
 end
 
--- Build a guard that shows a helpful message when the action cannot run.
--- opts.needs_db: also check that the project database exists.
--- 构造一个 guard，当操作无法运行时显示友好提示。
--- opts.needs_db: 额外检查项目数据库是否存在。
-local function dashboard_guard(opts, run_fn)
-	if type(opts) == "function" then
-		run_fn = opts
-		opts = {}
+local function cursor_label(state)
+	if not state.project_root then
+		return "[no project]"
 	end
+	return "[cursor symbol]"
+end
 
+local function build_label(state)
+	if not state.project_root then
+		return "[no project]"
+	end
+	return "[Win64 Development]"
+end
+
+local function editor_label(state)
+	if not state.project_root then
+		return "[no project]"
+	end
+	return "[build first]"
+end
+
+local function server_label(state)
+	return state.server_running and "[server online]" or "[server offline]"
+end
+
+local function log_label(state)
+	return (state.log_exists == "ok") and "[available]" or "[missing]"
+end
+
+local function registered_label(state)
+	if state.registered_count > 0 then
+		return "[" .. state.registered_count .. " registered]"
+	end
+	return "[none registered]"
+end
+
+-- Show a helpful message when not inside an Unreal project.
+-- 当前不在 Unreal 项目时显示友好提示。
+local function notify_no_project()
+	local items = project.list_registered_projects()
+	if vim.tbl_isempty(items) then
+		vim.notify(
+			"Not inside an Unreal project.\nOpen a .uproject file and run :UCore boot first.",
+			vim.log.levels.WARN
+		)
+	else
+		vim.notify(
+			"Not inside an Unreal project.\nUse 'Open registered project' below or open a .uproject file.",
+			vim.log.levels.WARN
+		)
+	end
+end
+
+-- Guard: the action needs an active Unreal project.
+-- Guard：操作需要当前在 Unreal 项目中。
+local function project_guard(fn)
+	return function()
+		local root = project.find_project_root()
+		if root then
+			return fn()
+		end
+		notify_no_project()
+	end
+end
+
+-- Guard: the action needs both a project root and an existing index database.
+-- Guard：操作需要项目根目录和已存在的索引数据库。
+local function index_guard(fn)
 	return function()
 		local root = project.find_project_root()
 		if not root then
-			local items = project.list_registered_projects()
-			if vim.tbl_isempty(items) then
-				vim.notify(
-					"Not inside an Unreal project.\nOpen a .uproject file and run :UCore boot first.",
-					vim.log.levels.WARN
-				)
-			else
-				vim.notify(
-					"Not inside an Unreal project.\nUse 'Open registered project' below or open a .uproject file.",
-					vim.log.levels.WARN
-				)
-			end
+			notify_no_project()
 			return
 		end
 
-		if opts.needs_db then
-			local paths = project.build_paths(root)
-			if vim.fn.filereadable(paths.db_path) ~= 1 then
-				vim.notify(
-					"Project index not found.\nRun 'Boot current project' first to create the index.",
-					vim.log.levels.WARN
-				)
-				return
-			end
+		local paths = project.build_paths(root)
+		if vim.fn.filereadable(paths.db_path) ~= 1 then
+			vim.notify(
+				"Project index is missing.\nChoose 'Boot current project' from :UCore first.",
+				vim.log.levels.WARN
+			)
+			return
 		end
 
-		run_fn()
+		fn()
 	end
+end
+
+-- Format one dashboard item row with fixed-width columns.
+-- 固定宽度列排版一次 dashboard item。
+local function dashboard_format(item)
+	return string.format(
+		"%s  %s  - %s",
+		pad_right(item.label, 28),
+		pad_right(item.badge, 18),
+		item.description
+	)
 end
 
 -- Open the main UCore project dashboard.
@@ -327,66 +399,71 @@ end
 function M.dashboard()
 	local s = M.collect_dashboard_state()
 
-	local server_state = s.server_running and "online" or "offline"
-
 	local items = {
 		{
 			label = "Boot current project",
-			detail = s.project_name and ("[" .. s.project_name .. "]") or "[no project]",
+			badge = project_label(s),
+			description = "Start server and prepare indexes",
 			run = M.boot,
 		},
 		{
 			label = "Find indexed items",
-			detail = project_index_label(s),
-			run = dashboard_guard({ needs_db = true }, function()
+			badge = index_label(s),
+			description = "Search symbols, modules, assets, config",
+			run = index_guard(function()
 				M.find("")
 			end),
 		},
 		{
 			label = "Go to definition",
-			detail = s.project_root and "[cursor symbol]" or "[no project]",
-			run = dashboard_guard(M.goto_definition),
+			badge = cursor_label(s),
+			description = "Jump from symbol under cursor",
+			run = project_guard(M.goto_definition),
 		},
 		{
 			label = "Find references",
-			detail = s.project_root and "[cursor symbol]" or "[no project]",
-			run = dashboard_guard(M.references),
+			badge = cursor_label(s),
+			description = "Find references for symbol under cursor",
+			run = project_guard(M.references),
 		},
 		{
 			label = "Build editor target",
-			detail = s.project_root and "[Win64 Development]" or "[no project]",
-			run = dashboard_guard(function()
+			badge = build_label(s),
+			description = "Build current Editor target",
+			run = project_guard(function()
 				M.build("")
 			end),
 		},
 		{
 			label = "Open Unreal Editor",
-			detail = s.project_root and "[build first]" or "[no project]",
-			run = dashboard_guard(function()
+			badge = editor_label(s),
+			description = "Build then launch Unreal Editor",
+			run = project_guard(function()
 				M.editor("")
 			end),
 		},
 		{
 			label = "Open status",
-			detail = "[server " .. server_state .. "]",
+			badge = server_label(s),
+			description = "Inspect runtime state",
 			run = M.status,
 		},
 		{
 			label = "Open logs",
-			detail = (s.log_exists == "ok") and "[available]" or "[missing]",
+			badge = log_label(s),
+			description = "Open latest server log",
 			run = M.logs,
 		},
 		{
 			label = "Open registered project",
-			detail = s.registered_count > 0 and ("[" .. s.registered_count .. " registered]") or "[none registered]",
+			badge = registered_label(s),
+			description = "Pick a known Unreal project",
 			run = M.open_project,
 		},
 	}
 
 	ui.select.items("UCore dashboard", items, {
-		format_item = function(item)
-			return string.format("%s  %s", item.label, item.detail)
-		end,
+		format_item = dashboard_format,
 		on_choice = function(item)
 			if item and item.run then
 				item.run()

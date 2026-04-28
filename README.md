@@ -187,10 +187,11 @@ User commands:
 :UCore help         " Show user commands
 ```
 
-The Dashboard (`:UCore`) shows state badges on every item — project name,
-index readiness (`ready` / `needs boot` / `no project`), server status, log
-availability, and registered project count. Actions that need a project or an
-index show a helpful redirect when the prerequisite is missing.
+The Dashboard (`:UCore`) shows state badges and descriptions on every item —
+project name, index readiness (`ready` / `needs boot` / `no project`), server
+status, log availability, and registered project count. Items are laid out in
+fixed-width columns for easy scanning. Actions that need a project or an index
+show a helpful redirect when the prerequisite is missing.
 
 Diagnostics:
 
