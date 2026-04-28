@@ -267,27 +267,58 @@ function M.collect_dashboard_state()
 	return state
 end
 
--- Build a guard that shows a helpful message when no Unreal project is active.
--- 构造一个 guard，当不在 Unreal 工程中时显示友好提示。
-local function dashboard_guard(run_fn)
+-- Return a display label for project index readiness.
+-- 返回项目索引就绪状态的显示标签。
+local function project_index_label(state)
+	if not state.project_root then
+		return "[no project]"
+	end
+	if state.project_db_state ~= "ok" then
+		return "[needs boot]"
+	end
+	return "[ready]"
+end
+
+-- Build a guard that shows a helpful message when the action cannot run.
+-- opts.needs_db: also check that the project database exists.
+-- 构造一个 guard，当操作无法运行时显示友好提示。
+-- opts.needs_db: 额外检查项目数据库是否存在。
+local function dashboard_guard(opts, run_fn)
+	if type(opts) == "function" then
+		run_fn = opts
+		opts = {}
+	end
+
 	return function()
 		local root = project.find_project_root()
-		if root then
-			return run_fn()
+		if not root then
+			local items = project.list_registered_projects()
+			if vim.tbl_isempty(items) then
+				vim.notify(
+					"Not inside an Unreal project.\nOpen a .uproject file and run :UCore boot first.",
+					vim.log.levels.WARN
+				)
+			else
+				vim.notify(
+					"Not inside an Unreal project.\nUse 'Open registered project' below or open a .uproject file.",
+					vim.log.levels.WARN
+				)
+			end
+			return
 		end
 
-		local items = project.list_registered_projects()
-		if vim.tbl_isempty(items) then
-			vim.notify(
-				"Not inside an Unreal project.\nOpen a .uproject file and run :UCore boot first.",
-				vim.log.levels.WARN
-			)
-		else
-			vim.notify(
-				"Not inside an Unreal project.\nUse 'Open registered project' below or open a .uproject file.",
-				vim.log.levels.WARN
-			)
+		if opts.needs_db then
+			local paths = project.build_paths(root)
+			if vim.fn.filereadable(paths.db_path) ~= 1 then
+				vim.notify(
+					"Project index not found.\nRun 'Boot current project' first to create the index.",
+					vim.log.levels.WARN
+				)
+				return
+			end
 		end
+
+		run_fn()
 	end
 end
 
@@ -306,8 +337,8 @@ function M.dashboard()
 		},
 		{
 			label = "Find indexed items",
-			detail = s.project_root and "[ready]" or "[no project]",
-			run = dashboard_guard(function()
+			detail = project_index_label(s),
+			run = dashboard_guard({ needs_db = true }, function()
 				M.find("")
 			end),
 		},
