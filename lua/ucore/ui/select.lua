@@ -663,6 +663,16 @@ local function pick(title, items, format_item, on_choice)
 	return pick_vim(title, items, format_item, on_choice)
 end
 
+-- Pick generic action items.
+-- 选择通用动作项。
+function M.items(title, items, opts)
+	opts = opts or {}
+
+	pick(title, items, opts.format_item or function(item)
+		return tostring(item.label or item.name or item.title or item)
+	end, opts.on_choice or function() end)
+end
+
 -- Pick a registered Unreal project.
 -- 选择一个已注册 Unreal 项目。
 function M.projects(items, on_choice)

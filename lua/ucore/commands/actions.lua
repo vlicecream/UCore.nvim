@@ -29,6 +29,16 @@ local function show_find_results(pattern, items)
 	})
 end
 
+local function current_project_label()
+	local root = project.find_project_root()
+	if not root then
+		return "No Unreal project detected"
+	end
+
+	local name = vim.fn.fnamemodify(root, ":t")
+	return string.format("%s - %s", name, root)
+end
+
 local function yes_no(value)
 	return value and "yes" or "no"
 end
@@ -212,6 +222,75 @@ end
 -- 打印已注册项目。
 function M.projects()
 	print(vim.inspect(project.list_registered_projects()))
+end
+
+-- Open the main UCore project dashboard.
+-- 打开 UCore 项目主面板。
+function M.dashboard()
+	local items = {
+		{
+			label = "Boot current project",
+			detail = current_project_label(),
+			run = M.boot,
+		},
+		{
+			label = "Find indexed items",
+			detail = "Symbols, modules, assets, and config values",
+			run = function()
+				M.find("")
+			end,
+		},
+		{
+			label = "Go to definition",
+			detail = "Jump from the symbol under cursor",
+			run = M.goto_definition,
+		},
+		{
+			label = "Find references",
+			detail = "Find references for the symbol under cursor",
+			run = M.references,
+		},
+		{
+			label = "Build editor target",
+			detail = "<ProjectName>Editor Win64 Development",
+			run = function()
+				M.build("")
+			end,
+		},
+		{
+			label = "Open Unreal Editor",
+			detail = "Build first, then launch the current .uproject",
+			run = function()
+				M.editor("")
+			end,
+		},
+		{
+			label = "Open status",
+			detail = "Runtime paths, server, project, and engine state",
+			run = M.status,
+		},
+		{
+			label = "Open logs",
+			detail = "Latest UCore server log",
+			run = M.logs,
+		},
+		{
+			label = "Open registered project",
+			detail = "Pick a project from the UCore registry",
+			run = M.open_project,
+		},
+	}
+
+	ui.select.items("UCore dashboard", items, {
+		format_item = function(item)
+			return string.format("%s - %s", item.label, item.detail)
+		end,
+		on_choice = function(item)
+			if item and item.run then
+				item.run()
+			end
+		end,
+	})
 end
 
 -- :UCore boot

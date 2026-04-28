@@ -7,7 +7,7 @@ local M = {}
 -- 把子命令转成小写，从而支持大小写不敏感。
 local function normalize_subcommand(args)
 	local sub = (args.args or ""):match("^%s*(%S+)")
-	return sub and sub:lower() or "boot"
+	return sub and sub:lower() or "dashboard"
 end
 
 -- Return the rest of the command line after the subcommand.
@@ -76,6 +76,7 @@ function M.dispatch(args)
   local tail = command_tail(args)
 
   local handlers = {
+    dashboard = actions.dashboard,
     boot = actions.boot,
     build = function()
       actions.build(tail)
@@ -131,6 +132,7 @@ function M.register()
 		nargs = "*",
 		complete = function(arglead)
 			local items = {
+				"dashboard",
 				"boot",
 				"build",
 				"build-cancel",
