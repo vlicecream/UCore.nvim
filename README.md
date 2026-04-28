@@ -345,21 +345,23 @@ https://github.com/vlicecream/UTreeSitter
 - Unreal project filetype detection for `.cpp`, `.h`, `.hpp`, `.inl`, etc.
 - default highlight groups for Unreal C++
 
-When you open an Unreal C++ file inside a project, UCore will:
+When you open an Unreal C++ file inside a project for the first time:
 
-1. Detect the file belongs to an Unreal project.
-2. Set the filetype to `unreal_cpp`.
-3. Auto-install the parser if missing (via `:TSInstallSync unreal_cpp`).
-4. Start tree-sitter highlighting on the current buffer immediately.
+1. UCore detects the file belongs to an Unreal project and sets filetype `unreal_cpp`.
+2. It checks whether the parser can attach. If not, it waits for nvim-treesitter
+   and the parser config to become ready (retries up to 20 times, 300ms apart).
+3. Once ready, it runs `:TSInstallSync unreal_cpp` automatically.
+4. After installation, highlighting starts on the current buffer — no reopen needed.
 
-No restart or manual `:TSInstall` needed — the first open Just Works.
+If the install fails or the network is slow, UCore retries silently and only shows
+a single warning after all retries are exhausted:
 
-If `:TSInstall unreal_cpp` says the language is unsupported, make sure UCore is
-loaded before running the install command, then run:
-
-```vim
-:checkhealth ucore
 ```
+:checkhealth ucore
+:TSInstallSync unreal_cpp
+```
+
+No restart or repeated file opens needed — the first open Just Works.
 
 ## Completion
 
