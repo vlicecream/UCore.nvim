@@ -61,6 +61,7 @@ local function dispatch_debug(tail)
 		complete = actions.complete,
 		goto = actions.goto_definition,
 		references = actions.references,
+		vcs = actions.vcs_debug,
 	}
 
 	local handler = handlers[sub]
@@ -93,6 +94,9 @@ function M.dispatch(args)
     end,
     goto = actions.goto_definition,
     references = actions.references,
+    changes = actions.changes,
+    checkout = actions.checkout,
+    commit = actions.commit,
     debug = function()
       dispatch_debug(tail)
     end,
@@ -135,6 +139,9 @@ function M.register()
 				"boot",
 				"build",
 				"build-cancel",
+				"changes",
+				"checkout",
+				"commit",
 				"editor",
 				"find",
 				"goto",
@@ -164,6 +171,7 @@ function M.register()
 				"complete",
 				"goto",
 				"references",
+				"vcs",
 				"help",
 			}
 

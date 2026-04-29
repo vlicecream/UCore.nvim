@@ -170,6 +170,30 @@ M.values = {
 		debounce_ms = 120,
 	},
 
+	-- VCS integration options.
+	-- 版本控制系统（VCS）集成配置。
+	vcs = {
+		-- Enable VCS features: detect, status, checkout, readonly prompt.
+		-- 是否启用 VCS 功能：检测、状态、checkout、只读保存提示。
+		enable = true,
+
+		-- Show a prompt when saving a read-only P4 file.
+		-- 保存 P4 只读文件时是否弹出确认对话框。
+		prompt_on_readonly_save = true,
+
+		-- VCS provider: "auto" for auto-detect, or "p4", "git", "svn".
+		-- VCS 提供者："auto" 自动检测，或指定 "p4"、"git"、"svn"。
+		provider = "auto",
+
+		-- P4-specific options.
+		-- P4 专有选项。
+		p4 = {
+			-- Path to the p4 executable.
+			-- p4 可执行文件路径。
+			command = "p4",
+		},
+	},
+
 	-- Development mode: call Cargo directly so code changes are picked up.
 	-- 开发模式：直接调用 Cargo，方便 Rust 代码修改后立即生效。
 	scanner_cmd = cargo_scanner_cmd(),

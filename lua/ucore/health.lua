@@ -389,6 +389,47 @@ local function report_treesitter_checks()
 	end
 end
 
+local function report_vcs_checks()
+	start("UCore VCS")
+
+	local vcs_config = config.values.vcs or {}
+	info("enabled: " .. yes_no(vcs_config.enable ~= false))
+	info("provider: " .. tostring(vcs_config.provider or "auto"))
+	info("prompt on readonly save: " .. yes_no(vcs_config.prompt_on_readonly_save ~= false))
+
+	if vcs_config.enable == false then
+		return
+	end
+
+	if executable("p4") then
+		ok("p4 executable found")
+	else
+		warn("p4 not found on PATH")
+	end
+
+	if executable("git") then
+		ok("git executable found")
+	end
+
+	if executable("svn") then
+		ok("svn executable found")
+	end
+
+	local buffer_path = vim.api.nvim_buf_get_name(0)
+	local root = buffer_path ~= "" and project.find_project_root(buffer_path)
+
+	if root then
+		local provider = pcall(require("ucore.vcs").detect, root)
+		if provider then
+			ok("VCS provider detected for project: " .. tostring(provider.name():upper()))
+		else
+			info("No VCS provider detected for current project root")
+		end
+	else
+		info("Open a file inside an Unreal project to detect VCS provider")
+	end
+end
+
 -- Neovim calls this function for :checkhealth ucore.
 -- Neovim 会在 :checkhealth ucore 时调用这个函数。
 function M.check()
@@ -398,6 +439,7 @@ function M.check()
 	report_ui_checks()
 	report_completion_checks()
 	report_treesitter_checks()
+	report_vcs_checks()
 end
 
 return M

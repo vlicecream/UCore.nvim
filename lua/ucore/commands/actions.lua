@@ -9,6 +9,7 @@ local unreal = require("ucore.unreal")
 local bootstrap = require("ucore.bootstrap")
 local completion = require("ucore.completion")
 local navigation = require("ucore.navigation")
+local vcs = require("ucore.vcs")
 
 local M = {}
 
@@ -478,6 +479,32 @@ function M.dashboard()
 			run = M.open_project,
 		},
 	}
+
+	if s.project_root then
+		local _, project_vcs = pcall(vcs.detect, s.project_root)
+		if project_vcs then
+			vim.list_extend(items, {
+				{
+					label = "Source Control: " .. project_vcs.name():upper() .. " changes",
+					badge = "[" .. project_vcs.name():upper() .. "]",
+					description = "List changed files",
+					run = M.changes,
+				},
+				{
+					label = "Source Control: Checkout current file",
+					badge = "[" .. project_vcs.name():upper() .. "]",
+					description = "p4 edit for current buffer",
+					run = M.checkout,
+				},
+				{
+					label = "Source Control: Commit",
+					badge = "[" .. project_vcs.name():upper() .. "]",
+					description = "Commit changes (UI coming soon)",
+					run = M.commit,
+				},
+			})
+		end
+	end
 
 	ui.select.items("UCore dashboard", items, {
 		format_item = dashboard_format,
@@ -964,6 +991,139 @@ function M.maps()
 	end)
 end
 
+-- :UCore changes
+-- Show VCS changes for the current project.
+-- 显示当前项目的 VCS 改动。
+function M.changes()
+  local root = project.find_project_root()
+  if not root then
+    return vim.notify("Could not find .uproject", vim.log.levels.ERROR)
+  end
+
+  local items = vcs.collect_changes(root)
+  if not items or vim.tbl_isempty(items) then
+    return vim.notify("UCore: no VCS changes found", vim.log.levels.INFO)
+  end
+
+  ui.select.items("UCore changes", items, {
+    format_item = function(item)
+      return string.format("%s  [%s]  %s", item.provider, item.status, item.path)
+    end,
+    on_choice = function(item)
+      if item and item.path and vim.fn.filereadable(item.path) == 1 then
+        vim.cmd.edit(vim.fn.fnameescape(item.path))
+      elseif item and item.path then
+        vim.notify("File not found: " .. item.path, vim.log.levels.WARN)
+      end
+    end,
+  })
+end
+
+-- :UCore checkout
+-- Checkout the current buffer file via VCS (p4 edit).
+-- 对当前文件执行 VCS checkout（P4 下为 p4 edit）。
+function M.checkout()
+  local path = vim.api.nvim_buf_get_name(0)
+  if path == "" then
+    return vim.notify("UCore: no file in current buffer", vim.log.levels.WARN)
+  end
+
+  local provider = vcs.detect_for_path(path)
+  if not provider then
+    return vim.notify("UCore: no VCS provider detected for this file", vim.log.levels.WARN)
+  end
+
+  if provider.name() ~= "p4" then
+    return vim.notify("UCore: checkout is a no-op for " .. provider.name():upper(), vim.log.levels.INFO)
+  end
+
+  local ok, err = provider.checkout(path)
+  if ok then
+    vim.bo[0].readonly = false
+    vim.notify("UCore: p4 edit " .. vim.fn.fnamemodify(path, ":t"), vim.log.levels.INFO)
+  else
+    vim.notify("UCore checkout failed: " .. tostring(err), vim.log.levels.ERROR)
+  end
+end
+
+-- :UCore commit
+-- VCS commit placeholder (v1: UI coming soon).
+-- VCS 提交占位（v1：提交界面正在开发中）。
+function M.commit()
+  vim.notify("UCore: commit UI coming soon", vim.log.levels.INFO)
+end
+
+-- :UCore debug vcs
+-- Print VCS diagnostics for the current file/project.
+-- 打印当前文件/项目的 VCS 诊断信息。
+function M.vcs_debug()
+  local path = vim.api.nvim_buf_get_name(0)
+  local root = project.find_project_root(path)
+
+  local lines = {
+    "UCore VCS Debug",
+    "",
+    "Current buffer: " .. (path ~= "" and path or "(none)"),
+    "Project root: " .. tostring(root or "(not in Unreal project)"),
+  }
+
+  if root then
+    local provider = vcs.detect(root)
+    if provider then
+      lines[#lines + 1] = "Provider: " .. provider.name():upper()
+
+      if provider.name() == "p4" then
+        local info, info_err = provider.info(root)
+        if info then
+          lines[#lines + 1] = "P4 client: " .. tostring(info["client name"] or "?")
+          lines[#lines + 1] = "P4 user: " .. tostring(info["user name"] or "?")
+          lines[#lines + 1] = "P4 root: " .. tostring(info["client root"] or "?")
+          lines[#lines + 1] = "P4 server: " .. tostring(info["server address"] or "?")
+        else
+          lines[#lines + 1] = "P4 info: " .. tostring(info_err)
+        end
+
+        if path and path ~= "" then
+          lines[#lines + 1] = ""
+          lines[#lines + 1] = "Current file:"
+          lines[#lines + 1] = "  writable: " .. tostring(vim.fn.filewritable(path) == 1)
+          lines[#lines + 1] = "  buffer readonly: " .. tostring(vim.bo[0].readonly)
+          local opened = provider.is_opened(path)
+          lines[#lines + 1] = "  p4 opened: " .. tostring(opened)
+        end
+
+        lines[#lines + 1] = ""
+        lines[#lines + 1] = "All opened files:"
+        local opened_files = provider.opened(root)
+        if #opened_files > 0 then
+          for _, f in ipairs(opened_files) do
+            lines[#lines + 1] = "  [" .. f.action .. "] " .. f.path
+          end
+        else
+          lines[#lines + 1] = "  (none)"
+        end
+      elseif provider.name() == "git" or provider.name() == "svn" then
+        local files = provider.status(root)
+        lines[#lines + 1] = "Status entries: " .. tostring(#(files or {}))
+        for _, f in ipairs(files or {}) do
+          lines[#lines + 1] = "  [" .. f.status .. "] " .. (f.path or "")
+        end
+      end
+    else
+      lines[#lines + 1] = "Provider: none (not in a VCS workspace)"
+    end
+  end
+
+  vim.cmd("botright new")
+  local buf = vim.api.nvim_get_current_buf()
+  vim.bo[buf].buftype = "nofile"
+  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].swapfile = false
+  vim.bo[buf].filetype = "ucore-status"
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].modified = false
+end
+
 -- Print :UCore command help.
 -- 打印 :UCore 命令帮助。
 function M.help()
@@ -976,8 +1136,11 @@ UCore commands:
   :UCore build-cancel Cancel the currently running Unreal build
   :UCore editor       Open current project in Unreal Editor
   :UCore find         Find indexed symbols, modules, assets, config
-  :UCore goto         Go to definition at cursor
+   :UCore goto         Go to definition at cursor
   :UCore references   Find references at cursor
+  :UCore changes      Show VCS changes for current project
+  :UCore checkout     Checkout current file (p4 edit)
+  :UCore commit       VCS commit (UI coming soon)
   :UCore debug        Debug and lifecycle subcommands
   :UCore help         Show this help
 ]])
@@ -1011,6 +1174,7 @@ UCore debug commands:
   :UCore debug references   Find references at cursor
   :UCore debug complete     Trigger manual completion in Insert mode
   :UCore debug maps         Print Lua-side component/module maps
+  :UCore debug vcs          Print VCS diagnostics
   :UCore debug help         Show this help
 ]])
 end
