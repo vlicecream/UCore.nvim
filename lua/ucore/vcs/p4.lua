@@ -2,6 +2,11 @@ local config = require("ucore.config")
 
 local M = {}
 
+local function sanitize(path)
+  if not path then return "" end
+  return tostring(path):gsub("\0", "")
+end
+
 local function executable(name)
   return vim.fn.executable(name) == 1
 end
@@ -60,7 +65,7 @@ function M.p4_cmd(subcommand, args)
   local vcs_p4 = (config.values.vcs or {}).p4 or {}
   local cmd = { vcs_p4.command or "p4", subcommand }
   for _, a in ipairs(args or {}) do
-    cmd[#cmd + 1] = a
+    cmd[#cmd + 1] = sanitize(a)
   end
   return cmd
 end
@@ -270,6 +275,7 @@ function M.client_root()
 end
 
 function M.is_opened(path)
+  path = sanitize(path)
   local result = M.system(M.p4_cmd("opened", {path:gsub("/", "\\")}))
   return vim.v.shell_error == 0 and result ~= ""
 end
@@ -314,8 +320,9 @@ function M.status(root)
 end
 
 function M.checkout(path, root)
-  if not is_real_local_path(path, root) then
-    return false, "invalid local file path: " .. tostring(path)
+  path = sanitize(path)
+  if vim.fn.filereadable(path) ~= 1 then
+    return false, "file not found: " .. path
   end
   local stdout, stderr, code = M.system_err(M.p4_cmd("edit", {path:gsub("/", "\\")}))
   if code ~= 0 then
@@ -326,6 +333,7 @@ function M.checkout(path, root)
 end
 
 function M.diff(path, root)
+  path = sanitize(path)
   if not is_real_local_path(path, root) then
     return nil, "invalid local file path: " .. tostring(path)
   end
@@ -381,6 +389,7 @@ function M.create_changelist(description)
 end
 
 function M.reopen_file(path, change_num)
+  path = sanitize(path)
   local stdout, stderr, code = M.system_err(M.p4_cmd("reopen", {"-c", tostring(change_num), path:gsub("/", "\\")}))
   if code ~= 0 then
     return false, (stderr ~= "" and stderr or stdout):match("[^\r\n]+") or "reopen failed"
@@ -403,8 +412,8 @@ function M.commit(root, files, message, opts)
   end
 
   local reopen_errs = {}
-  for _, path in ipairs(files or {}) do
-    local ok, reopen_err = M.reopen_file(path, change_num)
+  for _, raw_path in ipairs(files or {}) do
+    local ok, reopen_err = M.reopen_file(raw_path, change_num)
     if not ok then
       table.insert(reopen_errs, vim.fn.fnamemodify(path, ":t") .. ": " .. tostring(reopen_err))
     end
@@ -427,16 +436,21 @@ function M.commit(root, files, message, opts)
 end
 
 function M.do_revert(path, root)
-  if not is_real_local_path(path, root) then
-    return false, "invalid local file path: " .. tostring(path)
+  path = sanitize(path)
+  if vim.fn.filereadable(path) ~= 1 then
+    return false, "file not found: " .. path
   end
-  M.system(M.p4_cmd("revert", {path:gsub("/", "\\")}))
-  return vim.v.shell_error == 0, nil
+  local stdout, stderr, code = M.system_err(M.p4_cmd("revert", {path:gsub("/", "\\")}))
+  if code ~= 0 then
+    return false, (stderr ~= "" and stderr or stdout):match("[^\r\n]+") or "p4 revert failed"
+  end
+  return true, nil
 end
 
 function M.add_file(path, root)
+  path = sanitize(path)
   if not is_real_local_path(path, root) then
-    return false, "invalid local file path: " .. tostring(path)
+    return false, "invalid local file path: " .. path
   end
   local stdout, stderr, code = M.system_err(M.p4_cmd("add", {path:gsub("/", "\\")}))
   if code ~= 0 then

@@ -488,40 +488,81 @@ local function render_status_text()
   return "ready"
 end
 
-local function help_line(width)
-  local items = {
-    "j/k move",
-    "Space toggle",
-    "Enter open",
-    "d diff",
-    "c checkout",
-    "a add",
-    "r revert",
-    "m commit",
-    "R refresh",
-    "q close",
-  }
-  local short_items = {
-    "j/k move",
-    "d diff",
-    "m commit",
-    "R refresh",
-    "q close",
-  }
+local DASHBOARD_FOOTER_ITEMS = {
+  { key = "j/k",    label = "move" },
+  { key = "Space",  label = "toggle" },
+  { key = "Enter",  label = "open" },
+  { key = "d",      label = "diff" },
+  { key = "c",      label = "checkout" },
+  { key = "a",      label = "add" },
+  { key = "r",      label = "revert" },
+  { key = "m",      label = "commit" },
+  { key = "R",      label = "refresh" },
+  { key = "q",      label = "close" },
+}
+
+local DASHBOARD_FOOTER_SHORT_ITEMS = {
+  { key = "j/k", label = "move" },
+  { key = "d",   label = "diff" },
+  { key = "m",   label = "commit" },
+  { key = "R",   label = "refresh" },
+  { key = "q",   label = "close" },
+}
+
+local function build_shortcut_line(width, items, short_items, opts)
+  opts = opts or {}
+  local padding = opts.padding or 2
+  local min_gap = opts.min_gap or 2
+  local available = math.max(0, width - padding * 2)
+
   local active = items
-  local total = 0
-  for _, item in ipairs(active) do
-    total = total + vim.fn.strdisplaywidth(item)
-  end
-  if total + (#active - 1) * 2 > width - 2 then
-    active = short_items
-    total = 0
+  local spans = {}
+
+  for attempt = 1, 3 do
+    local item_texts = {}
+    local total_w = 0
     for _, item in ipairs(active) do
-      total = total + vim.fn.strdisplaywidth(item)
+      local text = item.key .. " " .. item.label
+      table.insert(item_texts, { text = text, w = vim.fn.strdisplaywidth(text), key = item.key })
+      total_w = total_w + vim.fn.strdisplaywidth(text)
+    end
+
+    local count = #active
+    local gaps = math.max(0, count - 1)
+    local remaining = available - total_w
+    local gap_w = 0
+
+    if remaining >= 0 then
+      gap_w = gaps > 0 and math.max(min_gap, math.floor(remaining / gaps)) or 0
+      local used = total_w + gap_w * gaps
+      local extra = available - used
+      local left_pad = math.floor(extra / 2)
+      local col = padding + left_pad
+
+      local prefix = string.rep(" ", padding + left_pad)
+      local parts = {}
+      for _, it in ipairs(item_texts) do
+        table.insert(spans, { start = col, finish = col + #it.key })
+        table.insert(parts, it.text)
+        col = col + it.w + gap_w
+      end
+      local line = prefix .. table.concat(parts, string.rep(" ", gap_w))
+      local suffix = math.max(0, width - vim.fn.strdisplaywidth(line))
+      return line .. string.rep(" ", suffix), spans
+    end
+
+    if attempt == 1 and short_items then
+      active = short_items
+    elseif attempt == 2 and min_gap > 1 then
+      min_gap = 1
+    else
+      break
     end
   end
-  local gap = math.max(2, math.floor((width - 2 - total) / math.max(1, #active - 1)))
-  return " " .. table.concat(active, string.rep(" ", gap))
+
+  local fallback = string.rep(" ", padding)
+      .. vim.fn.strcharpart(table.concat(vim.tbl_map(function(i) return i.key .. " " .. i.label end, active), " "), 0, math.max(0, width - padding * 2))
+  return fallback, {}
 end
 
 local function pad_to_width(text, width)
@@ -584,19 +625,15 @@ function M.render_footer()
   if not state or not state.wins or not state.wins.footer_buf then return end
   local buf = state.wins.footer_buf
   local width = vim.api.nvim_win_get_width(state.wins.footer_win)
-  local line = help_line(width)
+  local line, spans = build_shortcut_line(width, DASHBOARD_FOOTER_ITEMS, DASHBOARD_FOOTER_SHORT_ITEMS, {
+    padding = 4, min_gap = 2,
+  })
   vim.bo[buf].modifiable = true
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, { line })
   vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
   vim.api.nvim_buf_add_highlight(buf, ns, "UCoreVcsHelp", 0, 0, -1)
-  for _, key in ipairs({ "j/k", "Space", "Enter" }) do
-    add_pattern_highlight(buf, 0, line, key, "UCoreVcsFooterKey")
-  end
-  for _, phrase in ipairs({ "d diff", "c checkout", "a add", "r revert", "m commit", "R refresh", "q close" }) do
-    local start_col = line:find(phrase, 1, true)
-    if start_col then
-      vim.api.nvim_buf_add_highlight(buf, ns, "UCoreVcsFooterKey", 0, start_col - 1, start_col)
-    end
+  for _, span in ipairs(spans) do
+    vim.api.nvim_buf_add_highlight(buf, ns, "UCoreVcsFooterKey", 0, span.start, span.finish)
   end
   vim.bo[buf].modifiable = false
 end
@@ -858,6 +895,7 @@ end
 
 local function load_file_diff(item)
   if not state or not item or not item.path then return end
+  if vim.fn.filereadable(item.path) ~= 1 then return end
   if not is_dashboard_file(item.path) then
     state.cache.diff[item.path] = { error = "invalid local file path: " .. tostring(item.path) }
     M.render_right()
@@ -1030,6 +1068,10 @@ local function setup_keymaps()
       vim.notify("UCore: move to a file row", vim.log.levels.INFO)
       return
     end
+    if not item.path or vim.fn.filereadable(item.path) ~= 1 then
+      vim.notify("UCore: file not found on disk: " .. tostring(item.path), vim.log.levels.WARN)
+      return
+    end
     load_file_diff(item)
   end, opts)
 
@@ -1037,6 +1079,10 @@ local function setup_keymaps()
     local item = get_current_item()
     if not item or item.kind ~= "file" then
       vim.notify("UCore: move to a file row", vim.log.levels.INFO)
+      return
+    end
+    if not item.path or vim.fn.filereadable(item.path) ~= 1 then
+      vim.notify("UCore: file not found on disk", vim.log.levels.WARN)
       return
     end
     if item.section == "opened" then

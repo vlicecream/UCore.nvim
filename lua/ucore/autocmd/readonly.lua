@@ -94,6 +94,52 @@ function M.setup()
       end
     end,
   })
+
+  local prompted = {}
+  vim.api.nvim_create_autocmd("InsertEnter", {
+    group = group,
+    pattern = "*",
+    callback = function(ev)
+      local buf = ev.buf
+      if prompted[buf] then return end
+
+      local path = vim.api.nvim_buf_get_name(buf)
+      if vim.bo[buf].buftype ~= "" or path == "" then return end
+      if not vim.bo[buf].modified and not vim.bo[buf].readonly then return end
+
+      local project_root = require("ucore.project").find_project_root(path)
+      if not project_root then return end
+
+      if not vcs.is_readonly_p4(path) then return end
+
+      prompted[buf] = true
+      local fname = vim.fn.fnamemodify(path, ":t")
+      local choice = vim.fn.confirm(
+        "UCore: read-only file\n\"" .. fname .. "\"\nCheckout with p4 edit before editing?",
+        "&P4 checkout/edit\n&Edit anyway\n&Cancel",
+        1,
+        "Warning"
+      )
+
+      if choice == 1 then
+        local p4 = require("ucore.vcs.p4")
+        local ok, err = p4.checkout(path)
+        if ok then
+          vim.bo[buf].readonly = false
+          vim.schedule(function()
+            local ok_m, dashboard = pcall(require, "ucore.vcs.dashboard")
+            if ok_m and dashboard and dashboard.refresh then
+              dashboard.refresh()
+            end
+          end)
+        else
+          vim.notify("UCore: p4 edit failed: " .. tostring(err), vim.log.levels.ERROR)
+        end
+      elseif choice == 3 then
+        vim.cmd("stopinsert")
+      end
+    end,
+  })
 end
 
 return M

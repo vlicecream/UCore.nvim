@@ -69,9 +69,12 @@ function M.open(root, opts)
     separator_line = layout.separator_line,
   }
 
+  M.render_footer(buf, win, math.min(vim.o.columns - 8, 120))
   M.apply_highlights(buf)
   M.setup_keymaps(buf)
   pcall(vim.api.nvim_set_current_win, win)
+  vim.api.nvim_win_set_cursor(win, { commit_state.message_start + 1, 0 })
+  vim.cmd("startinsert!")
 end
 
 function M.build_files_from_paths(provider, root, paths)
@@ -226,7 +229,7 @@ function M.build_buffer_lines(provider, root, files, groups)
   local proj_name = vim.fn.fnamemodify(root, ":t")
   local layout = { file_lines = {} }
   local lines = {
-    string.format("P4 | %s                                      UCore Commit", proj_name),
+    string.format("P4 | %s", proj_name),
     "",
     "Workspace",
     "  Root: " .. root,
@@ -258,15 +261,87 @@ function M.build_buffer_lines(provider, root, files, groups)
   layout.message_start = #lines
   table.insert(lines, "")
   layout.separator_line = #lines + 1
-  table.insert(lines, string.rep("-", 80))
-  table.insert(lines, "Tab toggle        Ctrl-s submit        d diff        a add        r revert        q close")
-
+  table.insert(lines, "")
+  table.insert(lines, "")
   return lines, layout
+end
+
+local COMMIT_FOOTER_ITEMS = {
+  { key = "Tab",    label = "toggle" },
+  { key = "Ctrl-s", label = "submit" },
+  { key = "d",      label = "diff" },
+  { key = "a",      label = "add" },
+  { key = "r",      label = "revert" },
+  { key = "q",      label = "close" },
+}
+
+local COMMIT_FOOTER_SHORT_ITEMS = {
+  { key = "Tab",    label = "toggle" },
+  { key = "Ctrl-s", label = "submit" },
+  { key = "q",      label = "close" },
+}
+
+local function build_shortcut_line(width, items, short_items, opts)
+  opts = opts or {}
+  local padding = opts.padding or 2
+  local min_gap = opts.min_gap or 2
+  local available = math.max(0, width - padding * 2)
+
+  local active = items
+  local spans = {}
+
+  for attempt = 1, 3 do
+    local item_texts = {}
+    local total_w = 0
+    for _, item in ipairs(active) do
+      local text = item.key .. " " .. item.label
+      table.insert(item_texts, { text = text, w = vim.fn.strdisplaywidth(text), key = item.key })
+      total_w = total_w + vim.fn.strdisplaywidth(text)
+    end
+
+    local count = #active
+    local gaps = math.max(0, count - 1)
+    local remaining = available - total_w
+    local gap_w = 0
+
+    if remaining >= 0 then
+      gap_w = gaps > 0 and math.max(min_gap, math.floor(remaining / gaps)) or 0
+      local used = total_w + gap_w * gaps
+      local extra = available - used
+      local left_pad = math.floor(extra / 2)
+      local col = padding + left_pad
+
+      local prefix = string.rep(" ", padding + left_pad)
+      local parts = {}
+      for _, it in ipairs(item_texts) do
+        table.insert(spans, { start = col, finish = col + #it.key })
+        table.insert(parts, it.text)
+        col = col + it.w + gap_w
+      end
+      local line = prefix .. table.concat(parts, string.rep(" ", gap_w))
+      local suffix = math.max(0, width - vim.fn.strdisplaywidth(line))
+      return line .. string.rep(" ", suffix), spans
+    end
+
+    if attempt == 1 and short_items then
+      active = short_items
+    elseif attempt == 2 and min_gap > 1 then
+      min_gap = 1
+    else
+      break
+    end
+  end
+
+  local fallback = string.rep(" ", padding)
+      .. vim.fn.strcharpart(table.concat(vim.tbl_map(function(i) return i.key .. " " .. i.label end, active), " "), 0, math.max(0, width - padding * 2))
+  return fallback, {}
 end
 
 function M.create_buffer(lines, provider, root, files)
   local width = math.min(vim.o.columns - 8, 120)
-  local height = math.min(vim.o.lines - 6, 34)
+  local min_height = math.min(14, math.max(1, vim.o.lines - 6))
+  local content_height = #lines + 1
+  local height = math.min(vim.o.lines - 6, math.max(min_height, content_height))
   local row = math.max(1, math.floor((vim.o.lines - height) / 2))
   local col = math.max(0, math.floor((vim.o.columns - width) / 2))
   local buf = vim.api.nvim_create_buf(false, true)
@@ -294,9 +369,25 @@ function M.create_buffer(lines, provider, root, files)
 
   vim.api.nvim_set_option_value("winhl", "Normal:NormalFloat,FloatBorder:UCoreCommitBorder", { win = win })
   vim.api.nvim_set_option_value("cursorline", true, { win = win })
-  vim.api.nvim_win_set_cursor(win, { 1, 1 })
+  vim.b[buf].no_cmp = true
 
   return buf, win
+end
+
+function M.render_footer(buf, win, width)
+  if not commit_state then return end
+  local line, spans = build_shortcut_line(width, COMMIT_FOOTER_ITEMS, COMMIT_FOOTER_SHORT_ITEMS, {
+    padding = 4, min_gap = 2,
+  })
+  if commit_state.separator_line then
+    vim.api.nvim_buf_set_lines(buf, commit_state.separator_line - 1, commit_state.separator_line, false, {
+      string.rep("-", math.max(1, width)),
+    })
+  end
+  local last = vim.api.nvim_buf_line_count(buf)
+  vim.api.nvim_buf_set_lines(buf, last - 1, last, false, { line })
+  commit_state.footer_line = last
+  commit_state.footer_spans = spans
 end
 
 function M.get_file_at_line(buf, line)
@@ -344,13 +435,10 @@ function M.apply_highlights(buf)
       if rel_start then
         vim.api.nvim_buf_add_highlight(buf, ns, "UCoreCommitPath", lnum, rel_start - 1, -1)
       end
-    elseif i == #lines then
+    elseif commit_state.footer_line and i == commit_state.footer_line then
       vim.api.nvim_buf_add_highlight(buf, ns, "UCoreCommitMuted", lnum, 0, -1)
-      for _, key in ipairs({ "Tab", "Ctrl-s", "d", "a", "r", "q" }) do
-        local start_col = line:find(key, 1, true)
-        if start_col then
-          vim.api.nvim_buf_add_highlight(buf, ns, "UCoreCommitFooterKey", lnum, start_col - 1, start_col - 1 + #key)
-        end
+      for _, span in ipairs(commit_state.footer_spans or {}) do
+        vim.api.nvim_buf_add_highlight(buf, ns, "UCoreCommitFooterKey", lnum, span.start, span.finish)
       end
     end
   end
