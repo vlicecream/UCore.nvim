@@ -252,6 +252,38 @@ function M.do_revert(path)
   M.system(M.p4_cmd("revert", {path:gsub("/", "\\")}))
 end
 
+function M.add_file(path)
+  local result = M.system(M.p4_cmd("add", {path:gsub("/", "\\")}))
+  if vim.v.shell_error ~= 0 then
+    return false, result:match("[^\r\n]+") or result
+  end
+  return true, nil
+end
+
+function M.changelist_detail(change_num)
+  local result = M.system(M.p4_cmd("describe", {"-s", tostring(change_num)}))
+  if vim.v.shell_error ~= 0 then
+    return nil, "failed to describe changelist " .. tostring(change_num)
+  end
+  local detail = { number = tonumber(change_num), user = "", description = "", files = {}, status = "" }
+  for line in result:gmatch("[^\r\n]+") do
+    local user = line:match("^User:%s*(.+)$")
+    if user then detail.user = user end
+    local desc_line = line:match("^Description:%s*(.+)$")
+    if desc_line then detail.description = desc_line end
+    local cont = line:match("^%s+(.+)$")
+    if cont and detail.description ~= "" and detail.files and not cont:match("^Affected") and not cont:match("^Change") then
+      local status, path = cont:match("^(%S+)%s+(.+)$")
+      if status and path then
+        table.insert(detail.files, { status = status, path = path })
+      end
+    end
+    local status_tag = line:match("^Status:%s*(.+)$")
+    if status_tag then detail.status = status_tag end
+  end
+  return detail, nil
+end
+
 function M.pending_changelists(root)
   local result = M.system(M.p4_cmd("changes", {"-s", "pending", "-c", (root or "."):gsub("/", "\\") .. "/..."}))
   if vim.v.shell_error ~= 0 then

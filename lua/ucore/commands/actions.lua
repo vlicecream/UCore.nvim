@@ -483,28 +483,41 @@ function M.dashboard()
 	if s.project_root then
 		local _, project_vcs = pcall(vcs.detect, s.project_root)
 		if project_vcs then
-			vim.list_extend(items, {
-				{
-					label = "Source Control: " .. project_vcs.name():upper() .. " changes",
-					badge = "[" .. project_vcs.name():upper() .. "]",
-					description = "List changed files",
-					run = M.changes,
-				},
-				{
-					label = "Source Control: Checkout current file",
-					badge = "[" .. project_vcs.name():upper() .. "]",
-					description = "p4 edit for current buffer",
-					run = M.checkout,
-				},
-				{
-					label = "Source Control: Commit changes",
-					badge = "[" .. project_vcs.name():upper() .. "]",
-					description = "Open visual commit UI",
-					run = M.commit,
-				},
-			})
+			-- Source Control dashboard items (only P4-specific extras)
+			if project_vcs.name() == "p4" then
+				vim.list_extend(items, {
+					{
+						label = "Source Control: Pending changelists",
+						badge = "[P4]",
+						description = "View pending P4 changelists",
+						run = M.changelists,
+					},
+				})
+			end
 		end
 	end
+
+	-- Always add global source control items
+	vim.list_extend(items, {
+		{
+			label = "Source Control: Open changes",
+			badge = "[VCS]",
+			description = "List changed files",
+			run = M.changes,
+		},
+		{
+			label = "Source Control: Checkout current file",
+			badge = "[VCS]",
+			description = "p4 edit for current buffer",
+			run = M.checkout,
+		},
+		{
+			label = "Source Control: Commit changes",
+			badge = "[VCS]",
+			description = "Open visual commit UI",
+			run = M.commit,
+		},
+	})
 
 	ui.select.items("UCore dashboard", items, {
 		format_item = dashboard_format,
@@ -991,6 +1004,17 @@ function M.maps()
 	end)
 end
 
+-- :UCore changelists
+-- Show pending P4 changelists.
+-- 显示 P4 pending changelist 列表。
+function M.changelists()
+  local root = project.find_project_root()
+  if not root then
+    return vim.notify("Could not find .uproject", vim.log.levels.ERROR)
+  end
+  require("ucore.vcs.changelists").list(root)
+end
+
 -- :UCore changes
 -- Show VCS changes for the current project.
 -- 显示当前项目的 VCS 改动。
@@ -1005,18 +1029,147 @@ function M.changes()
     return vim.notify("UCore: no VCS changes found", vim.log.levels.INFO)
   end
 
-  ui.select.items("UCore changes", items, {
-    format_item = function(item)
-      return string.format("%s  [%s]  %s", item.provider, item.status, item.path)
-    end,
-    on_choice = function(item)
-      if item and item.path and vim.fn.filereadable(item.path) == 1 then
-        vim.cmd.edit(vim.fn.fnameescape(item.path))
-      elseif item and item.path then
-        vim.notify("File not found: " .. item.path, vim.log.levels.WARN)
+  local function format_item(item)
+    local tag = (item.depot or item.status == "local") and "opened" or "local"
+    return string.format("%s  %s  %s  %s", item.provider, tag, item.status, item.path)
+  end
+
+  local function open_file(item)
+    if item and item.path and vim.fn.filereadable(item.path) == 1 then
+      vim.cmd.edit(vim.fn.fnameescape(item.path))
+    elseif item and item.path then
+      vim.notify("File not found: " .. item.path, vim.log.levels.WARN)
+    end
+  end
+
+  local function do_checkout(item)
+    local provider = vcs.detect_for_path(item.path)
+    if provider and provider.name() == "p4" then
+      local ok, err = provider.checkout(item.path)
+      if ok then
+        vim.notify("UCore: p4 edit " .. vim.fn.fnamemodify(item.path, ":t"), vim.log.levels.INFO)
+      else
+        vim.notify("UCore checkout failed: " .. tostring(err), vim.log.levels.ERROR)
       end
-    end,
-  })
+    end
+  end
+
+  local function do_add(item)
+    local provider = vcs.detect_for_path(item.path)
+    if provider and provider.name() == "p4" and provider.add_file then
+      local ok, err = provider.add_file(item.path)
+      if ok then
+        item.status = "add"
+        vim.notify("UCore: p4 add " .. vim.fn.fnamemodify(item.path, ":t"), vim.log.levels.INFO)
+      else
+        vim.notify("UCore: p4 add failed: " .. tostring(err), vim.log.levels.ERROR)
+      end
+    end
+  end
+
+  local function do_revert(item)
+    local confirm = vim.fn.confirm(
+      "UCore: revert " .. vim.fn.fnamemodify(item.path, ":t") .. "?", "&Revert\n&Cancel", 2, "Question"
+    )
+    if confirm ~= 1 then return end
+    local provider = vcs.detect_for_path(item.path)
+    if provider and provider.name() == "p4" and provider.do_revert then
+      provider.do_revert(item.path)
+      vim.notify("UCore: reverted " .. vim.fn.fnamemodify(item.path, ":t"), vim.log.levels.INFO)
+    else
+      vim.notify("UCore: revert is not supported for this file", vim.log.levels.WARN)
+    end
+  end
+
+  local function do_diff(item)
+    local provider = vcs.detect_for_path(item.path)
+    if not provider then return end
+    local diff_text, diff_err = provider.diff(item.path)
+    if diff_err then
+      return vim.notify("UCore: diff failed: " .. tostring(diff_err), vim.log.levels.ERROR)
+    end
+    if not diff_text or diff_text == "" then
+      return vim.notify("UCore: no diff", vim.log.levels.INFO)
+    end
+    vim.cmd("botright 12new")
+    local dbuf = vim.api.nvim_get_current_buf()
+    vim.bo[dbuf].buftype = "nofile"
+    vim.bo[dbuf].bufhidden = "wipe"
+    vim.bo[dbuf].swapfile = false
+    vim.bo[dbuf].filetype = "diff"
+    local diff_lines = vim.split(diff_text, "\n", { plain = true })
+    vim.api.nvim_buf_set_lines(dbuf, 0, -1, false, diff_lines)
+    vim.bo[dbuf].modified = false
+  end
+
+  local telescope_available = pcall(require, "telescope.pickers")
+  if telescope_available then
+    local pickers = require("telescope.pickers")
+    local finders = require("telescope.finders")
+    local conf = require("telescope.config").values
+    local actions = require("telescope.actions")
+    local action_state = require("telescope.actions.state")
+
+    local entries = {}
+    for _, item in ipairs(items) do
+      local tag = (item.depot or item.status == "local") and "opened" or "local"
+      local display = string.format("%s  %s  %s", item.provider, tag, item.status, item.path)
+      table.insert(entries, {
+        value = item,
+        display = display,
+        ordinal = display,
+        path = item.path,
+      })
+    end
+
+    pickers.new({}, {
+      prompt_title = "UCore changes",
+      finder = finders.new_table({
+        results = entries,
+        entry_maker = function(e) return e end,
+      }),
+      sorter = conf.generic_sorter({}),
+      attach_mappings = function(prompt_bufnr)
+        actions.select_default:replace(function()
+          local sel = action_state.get_selected_entry()
+          actions.close(prompt_bufnr)
+          if sel then open_file(sel.value) end
+        end)
+
+        vim.keymap.set("n", "d", function()
+          local sel = action_state.get_selected_entry()
+          if sel then actions.close(prompt_bufnr); do_diff(sel.value) end
+        end, { buffer = prompt_bufnr, nowait = true })
+
+        vim.keymap.set("n", "c", function()
+          local sel = action_state.get_selected_entry()
+          if sel then do_checkout(sel.value) end
+        end, { buffer = prompt_bufnr, nowait = true })
+
+        vim.keymap.set("n", "a", function()
+          local sel = action_state.get_selected_entry()
+          if sel then do_add(sel.value) end
+        end, { buffer = prompt_bufnr, nowait = true })
+
+        vim.keymap.set("n", "r", function()
+          local sel = action_state.get_selected_entry()
+          if sel then actions.close(prompt_bufnr); do_revert(sel.value) end
+        end, { buffer = prompt_bufnr, nowait = true })
+
+        vim.keymap.set("n", "s", function()
+          actions.close(prompt_bufnr)
+          vim.schedule(function() M.commit() end)
+        end, { buffer = prompt_bufnr, nowait = true })
+
+        return true
+      end,
+    }):find()
+  else
+    ui.select.items("UCore changes", items, {
+      format_item = format_item,
+      on_choice = open_file,
+    })
+  end
 end
 
 -- :UCore commit
@@ -1166,6 +1319,7 @@ UCore commands:
    :UCore changes      Show VCS changes for current project
   :UCore checkout     Checkout current file (p4 edit)
   :UCore commit       Open visual commit UI
+  :UCore changelists   View pending P4 changelists
   :UCore debug        Debug and lifecycle subcommands
   :UCore help         Show this help
 ]])

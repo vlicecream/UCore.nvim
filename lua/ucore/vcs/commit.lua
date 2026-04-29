@@ -36,8 +36,8 @@ function M.open(root)
     root = root,
     provider = provider,
     files = files,
-    file_start = 10,
-    file_end = 9 + #files,
+    file_start = 11,
+    file_end = 10 + #files,
     message_start = 10 + #files + 2,
     separator_line = 10 + #files + 1,
   }
@@ -81,6 +81,7 @@ function M.collect_commit_files(provider, root)
           rel = rel,
           status = f.status == "open for add" and "add" or f.status,
           checked = false,
+          is_local = true,
         })
       end
     end
@@ -110,20 +111,30 @@ function M.build_buffer_lines(provider, root, files)
     "VCS: " .. provider.name():upper(),
     "Project: " .. proj_name,
     "Root: " .. root,
-    "",
-    "Files:",
   }
+
+  if provider.name() == "p4" then
+    local info, _ = provider.info(root)
+    if info then
+      table.insert(lines, "Client: " .. tostring(info["client name"] or "?"))
+      table.insert(lines, "User: " .. tostring(info["user name"] or "?"))
+    end
+  end
+
+  table.insert(lines, "")
+  table.insert(lines, "Files:")
 
   for _, f in ipairs(files) do
     local mark = f.checked and "[x]" or "[ ]"
-    table.insert(lines, string.format("  %s  %-6s %s", mark, f.status, f.rel))
+    local tag = f.is_local and "local" or "opened"
+    table.insert(lines, string.format("  %s  %-6s %-6s %s", mark, tag, f.status, f.rel))
   end
 
   table.insert(lines, "")
   table.insert(lines, "Message:")
   table.insert(lines, "")
   table.insert(lines, SEP)
-  table.insert(lines, "<Tab> toggle   <C-s> submit   d diff   r revert   q close")
+  table.insert(lines, "<Tab> toggle   <C-s> submit   d diff   a add   r revert   q close")
 
   return lines
 end
@@ -175,7 +186,7 @@ function M.toggle_file(buf)
     return
   end
 
-  local file, idx = M.get_file_at_line(buf, cur_line)
+  local file = M.get_file_at_line(buf, cur_line)
   if not file then return end
 
   file.checked = not file.checked
@@ -183,6 +194,40 @@ function M.toggle_file(buf)
   local line_content = vim.api.nvim_buf_get_lines(buf, cur_line - 1, cur_line, false)[1] or ""
   local new_line = line_content:gsub("%[.%]", mark)
   vim.api.nvim_buf_set_lines(buf, cur_line - 1, cur_line, false, { new_line })
+end
+
+function M.add_file(buf)
+  local cur_line = vim.api.nvim_win_get_cursor(0)[1]
+  if not M.is_file_line(buf, cur_line) then
+    vim.notify("UCore: move cursor to a local file to add", vim.log.levels.INFO)
+    return
+  end
+
+  local file = M.get_file_at_line(buf, cur_line)
+  if not file then return end
+
+  if not file.is_local then
+    vim.notify("UCore: file is already opened in P4", vim.log.levels.INFO)
+    return
+  end
+
+  local provider = commit_state.provider
+  if provider.name() == "p4" then
+    local ok, err = provider.add_file(file.path)
+    if ok then
+      file.is_local = false
+      file.checked = true
+      file.status = "add"
+      local line_content = vim.api.nvim_buf_get_lines(buf, cur_line - 1, cur_line, false)[1] or ""
+      local new_line = string.format("  [x]  opened  %-6s %s", "add", file.rel)
+      vim.api.nvim_buf_set_lines(buf, cur_line - 1, cur_line, false, { new_line })
+      vim.notify("UCore: p4 add " .. vim.fn.fnamemodify(file.path, ":t"), vim.log.levels.INFO)
+    else
+      vim.notify("UCore: p4 add failed: " .. tostring(err), vim.log.levels.ERROR)
+    end
+  else
+    vim.notify("UCore: add is not implemented for " .. provider.name():upper(), vim.log.levels.INFO)
+  end
 end
 
 function M.get_message(buf)
@@ -228,8 +273,19 @@ function M.submit(buf)
     return
   end
 
+  local summary_lines = {"Submit to " .. commit_state.provider.name():upper() .. "?", "", "Files:"}
+  for _, f in ipairs(checked) do
+    table.insert(summary_lines, "- " .. f.status .. " " .. f.rel)
+  end
+  table.insert(summary_lines, "")
+  table.insert(summary_lines, "Message:")
+  local msg_preview = message:gsub("\n", " "):sub(1, 80)
+  table.insert(summary_lines, msg_preview)
+  table.insert(summary_lines, "")
+  table.insert(summary_lines, "Proceed?")
+
   local confirm = vim.fn.confirm(
-    string.format("UCore: submit %d file(s) to %s?", #checked, commit_state.provider.name():upper()),
+    table.concat(summary_lines, "\n"),
     "&Yes\n&No",
     2,
     "Question"
@@ -248,7 +304,13 @@ function M.submit(buf)
     vim.api.nvim_buf_delete(buf, { force = true })
     commit_state = nil
   else
-    vim.notify("UCore: submit failed:\n" .. tostring(err), vim.log.levels.ERROR)
+    local err_text = tostring(err)
+    local change_hint = ""
+    local change_num = err_text:match("Change (%d+)")
+    if change_num then
+      change_hint = "\nChangelist " .. change_num .. " was kept.\nRun :UCore changelists"
+    end
+    vim.notify("UCore: submit failed:\n" .. err_text .. change_hint, vim.log.levels.ERROR)
     vim.bo[buf].modified = true
   end
 end
@@ -279,7 +341,13 @@ function M.diff_file(buf)
   vim.bo[dbuf].bufhidden = "wipe"
   vim.bo[dbuf].swapfile = false
   vim.bo[dbuf].filetype = "diff"
+  pcall(vim.api.nvim_buf_set_name, dbuf, "ucore://diff/" .. vim.fn.fnamemodify(file.path, ":t"))
+
   local diff_lines = vim.split(diff_text, "\n", { plain = true })
+  local header = "--- a/" .. file.rel
+  local header2 = "+++ b/" .. file.rel
+  table.insert(diff_lines, 1, header2)
+  table.insert(diff_lines, 1, header)
   vim.api.nvim_buf_set_lines(dbuf, 0, -1, false, diff_lines)
   vim.bo[dbuf].modified = false
 end
@@ -294,8 +362,8 @@ function M.revert_file(buf)
   if not file then return end
 
   local confirm = vim.fn.confirm(
-    "UCore: revert " .. vim.fn.fnamemodify(file.path, ":t") .. "?",
-    "&Yes\n&No",
+    "UCore: revert " .. vim.fn.fnamemodify(file.path, ":t") .. "?\n\nThis discards local changes.",
+    "&Revert\n&Cancel",
     2,
     "Question"
   )
@@ -345,6 +413,10 @@ function M.setup_keymaps(buf)
 
   vim.keymap.set("n", "d", function()
     M.diff_file(buf)
+  end, opts)
+
+  vim.keymap.set("n", "a", function()
+    M.add_file(buf)
   end, opts)
 
   vim.keymap.set("n", "r", function()
