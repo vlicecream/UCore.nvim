@@ -130,8 +130,8 @@ function M.register()
 
 	vim.api.nvim_create_user_command("UCore", M.dispatch, {
 		nargs = "*",
-		complete = function(arglead)
-			local items = {
+		complete = function(arglead, cmdline, cursorpos)
+			local user_items = {
 				"boot",
 				"build",
 				"build-cancel",
@@ -143,8 +143,45 @@ function M.register()
 				"help",
 			}
 
+			local debug_items = {
+				"logs",
+				"engine",
+				"engine-refresh",
+				"open",
+				"register",
+				"projects",
+				"modules",
+				"assets",
+				"search-symbols",
+				"status",
+				"rpc-status",
+				"setup",
+				"refresh",
+				"start",
+				"stop",
+				"restart",
+				"maps",
+				"complete",
+				"goto",
+				"references",
+				"help",
+			}
+
+			local line = cmdline or ""
+			local before_cursor = line:sub(1, (cursorpos or (#line + 1)) - 1)
+			local tail = before_cursor:match("^%s*UCore%s*(.-)%s*$") or ""
+			local first = tail:match("^(%S+)")
+			local in_debug = first and first:lower() == "debug"
+
+			local items = in_debug and debug_items or user_items
+			local needle = (arglead or ""):lower()
+
+			if in_debug and (tail:lower() == "debug" or tail:lower():match("^debug%s*$")) then
+				needle = ""
+			end
+
 			return vim.tbl_filter(function(item)
-				return item:find(arglead:lower(), 1, true) == 1
+				return item:find(needle, 1, true) == 1
 			end, items)
 		end,
 	})
