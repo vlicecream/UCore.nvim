@@ -8,12 +8,16 @@ local ns = vim.api.nvim_create_namespace("ucore_vcs_dashboard")
 local autocmd_group = nil
 
 local HIGHLIGHTS = {
-  UCoreVcsBorder = { link = "NormalFloat" },
-  UCoreVcsTitle = { link = "Title" },
+  UCoreVcsBorder = { fg = "#2aa7ff", bg = "#06121f" },
+  UCoreVcsTitle = { fg = "#00d7ff", bold = true },
   UCoreVcsHeader = { link = "NormalFloat" },
-  UCoreVcsSection = { link = "Statement" },
-  UCoreVcsSelected = { link = "CursorLine" },
-  UCoreVcsChecked = { link = "Operator" },
+  UCoreVcsProvider = { fg = "#7ee787", bold = true },
+  UCoreVcsProject = { fg = "#7ee787", bold = true },
+  UCoreVcsMeta = { fg = "#ffd166", bold = true },
+  UCoreVcsSection = { fg = "#00d7ff", bold = true },
+  UCoreVcsSelected = { fg = "#fff2a8", bg = "#5c5200", bold = true },
+  UCoreVcsSelector = { fg = "#ffd166", bg = "#5c5200", bold = true },
+  UCoreVcsChecked = { fg = "#d7ffaf", bold = true },
   UCoreVcsUnchecked = { link = "NonText" },
   UCoreVcsStatusEdit = { fg = "#4ec9b0" },
   UCoreVcsStatusAdd = { fg = "#6a9955" },
@@ -25,6 +29,10 @@ local HIGHLIGHTS = {
   UCoreVcsChangelistDesc = { link = "String" },
   UCoreVcsHelp = { link = "NonText" },
   UCoreVcsMuted = { link = "Comment" },
+  UCoreVcsFooterKey = { fg = "#ffd166", bold = true },
+  UCoreVcsDiffAdd = { fg = "#7ee787" },
+  UCoreVcsDiffDel = { fg = "#ff6b6b" },
+  UCoreVcsDiffHunk = { fg = "#58a6ff" },
 }
 
 for name, opts in pairs(HIGHLIGHTS) do
@@ -314,7 +322,7 @@ local function move_cursor(delta)
 end
 
 local function will_fit()
-  return vim.o.columns >= 82 and vim.o.lines >= 19
+  return vim.o.columns >= 82 and vim.o.lines >= 24
 end
 
 local function open_windows()
@@ -325,23 +333,29 @@ local function open_windows()
 
   local ed_w = vim.o.columns
   local ed_h = vim.o.lines
-  local left_w = math.max(46, math.floor(ed_w * 0.52))
-  local right_w = ed_w - left_w - 4
+  local total_w = math.min(ed_w - 4, 160)
+  local left_w = math.max(42, math.floor(total_w * 0.37))
+  local right_w = total_w - left_w - 4
   if right_w < 30 then
-    left_w = ed_w - 34
+    left_w = total_w - 34
     right_w = 30
   end
 
-  local h = math.min(ed_h - 2, 38)
+  local h = math.min(ed_h - 2, 42)
   local row = math.max(0, math.floor((ed_h - h) / 2))
-  local col = math.max(0, math.floor((ed_w - left_w - right_w - 4) / 2))
+  local col = math.max(0, math.floor((ed_w - total_w) / 2))
+  local header_h = 1
+  local footer_h = 1
+  local list_h = math.max(10, h - 9)
+  local main_row = row + header_h + 3
+  local footer_row = main_row + list_h + 3
 
   local success, result = pcall(function()
     local header_buf = vim.api.nvim_create_buf(false, true)
     local header_win = vim.api.nvim_open_win(header_buf, false, {
       relative = "editor",
-      width = left_w + right_w + 4,
-      height = 4,
+      width = total_w,
+      height = header_h,
       row = row,
       col = col,
       style = "minimal",
@@ -351,13 +365,12 @@ local function open_windows()
     })
     vim.bo[header_buf].modifiable = true
 
-    local list_h = h - 4
     local left_buf = vim.api.nvim_create_buf(false, true)
     local left_win = vim.api.nvim_open_win(left_buf, true, {
       relative = "editor",
-      width = left_w + 2,
+      width = left_w,
       height = list_h,
-      row = row + 4,
+      row = main_row,
       col = col,
       style = "minimal",
       border = "single",
@@ -369,23 +382,38 @@ local function open_windows()
     local right_buf = vim.api.nvim_create_buf(false, true)
     local right_win = vim.api.nvim_open_win(right_buf, false, {
       relative = "editor",
-      width = right_w + 2,
+      width = right_w,
       height = list_h,
-      row = row + 4,
+      row = main_row,
       col = col + left_w + 4,
       style = "minimal",
       border = "single",
     })
     vim.bo[right_buf].modifiable = true
 
-    vim.api.nvim_set_option_value("winhl", "Normal:NormalFloat", { win = header_win })
-    vim.api.nvim_set_option_value("winhl", "Normal:NormalFloat", { win = left_win })
-    vim.api.nvim_set_option_value("winhl", "Normal:NormalFloat", { win = right_win })
+    local footer_buf = vim.api.nvim_create_buf(false, true)
+    local footer_win = vim.api.nvim_open_win(footer_buf, false, {
+      relative = "editor",
+      width = total_w,
+      height = footer_h,
+      row = footer_row,
+      col = col,
+      style = "minimal",
+      border = "single",
+    })
+    vim.bo[footer_buf].modifiable = true
+
+    local winhl = "Normal:NormalFloat,FloatBorder:UCoreVcsBorder"
+    vim.api.nvim_set_option_value("winhl", winhl, { win = header_win })
+    vim.api.nvim_set_option_value("winhl", winhl, { win = left_win })
+    vim.api.nvim_set_option_value("winhl", winhl, { win = right_win })
+    vim.api.nvim_set_option_value("winhl", winhl, { win = footer_win })
 
     return {
       header_buf = header_buf, header_win = header_win,
       left_buf = left_buf, left_win = left_win,
       right_buf = right_buf, right_win = right_win,
+      footer_buf = footer_buf, footer_win = footer_win,
     }
   end)
 
@@ -408,9 +436,11 @@ function M.close()
     pcall(vim.api.nvim_win_close, w.header_win, true)
     pcall(vim.api.nvim_win_close, w.left_win, true)
     pcall(vim.api.nvim_win_close, w.right_win, true)
+    pcall(vim.api.nvim_win_close, w.footer_win, true)
     pcall(vim.api.nvim_buf_delete, w.header_buf, { force = true })
     pcall(vim.api.nvim_buf_delete, w.left_buf, { force = true })
     pcall(vim.api.nvim_buf_delete, w.right_buf, { force = true })
+    pcall(vim.api.nvim_buf_delete, w.footer_buf, { force = true })
   end
   state = nil
 end
@@ -430,10 +460,44 @@ local function render_status_text()
 end
 
 local function help_line(width)
-  local long = "j/k move  Space toggle  d diff  c edit  a add  r revert  m commit  l detail  s submit  R refresh  q close"
+  local long = "j/k move    Space toggle    Enter open    d diff    c checkout    a add    r revert    m commit    R refresh    q close"
   local short = "j/k move  d diff  m commit  R refresh  q close"
   local text = vim.fn.strdisplaywidth(long) <= width - 2 and long or short
   return " " .. text
+end
+
+local function pad_to_width(text, width)
+  local pad = width - vim.fn.strdisplaywidth(text)
+  if pad <= 0 then
+    return text
+  end
+  return text .. string.rep(" ", pad)
+end
+
+local function compose_header(left, center, right, width)
+  local left_w = vim.fn.strdisplaywidth(left)
+  local center_w = vim.fn.strdisplaywidth(center)
+  local right_w = vim.fn.strdisplaywidth(right)
+  if left_w + center_w + right_w + 4 > width then
+    center = "UCore VCS"
+    center_w = vim.fn.strdisplaywidth(center)
+  end
+
+  local center_col = math.max(left_w + 2, math.floor((width - center_w) / 2))
+  local right_col = math.max(center_col + center_w + 2, width - right_w)
+  local line = " " .. left
+  line = pad_to_width(line, center_col)
+  line = line .. center
+  line = pad_to_width(line, right_col)
+  line = line .. right
+  return line
+end
+
+local function add_pattern_highlight(buf, line, text, pattern, group)
+  local start_col = text:find(pattern, 1, true)
+  if start_col then
+    vim.api.nvim_buf_add_highlight(buf, ns, group, line, start_col - 1, start_col - 1 + #pattern)
+  end
 end
 
 function M.render_header()
@@ -443,19 +507,33 @@ function M.render_header()
   local info = state.data.info or {}
   local client = info["client name"] or "?"
   local user = info["user name"] or "?"
-  local n_opened = state.loading.files and "..." or (state.data.errors.files and "err" or tostring(count_values(state.data.opened)))
-  local n_local = state.loading.files and "..." or (state.data.errors.files and "err" or tostring(count_values(state.data.local_changes)))
-  local n_pending = count_section("pending")
-  local n_shelved = count_section("shelved")
   local left = string.format("P4 | %s", state.project_name or "?")
-  local stat = string.format("opened:%s  local:%s  pending:%s  shelved:%s", n_opened, n_local, n_pending, n_shelved)
+  local center = "UCore VCS"
+  local right = string.format("Client: %s | User: %s", client, user)
   local width = vim.api.nvim_win_get_width(state.wins.header_win)
-  local pad1 = math.max(2, width - vim.fn.strdisplaywidth(left) - vim.fn.strdisplaywidth(stat) - 3)
-  local status = render_status_text()
-  local line1 = " " .. left .. string.rep(" ", pad1) .. stat
-  local line2 = string.format(" Client: %s | User: %s | %s", client, user, status)
-  local line3 = help_line(width)
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, { line1, line2, line3 })
+  local line = compose_header(left, center, right, width)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, { line })
+  vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
+  add_pattern_highlight(buf, 0, line, "P4", "UCoreVcsProvider")
+  add_pattern_highlight(buf, 0, line, state.project_name or "?", "UCoreVcsProject")
+  add_pattern_highlight(buf, 0, line, center, "UCoreVcsTitle")
+  add_pattern_highlight(buf, 0, line, "Client:", "UCoreVcsMeta")
+  add_pattern_highlight(buf, 0, line, "User:", "UCoreVcsMeta")
+  vim.bo[buf].modifiable = false
+end
+
+function M.render_footer()
+  if not state or not state.wins or not state.wins.footer_buf then return end
+  local buf = state.wins.footer_buf
+  local width = vim.api.nvim_win_get_width(state.wins.footer_win)
+  local line = help_line(width)
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, { line })
+  vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
+  vim.api.nvim_buf_add_highlight(buf, ns, "UCoreVcsHelp", 0, 0, -1)
+  for _, key in ipairs({ "j/k", "Space", "Enter", "d", "c", "a", "r", "m", "R", "q" }) do
+    add_pattern_highlight(buf, 0, line, key, "UCoreVcsFooterKey")
+  end
   vim.bo[buf].modifiable = false
 end
 
@@ -463,16 +541,33 @@ function M.render_left()
   if not state or not state.wins then return end
   local buf = state.wins.left_buf
   local rows = state.rows
+  local win_width = vim.api.nvim_win_get_width(state.wins.left_win)
 
   vim.bo[buf].modifiable = true
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, {})
 
   local text_lines = {}
-  for _, row in ipairs(rows) do
+  for i, row in ipairs(rows) do
+    local selected = i == state.cursor and is_selectable(row)
+    local pointer = selected and "> " or "  "
     if row.kind == "section" then
-      table.insert(text_lines, row.label)
+      local label = row.label
+      local suffix = ""
+      if label == "Changes" then
+        suffix = section_count("files") .. " files"
+      elseif label == "Pending Changelists" then
+        suffix = section_count("pending") .. " changelists"
+      elseif label == "Shelved Changelists" then
+        suffix = section_count("shelved") .. " shelves"
+      end
+      if suffix ~= "" then
+        local pad = math.max(2, win_width - vim.fn.strdisplaywidth(label) - vim.fn.strdisplaywidth(suffix) - 2)
+        table.insert(text_lines, " " .. label .. string.rep(" ", pad) .. suffix)
+      else
+        table.insert(text_lines, " " .. label)
+      end
     elseif row.kind == "info" then
-      table.insert(text_lines, string.format("  %-7s %s", row.label, row.value))
+      table.insert(text_lines, string.format("   %-7s %s", row.label .. ":", row.value))
     elseif row.kind == "blank" then
       table.insert(text_lines, "")
     elseif row.kind == "empty" then
@@ -481,13 +576,13 @@ function M.render_left()
       local mark = row.checked and "[x]" or "[ ]"
       local dir = compact_directory(row.directory, 30)
       if dir ~= "" then
-        table.insert(text_lines, string.format("  %s  %-7s %-28s %s", mark, row.status, row.filename, dir))
+        table.insert(text_lines, string.format("%s%s  %-7s %-24s %s", pointer, mark, row.status, row.filename, dir))
       else
-        table.insert(text_lines, string.format("  %s  %-7s %s", mark, row.status, row.filename))
+        table.insert(text_lines, string.format("%s%s  %-7s %s", pointer, mark, row.status, row.filename))
       end
     elseif row.kind == "changelist" or row.kind == "shelved" then
       local desc = tostring(row.description or ""):gsub("\n", " "):sub(1, 55)
-      table.insert(text_lines, string.format("  %-6d  %s", row.number, desc))
+      table.insert(text_lines, string.format("%s%-6d  %s", pointer, row.number, desc))
     end
   end
 
@@ -508,6 +603,9 @@ function M.render_left()
     elseif row.kind == "info" or row.kind == "empty" then
       vim.api.nvim_buf_add_highlight(buf, ns, "UCoreVcsMuted", line, 0, #line_text)
     elseif row.kind == "file" then
+      if i == state.cursor then
+        vim.api.nvim_buf_add_highlight(buf, ns, "UCoreVcsSelector", line, 0, 2)
+      end
       local mark_begin = line_text:find("%[.%]")
       if mark_begin then
         vim.api.nvim_buf_add_highlight(buf, ns, row.checked and "UCoreVcsChecked" or "UCoreVcsUnchecked", line, mark_begin - 1, mark_begin + 2)
@@ -528,8 +626,11 @@ function M.render_left()
         vim.api.nvim_buf_add_highlight(buf, ns, "UCoreVcsDir", line, dir_start - 1, #line_text)
       end
     elseif row.kind == "changelist" or row.kind == "shelved" then
+      if i == state.cursor then
+        vim.api.nvim_buf_add_highlight(buf, ns, "UCoreVcsSelector", line, 0, 2)
+      end
       vim.api.nvim_buf_add_highlight(buf, ns, "UCoreVcsChangelistNum", line, 2, 8)
-      vim.api.nvim_buf_add_highlight(buf, ns, "UCoreVcsChangelistDesc", line, 9, #line_text)
+      vim.api.nvim_buf_add_highlight(buf, ns, "UCoreVcsChangelistDesc", line, 10, #line_text)
     end
   end
 
@@ -555,11 +656,29 @@ local function set_right_lines(lines, ft)
     vim.fn.winrestview({ topline = 1, lnum = 1, col = 0, curswant = 0, leftcol = 0 })
     vim.cmd("normal! 0")
   end)
+  vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
+  for i, line in ipairs(lines) do
+    local lnum = i - 1
+    if i == 1 then
+      vim.api.nvim_buf_add_highlight(buf, ns, "UCoreVcsSection", lnum, 0, #line)
+    elseif line:sub(1, 1) == "+" then
+      vim.api.nvim_buf_add_highlight(buf, ns, "UCoreVcsDiffAdd", lnum, 0, #line)
+    elseif line:sub(1, 1) == "-" then
+      vim.api.nvim_buf_add_highlight(buf, ns, "UCoreVcsDiffDel", lnum, 0, #line)
+    elseif line:sub(1, 2) == "@@" then
+      vim.api.nvim_buf_add_highlight(buf, ns, "UCoreVcsDiffHunk", lnum, 0, #line)
+    elseif line:match("^%s*File:") or line:match("^%s*Status:") or line:match("^%s*User:") then
+      vim.api.nvim_buf_add_highlight(buf, ns, "UCoreVcsMeta", lnum, 0, math.min(#line, 12))
+    end
+  end
 end
 
 local function render_file_summary(item)
   set_right_lines({
-    "File: " .. normalize_path(item.path),
+    "Diff / Preview",
+    "",
+    normalize_path(item.path),
+    "",
     "Status: " .. tostring(item.status or ""),
     "",
     "Press d to load diff.",
@@ -569,6 +688,8 @@ end
 local function render_change_summary(item)
   local label = item.kind == "shelved" and "Shelved Change" or "Change"
   set_right_lines({
+    "Diff / Preview",
+    "",
     label .. " " .. tostring(item.number),
     "User: " .. tostring(item.user or "?"),
     "",
@@ -583,19 +704,21 @@ function M.render_right()
   if not state or not state.wins then return end
   local item = get_current_item()
   if not item then
-    set_right_lines({ "No selection." }, "ucore-vcs-detail")
+    set_right_lines({ "Diff / Preview", "", "No selection." }, "ucore-vcs-detail")
     return
   end
 
   if item.kind == "file" then
     local cached = state.cache.diff[item.path]
     if cached and cached.loading then
-      set_right_lines({ "File: " .. normalize_path(item.path), "", "Loading diff..." }, "ucore-vcs-detail")
+      set_right_lines({ "Diff / Preview", "", normalize_path(item.path), "", "Loading diff..." }, "ucore-vcs-detail")
     elseif cached and cached.error then
-      set_right_lines({ "File: " .. normalize_path(item.path), "", "Diff failed: " .. tostring(cached.error) }, "ucore-vcs-detail")
+      set_right_lines({ "Diff / Preview", "", normalize_path(item.path), "", "Diff failed: " .. tostring(cached.error) }, "ucore-vcs-detail")
     elseif cached and cached.text then
       local lines = {
-        "File: " .. normalize_path(item.path),
+        "Diff / Preview",
+        "",
+        normalize_path(item.path),
         "Status: " .. tostring(item.status or ""),
         "",
       }
@@ -611,12 +734,14 @@ function M.render_right()
     local cache_key = item.kind .. ":" .. tostring(item.number)
     local cached = state.cache.changelist_detail[cache_key]
     if cached and cached.loading then
-      set_right_lines({ "Change " .. tostring(item.number), "", "Loading detail..." }, "ucore-vcs-detail")
+      set_right_lines({ "Diff / Preview", "", "Change " .. tostring(item.number), "", "Loading detail..." }, "ucore-vcs-detail")
     elseif cached and cached.error then
-      set_right_lines({ "Change " .. tostring(item.number), "", "Detail failed: " .. tostring(cached.error) }, "ucore-vcs-detail")
+      set_right_lines({ "Diff / Preview", "", "Change " .. tostring(item.number), "", "Detail failed: " .. tostring(cached.error) }, "ucore-vcs-detail")
     elseif cached and cached.detail then
       local detail = cached.detail
       local lines = {
+        "Diff / Preview",
+        "",
         (item.kind == "shelved" and "Shelved Change " or "Change ") .. tostring(detail.number),
         "User: " .. tostring(detail.user or "?"),
         "Status: " .. tostring(detail.status or ""),
@@ -636,7 +761,7 @@ function M.render_right()
     return
   end
 
-  set_right_lines({ "No preview available." }, "ucore-vcs-detail")
+  set_right_lines({ "Diff / Preview", "", "No preview available." }, "ucore-vcs-detail")
 end
 
 local function render_all(keep_cursor)
@@ -659,6 +784,7 @@ local function render_all(keep_cursor)
   M.render_header()
   M.render_left()
   M.render_right()
+  M.render_footer()
 end
 
 local function load_file_diff(item)
@@ -961,7 +1087,7 @@ q/Esc    Close dashboard
 ]], vim.log.levels.INFO)
   end, opts)
 
-  local all_bufs = { state.wins.header_buf, state.wins.left_buf, state.wins.right_buf }
+  local all_bufs = { state.wins.header_buf, state.wins.left_buf, state.wins.right_buf, state.wins.footer_buf }
   for _, b in ipairs(all_bufs) do
     vim.keymap.set("n", "q", M.close, { buffer = b, nowait = true, silent = true })
     vim.keymap.set("n", "<Esc>", M.close, { buffer = b, nowait = true, silent = true })
