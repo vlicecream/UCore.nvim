@@ -114,6 +114,31 @@ local function parse_changes(result)
   return changes
 end
 
+local function root_pathspec(root)
+  return (root or "."):gsub("/", "\\") .. "\\..."
+end
+
+local function parse_status_output(result)
+  local files = {}
+  for line in tostring(result or ""):gmatch("[^\r\n]+") do
+    line = vim.trim(line)
+    local status, rest = line:match("^(%S+)%s+(.+)$")
+    if status and rest then
+      local path = rest
+      path = path:gsub("%s+%-%s+.*$", "")
+      path = path:gsub("%s+%-+%s+.*$", "")
+      path = vim.trim(path)
+      if path ~= "" and not path:match("^//") then
+        table.insert(files, {
+          path = path,
+          status = status:lower(),
+        })
+      end
+    end
+  end
+  return files
+end
+
 local function async_result(cb)
   return function(result)
     vim.schedule(function()
@@ -196,7 +221,7 @@ end
 function M.opened(root)
   local args = {}
   if root then
-    args[#args + 1] = root:gsub("/", "\\") .. "/..."
+    args[#args + 1] = root_pathspec(root)
   end
   local result = M.system(M.p4_cmd("opened", args))
   if vim.v.shell_error ~= 0 then
@@ -221,22 +246,12 @@ function M.opened(root)
 end
 
 function M.status(root)
-  local args = {"-s", (root or "."):gsub("/", "\\") .. "/..."}
+  local args = {"-s", root_pathspec(root)}
   local result = M.system(M.p4_cmd("status", args))
   if vim.v.shell_error ~= 0 then
     return {}
   end
-  local files = {}
-  for line in result:gmatch("[^\r\n]+") do
-    local status, path = line:match("^(%S+)%s+(.+)$")
-    if status and path then
-      table.insert(files, {
-        path = path,
-        status = status:lower(),
-      })
-    end
-  end
-  return files
+  return parse_status_output(result)
 end
 
 function M.checkout(path)
@@ -404,7 +419,7 @@ function M.login(password)
 end
 
 function M.shelved_changelists(root)
-  local result = M.system(M.p4_cmd("changes", {"-s", "shelved", "-c", (root or "."):gsub("/", "\\") .. "/..."}))
+  local result = M.system(M.p4_cmd("changes", {"-s", "shelved", root_pathspec(root)}))
   if vim.v.shell_error ~= 0 then
     return {}
   end
@@ -412,7 +427,7 @@ function M.shelved_changelists(root)
 end
 
 function M.pending_changelists(root)
-  local result = M.system(M.p4_cmd("changes", {"-s", "pending", "-c", (root or "."):gsub("/", "\\") .. "/..."}))
+  local result = M.system(M.p4_cmd("changes", {"-s", "pending", root_pathspec(root)}))
   if vim.v.shell_error ~= 0 then
     return {}
   end
@@ -432,7 +447,7 @@ function M.info_async(cb)
 end
 
 function M.opened_async(root, cb)
-  local path = root and (root:gsub("/", "\\") .. "/...") or nil
+  local path = root and root_pathspec(root) or nil
   local args = {"-F", "%clientFile%|%action%|%depotFile%", "opened"}
   if path then
     args[#args + 1] = path
@@ -460,29 +475,19 @@ function M.opened_async(root, cb)
 end
 
 function M.status_async(root, cb)
-  local args = {"-s", (root or "."):gsub("/", "\\") .. "/..."}
+  local args = {"-s", root_pathspec(root)}
   M.system_async(M.p4_cmd("status", args), nil, function(stdout, stderr, code)
     if code ~= 0 then
       cb({}, (stderr ~= "" and stderr or stdout):match("[^\r\n]+") or "p4 status failed")
       return
     end
 
-    local files = {}
-    for line in stdout:gmatch("[^\r\n]+") do
-      local status, path = line:match("^(%S+)%s+(.+)$")
-      if status and path then
-        table.insert(files, {
-          path = path,
-          status = status:lower(),
-        })
-      end
-    end
-    cb(files, nil)
+    cb(parse_status_output(stdout), nil)
   end)
 end
 
 function M.pending_changelists_async(root, cb)
-  local args = {"-s", "pending", "-c", (root or "."):gsub("/", "\\") .. "/..."}
+  local args = {"-s", "pending", root_pathspec(root)}
   M.system_async(M.p4_cmd("changes", args), nil, function(stdout, stderr, code)
     if code ~= 0 then
       cb({}, (stderr ~= "" and stderr or stdout):match("[^\r\n]+") or "p4 pending changes failed")
@@ -493,7 +498,7 @@ function M.pending_changelists_async(root, cb)
 end
 
 function M.shelved_changelists_async(root, cb)
-  local args = {"-s", "shelved", "-c", (root or "."):gsub("/", "\\") .. "/..."}
+  local args = {"-s", "shelved", root_pathspec(root)}
   M.system_async(M.p4_cmd("changes", args), nil, function(stdout, stderr, code)
     if code ~= 0 then
       cb({}, (stderr ~= "" and stderr or stdout):match("[^\r\n]+") or "p4 shelved changes failed")

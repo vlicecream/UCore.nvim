@@ -93,12 +93,41 @@ local function should_show(section)
   return true
 end
 
-local function is_selectable(row)
-  return row and (row.kind == "file" or row.kind == "changelist" or row.kind == "shelved")
-end
-
 local function count_values(values)
   return type(values) == "table" and #values or 0
+end
+
+local function section_count(section)
+  if not state then
+    return "0"
+  end
+  if state.loading[section] then
+    return "..."
+  end
+  if state.data.errors[section] then
+    return "err"
+  end
+  if section == "info" then
+    return "1"
+  end
+  if section == "pending" then
+    return tostring(count_values(state.data.pending))
+  end
+  if section == "shelved" then
+    return tostring(count_values(state.data.shelved))
+  end
+  if section == "files" then
+    return tostring(count_values(state.data.opened) + count_values(state.data.local_changes))
+  end
+  return "0"
+end
+
+local function count_section(section)
+  return section_count(section)
+end
+
+local function is_selectable(row)
+  return row and (row.kind == "file" or row.kind == "changelist" or row.kind == "shelved")
 end
 
 local function loading_message(section)
@@ -312,7 +341,7 @@ local function open_windows()
     local header_win = vim.api.nvim_open_win(header_buf, false, {
       relative = "editor",
       width = left_w + right_w + 4,
-      height = 3,
+      height = 4,
       row = row,
       col = col,
       style = "minimal",
@@ -322,13 +351,13 @@ local function open_windows()
     })
     vim.bo[header_buf].modifiable = true
 
-    local list_h = h - 3
+    local list_h = h - 4
     local left_buf = vim.api.nvim_create_buf(false, true)
     local left_win = vim.api.nvim_open_win(left_buf, true, {
       relative = "editor",
       width = left_w + 2,
       height = list_h,
-      row = row + 3,
+      row = row + 4,
       col = col,
       style = "minimal",
       border = "single",
@@ -342,7 +371,7 @@ local function open_windows()
       relative = "editor",
       width = right_w + 2,
       height = list_h,
-      row = row + 3,
+      row = row + 4,
       col = col + left_w + 4,
       style = "minimal",
       border = "single",
@@ -414,10 +443,10 @@ function M.render_header()
   local info = state.data.info or {}
   local client = info["client name"] or "?"
   local user = info["user name"] or "?"
-  local n_opened = count_values(state.data.opened)
-  local n_local = count_values(state.data.local_changes)
-  local n_pending = count_values(state.data.pending)
-  local n_shelved = count_values(state.data.shelved)
+  local n_opened = state.loading.files and "..." or (state.data.errors.files and "err" or tostring(count_values(state.data.opened)))
+  local n_local = state.loading.files and "..." or (state.data.errors.files and "err" or tostring(count_values(state.data.local_changes)))
+  local n_pending = count_section("pending")
+  local n_shelved = count_section("shelved")
   local left = string.format("P4 | %s", state.project_name or "?")
   local stat = string.format("opened:%d  local:%d  pending:%d  shelved:%d", n_opened, n_local, n_pending, n_shelved)
   local width = vim.api.nvim_win_get_width(state.wins.header_win)
@@ -519,6 +548,13 @@ local function set_right_lines(lines, ft)
   vim.bo[buf].filetype = ft or "ucore-vcs-detail"
   vim.bo[buf].modifiable = false
   vim.bo[buf].modified = false
+  pcall(vim.api.nvim_win_set_cursor, state.wins.right_win, { 1, 0 })
+  pcall(vim.api.nvim_set_option_value, "wrap", false, { win = state.wins.right_win })
+  pcall(vim.api.nvim_set_option_value, "sidescrolloff", 0, { win = state.wins.right_win })
+  pcall(vim.api.nvim_win_call, state.wins.right_win, function()
+    vim.fn.winrestview({ topline = 1, lnum = 1, col = 0, curswant = 0, leftcol = 0 })
+    vim.cmd("normal! 0")
+  end)
 end
 
 local function render_file_summary(item)
