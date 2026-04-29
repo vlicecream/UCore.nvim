@@ -61,6 +61,12 @@ function M.setup()
           vim.bo[buf].readonly = false
           vim.bo[buf].modified = true
           vim.notify("UCore: p4 edit " .. vim.fn.fnamemodify(path, ":t"), vim.log.levels.INFO)
+          vim.schedule(function()
+            local ok_m, dashboard = pcall(require, "ucore.vcs.dashboard")
+            if ok_m and dashboard and dashboard.refresh then
+              dashboard.refresh()
+            end
+          end)
         else
           vim.notify("UCore: p4 edit failed: " .. tostring(err), vim.log.levels.ERROR)
           cancelled_buffers[buf] = true

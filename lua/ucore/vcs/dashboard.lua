@@ -317,6 +317,14 @@ function M.close()
   state = nil
 end
 
+local function count_kind(rows, kind)
+  local n = 0
+  for _, r in ipairs(rows or {}) do
+    if r.kind == kind then n = n + 1 end
+  end
+  return n
+end
+
 function M.render_header()
   if not state or not state.wins then return end
   local buf = state.wins.header_buf
@@ -324,12 +332,24 @@ function M.render_header()
   local info = state.info
   local client = info["client name"] or "?"
   local user = info["user name"] or "?"
+  local n_total = 0
+  local n_local = 0
+  for _, r in ipairs(state.rows) do
+    if r.kind == "file" then
+      n_total = n_total + 1
+      if r.section == "local" then n_local = n_local + 1 end
+    end
+  end
+  local n_opened = n_total - n_local
+  local n_changes = count_kind(state.rows, "changelist")
   local left = string.format("P4 | %s", state.project_name)
-  local client_part = string.format("Client: %s", client)
+  local stat = string.format("opened:%d  local:%d  pending:%d", n_opened, n_local, n_changes)
   local width = vim.api.nvim_win_get_width(state.wins.header_win)
-  local pad = math.max(2, width - vim.fn.strdisplaywidth(left) - vim.fn.strdisplaywidth(client_part) - 3)
-  local line1 = " " .. left .. string.rep(" ", pad) .. client_part
-  local line2 = " " .. string.rep(" ", #left + pad) .. string.format("User: %s", user)
+  local client_part = string.format("Client: %s", client)
+  local pad1 = math.max(2, width - vim.fn.strdisplaywidth(left) - vim.fn.strdisplaywidth(stat) - 3)
+  local pad2 = math.max(2, width - vim.fn.strdisplaywidth(left) - vim.fn.strdisplaywidth(client_part) - 3)
+  local line1 = " " .. left .. string.rep(" ", pad1) .. stat
+  local line2 = " " .. string.rep(" ", pad2 + 2) .. string.format("Client: %s | User: %s", client, user)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, { line1, line2 })
   vim.bo[buf].modifiable = false
 end

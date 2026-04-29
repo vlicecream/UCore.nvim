@@ -235,17 +235,31 @@ end
 function M.commit(root, files, message, opts)
   local change_num, err = M.create_changelist(message)
   if not change_num then
-    return false, tostring(err)
+    return false, "create changelist failed: " .. tostring(err)
   end
 
+  local reopen_errs = {}
   for _, path in ipairs(files or {}) do
     local ok, reopen_err = M.reopen_file(path, change_num)
     if not ok then
-      return false, "failed to move " .. vim.fn.fnamemodify(path, ":t") .. " to changelist " .. tostring(change_num) .. ": " .. tostring(reopen_err)
+      table.insert(reopen_errs, vim.fn.fnamemodify(path, ":t") .. ": " .. tostring(reopen_err))
     end
   end
 
-  return M.submit_changelist(change_num)
+  if #reopen_errs > 0 then
+    local msg = "reopen failed (changelist " .. tostring(change_num) .. " kept):\n" .. table.concat(reopen_errs, "\n")
+    msg = msg .. "\n\nRun :UCore vcs and open Pending Changelists"
+    return false, msg
+  end
+
+  local ok, result = M.submit_changelist(change_num)
+  if not ok then
+    local msg = "submit failed (changelist " .. tostring(change_num) .. " kept):\n" .. tostring(result)
+    msg = msg .. "\n\nRun :UCore vcs and open Pending Changelists"
+    return false, msg
+  end
+
+  return true, result
 end
 
 function M.do_revert(path)
