@@ -151,10 +151,8 @@ function M.vcs_dispatch(tail)
   sub = sub:lower()
   local handlers = {
     dashboard = function() require("ucore.vcs.dashboard").open() end,
-    changes = M.changes,
     checkout = M.checkout,
     commit = M.commit,
-    changelists = M.changelists,
     login = M.vcs_login,
   }
   local handler = handlers[sub]
@@ -1057,21 +1055,6 @@ end
 -- :UCore changelists
 -- Show pending P4 changelists (independent list).
 -- 显示 P4 pending changelist（独立列表）。
-function M.changelists()
-  local root = project.find_project_root()
-  if not root then
-    return vim.notify("Could not find .uproject", vim.log.levels.ERROR)
-  end
-  require("ucore.vcs.changelists").list(root)
-end
-
--- :UCore changes
--- Show VCS changes via the unified LazyGit-style dashboard (filtered to file rows).
--- 通过统一的 LazyGit 风格 dashboard 显示改动文件列表。
-function M.changes()
-  vcs.open_dashboard("files")
-end
-
 -- :UCore commit
 -- Open the VCS commit UI (scratch buffer with file list + message).
 -- 打开 VCS 可视化提交界面（scratch buffer，含文件列表和提交说明）。
@@ -1210,16 +1193,11 @@ UCore commands:
   :UCore find         Find indexed symbols, modules, assets, config
    :UCore goto         Go to definition at cursor
   :UCore references   Find references at cursor
-   :UCore vcs           Open LazyGit-style VCS Dashboard
+   :UCore vcs           Open VCS Dashboard
   :UCore vcs dashboard  Open VCS Dashboard
-  :UCore vcs changes    Show file changes in picker
-  :UCore vcs changelists View pending P4 changelists
   :UCore vcs checkout   Checkout current file (p4 edit)
   :UCore vcs commit     Open visual commit UI
-  :UCore changes       Show VCS changes
-  :UCore checkout      Checkout current file (p4 edit)
-  :UCore commit        Open visual commit UI
-  :UCore changelists   View pending P4 changelists
+  :UCore vcs login      Interactive P4 login
   :UCore debug        Debug and lifecycle subcommands
   :UCore help         Show this help
 ]])

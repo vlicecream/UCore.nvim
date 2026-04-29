@@ -96,10 +96,8 @@ function M.dispatch(args)
     end,
     goto = actions.goto_definition,
 		references = actions.references,
-		changes = actions.changes,
-		checkout = actions.checkout,
-		commit = actions.commit,
-		changelists = actions.changelists,
+    checkout = actions.checkout,
+    commit = actions.commit,
 		vcs = function()
 			actions.vcs_dispatch(tail)
 		end,
@@ -146,7 +144,6 @@ function M.register()
 				"build",
 				"build-cancel",
 				"vcs",
-				"changes",
 				"changelists",
 				"checkout",
 				"commit",
@@ -160,10 +157,8 @@ function M.register()
 
 			local vcs_items = {
 				"dashboard",
-				"changes",
 				"checkout",
 				"commit",
-				"changelists",
 				"login",
 			}
 
