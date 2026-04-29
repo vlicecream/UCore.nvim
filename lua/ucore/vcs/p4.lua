@@ -82,6 +82,23 @@ function M.system(cmd)
   return result
 end
 
+function M.system_err(cmd, stdin)
+  local opts = { text = true }
+  if stdin then opts.stdin = stdin end
+  local env = M.build_env()
+  if next(env) == nil then
+    local r = vim.system(cmd, opts):wait()
+    return r.stdout or "", r.stderr or "", r.code
+  end
+  local merged = vim.deepcopy(vim.env)
+  for k, v in pairs(env) do
+    merged[k] = v
+  end
+  opts.env = merged
+  local r = vim.system(cmd, opts):wait()
+  return r.stdout or "", r.stderr or "", r.code
+end
+
 function M.detect(root)
   if not executable(config.values.vcs.p4.command or "p4") then
     return false
@@ -165,10 +182,10 @@ function M.status(root)
 end
 
 function M.checkout(path)
-  local result = M.system(M.p4_cmd("edit", {path:gsub("/", "\\")}))
-  if vim.v.shell_error ~= 0 then
-    local err = result:match("[^\r\n]+") or result
-    return false, "p4 edit failed: " .. err
+  local stdout, stderr, code = M.system_err(M.p4_cmd("edit", {path:gsub("/", "\\")}))
+  if code ~= 0 then
+    local msg = (stderr ~= "" and stderr or stdout):match("[^\r\n]+") or "p4 edit failed"
+    return false, msg
   end
   return true, nil
 end
@@ -210,31 +227,32 @@ function M.create_changelist(description)
     return nil, "failed to read changelist spec"
   end
   local new_spec = spec:gsub("<enter description here>", description or "(no description)")
-  local result = vim.fn.system(M.p4_cmd("changelist", {"-i"}), new_spec)
-  if vim.v.shell_error ~= 0 then
-    return nil, "failed to create changelist: " .. (result:match("[^\r\n]+") or result)
+  local stdout, stderr, code = M.system_err(M.p4_cmd("changelist", {"-i"}), new_spec)
+  if code ~= 0 then
+    local msg = (stderr ~= "" and stderr or stdout):match("[^\r\n]+") or "failed to create changelist"
+    return nil, msg
   end
-  local change_num = result:match("Change (%d+)")
+  local change_num = stdout:match("Change (%d+)")
   if not change_num then
-    return nil, "could not parse changelist number from: " .. result
+    return nil, "could not parse changelist number"
   end
   return tonumber(change_num), nil
 end
 
 function M.reopen_file(path, change_num)
-  local result = M.system(M.p4_cmd("reopen", {"-c", tostring(change_num), path:gsub("/", "\\")}))
-  if vim.v.shell_error ~= 0 then
-    return false, result:match("[^\r\n]+") or result
+  local stdout, stderr, code = M.system_err(M.p4_cmd("reopen", {"-c", tostring(change_num), path:gsub("/", "\\")}))
+  if code ~= 0 then
+    return false, (stderr ~= "" and stderr or stdout):match("[^\r\n]+") or "reopen failed"
   end
   return true, nil
 end
 
 function M.submit_changelist(change_num)
-  local result = M.system(M.p4_cmd("submit", {"-c", tostring(change_num)}))
-  if vim.v.shell_error ~= 0 then
-    return false, result:match("[^\r\n]+") or result
+  local stdout, stderr, code = M.system_err(M.p4_cmd("submit", {"-c", tostring(change_num)}))
+  if code ~= 0 then
+    return false, (stderr ~= "" and stderr or stdout):match("[^\r\n]+") or "submit failed"
   end
-  return true, result
+  return true, stdout
 end
 
 function M.commit(root, files, message, opts)
@@ -272,9 +290,10 @@ function M.do_revert(path)
 end
 
 function M.add_file(path)
-  local result = M.system(M.p4_cmd("add", {path:gsub("/", "\\")}))
-  if vim.v.shell_error ~= 0 then
-    return false, result:match("[^\r\n]+") or result
+  local stdout, stderr, code = M.system_err(M.p4_cmd("add", {path:gsub("/", "\\")}))
+  if code ~= 0 then
+    local msg = (stderr ~= "" and stderr or stdout):match("[^\r\n]+") or "p4 add failed"
+    return false, msg
   end
   return true, nil
 end
