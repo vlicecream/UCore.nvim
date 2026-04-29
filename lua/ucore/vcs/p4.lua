@@ -135,9 +135,18 @@ local function is_real_local_path(path, root)
 
   local normalized = normalize_path(path)
   if normalized:match("^%a:/") then
-    return root == nil or normalize_path(normalized):lower():sub(1, #normalize_path(root):lower()) == normalize_path(root):lower()
+    if not root then
+      return vim.fn.filereadable(path) == 1 or vim.fn.isdirectory(path) == 1
+    end
+    local normalized_root = normalize_path(root):lower():gsub("/+$", "")
+    local normalized_path = normalize_path(normalized):lower()
+    return normalized_path == normalized_root or normalized_path:sub(1, #normalized_root + 1) == normalized_root .. "/"
   end
   return root ~= nil and not normalized:match("^%.%.")
+end
+
+function M.is_project_file(path, root)
+  return is_real_local_path(path, root)
 end
 
 local function resolve_local_status_path(path, root)
@@ -299,8 +308,8 @@ function M.status(root)
   return parse_status_output(result, root)
 end
 
-function M.checkout(path)
-  if not is_real_local_path(path) then
+function M.checkout(path, root)
+  if not is_real_local_path(path, root) then
     return false, "invalid local file path: " .. tostring(path)
   end
   local stdout, stderr, code = M.system_err(M.p4_cmd("edit", {path:gsub("/", "\\")}))
@@ -311,8 +320,8 @@ function M.checkout(path)
   return true, nil
 end
 
-function M.diff(path)
-  if not is_real_local_path(path) then
+function M.diff(path, root)
+  if not is_real_local_path(path, root) then
     return nil, "invalid local file path: " .. tostring(path)
   end
   local result = M.system(M.p4_cmd("diff", {path:gsub("/", "\\")}))
@@ -409,12 +418,16 @@ function M.commit(root, files, message, opts)
   return true, result
 end
 
-function M.do_revert(path)
+function M.do_revert(path, root)
+  if not is_real_local_path(path, root) then
+    return false, "invalid local file path: " .. tostring(path)
+  end
   M.system(M.p4_cmd("revert", {path:gsub("/", "\\")}))
+  return vim.v.shell_error == 0, nil
 end
 
-function M.add_file(path)
-  if not is_real_local_path(path) then
+function M.add_file(path, root)
+  if not is_real_local_path(path, root) then
     return false, "invalid local file path: " .. tostring(path)
   end
   local stdout, stderr, code = M.system_err(M.p4_cmd("add", {path:gsub("/", "\\")}))
@@ -577,8 +590,12 @@ function M.shelved_changelists_async(root, cb)
   end)
 end
 
-function M.diff_async(path, cb)
-  if not is_real_local_path(path) then
+function M.diff_async(path, root, cb)
+  if type(root) == "function" then
+    cb = root
+    root = nil
+  end
+  if not is_real_local_path(path, root) then
     vim.schedule(function()
       cb(nil, "invalid local file path: " .. tostring(path))
     end)

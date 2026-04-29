@@ -84,6 +84,10 @@ local function is_modify_candidate(item)
   return item and item.kind == "file" and item.section == "local" and item.status == "modify?"
 end
 
+local function is_dashboard_file(path)
+  return p4.is_project_file(path, state and state.root or nil)
+end
+
 local function should_show(section)
   if not state then
     return true
@@ -197,7 +201,7 @@ local function rebuild_rows()
   elseif data.errors.info then
     table.insert(rows, { kind = "empty", text = error_message("info") })
   else
-    table.insert(rows, { kind = "info", label = "Client", value = data.info["client name"] or "?" })
+    table.insert(rows, { kind = "info", label = "Workspace", value = data.info["client name"] or "?" })
     table.insert(rows, { kind = "info", label = "User", value = data.info["user name"] or "?" })
   end
 
@@ -211,30 +215,32 @@ local function rebuild_rows()
     else
       local local_seen = {}
       for _, f in ipairs(data.opened or {}) do
-        if f.path then
+        if f.path and is_dashboard_file(f.path) then
           local_seen[f.path:lower()] = true
         end
       end
 
       local has_changes = false
       for _, f in ipairs(data.opened or {}) do
-        has_changes = true
-        local name, dir = split_path(f.path)
-        table.insert(rows, {
-          kind = "file",
-          section = "opened",
-          checked = true,
-          status = f.action,
-          raw_status = f.action,
-          path = f.path,
-          filename = name,
-          directory = dir,
-          change = f.change or "default",
-        })
+        if is_dashboard_file(f.path) then
+          has_changes = true
+          local name, dir = split_path(f.path)
+          table.insert(rows, {
+            kind = "file",
+            section = "opened",
+            checked = true,
+            status = f.action,
+            raw_status = f.action,
+            path = f.path,
+            filename = name,
+            directory = dir,
+            change = f.change or "default",
+          })
+        end
       end
 
       for _, f in ipairs(data.local_changes or {}) do
-        if f.path and not local_seen[f.path:lower()] then
+        if f.path and is_dashboard_file(f.path) and not local_seen[f.path:lower()] then
           has_changes = true
           local name, dir = split_path(f.path)
           table.insert(rows, {
@@ -359,7 +365,8 @@ local function open_windows()
   local ed_h = vim.o.lines
   local total_w = ed_w - 4
   local left_w = math.max(42, math.floor(total_w * 0.37))
-  local right_w = total_w - left_w - 4
+  local gap = 2
+  local right_w = total_w - left_w - gap
   if right_w < 30 then
     left_w = total_w - 34
     right_w = 30
@@ -370,9 +377,9 @@ local function open_windows()
   local col = math.max(0, math.floor((ed_w - total_w) / 2))
   local header_h = 1
   local footer_h = 1
-  local list_h = math.max(10, h - 9)
-  local main_row = row + header_h + 3
-  local footer_row = main_row + list_h + 3
+  local main_row = row + header_h + 2
+  local footer_row = row + h - footer_h - 2
+  local list_h = math.max(10, footer_row - main_row - 1)
 
   local success, result = pcall(function()
     local header_buf = vim.api.nvim_create_buf(false, true)
@@ -407,7 +414,7 @@ local function open_windows()
       width = right_w,
       height = list_h,
       row = main_row,
-      col = col + left_w + 4,
+      col = col + left_w + gap,
       style = "minimal",
       border = "single",
     })
@@ -482,10 +489,39 @@ local function render_status_text()
 end
 
 local function help_line(width)
-  local long = "j/k move    Space toggle    Enter open    d diff    c checkout    a add    r revert    m commit    R refresh    q close"
-  local short = "j/k move  d diff  m commit  R refresh  q close"
-  local text = vim.fn.strdisplaywidth(long) <= width - 2 and long or short
-  return " " .. text
+  local items = {
+    "j/k move",
+    "Space toggle",
+    "Enter open",
+    "d diff",
+    "c checkout",
+    "a add",
+    "r revert",
+    "m commit",
+    "R refresh",
+    "q close",
+  }
+  local short_items = {
+    "j/k move",
+    "d diff",
+    "m commit",
+    "R refresh",
+    "q close",
+  }
+  local active = items
+  local total = 0
+  for _, item in ipairs(active) do
+    total = total + vim.fn.strdisplaywidth(item)
+  end
+  if total + (#active - 1) * 2 > width - 2 then
+    active = short_items
+    total = 0
+    for _, item in ipairs(active) do
+      total = total + vim.fn.strdisplaywidth(item)
+    end
+  end
+  local gap = math.max(2, math.floor((width - 2 - total) / math.max(1, #active - 1)))
+  return " " .. table.concat(active, string.rep(" ", gap))
 end
 
 local function pad_to_width(text, width)
@@ -527,11 +563,11 @@ function M.render_header()
   local buf = state.wins.header_buf
   vim.bo[buf].modifiable = true
   local info = state.data.info or {}
-  local client = info["client name"] or "?"
+  local workspace = info["client name"] or "?"
   local user = info["user name"] or "?"
   local left = string.format("P4 | %s", state.project_name or "?")
   local center = "UCore VCS"
-  local right = string.format("Client: %s | User: %s", client, user)
+  local right = string.format("Workspace: %s | User: %s", workspace, user)
   local width = vim.api.nvim_win_get_width(state.wins.header_win)
   local line = compose_header(left, center, right, width)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, { line })
@@ -539,7 +575,7 @@ function M.render_header()
   add_pattern_highlight(buf, 0, line, "P4", "UCoreVcsProvider")
   add_pattern_highlight(buf, 0, line, state.project_name or "?", "UCoreVcsProject")
   add_pattern_highlight(buf, 0, line, center, "UCoreVcsTitle")
-  add_pattern_highlight(buf, 0, line, "Client:", "UCoreVcsMeta")
+  add_pattern_highlight(buf, 0, line, "Workspace:", "UCoreVcsMeta")
   add_pattern_highlight(buf, 0, line, "User:", "UCoreVcsMeta")
   vim.bo[buf].modifiable = false
 end
@@ -816,6 +852,11 @@ end
 
 local function load_file_diff(item)
   if not state or not item or not item.path then return end
+  if not is_dashboard_file(item.path) then
+    state.cache.diff[item.path] = { error = "invalid local file path: " .. tostring(item.path) }
+    M.render_right()
+    return
+  end
   if state.cache.diff[item.path] and state.cache.diff[item.path].text then
     M.render_right()
     return
@@ -823,7 +864,7 @@ local function load_file_diff(item)
   state.cache.diff[item.path] = { loading = true }
   M.render_right()
   local token = state.token
-  p4.diff_async(item.path, function(text, err)
+  p4.diff_async(item.path, state.root, function(text, err)
     if not state or state.token ~= token then return end
     state.cache.diff[item.path] = err and { error = err } or { text = text or "" }
     M.render_right()
@@ -911,12 +952,16 @@ function M.load_data()
 
     p4.opened_async(root, function(files, err)
       if not state or state.token ~= token then return end
-      state.data.opened = files or {}
+      state.data.opened = vim.tbl_filter(function(file)
+        return file and is_dashboard_file(file.path)
+      end, files or {})
       done_files("opened", err)
     end)
     p4.status_async(root, function(files, err)
       if not state or state.token ~= token then return end
-      state.data.local_changes = files or {}
+      state.data.local_changes = vim.tbl_filter(function(file)
+        return file and is_dashboard_file(file.path)
+      end, files or {})
       done_files("status", err)
     end)
   end
@@ -996,7 +1041,7 @@ local function setup_keymaps()
       vim.notify("UCore: this looks like a new file. Use 'a' to p4 add it.", vim.log.levels.INFO)
       return
     end
-    local ok, err = p4.checkout(item.path)
+    local ok, err = p4.checkout(item.path, state.root)
     if ok then
       vim.notify("UCore: p4 edit " .. item.filename, vim.log.levels.INFO)
       M.refresh()
@@ -1019,7 +1064,7 @@ local function setup_keymaps()
       end
       return
     end
-    local ok, err = p4.add_file(item.path)
+    local ok, err = p4.add_file(item.path, state.root)
     if ok then
       vim.notify("UCore: p4 add " .. item.filename, vim.log.levels.INFO)
       M.refresh()
@@ -1039,9 +1084,13 @@ local function setup_keymaps()
       "&Revert\n&Cancel", 2, "Question"
     )
     if confirm ~= 1 then return end
-    p4.do_revert(item.path)
-    vim.notify("UCore: reverted " .. item.filename, vim.log.levels.INFO)
-    M.refresh()
+    local ok, err = p4.do_revert(item.path, state.root)
+    if ok then
+      vim.notify("UCore: reverted " .. item.filename, vim.log.levels.INFO)
+      M.refresh()
+    else
+      vim.notify("UCore: revert failed: " .. tostring(err), vim.log.levels.ERROR)
+    end
   end, opts)
 
   vim.keymap.set("n", "m", function()
