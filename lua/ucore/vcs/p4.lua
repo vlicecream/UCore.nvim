@@ -122,6 +122,10 @@ local function normalize_path(path)
   return tostring(path or ""):gsub("\\", "/")
 end
 
+local function is_depot_path(path)
+  return type(path) == "string" and path:match("^//") ~= nil
+end
+
 local function is_real_local_path(path, root)
   if not path or path == "" or path == "0" then
     return false
@@ -284,7 +288,7 @@ function M.opened(root)
     if depot_rev and action then
       local depot_file = depot_rev:gsub("#%d+$", "")
       local local_path = M.depot_to_local(depot_file)
-      if local_path then
+      if local_path and is_real_local_path(local_path, root) then
         local change = line:match("%-%s+%S+%s+(%S+)%s+change") or "default"
         if change == "0" then change = "default" end
         table.insert(files, {
@@ -332,6 +336,9 @@ function M.diff(path, root)
 end
 
 function M.depot_to_local(depot_file)
+  if not is_depot_path(depot_file) then
+    return nil
+  end
   local result = M.system(M.p4_cmd("where", {depot_file}))
   if vim.v.shell_error ~= 0 then
     return nil
@@ -537,7 +544,7 @@ function M.opened_async(root, cb)
           change = line:match("%-%s+%S+%s+(%S+)%s+change") or "default"
         end
       end
-      if (not client_file or not is_real_local_path(client_file, root)) and depot and depot ~= "" then
+      if (not client_file or not is_real_local_path(client_file, root)) and is_depot_path(depot) then
         client_file = M.depot_to_local(depot)
       end
       if client_file and action and is_real_local_path(client_file, root) then
@@ -601,6 +608,7 @@ function M.diff_async(path, root, cb)
     end)
     return
   end
+  path = path:gsub("/", "\\")
   M.system_async(M.p4_cmd("diff", {path:gsub("/", "\\")}), nil, function(stdout, stderr, code)
     if code ~= 0 then
       cb(nil, (stderr ~= "" and stderr or stdout):match("[^\r\n]+") or "p4 diff failed")
