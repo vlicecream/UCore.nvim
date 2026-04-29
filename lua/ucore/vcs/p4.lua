@@ -118,20 +118,62 @@ local function root_pathspec(root)
   return (root or "."):gsub("/", "\\") .. "\\..."
 end
 
-local function parse_status_output(result)
+local function normalize_path(path)
+  return tostring(path or ""):gsub("\\", "/")
+end
+
+local function is_real_local_path(path, root)
+  if not path or path == "" or path == "0" then
+    return false
+  end
+  if path:match("^//") or path:find("//", 1, true) then
+    return false
+  end
+  if path:find(" to add ", 1, true) or path:find(" to edit ", 1, true) then
+    return false
+  end
+
+  local normalized = normalize_path(path)
+  if normalized:match("^%a:/") then
+    return root == nil or normalize_path(normalized):lower():sub(1, #normalize_path(root):lower()) == normalize_path(root):lower()
+  end
+  return root ~= nil and not normalized:match("^%.%.")
+end
+
+local function resolve_local_status_path(path, root)
+  path = vim.trim(tostring(path or "")):gsub("#%d+$", "")
+  if not is_real_local_path(path, root) then
+    return nil
+  end
+  if path:gsub("\\", "/"):match("^%a:/") then
+    return path
+  end
+  return (root:gsub("[/\\]+$", "") .. "/" .. path):gsub("/", "\\")
+end
+
+local function parse_status_output(result, root)
   local files = {}
+  local valid_status = {
+    ["?"] = true,
+    ["!"] = true,
+    ["m"] = true,
+    ["a"] = true,
+    ["d"] = true,
+    ["r"] = true,
+  }
   for line in tostring(result or ""):gmatch("[^\r\n]+") do
     line = vim.trim(line)
     local status, rest = line:match("^(%S+)%s+(.+)$")
-    if status and rest then
+    status = status and status:lower()
+    if status and rest and valid_status[status] then
       local path = rest
       path = path:gsub("%s+%-%s+.*$", "")
       path = path:gsub("%s+%-+%s+.*$", "")
-      path = vim.trim(path)
-      if path ~= "" and not path:match("^//") then
+      path = resolve_local_status_path(path, root)
+      if path then
         table.insert(files, {
           path = path,
-          status = status:lower(),
+          status = status,
         })
       end
     end
@@ -234,10 +276,13 @@ function M.opened(root)
       local depot_file = depot_rev:gsub("#%d+$", "")
       local local_path = M.depot_to_local(depot_file)
       if local_path then
+        local change = line:match("%-%s+%S+%s+(%S+)%s+change") or "default"
+        if change == "0" then change = "default" end
         table.insert(files, {
           path = local_path,
           action = action,
           depot = depot_file,
+          change = change,
         })
       end
     end
@@ -251,10 +296,13 @@ function M.status(root)
   if vim.v.shell_error ~= 0 then
     return {}
   end
-  return parse_status_output(result)
+  return parse_status_output(result, root)
 end
 
 function M.checkout(path)
+  if not is_real_local_path(path) then
+    return false, "invalid local file path: " .. tostring(path)
+  end
   local stdout, stderr, code = M.system_err(M.p4_cmd("edit", {path:gsub("/", "\\")}))
   if code ~= 0 then
     local msg = (stderr ~= "" and stderr or stdout):match("[^\r\n]+") or "p4 edit failed"
@@ -264,6 +312,9 @@ function M.checkout(path)
 end
 
 function M.diff(path)
+  if not is_real_local_path(path) then
+    return nil, "invalid local file path: " .. tostring(path)
+  end
   local result = M.system(M.p4_cmd("diff", {path:gsub("/", "\\")}))
   if vim.v.shell_error ~= 0 then
     return nil, "p4 diff failed"
@@ -363,6 +414,9 @@ function M.do_revert(path)
 end
 
 function M.add_file(path)
+  if not is_real_local_path(path) then
+    return false, "invalid local file path: " .. tostring(path)
+  end
   local stdout, stderr, code = M.system_err(M.p4_cmd("add", {path:gsub("/", "\\")}))
   if code ~= 0 then
     local msg = (stderr ~= "" and stderr or stdout):match("[^\r\n]+") or "p4 add failed"
@@ -448,7 +502,7 @@ end
 
 function M.opened_async(root, cb)
   local path = root and root_pathspec(root) or nil
-  local args = {"-F", "%clientFile%|%action%|%depotFile%", "opened"}
+  local args = {"-F", "%clientFile%|%action%|%depotFile%|%change%", "opened"}
   if path then
     args[#args + 1] = path
   end
@@ -461,12 +515,27 @@ function M.opened_async(root, cb)
 
     local files = {}
     for line in stdout:gmatch("[^\r\n]+") do
-      local client_file, action, depot = line:match("^(.-)|([^|]+)|(.*)$")
-      if client_file and action and client_file ~= "" then
+      local client_file, action, depot, change = line:match("^(.-)|([^|]+)|([^|]*)|(.*)$")
+      if not client_file then
+        local depot_rev, opened_action = line:match("^(%S+)%s*%-%s*(%S+)")
+        if depot_rev and opened_action then
+          depot = depot_rev:gsub("#%d+$", "")
+          action = opened_action
+          change = line:match("%-%s+%S+%s+(%S+)%s+change") or "default"
+        end
+      end
+      if (not client_file or not is_real_local_path(client_file, root)) and depot and depot ~= "" then
+        client_file = M.depot_to_local(depot)
+      end
+      if client_file and action and is_real_local_path(client_file, root) then
+        if not change or change == "" or change == "0" then
+          change = "default"
+        end
         table.insert(files, {
           path = client_file,
           action = action,
           depot = depot,
+          change = change ~= "" and change or "default",
         })
       end
     end
@@ -482,7 +551,7 @@ function M.status_async(root, cb)
       return
     end
 
-    cb(parse_status_output(stdout), nil)
+    cb(parse_status_output(stdout, root), nil)
   end)
 end
 
@@ -509,6 +578,12 @@ function M.shelved_changelists_async(root, cb)
 end
 
 function M.diff_async(path, cb)
+  if not is_real_local_path(path) then
+    vim.schedule(function()
+      cb(nil, "invalid local file path: " .. tostring(path))
+    end)
+    return
+  end
   M.system_async(M.p4_cmd("diff", {path:gsub("/", "\\")}), nil, function(stdout, stderr, code)
     if code ~= 0 then
       cb(nil, (stderr ~= "" and stderr or stdout):match("[^\r\n]+") or "p4 diff failed")

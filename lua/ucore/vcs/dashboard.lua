@@ -134,6 +134,20 @@ local function count_section(section)
   return section_count(section)
 end
 
+local function default_changelist_count()
+  if not state or type(state.data.opened) ~= "table" then
+    return 0
+  end
+  local total = 0
+  for _, f in ipairs(state.data.opened) do
+    local change = tostring(f.change or "default"):lower()
+    if change == "" or change == "default" then
+      total = total + 1
+    end
+  end
+  return total
+end
+
 local function is_selectable(row)
   return row and (row.kind == "file" or row.kind == "changelist" or row.kind == "shelved")
 end
@@ -215,6 +229,7 @@ local function rebuild_rows()
           path = f.path,
           filename = name,
           directory = dir,
+          change = f.change or "default",
         })
       end
 
@@ -248,17 +263,26 @@ local function rebuild_rows()
       table.insert(rows, { kind = "empty", text = loading_message("pending") })
     elseif data.errors.pending then
       table.insert(rows, { kind = "empty", text = error_message("pending") })
-    elseif count_values(data.pending) > 0 then
-      for _, ch in ipairs(data.pending) do
+    else
+      local default_count = default_changelist_count()
+      if default_count > 0 then
         table.insert(rows, {
-          kind = "changelist",
-          number = ch.number,
-          description = tostring(ch.description or ""):gsub("\n", " "):sub(1, 60),
-          user = ch.user,
+          kind = "empty",
+          text = string.format("  default  Default changelist (%d opened files)", default_count),
         })
       end
-    else
-      table.insert(rows, { kind = "empty", text = "  (none)" })
+      if count_values(data.pending) > 0 then
+        for _, ch in ipairs(data.pending) do
+          table.insert(rows, {
+            kind = "changelist",
+            number = ch.number,
+            description = tostring(ch.description or ""):gsub("\n", " "):sub(1, 60),
+            user = ch.user,
+          })
+        end
+      elseif default_count == 0 then
+        table.insert(rows, { kind = "empty", text = "  (none)" })
+      end
     end
   end
 
@@ -333,7 +357,7 @@ local function open_windows()
 
   local ed_w = vim.o.columns
   local ed_h = vim.o.lines
-  local total_w = math.min(ed_w - 4, 160)
+  local total_w = ed_w - 4
   local left_w = math.max(42, math.floor(total_w * 0.37))
   local right_w = total_w - left_w - 4
   if right_w < 30 then
@@ -341,8 +365,8 @@ local function open_windows()
     right_w = 30
   end
 
-  local h = math.min(ed_h - 2, 42)
-  local row = math.max(0, math.floor((ed_h - h) / 2))
+  local h = ed_h - 4
+  local row = 1
   local col = math.max(0, math.floor((ed_w - total_w) / 2))
   local header_h = 1
   local footer_h = 1
@@ -360,8 +384,6 @@ local function open_windows()
       col = col,
       style = "minimal",
       border = "single",
-      title = " UCore VCS ",
-      title_pos = "center",
     })
     vim.bo[header_buf].modifiable = true
 
@@ -575,14 +597,15 @@ function M.render_left()
     elseif row.kind == "file" then
       local mark = row.checked and "[x]" or "[ ]"
       local dir = compact_directory(row.directory, 30)
+      local change = row.section == "opened" and ("[" .. tostring(row.change or "default") .. "]") or ""
       if dir ~= "" then
-        table.insert(text_lines, string.format("%s%s  %-7s %-24s %s", pointer, mark, row.status, row.filename, dir))
+        table.insert(text_lines, string.format("%s%s  %-7s %-10s %-24s %s", pointer, mark, row.status, change, row.filename, dir))
       else
-        table.insert(text_lines, string.format("%s%s  %-7s %s", pointer, mark, row.status, row.filename))
+        table.insert(text_lines, string.format("%s%s  %-7s %-10s %s", pointer, mark, row.status, change, row.filename))
       end
     elseif row.kind == "changelist" or row.kind == "shelved" then
       local desc = tostring(row.description or ""):gsub("\n", " "):sub(1, 55)
-      table.insert(text_lines, string.format("%s%-6d  %s", pointer, row.number, desc))
+      table.insert(text_lines, string.format("%sCL %-6d  %s", pointer, row.number, desc))
     end
   end
 
@@ -629,8 +652,12 @@ function M.render_left()
       if i == state.cursor then
         vim.api.nvim_buf_add_highlight(buf, ns, "UCoreVcsSelector", line, 0, 2)
       end
-      vim.api.nvim_buf_add_highlight(buf, ns, "UCoreVcsChangelistNum", line, 2, 8)
-      vim.api.nvim_buf_add_highlight(buf, ns, "UCoreVcsChangelistDesc", line, 10, #line_text)
+      local num = tostring(row.number)
+      local num_start = line_text:find(num, 1, true)
+      if num_start then
+        vim.api.nvim_buf_add_highlight(buf, ns, "UCoreVcsChangelistNum", line, num_start - 1, num_start - 1 + #num)
+        vim.api.nvim_buf_add_highlight(buf, ns, "UCoreVcsChangelistDesc", line, num_start + #num + 1, #line_text)
+      end
     end
   end
 
