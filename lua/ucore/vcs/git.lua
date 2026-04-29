@@ -54,4 +54,21 @@ function M.diff(path)
   return result, nil
 end
 
+function M.commit(root, files, message, opts)
+  local add_result = vim.fn.system(vim.list_extend({"git", "-C", root, "add", "--"}, files))
+  if vim.v.shell_error ~= 0 then
+    return false, "git add failed: " .. (add_result:match("[^\r\n]+") or add_result)
+  end
+
+  local msg_file = vim.fn.tempname()
+  vim.fn.writefile(vim.split(message, "\n", { plain = true }), msg_file)
+  local result = vim.fn.system({"git", "-C", root, "commit", "-F", msg_file})
+  vim.fn.delete(msg_file)
+
+  if vim.v.shell_error ~= 0 then
+    return false, "git commit failed: " .. (result:match("[^\r\n]+") or result)
+  end
+  return true, result
+end
+
 return M

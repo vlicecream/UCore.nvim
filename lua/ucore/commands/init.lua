@@ -42,6 +42,8 @@ local function dispatch_debug(tail)
 		projects = actions.projects,
 		modules = actions.modules,
 		assets = actions.assets,
+		["p4-changes"] = actions.pending_changelists,
+		p4changes = actions.pending_changelists,
 		["search-symbols"] = function()
 			actions.search_symbols(rest)
 		end,
@@ -95,7 +97,8 @@ function M.dispatch(args)
     goto = actions.goto_definition,
     references = actions.references,
     changes = actions.changes,
-    checkout = actions.checkout,
+	checkout = actions.checkout,
+	commit = actions.commit,
     debug = function()
       dispatch_debug(tail)
     end,
@@ -140,6 +143,7 @@ function M.register()
 				"build-cancel",
 				"changes",
 				"checkout",
+				"commit",
 				"editor",
 				"find",
 				"goto",
@@ -157,6 +161,7 @@ function M.register()
 				"projects",
 				"modules",
 				"assets",
+				"p4-changes",
 				"search-symbols",
 				"status",
 				"rpc-status",

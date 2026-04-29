@@ -49,4 +49,17 @@ function M.diff(path)
   return result, nil
 end
 
+function M.commit(root, files, message, opts)
+  local msg_file = vim.fn.tempname()
+  vim.fn.writefile(vim.split(message, "\n", { plain = true }), msg_file)
+  local args = vim.list_extend({"svn", "commit", "-F", msg_file}, files)
+  local result = vim.fn.system(args)
+  vim.fn.delete(msg_file)
+
+  if vim.v.shell_error ~= 0 then
+    return false, "svn commit failed: " .. (result:match("[^\r\n]+") or result)
+  end
+  return true, result
+end
+
 return M

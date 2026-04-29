@@ -496,6 +496,12 @@ function M.dashboard()
 					description = "p4 edit for current buffer",
 					run = M.checkout,
 				},
+				{
+					label = "Source Control: Commit changes",
+					badge = "[" .. project_vcs.name():upper() .. "]",
+					description = "Open visual commit UI",
+					run = M.commit,
+				},
 			})
 		end
 	end
@@ -1013,6 +1019,13 @@ function M.changes()
   })
 end
 
+-- :UCore commit
+-- Open the VCS commit UI (scratch buffer with file list + message).
+-- 打开 VCS 可视化提交界面（scratch buffer，含文件列表和提交说明）。
+function M.commit()
+  vcs.open_commit_ui()
+end
+
 -- :UCore checkout
 -- Checkout the current buffer file via VCS (p4 edit).
 -- 对当前文件执行 VCS checkout（P4 下为 p4 edit）。
@@ -1038,6 +1051,28 @@ function M.checkout()
   else
     vim.notify("UCore checkout failed: " .. tostring(err), vim.log.levels.ERROR)
   end
+end
+
+-- :UCore debug p4-changes
+-- Print pending P4 changelists.
+-- 打印 P4 pending changelist 简表。
+function M.pending_changelists()
+  local root = project.find_project_root()
+  if not root then
+    return vim.notify("Could not find .uproject", vim.log.levels.ERROR)
+  end
+  local provider = vcs.detect(root)
+  if not provider or provider.name() ~= "p4" then
+    return vim.notify("UCore: no P4 provider detected", vim.log.levels.WARN)
+  end
+  if not provider.pending_changelists then
+    return vim.notify("UCore: pending_changelists not available", vim.log.levels.WARN)
+  end
+  local changes = provider.pending_changelists(root)
+  if #changes == 0 then
+    return vim.notify("UCore: no pending changelists", vim.log.levels.INFO)
+  end
+  print(vim.inspect(changes))
 end
 
 -- :UCore debug vcs
@@ -1130,6 +1165,7 @@ UCore commands:
   :UCore references   Find references at cursor
    :UCore changes      Show VCS changes for current project
   :UCore checkout     Checkout current file (p4 edit)
+  :UCore commit       Open visual commit UI
   :UCore debug        Debug and lifecycle subcommands
   :UCore help         Show this help
 ]])
@@ -1164,6 +1200,7 @@ UCore debug commands:
   :UCore debug complete     Trigger manual completion in Insert mode
   :UCore debug maps         Print Lua-side component/module maps
   :UCore debug vcs          Print VCS diagnostics
+  :UCore debug p4-changes   Print pending P4 changelists
   :UCore debug help         Show this help
 ]])
 end

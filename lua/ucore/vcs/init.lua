@@ -157,6 +157,35 @@ function M.collect_changes(root)
   return items
 end
 
+function M.commit(root, files, message, opts)
+  local provider = M.detect(root)
+  if not provider then
+    return false, "no VCS provider detected"
+  end
+  if not provider.commit then
+    return false, "commit not implemented for " .. provider.name():upper()
+  end
+  return provider.commit(root, files, message, opts or {})
+end
+
+function M.revert(root, files)
+  local provider = M.detect(root)
+  if not provider then
+    return false, "no VCS provider detected"
+  end
+  if provider.name() == "p4" and provider.do_revert then
+    for _, path in ipairs(files or {}) do
+      provider.do_revert(path)
+    end
+    return true, nil
+  end
+  return false, "revert not implemented for " .. provider.name():upper()
+end
+
+function M.open_commit_ui()
+  require("ucore.vcs.commit").open()
+end
+
 function M.setup()
   local vcs_config = config.values.vcs or {}
   if vcs_config.enable == false then
