@@ -322,6 +322,48 @@ function M.changelist_detail(change_num)
   return detail, nil
 end
 
+function M.needs_login()
+  local result = M.system(M.p4_cmd("login", {"-s"}))
+  return vim.v.shell_error ~= 0
+end
+
+function M.login(password)
+  local ok = pcall(vim.fn.inputsave)
+  local pwd = password
+  if not pwd then
+    pwd = vim.fn.inputsecret("P4 password: ")
+  end
+  if ok then pcall(vim.fn.inputrestore) end
+  if pwd == "" then
+    return false, "password is empty"
+  end
+  local result = vim.fn.system(M.p4_cmd("login"), pwd)
+  if vim.v.shell_error ~= 0 then
+    local err = result:match("[^\r\n]+") or "login failed"
+    return false, err
+  end
+  return true, nil
+end
+
+function M.shelved_changelists(root)
+  local result = M.system(M.p4_cmd("changes", {"-s", "shelved", "-c", (root or "."):gsub("/", "\\") .. "/..."}))
+  if vim.v.shell_error ~= 0 then
+    return {}
+  end
+  local changes = {}
+  for line in result:gmatch("[^\r\n]+") do
+    local num, user, desc = line:match("^Change (%d+) .- by (.+) @ .- %((.-)%)")
+    if num then
+      table.insert(changes, {
+        number = tonumber(num),
+        user = user,
+        description = desc,
+      })
+    end
+  end
+  return changes
+end
+
 function M.pending_changelists(root)
   local result = M.system(M.p4_cmd("changes", {"-s", "pending", "-c", (root or "."):gsub("/", "\\") .. "/..."}))
   if vim.v.shell_error ~= 0 then
@@ -340,5 +382,7 @@ function M.pending_changelists(root)
   end
   return changes
 end
+
+M.shelved_detail = M.changelist_detail
 
 return M

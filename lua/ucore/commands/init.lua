@@ -164,6 +164,7 @@ function M.register()
 				"checkout",
 				"commit",
 				"changelists",
+				"login",
 			}
 
 			local debug_items = {

@@ -128,32 +128,46 @@ local function latest_server_log()
 	return best or fallback
 end
 
+-- :UCore vcs login
+-- Interactive P4 login.
+-- 交互式 P4 登录。
+function M.vcs_login()
+  local ok, err = pcall(function()
+    local p4 = require("ucore.vcs.p4")
+    return p4.login()
+  end)
+  if ok then
+    vim.notify("UCore: P4 login successful", vim.log.levels.INFO)
+  else
+    vim.notify("UCore: P4 login failed: " .. tostring(err), vim.log.levels.ERROR)
+  end
+end
+
 -- :UCore vcs ...  dispatch
--- Dispatch VCS subcommands: dashboard, changes, checkout, commit, changelists.
+-- Dispatch VCS subcommands: dashboard, changes, checkout, commit, changelists, login.
 -- 分发 VCS 子命令。
 function M.vcs_dispatch(tail)
   local sub = (tail or ""):match("^%s*(%S+)") or "dashboard"
   sub = sub:lower()
   local handlers = {
-    dashboard = M.vcs_dashboard,
-    changes = function()
-      vcs.open_dashboard("files")
-    end,
+    dashboard = function() require("ucore.vcs.dashboard").open() end,
+    changes = M.changes,
     checkout = M.checkout,
     commit = M.commit,
     changelists = M.changelists,
+    login = M.vcs_login,
   }
   local handler = handlers[sub]
   if handler then
     handler()
   else
-    vim.notify("Unknown UCore vcs command: " .. sub .. "\nAvailable: dashboard changes checkout commit changelists", vim.log.levels.WARN)
+    vim.notify("Unknown UCore vcs command: " .. sub .. "\nAvailable: dashboard changes checkout commit changelists login", vim.log.levels.WARN)
   end
-end
+  end
 
 -- :UCore vcs dashboard
--- Open the LazyGit-style VCS Dashboard.
--- 打开 LazyGit 风格 VCS Dashboard。
+-- Open the VCS Dashboard.
+-- 打开 VCS Dashboard。
 function M.vcs_dashboard()
   vcs.open_dashboard("all")
 end

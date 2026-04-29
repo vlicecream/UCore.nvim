@@ -83,9 +83,13 @@ function M.collect_data(root, filter)
 
   local opened = p4.opened(root) or {}
   local local_changes = p4.status(root) or {}
-  local changes = {}
+  local pending = {}
   if p4.pending_changelists then
-    changes = p4.pending_changelists(root) or {}
+    pending = p4.pending_changelists(root) or {}
+  end
+  local shelved = {}
+  if p4.shelved_changelists then
+    shelved = p4.shelved_changelists(root) or {}
   end
 
   local local_seen = {}
@@ -135,10 +139,28 @@ function M.collect_data(root, filter)
     table.insert(rows, { kind = "blank" })
     table.insert(rows, { kind = "section", label = "Pending Changelists" })
 
-    if #changes > 0 then
-      for _, ch in ipairs(changes) do
+    if #pending > 0 then
+      for _, ch in ipairs(pending) do
         table.insert(rows, {
           kind = "changelist",
+          number = ch.number,
+          description = ch.description:gsub("\n", " "):sub(1, 60),
+          user = ch.user,
+        })
+      end
+    else
+      table.insert(rows, { kind = "empty", text = "  (none)" })
+    end
+  end
+
+  if filter ~= "files" then
+    table.insert(rows, { kind = "blank" })
+    table.insert(rows, { kind = "section", label = "Shelved Changelists" })
+
+    if #shelved > 0 then
+      for _, ch in ipairs(shelved) do
+        table.insert(rows, {
+          kind = "shelved",
           number = ch.number,
           description = ch.description:gsub("\n", " "):sub(1, 60),
           user = ch.user,
@@ -225,7 +247,7 @@ local function open_windows()
 
   local success, result = pcall(function()
     local header_buf = vim.api.nvim_create_buf(false, true)
-    local header_win = vim.api.nvim_open_win(header_buf, true, {
+    local header_win = vim.api.nvim_open_win(header_buf, false, {
       relative = "editor",
       width = left_w + right_w + 4,
       height = 3,
@@ -239,7 +261,7 @@ local function open_windows()
     vim.bo[header_buf].modifiable = true
 
     local left_buf = vim.api.nvim_create_buf(false, true)
-    local left_win = vim.api.nvim_open_win(left_buf, false, {
+    local left_win = vim.api.nvim_open_win(left_buf, true, {
       relative = "editor",
       width = left_w + 2,
       height = h - 3,
@@ -341,9 +363,10 @@ function M.render_header()
     end
   end
   local n_opened = n_total - n_local
-  local n_changes = count_kind(state.rows, "changelist")
+  local n_pending = count_kind(state.rows, "changelist")
+  local n_shelved = count_kind(state.rows, "shelved")
   local left = string.format("P4 | %s", state.project_name)
-  local stat = string.format("opened:%d  local:%d  pending:%d", n_opened, n_local, n_changes)
+  local stat = string.format("opened:%d  local:%d  pending:%d  shelved:%d", n_opened, n_local, n_pending, n_shelved)
   local width = vim.api.nvim_win_get_width(state.wins.header_win)
   local client_part = string.format("Client: %s", client)
   local pad1 = math.max(2, width - vim.fn.strdisplaywidth(left) - vim.fn.strdisplaywidth(stat) - 3)
@@ -748,6 +771,14 @@ function M.open(opts)
   if not p4.detect(root) then
     vim.notify("UCore: no P4 provider detected", vim.log.levels.WARN)
     return
+  end
+
+  if p4.needs_login() then
+    local ok, err = p4.login()
+    if not ok then
+      vim.notify("UCore: P4 login failed: " .. tostring(err), vim.log.levels.ERROR)
+      return
+    end
   end
 
   state = {}
