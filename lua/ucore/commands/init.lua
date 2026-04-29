@@ -146,11 +146,6 @@ function M.register()
 				"build",
 				"build-cancel",
 				"vcs",
-				"vcs dashboard",
-				"vcs changes",
-				"vcs changelists",
-				"vcs checkout",
-				"vcs commit",
 				"changes",
 				"changelists",
 				"checkout",
@@ -161,6 +156,14 @@ function M.register()
 				"references",
 				"debug",
 				"help",
+			}
+
+			local vcs_items = {
+				"dashboard",
+				"changes",
+				"checkout",
+				"commit",
+				"changelists",
 			}
 
 			local debug_items = {
@@ -194,11 +197,24 @@ function M.register()
 			local tail = before_cursor:match("^%s*UCore%s*(.-)%s*$") or ""
 			local first = tail:match("^(%S+)")
 			local in_debug = first and first:lower() == "debug"
+			local in_vcs = first and first:lower() == "vcs"
 
-			local items = in_debug and debug_items or user_items
+			local items
+			if in_debug then
+				items = debug_items
+			elseif in_vcs then
+				items = vcs_items
+			else
+				items = user_items
+			end
+
 			local needle = (arglead or ""):lower()
 
 			if in_debug and (tail:lower() == "debug" or tail:lower():match("^debug%s*$")) then
+				needle = ""
+			end
+
+			if in_vcs and (tail:lower() == "vcs" or tail:lower():match("^vcs%s*$")) then
 				needle = ""
 			end
 
