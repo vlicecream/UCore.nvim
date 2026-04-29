@@ -188,6 +188,11 @@ User commands:
 :UCore find         " Find symbols, modules, assets, and config entries
 :UCore goto         " Go to definition at cursor
 :UCore references   " Find references at cursor
+:UCore changes      " Show P4 changes for current project
+:UCore checkout     " Checkout current file (p4 edit)
+:UCore commit       " Open visual commit UI
+:UCore changelists   " View pending P4 changelists
+:UCore vcs          " Open VCS Dashboard
 :UCore status       " Open a readable UCore runtime status report
 :UCore help         " Show user commands
 ```
@@ -645,6 +650,11 @@ return {
 :UCore find         " 查找符号、模块、资产和配置
 :UCore goto         " 跳转到光标处的定义
 :UCore references   " 查找光标处的引用
+:UCore changes      " 查看当前项目 P4 改动
+:UCore checkout     " 对当前文件执行 p4 edit
+:UCore commit       " 打开可视化提交界面
+:UCore changelists   " 查看 P4 pending changelist
+:UCore vcs          " 打开 VCS Dashboard
 :UCore status       " 查看运行时状态报告
 :UCore help         " 显示用户命令
 ```

@@ -95,15 +95,18 @@ function M.dispatch(args)
       actions.find(tail)
     end,
     goto = actions.goto_definition,
-    references = actions.references,
-    changes = actions.changes,
-    checkout = actions.checkout,
-    commit = actions.commit,
-    changelists = actions.changelists,
-    debug = function()
-      dispatch_debug(tail)
-    end,
-    help = actions.help,
+		references = actions.references,
+		changes = actions.changes,
+		checkout = actions.checkout,
+		commit = actions.commit,
+		changelists = actions.changelists,
+		vcs = function()
+			actions.vcs_dispatch(tail)
+		end,
+		debug = function()
+			dispatch_debug(tail)
+		end,
+		help = actions.help,
   }
 
   local handler = handlers[sub]
@@ -146,6 +149,7 @@ function M.register()
 				"changelists",
 				"checkout",
 				"commit",
+				"vcs",
 				"editor",
 				"find",
 				"goto",

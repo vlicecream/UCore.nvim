@@ -128,6 +128,27 @@ local function latest_server_log()
 	return best or fallback
 end
 
+-- :UCore vcs ...  dispatch
+-- Dispatch VCS subcommands: dashboard, changes, checkout, commit, changelists.
+-- 分发 VCS 子命令。
+function M.vcs_dispatch(tail)
+  local sub = (tail or ""):match("^%s*(%S+)") or "dashboard"
+  sub = sub:lower()
+  local handlers = {
+    dashboard = function() require("ucore.vcs.dashboard").open() end,
+    changes = M.changes,
+    checkout = M.checkout,
+    commit = M.commit,
+    changelists = M.changelists,
+  }
+  local handler = handlers[sub]
+  if handler then
+    handler()
+  else
+    vim.notify("Unknown UCore vcs command: " .. sub .. "\nAvailable: dashboard changes checkout commit changelists", vim.log.levels.WARN)
+  end
+end
+
 -- Jump to definition at the current cursor.
 -- 跳转当前光标下符号的定义。
 function M.goto_definition()
@@ -1316,10 +1337,11 @@ UCore commands:
   :UCore find         Find indexed symbols, modules, assets, config
    :UCore goto         Go to definition at cursor
   :UCore references   Find references at cursor
-   :UCore changes      Show VCS changes for current project
+   :UCore changes      Show P4 changes for current project
   :UCore checkout     Checkout current file (p4 edit)
   :UCore commit       Open visual commit UI
   :UCore changelists   View pending P4 changelists
+  :UCore vcs          Open VCS Dashboard
   :UCore debug        Debug and lifecycle subcommands
   :UCore help         Show this help
 ]])

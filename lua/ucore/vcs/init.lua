@@ -2,15 +2,13 @@ local config = require("ucore.config")
 
 local M = {}
 
-local providers = {
-  p4 = require("ucore.vcs.p4"),
-  git = require("ucore.vcs.git"),
-  svn = require("ucore.vcs.svn"),
-}
-
-local detect_order = { "p4", "git", "svn" }
+local p4 = require("ucore.vcs.p4")
 
 local detected_cache = {}
+
+function M.name()
+  return "p4"
+end
 
 function M.detect(root)
   if not root or root == "" then
@@ -24,21 +22,10 @@ function M.detect(root)
   local vcs_config = config.values.vcs or {}
   local requested = (vcs_config.provider or "auto"):lower()
 
-  if requested ~= "auto" then
-    local provider = providers[requested]
-    if provider and provider.detect(root) then
-      detected_cache[root] = provider
-      return provider
-    end
-    detected_cache[root] = nil
-    return nil
-  end
-
-  for _, name in ipairs(detect_order) do
-    local provider = providers[name]
-    if provider and provider.detect(root) then
-      detected_cache[root] = provider
-      return provider
+  if requested == "p4" or requested == "auto" then
+    if p4.detect(root) then
+      detected_cache[root] = p4
+      return p4
     end
   end
 
@@ -53,40 +40,52 @@ end
 function M.status(root)
   local provider = M.detect(root)
   if not provider then
-    return nil, "no VCS provider detected"
+    return nil, "no P4 provider detected"
   end
-  local ok, result = pcall(provider.status, provider, root)
-  if not ok then
-    return nil, tostring(result)
-  end
-  return result, nil
+  return provider.opened(root), nil
 end
 
 function M.checkout(path)
   local provider = M.detect_for_path(path)
   if not provider then
-    return false, "no VCS provider detected"
+    return false, "no P4 provider detected"
   end
-  if provider.name() == "p4" then
-    return provider.checkout(path)
-  end
-  return true, nil
+  return provider.checkout(path)
 end
 
 function M.diff(path)
   local provider = M.detect_for_path(path)
   if not provider then
-    return nil, "no VCS provider detected"
+    return nil, "no P4 provider detected"
   end
   return provider.diff(path)
+end
+
+function M.commit(root, files, message, opts)
+  local provider = M.detect(root)
+  if not provider then
+    return false, "no P4 provider detected"
+  end
+  return provider.commit(root, files, message, opts or {})
+end
+
+function M.revert(root, files)
+  local provider = M.detect(root)
+  if not provider then
+    return false, "no P4 provider detected"
+  end
+  for _, path in ipairs(files or {}) do
+    provider.do_revert(path)
+  end
+  return true, nil
 end
 
 function M.detect_for_path(path)
   if not path or path == "" then
     return nil
   end
-  local project = require("ucore.project")
-  local root = project.find_project_root(path)
+  local proj = require("ucore.project")
+  local root = proj.find_project_root(path)
   if not root then
     return nil
   end
@@ -95,7 +94,7 @@ end
 
 function M.is_readonly_p4(path)
   local provider = M.detect_for_path(path)
-  if not provider or provider.name() ~= "p4" then
+  if not provider then
     return false
   end
   if vim.fn.filewritable(path) == 1 then
@@ -108,48 +107,32 @@ function M.is_readonly_p4(path)
 end
 
 function M.collect_changes(root)
-  local provider = M.detect(root)
-  if not provider then
-    return nil
-  end
-
   local items = {}
   local seen = {}
 
-  if provider.name() == "p4" then
-    local opened = provider.opened(root)
-    for _, file in ipairs(opened or {}) do
-      local key = file.path:lower()
-      if not seen[key] then
-        seen[key] = true
-        table.insert(items, {
-          path = file.path,
-          status = file.action,
-          provider = "P4",
-          depot = file.depot,
-        })
-      end
-    end
-
-    local local_changes = provider.status(root)
-    for _, file in ipairs(local_changes or {}) do
-      local key = file.path:lower()
-      if not seen[key] then
-        seen[key] = true
-        table.insert(items, {
-          path = file.path,
-          status = "local",
-          provider = "P4",
-        })
-      end
-    end
-  else
-    local files = provider.status(root)
-    for _, file in ipairs(files or {}) do
+  local opened = p4.opened(root)
+  for _, f in ipairs(opened or {}) do
+    local key = f.path:lower()
+    if not seen[key] then
+      seen[key] = true
       table.insert(items, {
-        path = file.path,
-        status = file.status,
-        provider = provider.name():upper(),
+        path = f.path,
+        status = f.action,
+        provider = "P4",
+        depot = f.depot,
+      })
+    end
+  end
+
+  local local_changes = p4.status(root)
+  for _, f in ipairs(local_changes or {}) do
+    local key = f.path:lower()
+    if not seen[key] then
+      seen[key] = true
+      table.insert(items, {
+        path = f.path,
+        status = "local",
+        provider = "P4",
       })
     end
   end
@@ -157,29 +140,8 @@ function M.collect_changes(root)
   return items
 end
 
-function M.commit(root, files, message, opts)
-  local provider = M.detect(root)
-  if not provider then
-    return false, "no VCS provider detected"
-  end
-  if not provider.commit then
-    return false, "commit not implemented for " .. provider.name():upper()
-  end
-  return provider.commit(root, files, message, opts or {})
-end
-
-function M.revert(root, files)
-  local provider = M.detect(root)
-  if not provider then
-    return false, "no VCS provider detected"
-  end
-  if provider.name() == "p4" and provider.do_revert then
-    for _, path in ipairs(files or {}) do
-      provider.do_revert(path)
-    end
-    return true, nil
-  end
-  return false, "revert not implemented for " .. provider.name():upper()
+function M.open_dashboard()
+  require("ucore.vcs.dashboard").open()
 end
 
 function M.open_commit_ui()

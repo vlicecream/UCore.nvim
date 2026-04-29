@@ -407,14 +407,6 @@ local function report_vcs_checks()
 		warn("p4 not found on PATH")
 	end
 
-	if executable("git") then
-		ok("git executable found")
-	end
-
-	if executable("svn") then
-		ok("svn executable found")
-	end
-
 	local buffer_path = vim.api.nvim_buf_get_name(0)
 	local root = buffer_path ~= "" and project.find_project_root(buffer_path)
 
