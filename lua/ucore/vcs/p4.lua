@@ -65,6 +65,71 @@ function M.p4_cmd(subcommand, args)
   return cmd
 end
 
+local function p4_raw_cmd(args)
+  local vcs_p4 = (config.values.vcs or {}).p4 or {}
+  local cmd = { vcs_p4.command or "p4" }
+  for _, a in ipairs(args or {}) do
+    cmd[#cmd + 1] = a
+  end
+  return cmd
+end
+
+local function apply_env(opts)
+  local env = M.build_env()
+  if next(env) == nil then
+    return opts
+  end
+
+  local merged = vim.deepcopy(vim.env)
+  for k, v in pairs(env) do
+    merged[k] = v
+  end
+  opts.env = merged
+  return opts
+end
+
+local function parse_info(result)
+  local info = {}
+  for line in tostring(result or ""):gmatch("[^\r\n]+") do
+    local key, value = line:match("^(.-):%s*(.*)$")
+    if key and value then
+      info[key:lower()] = value
+    end
+  end
+  return info
+end
+
+local function parse_changes(result)
+  local changes = {}
+  for line in tostring(result or ""):gmatch("[^\r\n]+") do
+    local num, user, desc = line:match("^Change (%d+) .- by (.+) @ .- %((.-)%)")
+    if num then
+      table.insert(changes, {
+        number = tonumber(num),
+        user = user,
+        description = desc,
+      })
+    end
+  end
+  return changes
+end
+
+local function async_result(cb)
+  return function(result)
+    vim.schedule(function()
+      cb(result.stdout or "", result.stderr or "", result.code or 0)
+    end)
+  end
+end
+
+function M.system_async(cmd, stdin, cb)
+  local opts = apply_env({ text = true })
+  if stdin then
+    opts.stdin = stdin
+  end
+  vim.system(cmd, opts, async_result(cb))
+end
+
 function M.system(cmd)
   local env = M.build_env()
   if next(env) == nil then
@@ -112,14 +177,7 @@ function M.info(root)
   if vim.v.shell_error ~= 0 then
     return nil, "p4 info failed"
   end
-  local info = {}
-  for line in result:gmatch("[^\r\n]+") do
-    local key, value = line:match("^(.-):%s*(.*)$")
-    if key and value then
-      info[key:lower()] = value
-    end
-  end
-  return info, nil
+  return parse_info(result), nil
 end
 
 function M.client_root()
@@ -350,18 +408,7 @@ function M.shelved_changelists(root)
   if vim.v.shell_error ~= 0 then
     return {}
   end
-  local changes = {}
-  for line in result:gmatch("[^\r\n]+") do
-    local num, user, desc = line:match("^Change (%d+) .- by (.+) @ .- %((.-)%)")
-    if num then
-      table.insert(changes, {
-        number = tonumber(num),
-        user = user,
-        description = desc,
-      })
-    end
-  end
-  return changes
+  return parse_changes(result)
 end
 
 function M.pending_changelists(root)
@@ -369,20 +416,130 @@ function M.pending_changelists(root)
   if vim.v.shell_error ~= 0 then
     return {}
   end
-  local changes = {}
-  for line in result:gmatch("[^\r\n]+") do
-    local num, user, desc = line:match("^Change (%d+) .- by (.+) @ .- %((.-)%)")
-    if num then
-      table.insert(changes, {
-        number = tonumber(num),
-        user = user,
-        description = desc,
-      })
-    end
-  end
-  return changes
+  return parse_changes(result)
 end
 
 M.shelved_detail = M.changelist_detail
+
+function M.info_async(cb)
+  M.system_async(M.p4_cmd("info", {"-s"}), nil, function(stdout, stderr, code)
+    if code ~= 0 then
+      cb(nil, (stderr ~= "" and stderr or stdout):match("[^\r\n]+") or "p4 info failed")
+      return
+    end
+    cb(parse_info(stdout), nil)
+  end)
+end
+
+function M.opened_async(root, cb)
+  local path = root and (root:gsub("/", "\\") .. "/...") or nil
+  local args = {"-F", "%clientFile%|%action%|%depotFile%", "opened"}
+  if path then
+    args[#args + 1] = path
+  end
+
+  M.system_async(p4_raw_cmd(args), nil, function(stdout, stderr, code)
+    if code ~= 0 then
+      cb({}, (stderr ~= "" and stderr or stdout):match("[^\r\n]+") or "p4 opened failed")
+      return
+    end
+
+    local files = {}
+    for line in stdout:gmatch("[^\r\n]+") do
+      local client_file, action, depot = line:match("^(.-)|([^|]+)|(.*)$")
+      if client_file and action and client_file ~= "" then
+        table.insert(files, {
+          path = client_file,
+          action = action,
+          depot = depot,
+        })
+      end
+    end
+    cb(files, nil)
+  end)
+end
+
+function M.status_async(root, cb)
+  local args = {"-s", (root or "."):gsub("/", "\\") .. "/..."}
+  M.system_async(M.p4_cmd("status", args), nil, function(stdout, stderr, code)
+    if code ~= 0 then
+      cb({}, (stderr ~= "" and stderr or stdout):match("[^\r\n]+") or "p4 status failed")
+      return
+    end
+
+    local files = {}
+    for line in stdout:gmatch("[^\r\n]+") do
+      local status, path = line:match("^(%S+)%s+(.+)$")
+      if status and path then
+        table.insert(files, {
+          path = path,
+          status = status:lower(),
+        })
+      end
+    end
+    cb(files, nil)
+  end)
+end
+
+function M.pending_changelists_async(root, cb)
+  local args = {"-s", "pending", "-c", (root or "."):gsub("/", "\\") .. "/..."}
+  M.system_async(M.p4_cmd("changes", args), nil, function(stdout, stderr, code)
+    if code ~= 0 then
+      cb({}, (stderr ~= "" and stderr or stdout):match("[^\r\n]+") or "p4 pending changes failed")
+      return
+    end
+    cb(parse_changes(stdout), nil)
+  end)
+end
+
+function M.shelved_changelists_async(root, cb)
+  local args = {"-s", "shelved", "-c", (root or "."):gsub("/", "\\") .. "/..."}
+  M.system_async(M.p4_cmd("changes", args), nil, function(stdout, stderr, code)
+    if code ~= 0 then
+      cb({}, (stderr ~= "" and stderr or stdout):match("[^\r\n]+") or "p4 shelved changes failed")
+      return
+    end
+    cb(parse_changes(stdout), nil)
+  end)
+end
+
+function M.diff_async(path, cb)
+  M.system_async(M.p4_cmd("diff", {path:gsub("/", "\\")}), nil, function(stdout, stderr, code)
+    if code ~= 0 then
+      cb(nil, (stderr ~= "" and stderr or stdout):match("[^\r\n]+") or "p4 diff failed")
+      return
+    end
+    cb(stdout, nil)
+  end)
+end
+
+function M.changelist_detail_async(change_num, cb)
+  M.system_async(M.p4_cmd("describe", {"-s", tostring(change_num)}), nil, function(stdout, stderr, code)
+    if code ~= 0 then
+      cb(nil, (stderr ~= "" and stderr or stdout):match("[^\r\n]+") or ("failed to describe changelist " .. tostring(change_num)))
+      return
+    end
+
+    local detail = { number = tonumber(change_num), user = "", description = "", files = {}, status = "" }
+    for line in stdout:gmatch("[^\r\n]+") do
+      local user = line:match("^User:%s*(.+)$")
+      if user then detail.user = user end
+      local desc_line = line:match("^Description:%s*(.+)$")
+      if desc_line then detail.description = desc_line end
+      local cont = line:match("^%s+(.+)$")
+      if cont and detail.description ~= "" and detail.files and not cont:match("^Affected") and not cont:match("^Change") then
+        local status, path = cont:match("^(%S+)%s+(.+)$")
+        if status and path then
+          table.insert(detail.files, { status = status, path = path })
+        end
+      end
+      local status_tag = line:match("^Status:%s*(.+)$")
+      if status_tag then detail.status = status_tag end
+    end
+    cb(detail, nil)
+  end)
+end
+
+M.shelved_detail_async = M.changelist_detail_async
 
 return M

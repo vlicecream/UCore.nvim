@@ -8,23 +8,23 @@ local ns = vim.api.nvim_create_namespace("ucore_vcs_dashboard")
 local autocmd_group = nil
 
 local HIGHLIGHTS = {
-  UCoreVcsBorder     = { link = "NormalFloat" },
-  UCoreVcsTitle      = { link = "Title" },
-  UCoreVcsHeader     = { link = "NormalFloat" },
-  UCoreVcsSection    = { link = "Statement" },
-  UCoreVcsSelected   = { link = "CursorLine" },
-  UCoreVcsChecked    = { link = "Operator" },
-  UCoreVcsUnchecked  = { link = "NonText" },
+  UCoreVcsBorder = { link = "NormalFloat" },
+  UCoreVcsTitle = { link = "Title" },
+  UCoreVcsHeader = { link = "NormalFloat" },
+  UCoreVcsSection = { link = "Statement" },
+  UCoreVcsSelected = { link = "CursorLine" },
+  UCoreVcsChecked = { link = "Operator" },
+  UCoreVcsUnchecked = { link = "NonText" },
   UCoreVcsStatusEdit = { fg = "#4ec9b0" },
-  UCoreVcsStatusAdd  = { fg = "#6a9955" },
-  UCoreVcsStatusDel  = { fg = "#f14c4c" },
-  UCoreVcsStatusLocal= { fg = "#dcdcaa" },
-  UCoreVcsFilename   = { link = "Function" },
-  UCoreVcsDir        = { link = "Comment" },
+  UCoreVcsStatusAdd = { fg = "#6a9955" },
+  UCoreVcsStatusDel = { fg = "#f14c4c" },
+  UCoreVcsStatusLocal = { fg = "#dcdcaa" },
+  UCoreVcsFilename = { link = "Function" },
+  UCoreVcsDir = { link = "Comment" },
   UCoreVcsChangelistNum = { link = "Number" },
   UCoreVcsChangelistDesc = { link = "String" },
-  UCoreVcsHelp       = { link = "NonText" },
-  UCoreVcsMuted      = { link = "Comment" },
+  UCoreVcsHelp = { link = "NonText" },
+  UCoreVcsMuted = { link = "Comment" },
 }
 
 for name, opts in pairs(HIGHLIGHTS) do
@@ -61,6 +61,13 @@ local function compact_directory(path, width)
   return "..." .. tail
 end
 
+local function file_status_label(raw_status)
+  if raw_status == "open for add" or raw_status == "add" or raw_status == "a" or raw_status == "?" then
+    return "add?"
+  end
+  return "modify?"
+end
+
 local function is_add_candidate(item)
   return item and item.kind == "file" and item.section == "local" and item.status == "add?"
 end
@@ -69,82 +76,147 @@ local function is_modify_candidate(item)
   return item and item.kind == "file" and item.section == "local" and item.status == "modify?"
 end
 
-local function file_status_label(raw_status)
-  if raw_status == "open for add" or raw_status == "add" or raw_status == "a" or raw_status == "?" then
-    return "add?"
+local function should_show(section)
+  if not state then
+    return true
   end
-  return "modify?"
+  local filter = state.filter or "all"
+  if filter == "files" then
+    return section == "files"
+  end
+  if filter == "changelists" or filter == "pending" then
+    return section == "pending"
+  end
+  if filter == "shelved" then
+    return section == "shelved"
+  end
+  return true
 end
 
-function M.collect_data(root, filter)
-  filter = filter or "all"
-  local info, _ = p4.info(root)
-  info = info or {}
+local function is_selectable(row)
+  return row and (row.kind == "file" or row.kind == "changelist" or row.kind == "shelved")
+end
 
-  local opened = p4.opened(root) or {}
-  local local_changes = p4.status(root) or {}
-  local pending = {}
-  if p4.pending_changelists then
-    pending = p4.pending_changelists(root) or {}
+local function count_values(values)
+  return type(values) == "table" and #values or 0
+end
+
+local function loading_message(section)
+  if not state or not state.loading[section] then
+    return nil
   end
-  local shelved = {}
-  if p4.shelved_changelists then
-    shelved = p4.shelved_changelists(root) or {}
+  if section == "info" then
+    return "  (workspace loading...)"
+  end
+  if section == "files" then
+    return "  (changes loading...)"
+  end
+  if section == "pending" then
+    return "  (pending changelists loading...)"
+  end
+  if section == "shelved" then
+    return "  (shelved changelists loading...)"
+  end
+  return "  (loading...)"
+end
+
+local function error_message(section)
+  if not state then
+    return nil
+  end
+  local err = state.data.errors[section]
+  if not err then
+    return nil
+  end
+  return "  (" .. tostring(err) .. ")"
+end
+
+local function rebuild_rows()
+  if not state then
+    return
   end
 
-  local local_seen = {}
-  for _, f in ipairs(opened) do
-    local_seen[f.path:lower()] = true
-  end
-
-  local proj_name = vim.fn.fnamemodify(root, ":t")
+  local data = state.data
   local rows = {}
-
   table.insert(rows, { kind = "section", label = "Workspace" })
-  table.insert(rows, { kind = "info", label = "Root",    value = root })
-  table.insert(rows, { kind = "info", label = "Client",  value = info["client name"] or "?" })
-  table.insert(rows, { kind = "info", label = "User",    value = info["user name"] or "?" })
+  table.insert(rows, { kind = "info", label = "Root", value = state.root })
 
-  if filter ~= "changelists" then
+  if state.loading.info then
+    table.insert(rows, { kind = "empty", text = loading_message("info") })
+  elseif data.errors.info then
+    table.insert(rows, { kind = "empty", text = error_message("info") })
+  else
+    table.insert(rows, { kind = "info", label = "Client", value = data.info["client name"] or "?" })
+    table.insert(rows, { kind = "info", label = "User", value = data.info["user name"] or "?" })
+  end
+
+  if should_show("files") then
     table.insert(rows, { kind = "blank" })
     table.insert(rows, { kind = "section", label = "Changes" })
+    if state.loading.files then
+      table.insert(rows, { kind = "empty", text = loading_message("files") })
+    elseif data.errors.files then
+      table.insert(rows, { kind = "empty", text = error_message("files") })
+    else
+      local local_seen = {}
+      for _, f in ipairs(data.opened or {}) do
+        if f.path then
+          local_seen[f.path:lower()] = true
+        end
+      end
 
-    local has_changes = false
-    for _, f in ipairs(opened) do
-      has_changes = true
-      local name, dir = split_path(f.path)
-      table.insert(rows, {
-        kind = "file", section = "opened", checked = true,
-        status = f.action, raw_status = f.action,
-        path = f.path, filename = name, directory = dir,
-      })
-    end
-    for _, f in ipairs(local_changes) do
-      if not local_seen[f.path:lower()] then
+      local has_changes = false
+      for _, f in ipairs(data.opened or {}) do
         has_changes = true
         local name, dir = split_path(f.path)
         table.insert(rows, {
-          kind = "file", section = "local", checked = false,
-          status = file_status_label(f.status), raw_status = f.status,
-          path = f.path, filename = name, directory = dir,
+          kind = "file",
+          section = "opened",
+          checked = true,
+          status = f.action,
+          raw_status = f.action,
+          path = f.path,
+          filename = name,
+          directory = dir,
         })
       end
-    end
-    if not has_changes then
-      table.insert(rows, { kind = "empty", text = "  (no changes)" })
+
+      for _, f in ipairs(data.local_changes or {}) do
+        if f.path and not local_seen[f.path:lower()] then
+          has_changes = true
+          local name, dir = split_path(f.path)
+          table.insert(rows, {
+            kind = "file",
+            section = "local",
+            checked = false,
+            status = file_status_label(f.status),
+            raw_status = f.status,
+            path = f.path,
+            filename = name,
+            directory = dir,
+          })
+        end
+      end
+
+      if not has_changes then
+        table.insert(rows, { kind = "empty", text = "  (no changes)" })
+      end
     end
   end
 
-  if filter ~= "files" then
+  if should_show("pending") then
     table.insert(rows, { kind = "blank" })
     table.insert(rows, { kind = "section", label = "Pending Changelists" })
-
-    if #pending > 0 then
-      for _, ch in ipairs(pending) do
+    if state.loading.pending then
+      table.insert(rows, { kind = "empty", text = loading_message("pending") })
+    elseif data.errors.pending then
+      table.insert(rows, { kind = "empty", text = error_message("pending") })
+    elseif count_values(data.pending) > 0 then
+      for _, ch in ipairs(data.pending) do
         table.insert(rows, {
           kind = "changelist",
           number = ch.number,
-          description = ch.description:gsub("\n", " "):sub(1, 60),
+          description = tostring(ch.description or ""):gsub("\n", " "):sub(1, 60),
           user = ch.user,
         })
       end
@@ -153,16 +225,19 @@ function M.collect_data(root, filter)
     end
   end
 
-  if filter ~= "files" then
+  if should_show("shelved") then
     table.insert(rows, { kind = "blank" })
     table.insert(rows, { kind = "section", label = "Shelved Changelists" })
-
-    if #shelved > 0 then
-      for _, ch in ipairs(shelved) do
+    if state.loading.shelved then
+      table.insert(rows, { kind = "empty", text = loading_message("shelved") })
+    elseif data.errors.shelved then
+      table.insert(rows, { kind = "empty", text = error_message("shelved") })
+    elseif count_values(data.shelved) > 0 then
+      for _, ch in ipairs(data.shelved) do
         table.insert(rows, {
           kind = "shelved",
           number = ch.number,
-          description = ch.description:gsub("\n", " "):sub(1, 60),
+          description = tostring(ch.description or ""):gsub("\n", " "):sub(1, 60),
           user = ch.user,
         })
       end
@@ -171,21 +246,17 @@ function M.collect_data(root, filter)
     end
   end
 
-  return {
-    root = root,
-    project_name = proj_name,
-    info = info,
-    rows = rows,
-    cursor = 1,
-  }
+  state.rows = rows
 end
 
 local function cursor_to_first_selectable()
   if not state then return end
-  for i, row in ipairs(state.rows) do
-    if row.kind == "file" or row.kind == "changelist" then
-      state.cursor = i
-      return
+  for _, kind in ipairs({ "file", "changelist", "shelved" }) do
+    for i, row in ipairs(state.rows) do
+      if row.kind == kind then
+        state.cursor = i
+        return
+      end
     end
   end
   state.cursor = 1
@@ -194,10 +265,6 @@ end
 local function get_current_item()
   if not state then return nil end
   return state.rows[state.cursor]
-end
-
-local function is_selectable(row)
-  return row and (row.kind == "file" or row.kind == "changelist")
 end
 
 local function move_cursor(delta)
@@ -218,11 +285,7 @@ local function move_cursor(delta)
 end
 
 local function will_fit()
-  local min_left = 50
-  local min_right = 30
-  local min_height = 15
-  return vim.o.columns >= min_left + min_right + 2
-     and vim.o.lines >= min_height + 4
+  return vim.o.columns >= 82 and vim.o.lines >= 19
 end
 
 local function open_windows()
@@ -233,7 +296,6 @@ local function open_windows()
 
   local ed_w = vim.o.columns
   local ed_h = vim.o.lines
-
   local left_w = math.max(46, math.floor(ed_w * 0.52))
   local right_w = ed_w - left_w - 4
   if right_w < 30 then
@@ -260,11 +322,12 @@ local function open_windows()
     })
     vim.bo[header_buf].modifiable = true
 
+    local list_h = h - 3
     local left_buf = vim.api.nvim_create_buf(false, true)
     local left_win = vim.api.nvim_open_win(left_buf, true, {
       relative = "editor",
       width = left_w + 2,
-      height = h - 3,
+      height = list_h,
       row = row + 3,
       col = col,
       style = "minimal",
@@ -278,36 +341,22 @@ local function open_windows()
     local right_win = vim.api.nvim_open_win(right_buf, false, {
       relative = "editor",
       width = right_w + 2,
-      height = h - 3,
+      height = list_h,
       row = row + 3,
-      col = col + left_w + 2 + 2,
+      col = col + left_w + 4,
       style = "minimal",
       border = "single",
     })
     vim.bo[right_buf].modifiable = true
 
-    local footer_buf = vim.api.nvim_create_buf(false, true)
-    local footer_win = vim.api.nvim_open_win(footer_buf, false, {
-      relative = "editor",
-      width = left_w + right_w + 4,
-      height = 1,
-      row = row + h + 1,
-      col = col,
-      style = "minimal",
-      border = "none",
-    })
-    vim.bo[footer_buf].modifiable = true
-
     vim.api.nvim_set_option_value("winhl", "Normal:NormalFloat", { win = header_win })
     vim.api.nvim_set_option_value("winhl", "Normal:NormalFloat", { win = left_win })
     vim.api.nvim_set_option_value("winhl", "Normal:NormalFloat", { win = right_win })
-    vim.api.nvim_set_option_value("winhl", "Normal:NormalFloat", { win = footer_win })
 
     return {
       header_buf = header_buf, header_win = header_win,
       left_buf = left_buf, left_win = left_win,
       right_buf = right_buf, right_win = right_win,
-      footer_buf = footer_buf, footer_win = footer_win,
     }
   end)
 
@@ -330,61 +379,54 @@ function M.close()
     pcall(vim.api.nvim_win_close, w.header_win, true)
     pcall(vim.api.nvim_win_close, w.left_win, true)
     pcall(vim.api.nvim_win_close, w.right_win, true)
-    pcall(vim.api.nvim_win_close, w.footer_win, true)
     pcall(vim.api.nvim_buf_delete, w.header_buf, { force = true })
     pcall(vim.api.nvim_buf_delete, w.left_buf, { force = true })
     pcall(vim.api.nvim_buf_delete, w.right_buf, { force = true })
-    pcall(vim.api.nvim_buf_delete, w.footer_buf, { force = true })
   end
   state = nil
 end
 
-local function count_kind(rows, kind)
-  local n = 0
-  for _, r in ipairs(rows or {}) do
-    if r.kind == kind then n = n + 1 end
+local function render_status_text()
+  if not state then
+    return "closed"
   end
-  return n
+  if state.status and state.status ~= "" then
+    return state.status
+  end
+  if state.loading.info then return "loading workspace..." end
+  if state.loading.files then return "loading changes..." end
+  if state.loading.pending then return "loading pending..." end
+  if state.loading.shelved then return "loading shelved..." end
+  return "ready"
+end
+
+local function help_line(width)
+  local long = "j/k move  Space toggle  d diff  c edit  a add  r revert  m commit  l detail  s submit  R refresh  q close"
+  local short = "j/k move  d diff  m commit  R refresh  q close"
+  local text = vim.fn.strdisplaywidth(long) <= width - 2 and long or short
+  return " " .. text
 end
 
 function M.render_header()
   if not state or not state.wins then return end
   local buf = state.wins.header_buf
   vim.bo[buf].modifiable = true
-  local info = state.info
+  local info = state.data.info or {}
   local client = info["client name"] or "?"
   local user = info["user name"] or "?"
-  local n_total = 0
-  local n_local = 0
-  for _, r in ipairs(state.rows) do
-    if r.kind == "file" then
-      n_total = n_total + 1
-      if r.section == "local" then n_local = n_local + 1 end
-    end
-  end
-  local n_opened = n_total - n_local
-  local n_pending = count_kind(state.rows, "changelist")
-  local n_shelved = count_kind(state.rows, "shelved")
-  local left = string.format("P4 | %s", state.project_name)
+  local n_opened = count_values(state.data.opened)
+  local n_local = count_values(state.data.local_changes)
+  local n_pending = count_values(state.data.pending)
+  local n_shelved = count_values(state.data.shelved)
+  local left = string.format("P4 | %s", state.project_name or "?")
   local stat = string.format("opened:%d  local:%d  pending:%d  shelved:%d", n_opened, n_local, n_pending, n_shelved)
   local width = vim.api.nvim_win_get_width(state.wins.header_win)
-  local client_part = string.format("Client: %s", client)
   local pad1 = math.max(2, width - vim.fn.strdisplaywidth(left) - vim.fn.strdisplaywidth(stat) - 3)
-  local pad2 = math.max(2, width - vim.fn.strdisplaywidth(left) - vim.fn.strdisplaywidth(client_part) - 3)
+  local status = render_status_text()
   local line1 = " " .. left .. string.rep(" ", pad1) .. stat
-  local line2 = " " .. string.rep(" ", pad2 + 2) .. string.format("Client: %s | User: %s", client, user)
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, { line1, line2 })
-  vim.bo[buf].modifiable = false
-end
-
-function M.render_footer()
-  if not state or not state.wins then return end
-  local buf = state.wins.footer_buf
-  vim.bo[buf].modifiable = true
-  local lines = {
-    " j/k move  Space toggle  Enter open  d diff  c checkout  a add  r revert  m commit  l changelist  s submit  R refresh  ? help  q close",
-  }
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  local line2 = string.format(" Client: %s | User: %s | %s", client, user, status)
+  local line3 = help_line(width)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, { line1, line2, line3 })
   vim.bo[buf].modifiable = false
 end
 
@@ -414,8 +456,8 @@ function M.render_left()
       else
         table.insert(text_lines, string.format("  %s  %-7s %s", mark, row.status, row.filename))
       end
-    elseif row.kind == "changelist" then
-      local desc = (row.description or ""):gsub("\n", " "):sub(1, 55)
+    elseif row.kind == "changelist" or row.kind == "shelved" then
+      local desc = tostring(row.description or ""):gsub("\n", " "):sub(1, 55)
       table.insert(text_lines, string.format("  %-6d  %s", row.number, desc))
     end
   end
@@ -427,23 +469,19 @@ function M.render_left()
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, text_lines)
   vim.bo[buf].modifiable = false
   vim.bo[buf].modified = false
-
   vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
 
   for i, row in ipairs(rows) do
     local line = i - 1
     local line_text = text_lines[line + 1] or ""
-
     if row.kind == "section" then
       vim.api.nvim_buf_add_highlight(buf, ns, "UCoreVcsSection", line, 0, #line_text)
-    elseif row.kind == "info" then
+    elseif row.kind == "info" or row.kind == "empty" then
       vim.api.nvim_buf_add_highlight(buf, ns, "UCoreVcsMuted", line, 0, #line_text)
     elseif row.kind == "file" then
       local mark_begin = line_text:find("%[.%]")
       if mark_begin then
-        vim.api.nvim_buf_add_highlight(buf, ns,
-          row.checked and "UCoreVcsChecked" or "UCoreVcsUnchecked",
-          line, mark_begin - 1, mark_begin + 2)
+        vim.api.nvim_buf_add_highlight(buf, ns, row.checked and "UCoreVcsChecked" or "UCoreVcsUnchecked", line, mark_begin - 1, mark_begin + 2)
       end
       local stat_end = (mark_begin or 0) + 4 + 7
       local sg = "UCoreVcsStatusEdit"
@@ -460,7 +498,7 @@ function M.render_left()
       if dir_start then
         vim.api.nvim_buf_add_highlight(buf, ns, "UCoreVcsDir", line, dir_start - 1, #line_text)
       end
-    elseif row.kind == "changelist" then
+    elseif row.kind == "changelist" or row.kind == "shelved" then
       vim.api.nvim_buf_add_highlight(buf, ns, "UCoreVcsChangelistNum", line, 2, 8)
       vim.api.nvim_buf_add_highlight(buf, ns, "UCoreVcsChangelistDesc", line, 9, #line_text)
     end
@@ -473,62 +511,249 @@ function M.render_left()
   end
 end
 
-function M.render_right()
+local function set_right_lines(lines, ft)
   if not state or not state.wins then return end
   local buf = state.wins.right_buf
-  local item = get_current_item()
-
   vim.bo[buf].modifiable = true
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, {})
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].filetype = ft or "ucore-vcs-detail"
+  vim.bo[buf].modifiable = false
+  vim.bo[buf].modified = false
+end
 
+local function render_file_summary(item)
+  set_right_lines({
+    "File: " .. normalize_path(item.path),
+    "Status: " .. tostring(item.status or ""),
+    "",
+    "Press d to load diff.",
+  }, "ucore-vcs-detail")
+end
+
+local function render_change_summary(item)
+  local label = item.kind == "shelved" and "Shelved Change" or "Change"
+  set_right_lines({
+    label .. " " .. tostring(item.number),
+    "User: " .. tostring(item.user or "?"),
+    "",
+    "Description:",
+    "  " .. tostring(item.description or ""),
+    "",
+    "Press l or Enter to load detail.",
+  }, "ucore-vcs-detail")
+end
+
+function M.render_right()
+  if not state or not state.wins then return end
+  local item = get_current_item()
   if not item then
-    vim.bo[buf].modifiable = false
+    set_right_lines({ "No selection." }, "ucore-vcs-detail")
     return
   end
 
   if item.kind == "file" then
-    local diff_text, diff_err = p4.diff(item.path)
-    local title = {
-      "File: " .. normalize_path(item.path),
-      "Status: " .. tostring(item.status or ""),
-      "",
-    }
-    if diff_text and diff_text ~= "" then
-      local lines = vim.split(diff_text, "\n", { plain = true })
-      vim.list_extend(title, lines)
-      vim.api.nvim_buf_set_lines(buf, 0, -1, false, title)
-      vim.bo[buf].filetype = "diff"
-    elseif item.path and vim.fn.filereadable(item.path) == 1 then
-      local ok, lines = pcall(vim.fn.readfile, item.path, "", 500)
-      if ok then
-        vim.list_extend(title, lines)
-        vim.api.nvim_buf_set_lines(buf, 0, -1, false, title)
-        local ft = vim.filetype.match({ filename = item.path }) or ""
-        vim.bo[buf].filetype = ft
-      end
-    end
-  elseif item.kind == "changelist" then
-    local detail, detail_err = p4.changelist_detail(item.number)
-    if detail then
+    local cached = state.cache.diff[item.path]
+    if cached and cached.loading then
+      set_right_lines({ "File: " .. normalize_path(item.path), "", "Loading diff..." }, "ucore-vcs-detail")
+    elseif cached and cached.error then
+      set_right_lines({ "File: " .. normalize_path(item.path), "", "Diff failed: " .. tostring(cached.error) }, "ucore-vcs-detail")
+    elseif cached and cached.text then
       local lines = {
-        "Change " .. tostring(detail.number),
-        "User: " .. detail.user,
+        "File: " .. normalize_path(item.path),
+        "Status: " .. tostring(item.status or ""),
+        "",
+      }
+      vim.list_extend(lines, vim.split(cached.text, "\n", { plain = true }))
+      set_right_lines(lines, "diff")
+    else
+      render_file_summary(item)
+    end
+    return
+  end
+
+  if item.kind == "changelist" or item.kind == "shelved" then
+    local cache_key = item.kind .. ":" .. tostring(item.number)
+    local cached = state.cache.changelist_detail[cache_key]
+    if cached and cached.loading then
+      set_right_lines({ "Change " .. tostring(item.number), "", "Loading detail..." }, "ucore-vcs-detail")
+    elseif cached and cached.error then
+      set_right_lines({ "Change " .. tostring(item.number), "", "Detail failed: " .. tostring(cached.error) }, "ucore-vcs-detail")
+    elseif cached and cached.detail then
+      local detail = cached.detail
+      local lines = {
+        (item.kind == "shelved" and "Shelved Change " or "Change ") .. tostring(detail.number),
+        "User: " .. tostring(detail.user or "?"),
+        "Status: " .. tostring(detail.status or ""),
         "",
         "Description:",
-        "  " .. detail.description,
+        "  " .. tostring(detail.description or ""),
         "",
         "Files:",
       }
       for _, f in ipairs(detail.files or {}) do
-        table.insert(lines, "  " .. f.status .. "  " .. f.path)
+        table.insert(lines, "  " .. tostring(f.status or "") .. "  " .. tostring(f.path or ""))
       end
-      vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-      vim.bo[buf].filetype = "ucore-vcs-detail"
+      set_right_lines(lines, "ucore-vcs-detail")
+    else
+      render_change_summary(item)
     end
+    return
   end
 
-  vim.bo[buf].modifiable = false
-  vim.bo[buf].modified = false
+  set_right_lines({ "No preview available." }, "ucore-vcs-detail")
+end
+
+local function render_all(keep_cursor)
+  if not state then return end
+  local old_item = get_current_item()
+  local old_key = old_item and (old_item.path or (old_item.kind .. ":" .. tostring(old_item.number))) or nil
+  rebuild_rows()
+  if keep_cursor and old_key then
+    for i, row in ipairs(state.rows) do
+      local key = row.path or (row.kind .. ":" .. tostring(row.number))
+      if key == old_key then
+        state.cursor = i
+        break
+      end
+    end
+  end
+  if not is_selectable(state.rows[state.cursor]) then
+    cursor_to_first_selectable()
+  end
+  M.render_header()
+  M.render_left()
+  M.render_right()
+end
+
+local function load_file_diff(item)
+  if not state or not item or not item.path then return end
+  if state.cache.diff[item.path] and state.cache.diff[item.path].text then
+    M.render_right()
+    return
+  end
+  state.cache.diff[item.path] = { loading = true }
+  M.render_right()
+  local token = state.token
+  p4.diff_async(item.path, function(text, err)
+    if not state or state.token ~= token then return end
+    state.cache.diff[item.path] = err and { error = err } or { text = text or "" }
+    M.render_right()
+  end)
+end
+
+local function load_changelist_detail(item)
+  if not state or not item or not item.number then return end
+  local cache_key = item.kind .. ":" .. tostring(item.number)
+  if state.cache.changelist_detail[cache_key] and state.cache.changelist_detail[cache_key].detail then
+    M.render_right()
+    return
+  end
+  state.cache.changelist_detail[cache_key] = { loading = true }
+  M.render_right()
+  local token = state.token
+  local loader = item.kind == "shelved" and p4.shelved_detail_async or p4.changelist_detail_async
+  loader(item.number, function(detail, err)
+    if not state or state.token ~= token then return end
+    state.cache.changelist_detail[cache_key] = err and { error = err } or { detail = detail }
+    M.render_right()
+  end)
+end
+
+local function set_loading_for_filter()
+  local filter = state.filter or "all"
+  state.loading.info = true
+  state.loading.files = filter == "all" or filter == "files"
+  state.loading.pending = filter == "all" or filter == "changelists" or filter == "pending"
+  state.loading.shelved = filter == "all" or filter == "shelved"
+end
+
+local function mark_done(section, err)
+  if not state then return end
+  state.loading[section] = false
+  state.data.errors[section] = err
+end
+
+local function is_ready()
+  return not state.loading.info
+      and not state.loading.files
+      and not state.loading.pending
+      and not state.loading.shelved
+end
+
+local function update_ready_status()
+  if state and is_ready() then
+    state.status = "ready"
+  end
+end
+
+function M.load_data()
+  if not state then return end
+  local root = state.root
+  local token = state.token
+  set_loading_for_filter()
+  state.data.info = {}
+  state.data.opened = {}
+  state.data.local_changes = {}
+  state.data.pending = {}
+  state.data.shelved = {}
+  state.data.errors = {}
+  render_all(false)
+
+  p4.info_async(function(info, err)
+    if not state or state.token ~= token then return end
+    state.data.info = info or {}
+    mark_done("info", err and ("p4 info failed: " .. tostring(err)) or nil)
+    update_ready_status()
+    render_all(true)
+  end)
+
+  if state.loading.files then
+    local pending_files = 2
+    local file_errors = {}
+    local function done_files(kind, err)
+      if err then table.insert(file_errors, kind .. ": " .. tostring(err)) end
+      pending_files = pending_files - 1
+      if pending_files == 0 then
+        mark_done("files", #file_errors > 0 and table.concat(file_errors, "; ") or nil)
+        update_ready_status()
+        render_all(true)
+      end
+    end
+
+    p4.opened_async(root, function(files, err)
+      if not state or state.token ~= token then return end
+      state.data.opened = files or {}
+      done_files("opened", err)
+    end)
+    p4.status_async(root, function(files, err)
+      if not state or state.token ~= token then return end
+      state.data.local_changes = files or {}
+      done_files("status", err)
+    end)
+  end
+
+  if state.loading.pending then
+    p4.pending_changelists_async(root, function(changes, err)
+      if not state or state.token ~= token then return end
+      state.data.pending = changes or {}
+      mark_done("pending", err and ("p4 pending failed: " .. tostring(err)) or nil)
+      update_ready_status()
+      render_all(true)
+    end)
+  end
+
+  if state.loading.shelved then
+    p4.shelved_changelists_async(root, function(changes, err)
+      if not state or state.token ~= token then return end
+      state.data.shelved = changes or {}
+      mark_done("shelved", err and ("p4 shelved failed: " .. tostring(err)) or nil)
+      update_ready_status()
+      render_all(true)
+    end)
+  end
+
+  update_ready_status()
+  render_all(true)
 end
 
 local function setup_keymaps()
@@ -554,11 +779,8 @@ local function setup_keymaps()
     if item.kind == "file" and item.path and vim.fn.filereadable(item.path) == 1 then
       M.close()
       vim.cmd.edit(vim.fn.fnameescape(item.path))
-    elseif item.kind == "changelist" then
-      local detail, err = p4.changelist_detail(item.number)
-      if detail then
-        M.render_right()
-      end
+    elseif item.kind == "changelist" or item.kind == "shelved" then
+      load_changelist_detail(item)
     end
   end, opts)
 
@@ -568,7 +790,7 @@ local function setup_keymaps()
       vim.notify("UCore: move to a file row", vim.log.levels.INFO)
       return
     end
-    M.render_right()
+    load_file_diff(item)
   end, opts)
 
   vim.keymap.set("n", "c", function()
@@ -587,11 +809,8 @@ local function setup_keymaps()
     end
     local ok, err = p4.checkout(item.path)
     if ok then
-      item.checked = true
-      item.section = "opened"
-      item.status = "edit"
       vim.notify("UCore: p4 edit " .. item.filename, vim.log.levels.INFO)
-      M.render_left()
+      M.refresh()
     else
       vim.notify("UCore: p4 edit failed: " .. tostring(err), vim.log.levels.ERROR)
     end
@@ -613,11 +832,8 @@ local function setup_keymaps()
     end
     local ok, err = p4.add_file(item.path)
     if ok then
-      item.checked = true
-      item.section = "opened"
-      item.status = "add"
       vim.notify("UCore: p4 add " .. item.filename, vim.log.levels.INFO)
-      M.render_left()
+      M.refresh()
     else
       vim.notify("UCore: p4 add failed: " .. tostring(err), vim.log.levels.ERROR)
     end
@@ -659,17 +875,17 @@ local function setup_keymaps()
 
   vim.keymap.set("n", "l", function()
     local item = get_current_item()
-    if not item or item.kind ~= "changelist" then
+    if not item or (item.kind ~= "changelist" and item.kind ~= "shelved") then
       vim.notify("UCore: move to a changelist row", vim.log.levels.INFO)
       return
     end
-    M.render_right()
+    load_changelist_detail(item)
   end, opts)
 
   vim.keymap.set("n", "s", function()
     local item = get_current_item()
     if not item or item.kind ~= "changelist" then
-      vim.notify("UCore: move to a changelist row", vim.log.levels.INFO)
+      vim.notify("UCore: move to a pending changelist row", vim.log.levels.INFO)
       return
     end
     local confirm = vim.fn.confirm(
@@ -696,20 +912,20 @@ UCore VCS Dashboard
 j/k      Move selection
 Space    Toggle file checked
 Enter    Open file / show changelist detail
-d        Refresh preview pane (diff)
+d        Load diff for selected file
 c        p4 edit selected file
 a        p4 add selected local candidate
 r        Revert selected file (with confirmation)
 m        Open commit UI with checked files
 l        Show changelist detail in preview
-s        Submit selected changelist
+s        Submit selected pending changelist
 R        Refresh data
 ?        This help
 q/Esc    Close dashboard
 ]], vim.log.levels.INFO)
   end, opts)
 
-  local all_bufs = { state.wins.header_buf, state.wins.left_buf, state.wins.right_buf, state.wins.footer_buf }
+  local all_bufs = { state.wins.header_buf, state.wins.left_buf, state.wins.right_buf }
   for _, b in ipairs(all_bufs) do
     vim.keymap.set("n", "q", M.close, { buffer = b, nowait = true, silent = true })
     vim.keymap.set("n", "<Esc>", M.close, { buffer = b, nowait = true, silent = true })
@@ -735,18 +951,11 @@ end
 
 function M.refresh()
   if not state then return end
-  local root = state.root
-  local new_data = M.collect_data(root, state.filter)
-  state.rows = new_data.rows
-  state.info = new_data.info
-  state.project_name = new_data.project_name
-  if not is_selectable(state.rows[state.cursor]) then
-    cursor_to_first_selectable()
-  end
-  M.render_header()
-  M.render_left()
-  M.render_right()
-  M.render_footer()
+  state.token = state.token + 1
+  state.status = "refreshing..."
+  state.cache.diff = {}
+  state.cache.changelist_detail = {}
+  M.load_data()
 end
 
 function M.open(opts)
@@ -781,26 +990,34 @@ function M.open(opts)
     end
   end
 
-  state = {}
+  state = {
+    root = root,
+    project_name = vim.fn.fnamemodify(root, ":t"),
+    filter = opts.filter or "all",
+    rows = {},
+    cursor = 1,
+    status = "loading...",
+    token = 1,
+    loading = {},
+    data = {
+      info = {},
+      opened = {},
+      local_changes = {},
+      pending = {},
+      shelved = {},
+      errors = {},
+    },
+    cache = {
+      diff = {},
+      changelist_detail = {},
+    },
+  }
+
   local wins = open_windows()
   if not wins then state = nil; return end
   state.wins = wins
-
-  state.filter = opts.filter or "all"
-  state.data = M.collect_data(root, state.filter)
-  state.root = root
-  state.rows = state.data.rows
-  state.info = state.data.info
-  state.project_name = state.data.project_name
-  state.cursor = 1
-
-  cursor_to_first_selectable()
-
-  M.render_header()
-  M.render_left()
-  M.render_right()
-  M.render_footer()
   setup_keymaps()
+  M.load_data()
 end
 
 return M
