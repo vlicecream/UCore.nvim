@@ -70,11 +70,13 @@ function M.system(cmd)
   if next(env) == nil then
     return vim.fn.system(cmd)
   end
-  local env_list = {}
+  local merged = vim.deepcopy(vim.env)
   for k, v in pairs(env) do
-    table.insert(env_list, k .. "=" .. v)
+    merged[k] = v
   end
-  return vim.fn.system(cmd, env_list)
+  local result = vim.system(cmd, { env = merged, text = true }):wait()
+  vim.v.shell_error = result.code
+  return result.stdout or ""
 end
 
 function M.detect(root)
