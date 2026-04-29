@@ -181,8 +181,8 @@ M.values = {
 		-- 保存 P4 只读文件时是否弹出确认对话框。
 		prompt_on_readonly_save = true,
 
-		-- VCS provider: "auto" for auto-detect, or "p4", "git", "svn".
-		-- VCS 提供者："auto" 自动检测，或指定 "p4"、"git"、"svn"。
+		-- VCS provider: "auto" for auto-detect (currently P4-only).
+		-- VCS 提供者："auto" 自动检测（当前仅支持 P4）。
 		provider = "auto",
 
 		-- P4-specific options.

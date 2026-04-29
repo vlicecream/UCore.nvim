@@ -28,6 +28,7 @@ pickers, completion sources, semantic highlights, and health checks.
 - Unreal C++ Tree-sitter parser registration and highlight defaults
 - Optional Telescope picker integration
 - Optional blink.cmp completion source
+- VCS Dashboard (`:UCore vcs`) with Perforce integration
 - Runtime status and logs with `:UCore status` and `:UCore logs`
 - Environment diagnostics through `:checkhealth ucore`
 
@@ -39,6 +40,7 @@ pickers, completion sources, semantic highlights, and health checks.
 - `nvim-treesitter` if you want Unreal C++ Tree-sitter highlighting
 - `telescope.nvim` or `fzf-lua` if you want a richer picker UI
 - `blink.cmp` if you want UCore as a completion source
+- `p4` command-line client for VCS features (Perforce)
 
 Windows is the primary development target today.
 
@@ -290,6 +292,34 @@ u_scanner       CLI bridge for setup, refresh, watch, and queries
 u_core_server   long-running RPC server used by interactive features
 ```
 
+### Version Control
+
+P4 (Perforce) is supported. SVN support is planned.
+
+`:UCore vcs` opens a LazyGit-style floating window with workspace info, file changes, pending changelists, and diff preview.
+
+VCS commands:
+
+```vim
+:UCore vcs               " Open VCS Dashboard
+:UCore vcs dashboard     " Same as above
+:UCore vcs changes       " Show file changes (picker)
+:UCore vcs checkout      " p4 edit current file
+:UCore vcs commit        " Open visual commit UI
+:UCore vcs changelists    " View pending changelists
+```
+
+Legacy aliases kept for compatibility:
+
+```vim
+:UCore changes
+:UCore checkout
+:UCore commit
+:UCore changelists
+```
+
+See `docs/vcs.md` for detailed usage, P4 configuration, and troubleshooting.
+
 ### Unreal Build and Editor
 
 Build the current project's default editor target:
@@ -492,6 +522,7 @@ UCore.nvim 是一个面向 Unreal Engine 项目的 Neovim 插件。
 - 注册 Unreal C++ Tree-sitter 解析器和默认高亮
 - 可选的 Telescope 选择器集成
 - 可选的 blink.cmp 补全源
+- VCS Dashboard（`:UCore vcs`）集成 Perforce
 - 运行时状态和日志：`:UCore status` / `:UCore logs`
 - 环境诊断：`:checkhealth ucore`
 
@@ -503,6 +534,7 @@ UCore.nvim 是一个面向 Unreal Engine 项目的 Neovim 插件。
 - `nvim-treesitter`（需要 Unreal C++ Tree-sitter 高亮时安装）
 - `telescope.nvim` 或 `fzf-lua`（需要更丰富的选择器 UI 时安装）
 - `blink.cmp`（需要 UCore 补全源时安装）
+- `p4` 命令行客户端（VCS 功能需要 Perforce）
 
 目前主要开发目标为 Windows 平台。
 
@@ -749,6 +781,34 @@ cargo build --release --bin u_core_server --bin u_scanner
 u_scanner       CLI 桥接：设置、刷新、监听和查询
 u_core_server   长运行 RPC 服务器，用于交互功能
 ```
+
+### 版本控制
+
+P4 (Perforce) 是当前支持的版本控制系统。SVN 支持计划中。
+
+`:UCore vcs` 打开一个 LazyGit 风格的多面板浮动窗口，包含工作区信息、文件变更、pending changelist 和 diff 预览。
+
+VCS 命令：
+
+```vim
+:UCore vcs               " 打开 VCS Dashboard
+:UCore vcs dashboard     " 同上
+:UCore vcs changes       " 显示文件变更（picker）
+:UCore vcs checkout      " p4 edit 当前文件
+:UCore vcs commit        " 打开可视化提交界面
+:UCore vcs changelists    " 查看 pending changelist
+```
+
+兼容旧命令保留：
+
+```vim
+:UCore changes
+:UCore checkout
+:UCore commit
+:UCore changelists
+```
+
+详细用法和 P4 配置见 `docs/vcs.md`。
 
 ### Unreal 构建和编辑器
 

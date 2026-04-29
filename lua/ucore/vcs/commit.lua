@@ -7,7 +7,8 @@ local commit_state = nil
 
 local SEP = string.rep("━", 60)
 
-function M.open(root)
+function M.open(root, opts)
+  opts = opts or {}
   if not root then
     root = project.find_project_root()
     if not root then
@@ -22,7 +23,13 @@ function M.open(root)
     return
   end
 
-  local files = M.collect_commit_files(provider, root)
+  local files
+  if opts.files then
+    files = M.build_files_from_paths(provider, root, opts.files)
+  else
+    files = M.collect_commit_files(provider, root)
+  end
+
   if not files or #files == 0 then
     vim.notify("UCore: no changes to commit", vim.log.levels.INFO)
     return
@@ -44,6 +51,26 @@ function M.open(root)
 
   M.setup_keymaps(buf)
   vim.api.nvim_set_current_buf(buf)
+end
+
+function M.build_files_from_paths(provider, root, paths)
+  local local_path = root:gsub("/", "\\") .. "\\"
+  local files = {}
+  local seen = {}
+  for _, path in ipairs(paths or {}) do
+    local rel = path:lower():gsub(local_path:lower(), "")
+    local key = rel:lower()
+    if not seen[key] then
+      seen[key] = true
+      table.insert(files, {
+        path = path,
+        rel = rel,
+        status = "edit",
+        checked = true,
+      })
+    end
+  end
+  return files
 end
 
 function M.collect_commit_files(provider, root)
@@ -218,7 +245,6 @@ function M.add_file(buf)
       file.is_local = false
       file.checked = true
       file.status = "add"
-      local line_content = vim.api.nvim_buf_get_lines(buf, cur_line - 1, cur_line, false)[1] or ""
       local new_line = string.format("  [x]  opened  %-6s %s", "add", file.rel)
       vim.api.nvim_buf_set_lines(buf, cur_line - 1, cur_line, false, { new_line })
       vim.notify("UCore: p4 add " .. vim.fn.fnamemodify(file.path, ":t"), vim.log.levels.INFO)

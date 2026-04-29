@@ -140,12 +140,12 @@ function M.collect_changes(root)
   return items
 end
 
-function M.open_dashboard()
-  require("ucore.vcs.dashboard").open()
+function M.open_dashboard(filter)
+  require("ucore.vcs.dashboard").open({ filter = filter or "all" })
 end
 
-function M.open_commit_ui()
-  require("ucore.vcs.commit").open()
+function M.open_commit_ui(root, preselected_files)
+  require("ucore.vcs.commit").open(root, { files = preselected_files })
 end
 
 function M.setup()
