@@ -54,8 +54,4 @@ function M.diff(path)
   return result, nil
 end
 
-function M.commit(root, files, message)
-  return false, "Git commit via UI is not yet implemented"
-end
-
 return M

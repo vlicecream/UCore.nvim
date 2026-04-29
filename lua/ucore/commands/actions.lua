@@ -496,12 +496,6 @@ function M.dashboard()
 					description = "p4 edit for current buffer",
 					run = M.checkout,
 				},
-				{
-					label = "Source Control: Commit",
-					badge = "[" .. project_vcs.name():upper() .. "]",
-					description = "Commit changes (UI coming soon)",
-					run = M.commit,
-				},
 			})
 		end
 	end
@@ -1046,13 +1040,6 @@ function M.checkout()
   end
 end
 
--- :UCore commit
--- VCS commit placeholder (v1: UI coming soon).
--- VCS 提交占位（v1：提交界面正在开发中）。
-function M.commit()
-  vim.notify("UCore: commit UI coming soon", vim.log.levels.INFO)
-end
-
 -- :UCore debug vcs
 -- Print VCS diagnostics for the current file/project.
 -- 打印当前文件/项目的 VCS 诊断信息。
@@ -1073,6 +1060,9 @@ function M.vcs_debug()
       lines[#lines + 1] = "Provider: " .. provider.name():upper()
 
       if provider.name() == "p4" then
+        lines[#lines + 1] = "P4 config source: " .. tostring(provider.config_source())
+        lines[#lines + 1] = "P4 command: " .. tostring(provider.p4_cmd("info")[1])
+
         local info, info_err = provider.info(root)
         if info then
           lines[#lines + 1] = "P4 client: " .. tostring(info["client name"] or "?")
@@ -1138,9 +1128,8 @@ UCore commands:
   :UCore find         Find indexed symbols, modules, assets, config
    :UCore goto         Go to definition at cursor
   :UCore references   Find references at cursor
-  :UCore changes      Show VCS changes for current project
+   :UCore changes      Show VCS changes for current project
   :UCore checkout     Checkout current file (p4 edit)
-  :UCore commit       VCS commit (UI coming soon)
   :UCore debug        Debug and lifecycle subcommands
   :UCore help         Show this help
 ]])

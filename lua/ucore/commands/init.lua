@@ -96,7 +96,6 @@ function M.dispatch(args)
     references = actions.references,
     changes = actions.changes,
     checkout = actions.checkout,
-    commit = actions.commit,
     debug = function()
       dispatch_debug(tail)
     end,
@@ -141,7 +140,6 @@ function M.register()
 				"build-cancel",
 				"changes",
 				"checkout",
-				"commit",
 				"editor",
 				"find",
 				"goto",

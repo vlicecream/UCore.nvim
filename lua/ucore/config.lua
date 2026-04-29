@@ -191,6 +191,19 @@ M.values = {
 			-- Path to the p4 executable.
 			-- p4 可执行文件路径。
 			command = "p4",
+
+			-- nil means use the normal P4 environment:
+			-- P4PORT, P4USER, P4CLIENT, P4CONFIG, P4PASSWD, etc.
+			-- 默认 nil 表示使用 P4 标准环境变量。
+			env = nil,
+
+			-- Optional explicit overrides. Only applied when set.
+			-- 可选显式覆盖。仅在设置时生效。
+			port = nil,
+			user = nil,
+			client = nil,
+			charset = nil,
+			config = nil,
 		},
 	},
 

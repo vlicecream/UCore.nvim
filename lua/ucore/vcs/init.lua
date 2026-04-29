@@ -81,14 +81,6 @@ function M.diff(path)
   return provider.diff(path)
 end
 
-function M.commit(root, files, message)
-  local provider = M.detect(root)
-  if not provider then
-    return false, "no VCS provider detected"
-  end
-  return provider.commit(root, files, message)
-end
-
 function M.detect_for_path(path)
   if not path or path == "" then
     return nil
