@@ -5,7 +5,24 @@ local M = {}
 
 local commit_state = nil
 
-local SEP = string.rep("━", 60)
+local ns = vim.api.nvim_create_namespace("ucore_vcs_commit")
+
+local HIGHLIGHTS = {
+  UCoreCommitBorder = { fg = "#2aa7ff", bg = "#06121f" },
+  UCoreCommitTitle = { fg = "#00d7ff", bold = true },
+  UCoreCommitSection = { fg = "#00d7ff", bold = true },
+  UCoreCommitMeta = { fg = "#ffd166", bold = true },
+  UCoreCommitChecked = { fg = "#d7ffaf", bold = true },
+  UCoreCommitUnchecked = { link = "NonText" },
+  UCoreCommitStatus = { fg = "#4ec9b0", bold = true },
+  UCoreCommitPath = { link = "Function" },
+  UCoreCommitMuted = { link = "Comment" },
+  UCoreCommitFooterKey = { fg = "#ffd166", bold = true },
+}
+
+for name, opts in pairs(HIGHLIGHTS) do
+  pcall(vim.api.nvim_set_hl, 0, name, opts)
+end
 
 function M.open(root, opts)
   opts = opts or {}
@@ -35,22 +52,26 @@ function M.open(root, opts)
     return
   end
 
-  local lines = M.build_buffer_lines(provider, root, files)
-  local buf = M.create_buffer(lines, provider, root, files)
+  M.decorate_files(provider, root, files)
+  local groups = M.group_files(files)
+  local lines, layout = M.build_buffer_lines(provider, root, files, groups)
+  local buf, win = M.create_buffer(lines, provider, root, files)
 
   commit_state = {
     buf = buf,
+    win = win,
     root = root,
     provider = provider,
     files = files,
-    file_start = 11,
-    file_end = 10 + #files,
-    message_start = 10 + #files + 2,
-    separator_line = 10 + #files + 1,
+    groups = groups,
+    file_lines = layout.file_lines,
+    message_start = layout.message_start,
+    separator_line = layout.separator_line,
   }
 
+  M.apply_highlights(buf)
   M.setup_keymaps(buf)
-  vim.api.nvim_set_current_buf(buf)
+  pcall(vim.api.nvim_set_current_win, win)
 end
 
 function M.build_files_from_paths(provider, root, paths)
@@ -67,6 +88,7 @@ function M.build_files_from_paths(provider, root, paths)
         rel = rel,
         status = "edit",
         checked = true,
+        change = "default",
       })
     end
   end
@@ -94,6 +116,7 @@ function M.collect_commit_files(provider, root)
           status = f.action,
           checked = true,
           depot = f.depot,
+          change = f.change or "default",
         })
       end
     end
@@ -109,6 +132,7 @@ function M.collect_commit_files(provider, root)
           status = f.status == "open for add" and "add" or f.status,
           checked = false,
           is_local = true,
+          change = "local",
         })
       end
     end
@@ -125,50 +149,138 @@ function M.collect_commit_files(provider, root)
       rel = rel,
       status = f.status,
       checked = true,
+      change = "default",
     })
   end
   return files
 end
 
-function M.build_buffer_lines(provider, root, files)
+function M.decorate_files(provider, root, files)
+  if provider.name() ~= "p4" then
+    return
+  end
+
+  local opened = provider.opened(root)
+  local by_path = {}
+  for _, f in ipairs(opened or {}) do
+    if f.path then
+      by_path[f.path:gsub("\\", "/"):lower()] = f
+    end
+  end
+
+  for _, file in ipairs(files or {}) do
+    local opened_file = by_path[tostring(file.path or ""):gsub("\\", "/"):lower()]
+    if opened_file then
+      file.status = opened_file.action or file.status
+      file.depot = opened_file.depot
+      file.change = opened_file.change or file.change or "default"
+      file.is_local = false
+    else
+      file.change = file.change or (file.is_local and "local" or "default")
+    end
+  end
+end
+
+function M.group_files(files)
+  local order = {}
+  local groups = {}
+  for _, file in ipairs(files or {}) do
+    local change = tostring(file.change or "default")
+    if change == "" or change == "0" then
+      change = "default"
+    end
+    file.change = change
+    if not groups[change] then
+      groups[change] = { change = change, files = {} }
+      table.insert(order, change)
+    end
+    table.insert(groups[change].files, file)
+  end
+
+  table.sort(order, function(a, b)
+    if a == "default" then return true end
+    if b == "default" then return false end
+    if a == "local" then return false end
+    if b == "local" then return true end
+    return tostring(a) < tostring(b)
+  end)
+
+  local result = {}
+  for _, key in ipairs(order) do
+    table.insert(result, groups[key])
+  end
+  return result
+end
+
+local function changelist_label(change)
+  if change == "default" then
+    return "Default changelist"
+  end
+  if change == "local" then
+    return "Local candidates"
+  end
+  return "Changelist " .. tostring(change)
+end
+
+function M.build_buffer_lines(provider, root, files, groups)
   local proj_name = vim.fn.fnamemodify(root, ":t")
+  local layout = { file_lines = {} }
   local lines = {
-    "UCore Commit",
-    SEP,
-    "VCS: " .. provider.name():upper(),
-    "Project: " .. proj_name,
-    "Root: " .. root,
+    string.format("P4 | %s                                      UCore Commit", proj_name),
+    "",
+    "Workspace",
+    "  Root: " .. root,
   }
 
   if provider.name() == "p4" then
     local info, _ = provider.info(root)
     if info then
-      table.insert(lines, "Client: " .. tostring(info["client name"] or "?"))
-      table.insert(lines, "User: " .. tostring(info["user name"] or "?"))
+      table.insert(lines, "  Workspace: " .. tostring(info["client name"] or "?"))
+      table.insert(lines, "  User: " .. tostring(info["user name"] or "?"))
     end
   end
 
   table.insert(lines, "")
-  table.insert(lines, "Files:")
+  table.insert(lines, "Changelists")
 
-  for _, f in ipairs(files) do
-    local mark = f.checked and "[x]" or "[ ]"
-    local tag = f.is_local and "local" or "opened"
-    table.insert(lines, string.format("  %s  %-6s %-6s %s", mark, tag, f.status, f.rel))
+  for _, group in ipairs(groups or {}) do
+    table.insert(lines, string.format("  %s (%d files)", changelist_label(group.change), #group.files))
+    for _, f in ipairs(group.files) do
+      local mark = f.checked and "[x]" or "[ ]"
+      local tag = f.is_local and "local" or "opened"
+      table.insert(lines, string.format("    %s  %-6s %-7s %s", mark, tag, f.status, f.rel))
+      layout.file_lines[#lines] = f
+    end
   end
 
   table.insert(lines, "")
   table.insert(lines, "Message:")
+  layout.message_start = #lines
   table.insert(lines, "")
-  table.insert(lines, SEP)
-  table.insert(lines, "<Tab> toggle   <C-s> submit   d diff   a add   r revert   q close")
+  layout.separator_line = #lines + 1
+  table.insert(lines, string.rep("-", 80))
+  table.insert(lines, "Tab toggle        Ctrl-s submit        d diff        a add        r revert        q close")
 
-  return lines
+  return lines, layout
 end
 
 function M.create_buffer(lines, provider, root, files)
-  vim.cmd("botright 20new")
-  local buf = vim.api.nvim_get_current_buf()
+  local width = math.min(vim.o.columns - 8, 120)
+  local height = math.min(vim.o.lines - 6, 34)
+  local row = math.max(1, math.floor((vim.o.lines - height) / 2))
+  local col = math.max(0, math.floor((vim.o.columns - width) / 2))
+  local buf = vim.api.nvim_create_buf(false, true)
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative = "editor",
+    width = width,
+    height = height,
+    row = row,
+    col = col,
+    style = "minimal",
+    border = "single",
+    title = " UCore Commit ",
+    title_pos = "center",
+  })
 
   vim.bo[buf].buftype = "acwrite"
   vim.bo[buf].bufhidden = "wipe"
@@ -180,30 +292,68 @@ function M.create_buffer(lines, provider, root, files)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   vim.bo[buf].modified = false
 
-  vim.api.nvim_set_option_value("cursorline", true, { buf = buf })
-  vim.api.nvim_win_set_cursor(0, { 1, 1 })
+  vim.api.nvim_set_option_value("winhl", "Normal:NormalFloat,FloatBorder:UCoreCommitBorder", { win = win })
+  vim.api.nvim_set_option_value("cursorline", true, { win = win })
+  vim.api.nvim_win_set_cursor(win, { 1, 1 })
 
-  return buf
+  return buf, win
 end
 
 function M.get_file_at_line(buf, line)
   if not commit_state then return nil end
-  local idx = line - commit_state.file_start + 1
-  if idx < 1 or idx > #commit_state.files then return nil end
-  return commit_state.files[idx], idx
+  return commit_state.file_lines[line], line
 end
 
 function M.is_file_line(buf, line)
   if not commit_state then return false end
-  local s = commit_state.file_start
-  local e = commit_state.file_end
-  return line >= s and line <= e
+  return commit_state.file_lines[line] ~= nil
 end
 
 function M.is_message_line(buf, line)
   if not commit_state then return false end
   return line >= (commit_state.message_start + 1)
       and line < commit_state.separator_line
+end
+
+function M.apply_highlights(buf)
+  if not commit_state then return end
+  vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  for i, line in ipairs(lines) do
+    local lnum = i - 1
+    if i == 1 then
+      vim.api.nvim_buf_add_highlight(buf, ns, "UCoreCommitTitle", lnum, 0, -1)
+    elseif line == "Workspace" or line == "Changelists" or line == "Message:" then
+      vim.api.nvim_buf_add_highlight(buf, ns, "UCoreCommitSection", lnum, 0, -1)
+    elseif line:match("^%s+Root:") or line:match("^%s+Workspace:") or line:match("^%s+User:") then
+      vim.api.nvim_buf_add_highlight(buf, ns, "UCoreCommitMuted", lnum, 0, -1)
+    elseif line:match("^%s+Default changelist") or line:match("^%s+Changelist") or line:match("^%s+Local candidates") then
+      vim.api.nvim_buf_add_highlight(buf, ns, "UCoreCommitMeta", lnum, 0, -1)
+    elseif commit_state.file_lines[i] then
+      local mark = line:find("%[.%]")
+      if mark then
+        local file = commit_state.file_lines[i]
+        vim.api.nvim_buf_add_highlight(buf, ns, file.checked and "UCoreCommitChecked" or "UCoreCommitUnchecked", lnum, mark - 1, mark + 2)
+      end
+      local file = commit_state.file_lines[i]
+      local status_start = line:find(tostring(file.status or ""), 1, true)
+      if status_start then
+        vim.api.nvim_buf_add_highlight(buf, ns, "UCoreCommitStatus", lnum, status_start - 1, status_start - 1 + #tostring(file.status))
+      end
+      local rel_start = line:find(file.rel, 1, true)
+      if rel_start then
+        vim.api.nvim_buf_add_highlight(buf, ns, "UCoreCommitPath", lnum, rel_start - 1, -1)
+      end
+    elseif i == #lines then
+      vim.api.nvim_buf_add_highlight(buf, ns, "UCoreCommitMuted", lnum, 0, -1)
+      for _, key in ipairs({ "Tab", "Ctrl-s", "d", "a", "r", "q" }) do
+        local start_col = line:find(key, 1, true)
+        if start_col then
+          vim.api.nvim_buf_add_highlight(buf, ns, "UCoreCommitFooterKey", lnum, start_col - 1, start_col - 1 + #key)
+        end
+      end
+    end
+  end
 end
 
 function M.toggle_file(buf)
@@ -221,6 +371,7 @@ function M.toggle_file(buf)
   local line_content = vim.api.nvim_buf_get_lines(buf, cur_line - 1, cur_line, false)[1] or ""
   local new_line = line_content:gsub("%[.%]", mark)
   vim.api.nvim_buf_set_lines(buf, cur_line - 1, cur_line, false, { new_line })
+  M.apply_highlights(buf)
 end
 
 function M.add_file(buf)
@@ -240,13 +391,15 @@ function M.add_file(buf)
 
   local provider = commit_state.provider
   if provider.name() == "p4" then
-    local ok, err = provider.add_file(file.path)
+    local ok, err = provider.add_file(file.path, commit_state.root)
     if ok then
       file.is_local = false
       file.checked = true
       file.status = "add"
-      local new_line = string.format("  [x]  opened  %-6s %s", "add", file.rel)
+      file.change = "default"
+      local new_line = string.format("    [x]  opened %-7s %s", "add", file.rel)
       vim.api.nvim_buf_set_lines(buf, cur_line - 1, cur_line, false, { new_line })
+      M.apply_highlights(buf)
       vim.notify("UCore: p4 add " .. vim.fn.fnamemodify(file.path, ":t"), vim.log.levels.INFO)
     else
       vim.notify("UCore: p4 add failed: " .. tostring(err), vim.log.levels.ERROR)
@@ -284,6 +437,16 @@ function M.get_checked_files(buf)
   return checked
 end
 
+function M.get_checked_changelists(files)
+  local groups = {}
+  for _, f in ipairs(files or {}) do
+    local change = tostring(f.change or "default")
+    groups[change] = groups[change] or {}
+    table.insert(groups[change], f)
+  end
+  return groups
+end
+
 function M.submit(buf)
   if not commit_state then return end
 
@@ -299,7 +462,16 @@ function M.submit(buf)
     return
   end
 
-  local summary_lines = {"Submit to " .. commit_state.provider.name():upper() .. "?", "", "Files:"}
+  local checked_groups = M.get_checked_changelists(checked)
+  local group_names = vim.tbl_keys(checked_groups)
+  table.sort(group_names)
+
+  local summary_lines = {"Submit to " .. commit_state.provider.name():upper() .. "?", "", "Changelists:"}
+  for _, change in ipairs(group_names) do
+    table.insert(summary_lines, "- " .. changelist_label(change) .. " (" .. tostring(#checked_groups[change]) .. " files)")
+  end
+  table.insert(summary_lines, "")
+  table.insert(summary_lines, "Files:")
   for _, f in ipairs(checked) do
     table.insert(summary_lines, "- " .. f.status .. " " .. f.rel)
   end
@@ -322,8 +494,13 @@ function M.submit(buf)
 
   vim.notify("UCore: submitting...", vim.log.levels.INFO)
 
-  local file_paths = vim.tbl_map(function(f) return f.path end, checked)
-  local ok, err = commit_state.provider.commit(commit_state.root, file_paths, message, {})
+  local ok, err
+  if commit_state.provider.name() == "p4" and #group_names == 1 and group_names[1] ~= "default" and group_names[1] ~= "local" then
+    ok, err = commit_state.provider.submit_changelist(group_names[1])
+  else
+    local file_paths = vim.tbl_map(function(f) return f.path end, checked)
+    ok, err = commit_state.provider.commit(commit_state.root, file_paths, message, {})
+  end
 
   if ok then
     vim.notify("UCore: submit successful", vim.log.levels.INFO)
@@ -351,7 +528,7 @@ function M.diff_file(buf)
   if not file then return end
 
   local provider = commit_state.provider
-  local diff_text, diff_err = provider.diff(file.path)
+  local diff_text, diff_err = provider.diff(file.path, commit_state.root)
   if diff_err then
     vim.notify("UCore: diff failed: " .. tostring(diff_err), vim.log.levels.ERROR)
     return
@@ -397,8 +574,13 @@ function M.revert_file(buf)
 
   local provider = commit_state.provider
   if provider.name() == "p4" then
-    provider.do_revert(file.path)
-    vim.notify("UCore: reverted " .. vim.fn.fnamemodify(file.path, ":t"), vim.log.levels.INFO)
+    local ok, err = provider.do_revert(file.path, commit_state.root)
+    if ok then
+      vim.notify("UCore: reverted " .. vim.fn.fnamemodify(file.path, ":t"), vim.log.levels.INFO)
+    else
+      vim.notify("UCore: revert failed: " .. tostring(err), vim.log.levels.ERROR)
+      return
+    end
   else
     vim.notify("UCore: revert is not implemented for " .. provider.name():upper(), vim.log.levels.INFO)
   end

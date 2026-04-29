@@ -127,7 +127,8 @@ local function is_depot_path(path)
 end
 
 local function is_real_local_path(path, root)
-  if not path or path == "" or path == "0" then
+  path = tostring(path or "")
+  if not path or path == "" or path == "0" or path:match("[/\\]0$") then
     return false
   end
   if path:match("^//") or path:find("//", 1, true) then
@@ -599,8 +600,11 @@ end
 
 function M.diff_async(path, root, cb)
   if type(root) == "function" then
-    cb = root
-    root = nil
+    local old_cb = root
+    vim.schedule(function()
+      old_cb(nil, "internal error: p4.diff_async requires project root")
+    end)
+    return
   end
   if not is_real_local_path(path, root) then
     vim.schedule(function()

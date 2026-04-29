@@ -589,8 +589,14 @@ function M.render_footer()
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, { line })
   vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
   vim.api.nvim_buf_add_highlight(buf, ns, "UCoreVcsHelp", 0, 0, -1)
-  for _, key in ipairs({ "j/k", "Space", "Enter", "d", "c", "a", "r", "m", "R", "q" }) do
+  for _, key in ipairs({ "j/k", "Space", "Enter" }) do
     add_pattern_highlight(buf, 0, line, key, "UCoreVcsFooterKey")
+  end
+  for _, phrase in ipairs({ "d diff", "c checkout", "a add", "r revert", "m commit", "R refresh", "q close" }) do
+    local start_col = line:find(phrase, 1, true)
+    if start_col then
+      vim.api.nvim_buf_add_highlight(buf, ns, "UCoreVcsFooterKey", 0, start_col - 1, start_col)
+    end
   end
   vim.bo[buf].modifiable = false
 end
