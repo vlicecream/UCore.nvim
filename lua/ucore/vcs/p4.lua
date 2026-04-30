@@ -204,7 +204,7 @@ local function parse_describe_output(result, change_num, default_status)
       goto continue
     end
 
-    if line:match("^Affected files") then
+    if line:match("^Affected files") or line:match("^Shelved files") then
       in_description = false
       before_files = false
       goto continue

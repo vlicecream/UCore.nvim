@@ -125,7 +125,7 @@ local function section_count(section)
     return "1"
   end
   if section == "shelved" then
-    return tostring(count_values(state.data.shelved))
+    return tostring(count_values(state.data.shelved)) .. " shelves"
   end
   if section == "files" then
     local groups = group_opened_by_changelist(state.data.opened)
@@ -369,7 +369,7 @@ local function rebuild_rows()
 
   if should_show("writable") then
     table.insert(rows, { kind = "blank" })
-    table.insert(rows, { kind = "section", label = "Writable (Not Checked Out)" })
+    table.insert(rows, { kind = "section", label = "Writable Files" })
     if state.loading.writable then
       table.insert(rows, { kind = "empty", text = loading_message("writable") })
     elseif data.errors.writable then
@@ -412,32 +412,55 @@ local function rebuild_rows()
           state.expanded.shelves[key] = false
         end
         local fold = expanded and "▾" or "▸"
+        local file_count = 0
+        local cached = state.data.shelf_files[key]
+        if cached and type(cached.files) == "table" then
+          file_count = #cached.files
+        end
+        local display_name = tostring(ch.description or ""):gsub("\n", " "):sub(1, 40)
+        if #display_name == 0 then
+          display_name = "<no description>"
+        end
+        local count_str = " (" .. tostring(file_count) .. " file" .. (file_count ~= 1 and "s" or "") .. ")"
+        if expanded and not cached then
+          count_str = ""
+        end
+        local header_text = string.format("%s %s%s                  CL %d", fold, display_name, count_str, ch.number)
         table.insert(rows, {
           kind = "shelf_header",
           number = ch.number,
           expanded = expanded,
-          file_count = 0,
-          description = tostring(ch.description or ""):gsub("\n", " "):sub(1, 60),
-          text = string.format("%s Shelf %d  %s", fold, ch.number, tostring(ch.description or ""):gsub("\n", " "):sub(1, 50)),
+          file_count = file_count,
+          description = display_name,
+          user = ch.user,
+          text = header_text,
         })
         if expanded then
-          local shelf_files = state.data.shelf_files[key]
-          if shelf_files then
-            for _, f in ipairs(shelf_files) do
-              local file_path = p4.normalize_local_file(f.path, state.root) or f.path
-              if file_path then
-                local name, dir = split_path(file_path)
-                table.insert(rows, {
-                  kind = "file",
-                  section = "shelf",
-                  checked = false,
-                  status = f.status or "edit",
-                  raw_status = f.status or "edit",
-                  path = file_path,
-                  filename = name,
-                  directory = dir,
-                })
+          local cached = state.data.shelf_files[key]
+          if cached and type(cached.files) == "table" then
+            for _, f in ipairs(cached.files) do
+              local file_path = f.path
+              -- convert depot path to local
+              if file_path:match("^//") then
+                file_path = file_path:gsub("#%d+$", "")
+                local local_p = p4.depot_to_local(file_path)
+                if local_p then
+                  file_path = local_p
+                end
               end
+              local name, dir = split_path(file_path)
+              local action = f.status or f.action or "edit"
+              table.insert(rows, {
+                kind = "file",
+                section = "shelf",
+                checked = false,
+                status = "shelved/" .. action:lower(),
+                raw_status = action,
+                path = file_path,
+                filename = name ~= file_path and name or file_path,
+                directory = dir ~= file_path and dir or "",
+                shelf_number = ch.number,
+              })
             end
           else
             table.insert(rows, { kind = "empty", text = "  (loading...)" })
@@ -796,7 +819,7 @@ function M.render_left()
       local suffix = ""
       if label == "Workspace Changes" then
         suffix = section_count("files") .. " files"
-      elseif label == "Writable (Not Checked Out)" then
+      elseif label == "Writable Files" then
         suffix = section_count("writable") .. " files"
       elseif label == "Pending Changelists" then
         suffix = section_count("pending") .. " changelists"
@@ -1011,6 +1034,30 @@ function load_file_diff(item)
   end)
 end
 
+function load_shelf_diff(change_num, file)
+  if not state then return end
+  local cache_key = "shelf_diff:" .. tostring(change_num)
+  if file then
+    cache_key = cache_key .. ":" .. vim.fn.fnamemodify(file.path, ":t")
+  end
+  if state.cache.diff[cache_key] and state.cache.diff[cache_key].text then
+    M.render_right()
+    return
+  end
+  state.cache.diff[cache_key] = { loading = true }
+  M.render_right()
+  local token = state.token
+  p4.system_async(p4.p4_cmd("describe", {"-S", "-du", tostring(change_num)}), nil, function(stdout, stderr, code)
+    if not state or state.token ~= token then return end
+    if code ~= 0 then
+      state.cache.diff[cache_key] = { error = (stderr ~= "" and stderr or stdout):match("[^\r\n]+") or "shelf diff failed" }
+    else
+      state.cache.diff[cache_key] = { text = stdout or "" }
+    end
+    M.render_right()
+  end)
+end
+
 function M.render_right()
   if not state or not state.wins then return end
   local item = get_current_item()
@@ -1020,7 +1067,11 @@ function M.render_right()
   end
 
   if item.kind == "file" then
-    local cached = state.cache.diff[item.path]
+    local cache_key = item.path
+    if item.section == "shelf" then
+      cache_key = "shelf_diff:" .. tostring(item.shelf_number or 0) .. ":" .. vim.fn.fnamemodify(item.path, ":t")
+    end
+    local cached = state.cache.diff[cache_key]
     if cached and cached.loading then
       set_right_lines({ "Diff / Preview", "", normalize_path(item.path), "", "Loading diff..." }, "ucore-vcs-detail")
     elseif cached and cached.error then
@@ -1036,7 +1087,20 @@ function M.render_right()
       vim.list_extend(lines, vim.split(cached.text, "\n", { plain = true }))
       set_right_lines(lines, "diff")
     else
-      load_file_diff(item)
+      if item.section == "shelf" then
+        set_right_lines({
+          "Diff / Preview",
+          "",
+          "Shelved File",
+          item.filename or item.path,
+          "Status: " .. tostring(item.status or ""),
+          "Changelist: " .. tostring(item.shelf_number or ""),
+          "",
+          "Press d to load diff.",
+        }, "ucore-vcs-detail")
+      else
+        load_file_diff(item)
+      end
     end
     return
   end
@@ -1092,24 +1156,42 @@ function M.render_right()
   end
 
   if item.kind == "shelf_header" then
+    local shelf_diff_key = "shelf_diff:" .. tostring(item.number)
+    local shelf_diff = state.cache.diff[shelf_diff_key]
+    if shelf_diff and shelf_diff.loading then
+      set_right_lines({ "Diff / Preview", "", "Shelf " .. tostring(item.number), "", "Loading diff..." }, "ucore-vcs-detail")
+      return
+    elseif shelf_diff and shelf_diff.error then
+      set_right_lines({ "Diff / Preview", "", "Shelf " .. tostring(item.number), "", "Diff failed: " .. tostring(shelf_diff.error) }, "ucore-vcs-detail")
+      return
+    elseif shelf_diff and shelf_diff.text then
+      local lines = { "Diff / Preview", "", "Shelf Diff  CL " .. tostring(item.number), "", "Full shelf diff:", "" }
+      vim.list_extend(lines, vim.split(shelf_diff.text, "\n", { plain = true }))
+      set_right_lines(lines, "diff")
+      return
+    end
     local key = tostring(item.number)
-    local shelf_files = state.data.shelf_files[key]
+    local entry = state.data.shelf_files[key]
+    local files = entry and entry.files or {}
+    local file_count = type(files) == "table" and #files or 0
     local lines = {
       "Diff / Preview",
       "",
-      "Shelf: " .. tostring(item.number),
+      "Shelved Changelist",
       "Description: " .. tostring(item.description or ""),
-      "Files: " .. tostring(shelf_files and #shelf_files or "?"),
+      "ID: " .. tostring(item.number),
+      "User: " .. tostring(item.user or "?"),
+      "Files: " .. tostring(file_count),
       "",
     }
-    if shelf_files then
-      for _, f in ipairs(shelf_files) do
-        table.insert(lines, "  " .. tostring(f.status or "") .. "  " .. tostring(f.path or ""))
-      end
-      table.insert(lines, "")
-      table.insert(lines, "Press Enter to collapse.")
-    elseif item.expanded then
+    if entry and entry.error then
+      table.insert(lines, "Failed to load files:")
+      table.insert(lines, "  " .. tostring(entry.error))
+    elseif item.expanded and not entry then
       table.insert(lines, "Loading shelf files...")
+    elseif item.expanded then
+      table.insert(lines, "Press Enter to collapse.")
+      table.insert(lines, "Press d to load shelf diff.")
     else
       table.insert(lines, "Press Enter to expand.")
     end
@@ -1308,22 +1390,41 @@ local function setup_keymaps()
       local key = tostring(item.number)
       local was_expanded = item.expanded
       state.expanded.shelves[key] = not was_expanded
-      if not was_expanded and not state.data.shelf_files[key] then
+      if not was_expanded then
+        -- always re-fetch on expand, drop stale cache
+        state.data.shelf_files[key] = nil
+        local token = state.token
         local token = state.token
         p4.shelved_detail_async(item.number, function(detail, err)
           if not state or state.token ~= token then return end
           if detail and detail.files then
             local files = {}
             for _, f in ipairs(detail.files or {}) do
-              local local_path = p4.normalize_local_file(f.path, state.root) or f.path
+              local fpath = f.path or ""
+              -- depot path -> local
+              if fpath:match("^//") then
+                fpath = fpath:gsub("#%d+$", "")
+                local local_p = p4.depot_to_local(fpath)
+                if local_p then
+                  fpath = local_p
+                end
+              end
               table.insert(files, {
                 status = f.status or "edit",
-                path = local_path,
+                path = fpath,
+                action = f.status or "edit",
               })
             end
-            state.data.shelf_files[key] = files
+            state.data.shelf_files[key] = {
+              files = files,
+              loading = false,
+            }
           else
-            state.data.shelf_files[key] = {}
+            state.data.shelf_files[key] = {
+              files = {},
+              loading = false,
+              error = err,
+            }
           end
           render_all(true)
         end)
@@ -1338,11 +1439,19 @@ local function setup_keymaps()
 
   vim.keymap.set("n", "d", function()
     local item = get_current_item()
+    if item and item.kind == "shelf_header" then
+      load_shelf_diff(item.number, nil)
+      return
+    end
     if not item or item.kind ~= "file" then
       vim.notify("UCore: move to a file row", vim.log.levels.INFO)
       return
     end
     if not item.path or vim.fn.filereadable(item.path) ~= 1 then
+      if item.section == "shelf" then
+        load_shelf_diff(item.shelf_number or 0, item)
+        return
+      end
       vim.notify("UCore: file not found on disk: " .. tostring(item.path), vim.log.levels.WARN)
       return
     end
