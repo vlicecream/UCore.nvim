@@ -500,6 +500,32 @@ local function get_current_item()
   return state.rows[state.cursor]
 end
 
+local function find_loaded_buffer(path)
+  if not path or path == "" then
+    return nil
+  end
+  local target = normalize_path(path):lower()
+  for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_valid(bufnr) then
+      local buf_path = vim.api.nvim_buf_get_name(bufnr)
+      if buf_path ~= "" and normalize_path(buf_path):lower() == target then
+        return bufnr
+      end
+    end
+  end
+  return nil
+end
+
+local function reload_buffer_from_disk(path)
+  local bufnr = find_loaded_buffer(path)
+  if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+  vim.api.nvim_buf_call(bufnr, function()
+    vim.cmd("silent! edit!")
+  end)
+end
+
 local function move_cursor(delta)
   if not state then return end
   local n = #state.rows
@@ -1552,13 +1578,17 @@ local function setup_keymaps()
       vim.notify("UCore: writable files are not opened in P4. Checkout first with 'c', then revert with 'r'.", vim.log.levels.INFO)
       return
     end
-    local confirm = vim.fn.confirm(
-      "UCore: revert " .. item.filename .. "?\nThis discards local changes.",
-      "&Revert\n&Cancel", 2, "Question"
-    )
+    local loaded_buf = find_loaded_buffer(item.path)
+    local has_unsaved_buffer = loaded_buf and vim.api.nvim_buf_is_valid(loaded_buf) and vim.bo[loaded_buf].modified
+    local message = "UCore: revert " .. item.filename .. "?\nThis discards local changes."
+    if has_unsaved_buffer then
+      message = message .. "\n\nThis file also has unsaved buffer changes; they will be discarded too."
+    end
+    local confirm = vim.fn.confirm(message, "&Revert\n&Cancel", 2, "Question")
     if confirm ~= 1 then return end
     local ok, err = p4.do_revert(item.path, state.root)
     if ok then
+      reload_buffer_from_disk(item.path)
       vim.notify("UCore: reverted " .. item.filename, vim.log.levels.INFO)
       M.refresh()
     else
