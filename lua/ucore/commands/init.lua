@@ -42,6 +42,8 @@ local function dispatch_debug(tail)
 		projects = actions.projects,
 		modules = actions.modules,
 		assets = actions.assets,
+		["p4-changes"] = actions.pending_changelists,
+		p4changes = actions.pending_changelists,
 		["search-symbols"] = function()
 			actions.search_symbols(rest)
 		end,
@@ -61,6 +63,7 @@ local function dispatch_debug(tail)
 		complete = actions.complete,
 		goto = actions.goto_definition,
 		references = actions.references,
+		vcs = actions.vcs_debug,
 	}
 
 	local handler = handlers[sub]
@@ -92,11 +95,16 @@ function M.dispatch(args)
       actions.find(tail)
     end,
     goto = actions.goto_definition,
-    references = actions.references,
-    debug = function()
-      dispatch_debug(tail)
-    end,
-    help = actions.help,
+		references = actions.references,
+    checkout = actions.checkout,
+    commit = actions.commit,
+		vcs = function()
+			actions.vcs_dispatch(tail)
+		end,
+		debug = function()
+			dispatch_debug(tail)
+		end,
+		help = actions.help,
   }
 
   local handler = handlers[sub]
@@ -130,11 +138,15 @@ function M.register()
 
 	vim.api.nvim_create_user_command("UCore", M.dispatch, {
 		nargs = "*",
-		complete = function(arglead)
-			local items = {
+		complete = function(arglead, cmdline, cursorpos)
+			local user_items = {
 				"boot",
 				"build",
 				"build-cancel",
+				"vcs",
+				"changelists",
+				"checkout",
+				"commit",
 				"editor",
 				"find",
 				"goto",
@@ -143,8 +155,67 @@ function M.register()
 				"help",
 			}
 
+			local vcs_items = {
+				"dashboard",
+				"checkout",
+				"commit",
+				"login",
+			}
+
+			local debug_items = {
+				"logs",
+				"engine",
+				"engine-refresh",
+				"open",
+				"register",
+				"projects",
+				"modules",
+				"assets",
+				"p4-changes",
+				"search-symbols",
+				"status",
+				"rpc-status",
+				"setup",
+				"refresh",
+				"start",
+				"stop",
+				"restart",
+				"maps",
+				"complete",
+				"goto",
+				"references",
+				"vcs",
+				"help",
+			}
+
+			local line = cmdline or ""
+			local before_cursor = line:sub(1, (cursorpos or (#line + 1)) - 1)
+			local tail = before_cursor:match("^%s*UCore%s*(.-)%s*$") or ""
+			local first = tail:match("^(%S+)")
+			local in_debug = first and first:lower() == "debug"
+			local in_vcs = first and first:lower() == "vcs"
+
+			local items
+			if in_debug then
+				items = debug_items
+			elseif in_vcs then
+				items = vcs_items
+			else
+				items = user_items
+			end
+
+			local needle = (arglead or ""):lower()
+
+			if in_debug and (tail:lower() == "debug" or tail:lower():match("^debug%s*$")) then
+				needle = ""
+			end
+
+			if in_vcs and (tail:lower() == "vcs" or tail:lower():match("^vcs%s*$")) then
+				needle = ""
+			end
+
 			return vim.tbl_filter(function(item)
-				return item:find(arglead:lower(), 1, true) == 1
+				return item:find(needle, 1, true) == 1
 			end, items)
 		end,
 	})

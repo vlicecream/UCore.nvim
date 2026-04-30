@@ -150,12 +150,16 @@ end
 -- Request completions from Rust for the current cursor position.
 -- 根据当前光标位置向 Rust 请求补全。
 function M.request(callback)
-	callback = callback or function() end
+  callback = callback or function() end
 
-	local root = project.find_project_root()
-	if not root then
-		return callback(nil, "Could not find .uproject")
-	end
+  if vim.b.no_cmp or vim.b.ucore_completion_disabled then
+    return callback(nil, "disabled")
+  end
+
+  local root = project.find_project_root()
+  if not root then
+    return callback(nil, "Could not find .uproject")
+  end
 
 	local file_path = vim.api.nvim_buf_get_name(0)
 	if file_path == "" then

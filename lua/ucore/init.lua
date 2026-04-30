@@ -11,6 +11,9 @@ function M.setup(opts)
 	require("ucore.completion").setup()
 	require("ucore.semantic").setup()
 	require("ucore.autocmd").setup()
+	pcall(function()
+		require("ucore.vcs").setup()
+	end)
 end
 
 return M
