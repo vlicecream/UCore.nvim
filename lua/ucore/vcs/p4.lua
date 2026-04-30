@@ -139,6 +139,8 @@ function M.build_env()
   end
   if vcs_p4.charset then
     env.P4CHARSET = tostring(vcs_p4.charset)
+  else
+    env.P4CHARSET = "utf8"
   end
   if vcs_p4.config then
     env.P4CONFIG = tostring(vcs_p4.config)
