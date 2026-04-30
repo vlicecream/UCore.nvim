@@ -271,14 +271,14 @@ local function rebuild_rows()
     end
   end
 
-  if should_show("writable") and count_values(data.writable_unopened) > 0 then
+  if should_show("writable") then
     table.insert(rows, { kind = "blank" })
     table.insert(rows, { kind = "section", label = "Writable (Not Checked Out)" })
     if state.loading.writable then
       table.insert(rows, { kind = "empty", text = loading_message("writable") })
     elseif data.errors.writable then
       table.insert(rows, { kind = "empty", text = error_message("writable") })
-    else
+    elseif count_values(data.writable_unopened) > 0 then
       for _, f in ipairs(data.writable_unopened or {}) do
         local file_path = p4.normalize_local_file(f.path, state.root)
         if file_path then
@@ -295,6 +295,8 @@ local function rebuild_rows()
           })
         end
       end
+    else
+      table.insert(rows, { kind = "empty", text = "  (none)" })
     end
   end
 
@@ -1077,13 +1079,21 @@ function M.load_data()
     p4.status_async(root, function(files, err)
       if not state or state.token ~= token then return end
       state.data.local_changes = vim.tbl_filter(function(file)
-        return file and file.action ~= "edit" and is_dashboard_file(file.path)
+        return file and is_dashboard_file(file.path)
       end, files or {})
-      state.data.writable_unopened = vim.tbl_filter(function(file)
-        return file and file.action == "edit" and is_dashboard_file(file.path)
-      end, files or {})
-      mark_done("writable", nil)
       done_files("status", err)
+    end)
+  end
+
+  if state.loading.writable then
+    p4.writable_unopened_async(root, function(files, err)
+      if not state or state.token ~= token then return end
+      state.data.writable_unopened = vim.tbl_filter(function(file)
+        return file and is_dashboard_file(file.path)
+      end, files or {})
+      mark_done("writable", err and ("p4 writable failed: " .. tostring(err)) or nil)
+      update_ready_status()
+      render_all(true)
     end)
   end
 

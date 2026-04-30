@@ -259,6 +259,7 @@ local function existing_pathspecs(root)
 
   add_dir("Source")
   add_dir("Config")
+  add_dir("Content")
 
   for _, uproject in ipairs(vim.fn.glob(normalized_root .. "/*.uproject", false, true)) do
     add_file(uproject)
@@ -269,6 +270,8 @@ local function existing_pathspecs(root)
     for _, plugin_dir in ipairs(vim.fn.glob(plugins_root .. "/*", false, true)) do
       if vim.fn.isdirectory(plugin_dir) == 1 then
         add_dir(plugin_dir:sub(#normalized_root + 2) .. "/Source")
+        add_dir(plugin_dir:sub(#normalized_root + 2) .. "/Config")
+        add_dir(plugin_dir:sub(#normalized_root + 2) .. "/Content")
         for _, uplugin in ipairs(vim.fn.glob(plugin_dir .. "/*.uplugin", false, true)) do
           add_file(uplugin)
         end
@@ -320,6 +323,93 @@ end
 
 function M.is_project_file(path, root)
   return is_real_local_path(path, root)
+end
+
+local RECONCILE_EXCLUDED_DIRS = {
+  [".git"] = true,
+  [".svn"] = true,
+  [".p4"] = true,
+  [".vs"] = true,
+  [".idea"] = true,
+  [".vscode"] = true,
+  ["binaries"] = true,
+  ["build"] = true,
+  ["deriveddatacache"] = true,
+  ["intermediate"] = true,
+  ["saved"] = true,
+}
+
+local RECONCILE_EXCLUDED_EXTS = {
+  a = true,
+  cache = true,
+  db = true,
+  dll = true,
+  dylib = true,
+  exe = true,
+  exp = true,
+  idb = true,
+  ilk = true,
+  ipch = true,
+  lib = true,
+  log = true,
+  obj = true,
+  o = true,
+  pdb = true,
+  pch = true,
+  so = true,
+  sqlite = true,
+  suo = true,
+  tmp = true,
+}
+
+local RECONCILE_EXCLUDED_PATTERNS = {
+  "%.sln%.dotsettings%.user$",
+  "%.user$",
+}
+
+local function relative_project_path(path, root)
+  if not root then return nil end
+  local normalized_root = normalize_path(root):lower():gsub("/+$", "")
+  local normalized_path = normalize_path(path)
+  local lowered_path = normalized_path:lower()
+  if lowered_path == normalized_root then
+    return ""
+  end
+  if lowered_path:sub(1, #normalized_root + 1) ~= normalized_root .. "/" then
+    return nil
+  end
+  return normalized_path:sub(#normalized_root + 2)
+end
+
+local function should_keep_reconcile_file(path, root)
+  if not is_real_local_path(path, root) then
+    return false
+  end
+
+  local relative = relative_project_path(path, root)
+  if not relative or relative == "" then
+    return false
+  end
+
+  local lower = normalize_path(relative):lower()
+  for segment in lower:gmatch("[^/]+") do
+    if RECONCILE_EXCLUDED_DIRS[segment] then
+      return false
+    end
+  end
+
+  local ext = lower:match("%.([^%.]+)$")
+  if ext and RECONCILE_EXCLUDED_EXTS[ext] then
+    return false
+  end
+
+  for _, pattern in ipairs(RECONCILE_EXCLUDED_PATTERNS) do
+    if lower:match(pattern) then
+      return false
+    end
+  end
+
+  return true
 end
 
 function M.normalize_local_file(path, root)
@@ -377,7 +467,7 @@ local function parse_reconcile_output(result, root)
         local_path = resolve_local_status_path(path, root)
       end
 
-      if local_path and is_real_local_path(local_path, root) then
+      if local_path and should_keep_reconcile_file(local_path, root) then
         local action = reconcile_action_from_text(action_text or raw)
         table.insert(files, {
           path = local_path,
@@ -541,7 +631,7 @@ function M.opened(root)
 end
 
 function M.status(root)
-  local files, _stdout, _stderr, code = reconcile_preview(root, {})
+  local files, _stdout, _stderr, code = reconcile_preview(root, {"-a", "-d"})
   if code ~= 0 then
     return {}
   end
@@ -913,7 +1003,7 @@ function M.opened_async(root, cb)
 end
 
 function M.status_async(root, cb)
-  reconcile_preview_async(root, {}, function(parsed, stdout, stderr, code)
+  reconcile_preview_async(root, {"-a", "-d"}, function(parsed, stdout, stderr, code)
     if code ~= 0 then
       cb({}, (stderr ~= "" and stderr or stdout):match("[^\r\n]+") or "p4 reconcile failed")
       return
