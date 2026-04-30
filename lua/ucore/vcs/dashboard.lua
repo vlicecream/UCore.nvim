@@ -33,6 +33,9 @@ local HIGHLIGHTS = {
   UCoreVcsDiffAdd = { fg = "#7ee787" },
   UCoreVcsDiffDel = { fg = "#ff6b6b" },
   UCoreVcsDiffHunk = { fg = "#58a6ff" },
+  UCoreVcsFoldOpen = { fg = "#ffd166", bold = true },
+  UCoreVcsFoldClosed = { fg = "#7ee787", bold = true },
+  UCoreVcsGroupTitle = { fg = "#00d7ff", bold = true },
 }
 
 for name, opts in pairs(HIGHLIGHTS) do
@@ -96,9 +99,6 @@ local function should_show(section)
   if filter == "files" then
     return section == "files" or section == "writable"
   end
-  if filter == "changelists" or filter == "pending" then
-    return section == "pending"
-  end
   if filter == "shelved" then
     return section == "shelved"
   end
@@ -108,6 +108,8 @@ end
 local function count_values(values)
   return type(values) == "table" and #values or 0
 end
+
+local group_opened_by_changelist
 
 local function section_count(section)
   if not state then
@@ -122,14 +124,16 @@ local function section_count(section)
   if section == "info" then
     return "1"
   end
-  if section == "pending" then
-    return tostring(count_values(state.data.pending))
-  end
   if section == "shelved" then
     return tostring(count_values(state.data.shelved))
   end
   if section == "files" then
-    return tostring(count_values(state.data.opened) + count_values(state.data.local_changes))
+    local groups = group_opened_by_changelist(state.data.opened)
+    local count = 0
+    for _, files in pairs(groups) do
+      count = count + #files
+    end
+    return tostring(count + count_values(state.data.local_changes))
   end
   if section == "writable" then
     return tostring(count_values(state.data.writable_unopened))
@@ -141,22 +145,82 @@ local function count_section(section)
   return section_count(section)
 end
 
-local function default_changelist_count()
-  if not state or type(state.data.opened) ~= "table" then
-    return 0
-  end
-  local total = 0
-  for _, f in ipairs(state.data.opened) do
-    local change = tostring(f.change or "default"):lower()
-    if change == "" or change == "default" then
-      total = total + 1
-    end
-  end
-  return total
+local function is_selectable(row)
+  return row and (row.kind == "file" or row.kind == "changelist" or row.kind == "shelved" or row.kind == "changelist_header" or row.kind == "shelf_header")
 end
 
-local function is_selectable(row)
-  return row and (row.kind == "file" or row.kind == "changelist" or row.kind == "shelved")
+local function normalize_change_id(change)
+  change = vim.trim(tostring(change or ""))
+  if change == "" or change == "0" then
+    return "default"
+  end
+
+  local lowered = change:lower()
+  if lowered == "default" or lowered == "default change" then
+    return "default"
+  end
+
+  return lowered:match("^change%s+(%d+)$") or lowered:match("^(%d+)%s+change$") or change
+end
+
+group_opened_by_changelist = function(opened)
+  local groups = {}
+  for _, file in ipairs(opened or {}) do
+    local change = normalize_change_id(file.change)
+    file.change = change
+    groups[change] = groups[change] or {}
+    table.insert(groups[change], file)
+  end
+  return groups
+end
+
+local function clean_description(desc)
+  desc = tostring(desc or ""):gsub("\r", " "):gsub("\n", " ")
+  desc = vim.trim(desc)
+  if desc == "" then
+    return ""
+  end
+  return desc
+end
+
+local function pending_description(change)
+  change = normalize_change_id(change)
+  if not state or change == "default" then
+    return "Default changelist"
+  end
+  for _, ch in ipairs(state.data.pending or {}) do
+    if tostring(ch.number) == tostring(change) then
+      local desc = clean_description(ch.description)
+      if desc ~= "" then
+        return desc
+      end
+      break
+    end
+  end
+  return "Change " .. tostring(change)
+end
+
+local function trim_display(text, max_width)
+  text = tostring(text or "")
+  if vim.fn.strdisplaywidth(text) <= max_width then
+    return text
+  end
+  return vim.fn.strcharpart(text, 0, math.max(1, max_width - 1)) .. "…"
+end
+
+local function trace_changelist_desc(op, payload)
+  local ok_config, config = pcall(require, "ucore.config")
+  local dir = ok_config and config.values and config.values.cache_dir or (vim.fn.stdpath("data") .. "/ucore")
+  pcall(vim.fn.mkdir, dir, "p")
+
+  local lines = {
+    string.rep("=", 80),
+    os.date("%Y-%m-%d %H:%M:%S") .. "  " .. tostring(op),
+    vim.inspect(payload or {}),
+    "",
+  }
+
+  pcall(vim.fn.writefile, lines, dir .. "/vcs-changelist-desc.log", "a")
 end
 
 local function loading_message(section)
@@ -171,9 +235,6 @@ local function loading_message(section)
   end
   if section == "writable" then
     return "  (scanning writable files...)"
-  end
-  if section == "pending" then
-    return "  (pending changelists loading...)"
   end
   if section == "shelved" then
     return "  (shelved changelists loading...)"
@@ -219,49 +280,105 @@ local function rebuild_rows()
     elseif data.errors.files then
       table.insert(rows, { kind = "empty", text = error_message("files") })
     else
-      local local_seen = {}
-      for _, f in ipairs(data.opened or {}) do
-        local file_path = p4.normalize_local_file(f.path, state.root)
-        if file_path then
-          local_seen[file_path:lower()] = true
-        end
+      local groups = group_opened_by_changelist(data.opened)
+      local change_order = {}
+      for k in pairs(groups) do
+        table.insert(change_order, k)
       end
+      table.sort(change_order, function(a, b)
+        if a == "default" then return true end
+        if b == "default" then return false end
+        local na = tonumber(a) or 0
+        local nb = tonumber(b) or 0
+        return na < nb
+      end)
 
       local has_changes = false
-      for _, f in ipairs(data.opened or {}) do
-        local file_path = p4.normalize_local_file(f.path, state.root)
-        if file_path then
-          has_changes = true
-          local name, dir = split_path(file_path)
-          table.insert(rows, {
-            kind = "file",
-            section = "opened",
-            checked = true,
-            status = f.action,
-            raw_status = f.action,
-            path = file_path,
-            filename = name,
-            directory = dir,
-            change = f.change or "default",
-          })
+      for _, change in ipairs(change_order) do
+        local files = groups[change]
+        local expanded = state.expanded.changelists[change]
+        if expanded == nil then
+          expanded = change == "default"
+          state.expanded.changelists[change] = expanded
+        end
+        local desc = pending_description(change)
+        trace_changelist_desc("dashboard.changelist_header_desc", {
+          change = change,
+          desc = desc,
+          pending = data.pending,
+          files = files,
+        })
+        has_changes = true
+        local fold = expanded and "▾" or "▸"
+        local display_name = trim_display(desc, 50)
+        local header_text = string.format("%s %s (%d files)", fold, display_name, #files)
+        table.insert(rows, {
+          kind = "changelist_header",
+          change = change,
+          expanded = expanded,
+          file_count = #files,
+          description = desc,
+          text = header_text,
+        })
+        if expanded then
+          table.sort(files, function(a, b)
+            local pa = p4.normalize_local_file(a.path, state.root) or a.path or ""
+            local pb = p4.normalize_local_file(b.path, state.root) or b.path or ""
+            return pa:lower() < pb:lower()
+          end)
+          for _, f in ipairs(files) do
+            local file_path = p4.normalize_local_file(f.path, state.root)
+            if file_path then
+              local name, dir = split_path(file_path)
+              table.insert(rows, {
+                kind = "file",
+                section = "opened",
+                checked = true,
+                status = f.action,
+                raw_status = f.action,
+                path = file_path,
+                filename = name,
+                directory = dir,
+                change = change,
+              })
+            end
+          end
         end
       end
 
-      for _, f in ipairs(data.local_changes or {}) do
-        local file_path = p4.normalize_local_file(f.path, state.root)
-        if file_path and not local_seen[file_path:lower()] then
-          has_changes = true
-          local name, dir = split_path(file_path)
-          table.insert(rows, {
-            kind = "file",
-            section = "local",
-            checked = false,
-            status = file_status_label(f.status),
-            raw_status = f.status,
-            path = file_path,
-            filename = name,
-            directory = dir,
-          })
+      if count_values(data.local_changes) > 0 then
+        local local_expanded = state.expanded.changelists["local"]
+        if local_expanded == nil then
+          local_expanded = true
+          state.expanded.changelists["local"] = true
+        end
+        has_changes = true
+        local fold = local_expanded and "▾" or "▸"
+        table.insert(rows, {
+          kind = "changelist_header",
+          change = "local",
+          expanded = local_expanded,
+          file_count = count_values(data.local_changes),
+          description = "Local candidates",
+          text = string.format("%s Local candidates (%d files)", fold, count_values(data.local_changes)),
+        })
+        if local_expanded then
+          for _, f in ipairs(data.local_changes or {}) do
+            local file_path = p4.normalize_local_file(f.path, state.root)
+            if file_path then
+              local name, dir = split_path(file_path)
+              table.insert(rows, {
+                kind = "file",
+                section = "local",
+                checked = false,
+                status = file_status_label(f.status),
+                raw_status = f.status,
+                path = file_path,
+                filename = name,
+                directory = dir,
+              })
+            end
+          end
         end
       end
 
@@ -300,36 +417,6 @@ local function rebuild_rows()
     end
   end
 
-  if should_show("pending") then
-    table.insert(rows, { kind = "blank" })
-    table.insert(rows, { kind = "section", label = "Pending Changelists" })
-    if state.loading.pending then
-      table.insert(rows, { kind = "empty", text = loading_message("pending") })
-    elseif data.errors.pending then
-      table.insert(rows, { kind = "empty", text = error_message("pending") })
-    else
-      local default_count = default_changelist_count()
-      if default_count > 0 then
-        table.insert(rows, {
-          kind = "empty",
-          text = string.format("  default  Default changelist (%d opened files)", default_count),
-        })
-      end
-      if count_values(data.pending) > 0 then
-        for _, ch in ipairs(data.pending) do
-          table.insert(rows, {
-            kind = "changelist",
-            number = ch.number,
-            description = tostring(ch.description or ""):gsub("\n", " "):sub(1, 60),
-            user = ch.user,
-          })
-        end
-      elseif default_count == 0 then
-        table.insert(rows, { kind = "empty", text = "  (none)" })
-      end
-    end
-  end
-
   if should_show("shelved") then
     table.insert(rows, { kind = "blank" })
     table.insert(rows, { kind = "section", label = "Shelves" })
@@ -339,12 +426,44 @@ local function rebuild_rows()
       table.insert(rows, { kind = "empty", text = error_message("shelved") })
     elseif count_values(data.shelved) > 0 then
       for _, ch in ipairs(data.shelved) do
+        local key = tostring(ch.number)
+        local expanded = state.expanded.shelves[key]
+        if expanded == nil then
+          expanded = false
+          state.expanded.shelves[key] = false
+        end
+        local fold = expanded and "▾" or "▸"
         table.insert(rows, {
-          kind = "shelved",
+          kind = "shelf_header",
           number = ch.number,
+          expanded = expanded,
+          file_count = 0,
           description = tostring(ch.description or ""):gsub("\n", " "):sub(1, 60),
-          user = ch.user,
+          text = string.format("%s Shelf %d  %s", fold, ch.number, tostring(ch.description or ""):gsub("\n", " "):sub(1, 50)),
         })
+        if expanded then
+          local shelf_files = state.data.shelf_files[key]
+          if shelf_files then
+            for _, f in ipairs(shelf_files) do
+              local file_path = p4.normalize_local_file(f.path, state.root) or f.path
+              if file_path then
+                local name, dir = split_path(file_path)
+                table.insert(rows, {
+                  kind = "file",
+                  section = "shelf",
+                  checked = false,
+                  status = f.status or "edit",
+                  raw_status = f.status or "edit",
+                  path = file_path,
+                  filename = name,
+                  directory = dir,
+                })
+              end
+            end
+          else
+            table.insert(rows, { kind = "empty", text = "  (loading...)" })
+          end
+        end
       end
     else
       table.insert(rows, { kind = "empty", text = "  (none)" })
@@ -356,7 +475,7 @@ end
 
 local function cursor_to_first_selectable()
   if not state then return end
-  for _, kind in ipairs({ "file", "changelist", "shelved" }) do
+  for _, kind in ipairs({ "changelist_header", "shelf_header", "file", "changelist", "shelved" }) do
     for i, row in ipairs(state.rows) do
       if row.kind == kind then
         state.cursor = i
@@ -521,7 +640,6 @@ local function render_status_text()
   end
   if state.loading.info then return "loading workspace..." end
   if state.loading.files then return "loading changes..." end
-  if state.loading.pending then return "loading pending..." end
   if state.loading.shelved then return "loading shelved..." end
   return "ready"
 end
@@ -732,6 +850,10 @@ function M.render_left()
     elseif row.kind == "changelist" or row.kind == "shelved" then
       local desc = tostring(row.description or ""):gsub("\n", " "):sub(1, 55)
       table.insert(text_lines, string.format("%sCL %-6d  %s", pointer, row.number, desc))
+    elseif row.kind == "changelist_header" then
+      table.insert(text_lines, string.format("%s%s", pointer, row.text or ""))
+    elseif row.kind == "shelf_header" then
+      table.insert(text_lines, string.format("%s%s", pointer, row.text or ""))
     end
   end
 
@@ -786,6 +908,16 @@ function M.render_left()
         vim.api.nvim_buf_add_highlight(buf, ns, "UCoreVcsChangelistNum", line, num_start - 1, num_start - 1 + #num)
         vim.api.nvim_buf_add_highlight(buf, ns, "UCoreVcsChangelistDesc", line, num_start + #num + 1, #line_text)
       end
+    elseif row.kind == "changelist_header" then
+      if i == state.cursor then
+        vim.api.nvim_buf_add_highlight(buf, ns, "UCoreVcsSelector", line, 0, 2)
+      end
+      vim.api.nvim_buf_add_highlight(buf, ns, row.expanded and "UCoreVcsFoldOpen" or "UCoreVcsFoldClosed", line, 0, #line_text)
+    elseif row.kind == "shelf_header" then
+      if i == state.cursor then
+        vim.api.nvim_buf_add_highlight(buf, ns, "UCoreVcsSelector", line, 0, 2)
+      end
+      vim.api.nvim_buf_add_highlight(buf, ns, row.expanded and "UCoreVcsFoldOpen" or "UCoreVcsFoldClosed", line, 0, #line_text)
     end
   end
 
@@ -961,17 +1093,62 @@ function M.render_right()
     return
   end
 
+  if item.kind == "changelist_header" then
+    local lines = {
+      "Diff / Preview",
+      "",
+      "Changelist",
+      "Description: " .. tostring(item.description or ""),
+      "ID: " .. tostring(item.change or "default"),
+      "Files: " .. tostring(item.file_count or 0),
+      "",
+    }
+    if item.expanded then
+      table.insert(lines, "Press Enter to collapse.")
+    else
+      table.insert(lines, "Press Enter to expand.")
+    end
+    set_right_lines(lines, "ucore-vcs-detail")
+    return
+  end
+
+  if item.kind == "shelf_header" then
+    local key = tostring(item.number)
+    local shelf_files = state.data.shelf_files[key]
+    local lines = {
+      "Diff / Preview",
+      "",
+      "Shelf: " .. tostring(item.number),
+      "Description: " .. tostring(item.description or ""),
+      "Files: " .. tostring(shelf_files and #shelf_files or "?"),
+      "",
+    }
+    if shelf_files then
+      for _, f in ipairs(shelf_files) do
+        table.insert(lines, "  " .. tostring(f.status or "") .. "  " .. tostring(f.path or ""))
+      end
+      table.insert(lines, "")
+      table.insert(lines, "Press Enter to collapse.")
+    elseif item.expanded then
+      table.insert(lines, "Loading shelf files...")
+    else
+      table.insert(lines, "Press Enter to expand.")
+    end
+    set_right_lines(lines, "ucore-vcs-detail")
+    return
+  end
+
   set_right_lines({ "Diff / Preview", "", "No preview available." }, "ucore-vcs-detail")
 end
 
 local function render_all(keep_cursor)
   if not state then return end
   local old_item = get_current_item()
-  local old_key = old_item and (old_item.path or (old_item.kind .. ":" .. tostring(old_item.number))) or nil
+  local old_key = old_item and (old_item.path or (old_item.change and old_item.kind .. ":change:" .. old_item.change) or (old_item.kind .. ":" .. tostring(old_item.number))) or nil
   rebuild_rows()
   if keep_cursor and old_key then
     for i, row in ipairs(state.rows) do
-      local key = row.path or (row.kind .. ":" .. tostring(row.number))
+      local key = row.path or (row.change and row.kind .. ":change:" .. row.change) or (row.kind .. ":" .. tostring(row.number))
       if key == old_key then
         state.cursor = i
         break
@@ -1009,7 +1186,6 @@ local function set_loading_for_filter()
   local filter = state.filter or "all"
   state.loading.info = true
   state.loading.files = filter == "all" or filter == "files"
-  state.loading.pending = filter == "all" or filter == "changelists" or filter == "pending"
   state.loading.shelved = filter == "all" or filter == "shelved"
   state.loading.writable = filter == "all" or filter == "files"
 end
@@ -1023,7 +1199,6 @@ end
 local function is_ready()
   return not state.loading.info
       and not state.loading.files
-      and not state.loading.pending
       and not state.loading.shelved
       and not state.loading.writable
 end
@@ -1045,7 +1220,12 @@ function M.load_data()
   state.data.writable_unopened = {}
   state.data.pending = {}
   state.data.shelved = {}
+  state.data.shelf_files = {}
   state.data.errors = {}
+  state.expanded = {
+    changelists = {},
+    shelves = {},
+  }
   render_all(false)
 
   p4.info_async(function(info, err)
@@ -1074,6 +1254,12 @@ function M.load_data()
       state.data.opened = vim.tbl_filter(function(file)
         return file and is_dashboard_file(file.path)
       end, files or {})
+      trace_changelist_desc("dashboard.opened_files", {
+        root = root,
+        err = err,
+        raw_files = files,
+        filtered_files = state.data.opened,
+      })
       done_files("opened", err)
     end)
     p4.status_async(root, function(files, err)
@@ -1097,15 +1283,18 @@ function M.load_data()
     end)
   end
 
-  if state.loading.pending then
-    p4.pending_changelists_async(root, function(changes, err)
-      if not state or state.token ~= token then return end
-      state.data.pending = changes or {}
-      mark_done("pending", err and ("p4 pending failed: " .. tostring(err)) or nil)
-      update_ready_status()
-      render_all(true)
-    end)
-  end
+  -- fetch pending changelists for header descriptions (not displayed as section)
+  p4.pending_changelists_async(root, function(changes, err)
+    if not state or state.token ~= token then return end
+    state.data.pending = changes or {}
+    trace_changelist_desc("dashboard.pending_changelists", {
+      root = root,
+      err = err,
+      changes = changes,
+    })
+    update_ready_status()
+    render_all(true)
+  end)
 
   if state.loading.shelved then
     p4.shelved_changelists_async(root, function(changes, err)
@@ -1144,8 +1333,38 @@ local function setup_keymaps()
     if item.kind == "file" and item.path and vim.fn.filereadable(item.path) == 1 then
       M.close()
       vim.cmd.edit(vim.fn.fnameescape(item.path))
+    elseif item.kind == "changelist_header" then
+      state.expanded.changelists[item.change] = not item.expanded
+      render_all(true)
+    elseif item.kind == "shelf_header" then
+      local key = tostring(item.number)
+      local was_expanded = item.expanded
+      state.expanded.shelves[key] = not was_expanded
+      if not was_expanded and not state.data.shelf_files[key] then
+        local token = state.token
+        p4.shelved_detail_async(item.number, function(detail, err)
+          if not state or state.token ~= token then return end
+          if detail and detail.files then
+            local files = {}
+            for _, f in ipairs(detail.files or {}) do
+              local local_path = p4.normalize_local_file(f.path, state.root) or f.path
+              table.insert(files, {
+                status = f.status or "edit",
+                path = local_path,
+              })
+            end
+            state.data.shelf_files[key] = files
+          else
+            state.data.shelf_files[key] = {}
+          end
+          render_all(true)
+        end)
+      end
+      render_all(true)
     elseif item.kind == "changelist" or item.kind == "shelved" then
-      load_changelist_detail(item)
+      M.enter_drill(item)
+    elseif item.kind == "back" then
+      M.go_back()
     end
   end, opts)
 
@@ -1269,7 +1488,7 @@ local function setup_keymaps()
   vim.keymap.set("n", "l", function()
     local item = get_current_item()
     if not item or (item.kind ~= "changelist" and item.kind ~= "shelved") then
-      vim.notify("UCore: move to a changelist row", vim.log.levels.INFO)
+      vim.notify("UCore: move to a drill-down changelist row", vim.log.levels.INFO)
       return
     end
     load_changelist_detail(item)
@@ -1278,7 +1497,7 @@ local function setup_keymaps()
   vim.keymap.set("n", "s", function()
     local item = get_current_item()
     if not item or item.kind ~= "changelist" then
-      vim.notify("UCore: move to a pending changelist row", vim.log.levels.INFO)
+      vim.notify("UCore: move to a drill-down changelist row", vim.log.levels.INFO)
       return
     end
     local confirm = vim.fn.confirm(
@@ -1304,13 +1523,13 @@ UCore VCS Dashboard
 
 j/k      Move selection
 Space    Toggle file checked
-Enter    Open file / show changelist detail
+Enter    Open file / toggle changelist or shelf
 d        Load diff for selected file
 c        p4 edit selected file
 a        p4 add selected local candidate
 r        Revert selected file (with confirmation)
 m        Open commit UI with checked files
-l        Show changelist detail in preview
+l        Show drill-down changelist detail
 s        Submit selected pending changelist
 R        Refresh data
 ?        This help
@@ -1399,11 +1618,16 @@ function M.open(opts)
       writable_unopened = {},
       pending = {},
       shelved = {},
+      shelf_files = {},
       errors = {},
     },
     cache = {
       diff = {},
       changelist_detail = {},
+    },
+    expanded = {
+      changelists = {},
+      shelves = {},
     },
   }
 

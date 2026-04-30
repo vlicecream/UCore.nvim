@@ -99,6 +99,29 @@ local function trace_reconcile_event(op, root, cmd, stdout, stderr, code, parsed
   pcall(vim.fn.writefile, lines, dir .. "/vcs-reconcile.log", "a")
 end
 
+local function trace_changelist_event(op, root, cmd, stdout, stderr, code, parsed)
+  local dir = (config.values and config.values.cache_dir) or (vim.fn.stdpath("data") .. "/ucore")
+  pcall(vim.fn.mkdir, dir, "p")
+
+  local lines = {
+    string.rep("=", 80),
+    os.date("%Y-%m-%d %H:%M:%S") .. "  " .. tostring(op),
+    "root: " .. vim.inspect(root),
+    "cmd: " .. vim.inspect(cmd),
+    "code: " .. tostring(code),
+    "cwd: " .. vim.inspect(vim.fn.getcwd()),
+    "-- stdout --",
+    tostring(stdout or ""),
+    "-- stderr --",
+    tostring(stderr or ""),
+    "-- parsed --",
+    vim.inspect(parsed or {}),
+    "",
+  }
+
+  pcall(vim.fn.writefile, lines, dir .. "/vcs-changelist-desc.log", "a")
+end
+
 local function is_suspicious_file_arg(path, root)
   path = sanitize(path)
   if path == "" or path == "0" or path:match("[/\\]0$") then
@@ -214,9 +237,9 @@ local function parse_changes(result)
   for line in tostring(result or ""):gmatch("[^\r\n]+") do
     local num = line:match("^Change (%d+)")
     if num then
-      local user = line:match(" by (.+)@")
+      local user = line:match(" by ([^@%s]+)@")
       if user then
-        local desc = line:match("'(.-)'$")
+        local desc = line:match("'(.*)'%s*$")
         table.insert(changes, {
           number = tonumber(num),
           user = user,
@@ -226,6 +249,109 @@ local function parse_changes(result)
     end
   end
   return changes
+end
+
+local function normalize_change_id(change)
+  change = vim.trim(tostring(change or ""))
+  if change == "" or change == "0" then
+    return "default"
+  end
+
+  local lowered = change:lower()
+  if lowered == "default" or lowered == "default change" then
+    return "default"
+  end
+
+  local number = lowered:match("^change%s+(%d+)$") or lowered:match("^(%d+)%s+change$")
+  if number then
+    return number
+  end
+
+  return change
+end
+
+local function parse_opened_change(line, fallback)
+  local change = line:match("%-%s+%S+%s+change%s+(%d+)")
+      or line:match("%-%s+%S+%s+(%d+)%s+change")
+      or line:match("%-%s+%S+%s+(default%s+change)")
+      or fallback
+  return normalize_change_id(change)
+end
+
+local function parse_describe_output(result, change_num, default_status)
+  local detail = {
+    number = tonumber(change_num),
+    user = "",
+    description = "",
+    files = {},
+    status = default_status or "",
+  }
+  local desc_lines = {}
+  local in_description = false
+  local saw_change_header = false
+  local before_files = true
+
+  for line in tostring(result or ""):gmatch("[^\r\n]+") do
+    local header_user = line:match("^Change%s+%d+%s+by%s+([^@%s]+)@")
+    if header_user then
+      detail.user = header_user
+      saw_change_header = true
+      goto continue
+    end
+
+    local user = line:match("^User:%s*(.+)$")
+    if user then detail.user = user end
+
+    local status_tag = line:match("^Status:%s*(.+)$")
+    if status_tag then detail.status = status_tag end
+
+    local inline_desc = line:match("^Description:%s*(.*)$")
+    if inline_desc ~= nil then
+      in_description = true
+      inline_desc = vim.trim(inline_desc)
+      if inline_desc ~= "" then
+        table.insert(desc_lines, inline_desc)
+      end
+      goto continue
+    end
+
+    if line:match("^Affected files") then
+      in_description = false
+      before_files = false
+      goto continue
+    end
+
+    if in_description then
+      if line:match("^%S") then
+        in_description = false
+      else
+        local desc = vim.trim(line)
+        if desc ~= "" then
+          table.insert(desc_lines, desc)
+        end
+        goto continue
+      end
+    end
+
+    if saw_change_header and before_files then
+      local desc = vim.trim(line)
+      if desc ~= "" and not desc:match("^%.%.%.") then
+        table.insert(desc_lines, desc)
+      end
+      goto continue
+    end
+
+    local depot, rev_action = line:match("^%.%.%.%s+(%S+)%s+(.+)$")
+    if depot and rev_action then
+      local action = rev_action:match("#%d+%s+(%S+)") or rev_action:match("^(%S+)")
+      table.insert(detail.files, { status = action or "", path = depot })
+    end
+
+    ::continue::
+  end
+
+  detail.description = table.concat(desc_lines, " ")
+  return detail
 end
 
 local function root_pathspec(root)
@@ -618,8 +744,7 @@ function M.opened(root)
       local depot_file = depot_rev:gsub("#%d+$", "")
       local local_path = M.depot_to_local(depot_file)
       if local_path and is_real_local_path(local_path, root) then
-        local change = line:match("%-%s+%S+%s+(%S+)%s+change") or "default"
-        if change == "0" then change = "default" end
+        local change = parse_opened_change(line, "default")
         table.insert(files, {
           path = local_path,
           action = action,
@@ -813,23 +938,7 @@ function M.changelist_detail(change_num)
   if vim.v.shell_error ~= 0 then
     return nil, "failed to describe changelist " .. tostring(change_num)
   end
-  local detail = { number = tonumber(change_num), user = "", description = "", files = {}, status = "" }
-  for line in result:gmatch("[^\r\n]+") do
-    local user = line:match("^User:%s*(.+)$")
-    if user then detail.user = user end
-    local desc_line = line:match("^Description:%s*(.+)$")
-    if desc_line then detail.description = desc_line end
-    local cont = line:match("^%s+(.+)$")
-    if cont and detail.description ~= "" and detail.files and not cont:match("^Affected") and not cont:match("^Change") then
-      local status, path = cont:match("^(%S+)%s+(.+)$")
-      if status and path then
-        table.insert(detail.files, { status = status, path = path })
-      end
-    end
-    local status_tag = line:match("^Status:%s*(.+)$")
-    if status_tag then detail.status = status_tag end
-  end
-  return detail, nil
+  return parse_describe_output(result, change_num, ""), nil
 end
 
 function M.needs_login()
@@ -874,11 +983,29 @@ function M.shelved_changelists(root)
 end
 
 function M.pending_changelists(root)
-  local result = M.system(M.p4_cmd("changes", {"-s", "pending", root_pathspec(root)}))
+  local info = M.info()
+  local client = info and info["client name"]
+  local user = info and info["user name"]
+  local args = {"-s", "pending"}
+  if client and client ~= "" then
+    vim.list_extend(args, {"-c", client})
+  end
+  if user and user ~= "" then
+    vim.list_extend(args, {"-u", user})
+  end
+  if not client or client == "" then
+    args[#args + 1] = root_pathspec(root)
+  end
+
+  local cmd = M.p4_cmd("changes", args)
+  local result = M.system(cmd)
   if vim.v.shell_error ~= 0 then
+    trace_changelist_event("p4.pending_changelists", root, cmd, result, "", vim.v.shell_error, {})
     return {}
   end
-  return parse_changes(result)
+  local parsed = parse_changes(result)
+  trace_changelist_event("p4.pending_changelists", root, cmd, result, "", vim.v.shell_error, parsed)
+  return parsed
 end
 
 local function allwrite_enabled()
@@ -934,21 +1061,7 @@ function M.shelved_detail(change_num)
   if vim.v.shell_error ~= 0 then
     return nil, "failed to describe shelved changelist " .. tostring(change_num)
   end
-  local detail = { number = tonumber(change_num), user = "", description = "", files = {}, status = "shelved" }
-  for line in result:gmatch("[^\r\n]+") do
-    local user = line:match("^User:%s*(.+)$")
-    if user then detail.user = user end
-    local desc_line = line:match("^Description:%s*(.+)$")
-    if desc_line then detail.description = desc_line end
-    local cont = line:match("^%s+(.+)$")
-    if cont and detail.description ~= "" and detail.files and not cont:match("^Affected") and not cont:match("^Change") then
-      local status, path = cont:match("^(%S+)%s+(.+)$")
-      if status and path then
-        table.insert(detail.files, { status = status, path = path })
-      end
-    end
-  end
-  return detail, nil
+  return parse_describe_output(result, change_num, "shelved"), nil
 end
 
 function M.info_async(cb)
@@ -982,7 +1095,7 @@ function M.opened_async(root, cb)
         if depot_rev and opened_action then
           depot = depot_rev:gsub("#%d+$", "")
           action = opened_action
-          change = line:match("%-%s+%S+%s+(%S+)%s+change") or "default"
+          change = parse_opened_change(line, "default")
         end
       end
       if (not client_file or not is_real_local_path(client_file, root)) and is_depot_path(depot) then
@@ -992,11 +1105,12 @@ function M.opened_async(root, cb)
         if not change or change == "" or change == "0" then
           change = "default"
         end
+        change = normalize_change_id(change)
         table.insert(files, {
           path = client_file,
           action = action,
           depot = depot,
-          change = change ~= "" and change or "default",
+          change = change,
         })
       end
     end
@@ -1016,13 +1130,31 @@ function M.status_async(root, cb)
 end
 
 function M.pending_changelists_async(root, cb)
-  local args = {"-s", "pending", root_pathspec(root)}
-  M.system_async(M.p4_cmd("changes", args), nil, function(stdout, stderr, code)
-    if code ~= 0 then
-      cb({}, (stderr ~= "" and stderr or stdout):match("[^\r\n]+") or "p4 pending changes failed")
-      return
+  M.info_async(function(info)
+    local client = info and info["client name"]
+    local user = info and info["user name"]
+    local args = {"-s", "pending"}
+    if client and client ~= "" then
+      vim.list_extend(args, {"-c", client})
     end
-    cb(parse_changes(stdout), nil)
+    if user and user ~= "" then
+      vim.list_extend(args, {"-u", user})
+    end
+    if not client or client == "" then
+      args[#args + 1] = root_pathspec(root)
+    end
+
+    local cmd = M.p4_cmd("changes", args)
+    M.system_async(cmd, nil, function(stdout, stderr, code)
+      if code ~= 0 then
+        trace_changelist_event("p4.pending_changelists_async", root, cmd, stdout, stderr, code, {})
+        cb({}, (stderr ~= "" and stderr or stdout):match("[^\r\n]+") or "p4 pending changes failed")
+        return
+      end
+      local parsed = parse_changes(stdout)
+      trace_changelist_event("p4.pending_changelists_async", root, cmd, stdout, stderr, code, parsed)
+      cb(parsed, nil)
+    end)
   end)
 end
 
@@ -1093,23 +1225,7 @@ function M.changelist_detail_async(change_num, cb)
       return
     end
 
-    local detail = { number = tonumber(change_num), user = "", description = "", files = {}, status = "" }
-    for line in stdout:gmatch("[^\r\n]+") do
-      local user = line:match("^User:%s*(.+)$")
-      if user then detail.user = user end
-      local desc_line = line:match("^Description:%s*(.+)$")
-      if desc_line then detail.description = desc_line end
-      local cont = line:match("^%s+(.+)$")
-      if cont and detail.description ~= "" and detail.files and not cont:match("^Affected") and not cont:match("^Change") then
-        local status, path = cont:match("^(%S+)%s+(.+)$")
-        if status and path then
-          table.insert(detail.files, { status = status, path = path })
-        end
-      end
-      local status_tag = line:match("^Status:%s*(.+)$")
-      if status_tag then detail.status = status_tag end
-    end
-    cb(detail, nil)
+    cb(parse_describe_output(stdout, change_num, ""), nil)
   end)
 end
 
@@ -1120,21 +1236,7 @@ function M.shelved_detail_async(change_num, cb)
       return
     end
 
-    local detail = { number = tonumber(change_num), user = "", description = "", files = {}, status = "shelved" }
-    for line in stdout:gmatch("[^\r\n]+") do
-      local user = line:match("^User:%s*(.+)$")
-      if user then detail.user = user end
-      local desc_line = line:match("^Description:%s*(.+)$")
-      if desc_line then detail.description = desc_line end
-      local cont = line:match("^%s+(.+)$")
-      if cont and detail.description ~= "" and detail.files and not cont:match("^Affected") and not cont:match("^Change") then
-        local status, path = cont:match("^(%S+)%s+(.+)$")
-        if status and path then
-          table.insert(detail.files, { status = status, path = path })
-        end
-      end
-    end
-    cb(detail, nil)
+    cb(parse_describe_output(stdout, change_num, "shelved"), nil)
   end)
 end
 
