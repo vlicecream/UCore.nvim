@@ -296,14 +296,18 @@ u_core_server   long-running RPC server used by interactive features
 
 P4 (Perforce) is supported. SVN support is planned.
 
-`:UCore vcs` opens a LazyGit-style floating window with workspace info, file changes, pending changelists, and diff preview.
+`:UCore vcs` opens the main LazyGit-style VCS Dashboard. It shows workspace files, writable-but-not-opened files, pending changelists, shelves, and diff/detail preview. `:UCore changes` opens the same dashboard.
+
+Read-only P4 files are handled before editing: pressing `i`, `a`, `o`, or `O` asks whether to run `p4 edit`, make the file writable only, or cancel. Files that are already opened in P4 but still read-only locally are made writable automatically.
+
+Before commit/build/editor actions, UCore checks unsaved project buffers and asks whether to save them first. Reverting an opened file from the dashboard also reloads the corresponding Neovim buffer after `p4 revert` succeeds.
 
 VCS commands:
 
 ```vim
 :UCore vcs               " Open VCS Dashboard
 :UCore vcs dashboard     " Same as above
-:UCore vcs changes       " Show file changes (picker)
+:UCore vcs changes       " Open dashboard focused on changes
 :UCore vcs checkout      " p4 edit current file
 :UCore vcs commit        " Open visual commit UI
 :UCore vcs changelists    " View pending changelists
@@ -786,14 +790,18 @@ u_core_server   长运行 RPC 服务器，用于交互功能
 
 P4 (Perforce) 是当前支持的版本控制系统。SVN 支持计划中。
 
-`:UCore vcs` 打开一个 LazyGit 风格的多面板浮动窗口，包含工作区信息、文件变更、pending changelist 和 diff 预览。
+`:UCore vcs` 打开主 VCS Dashboard，风格接近 LazyGit/P4V，包含 workspace 文件、可写但未 checkout 的文件、pending changelist、shelf，以及 diff/detail 预览。`:UCore changes` 也会进入同一个 dashboard。
+
+P4 只读文件会在编辑前处理：按 `i`、`a`、`o`、`O` 时，UCore 会询问是否执行 `p4 edit`、仅改成本地可写，或取消编辑。已经在 P4 opened 但本地仍是只读的文件，会自动解除只读后继续编辑。
+
+提交、构建和打开编辑器前，UCore 会检查项目内未保存 buffer，并询问是否先保存。Dashboard 中 revert 成功后，也会自动刷新对应 Neovim buffer，避免内容还停留在旧的未保存状态。
 
 VCS 命令：
 
 ```vim
 :UCore vcs               " 打开 VCS Dashboard
 :UCore vcs dashboard     " 同上
-:UCore vcs changes       " 显示文件变更（picker）
+:UCore vcs changes       " 打开 dashboard 并聚焦变更
 :UCore vcs checkout      " p4 edit 当前文件
 :UCore vcs commit        " 打开可视化提交界面
 :UCore vcs changelists    " 查看 pending changelist
