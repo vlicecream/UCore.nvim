@@ -37,6 +37,7 @@ local function collect_items(root, provider, filter)
         group = "Opened",
         status = f.action,
         path = f.path,
+        root = root,
         filename = name,
         directory = dir,
         checked = true,
@@ -51,6 +52,7 @@ local function collect_items(root, provider, filter)
         group = "Local",
         status = label,
         path = f.path,
+        root = root,
         filename = name,
         directory = dir,
         checked = false,
@@ -129,7 +131,7 @@ local function setup_preview(entry, bufnr)
   if not item then return end
 
   if item.kind == "file" then
-    local diff_text, diff_err = p4.diff(item.path)
+    local diff_text, diff_err = p4.diff(item.path, item.root)
     if diff_text and diff_text ~= "" then
       local lines = vim.split(diff_text, "\n", { plain = true })
       table.insert(lines, 1, "+++ b/" .. (item.directory .. "/" .. item.filename):gsub("\\", "/"))
@@ -313,7 +315,7 @@ function M.open(opts)
         end
         actions.close(prompt_bufnr)
         local item = sel.value
-        local diff_text, diff_err = p4.diff(item.path)
+        local diff_text, diff_err = p4.diff(item.path, state.root)
         if diff_err then
           vim.notify("UCore: " .. tostring(diff_err), vim.log.levels.ERROR)
           return
@@ -348,7 +350,7 @@ function M.open(opts)
           vim.notify("UCore: " .. item.filename .. " is already opened in P4", vim.log.levels.INFO)
           return
         end
-        local ok, err = p4.checkout(item.path)
+        local ok, err = p4.checkout(item.path, state.root)
         if ok then
           item.checked = true
           item.is_local = false
@@ -370,7 +372,7 @@ function M.open(opts)
           vim.notify("UCore: " .. item.filename .. " is already opened in P4", vim.log.levels.INFO)
           return
         end
-        local ok, err = p4.add_file(item.path)
+        local ok, err = p4.add_file(item.path, state.root)
         if ok then
           item.checked = true
           item.is_local = false
@@ -394,7 +396,7 @@ function M.open(opts)
         if confirm ~= 1 then return end
         actions.close(prompt_bufnr)
         vim.schedule(function()
-          p4.do_revert(item.path)
+          p4.do_revert(item.path, state.root)
           vim.notify("UCore: reverted " .. item.filename, vim.log.levels.INFO)
         end)
       end, { buffer = prompt_bufnr, nowait = true })

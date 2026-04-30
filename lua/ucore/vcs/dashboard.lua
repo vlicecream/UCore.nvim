@@ -215,23 +215,25 @@ local function rebuild_rows()
     else
       local local_seen = {}
       for _, f in ipairs(data.opened or {}) do
-        if f.path and is_dashboard_file(f.path) then
-          local_seen[f.path:lower()] = true
+        local file_path = p4.normalize_local_file(f.path, state.root)
+        if file_path then
+          local_seen[file_path:lower()] = true
         end
       end
 
       local has_changes = false
       for _, f in ipairs(data.opened or {}) do
-        if is_dashboard_file(f.path) then
+        local file_path = p4.normalize_local_file(f.path, state.root)
+        if file_path then
           has_changes = true
-          local name, dir = split_path(f.path)
+          local name, dir = split_path(file_path)
           table.insert(rows, {
             kind = "file",
             section = "opened",
             checked = true,
             status = f.action,
             raw_status = f.action,
-            path = f.path,
+            path = file_path,
             filename = name,
             directory = dir,
             change = f.change or "default",
@@ -240,16 +242,17 @@ local function rebuild_rows()
       end
 
       for _, f in ipairs(data.local_changes or {}) do
-        if f.path and is_dashboard_file(f.path) and not local_seen[f.path:lower()] then
+        local file_path = p4.normalize_local_file(f.path, state.root)
+        if file_path and not local_seen[file_path:lower()] then
           has_changes = true
-          local name, dir = split_path(f.path)
+          local name, dir = split_path(file_path)
           table.insert(rows, {
             kind = "file",
             section = "local",
             checked = false,
             status = file_status_label(f.status),
             raw_status = f.status,
-            path = f.path,
+            path = file_path,
             filename = name,
             directory = dir,
           })
