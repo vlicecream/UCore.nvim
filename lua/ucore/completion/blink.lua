@@ -73,9 +73,18 @@ end
 -- Request completion candidates from the Rust backend.
 -- 从 Rust 后端请求补全候选。
 function M:get_completions(_, callback)
-	local cancelled = false
+  if vim.b.no_cmp or vim.b.ucore_completion_disabled or vim.b.blink_cmp_disabled then
+    callback({
+      is_incomplete_forward = false,
+      is_incomplete_backward = false,
+      items = {},
+    })
+    return
+  end
 
-	completion.request(function(items, err)
+  local cancelled = false
+
+  completion.request(function(items, err)
 		if cancelled then
 			return
 		end

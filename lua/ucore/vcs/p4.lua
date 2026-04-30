@@ -187,13 +187,17 @@ end
 local function parse_changes(result)
   local changes = {}
   for line in tostring(result or ""):gmatch("[^\r\n]+") do
-    local num, user, desc = line:match("^Change (%d+) .- by (.+) @ .- %((.-)%)")
+    local num = line:match("^Change (%d+)")
     if num then
-      table.insert(changes, {
-        number = tonumber(num),
-        user = user,
-        description = desc,
-      })
+      local user = line:match(" by (.+)@")
+      if user then
+        local desc = line:match("'(.-)'$")
+        table.insert(changes, {
+          number = tonumber(num),
+          user = user,
+          description = desc ~= nil and desc or "",
+        })
+      end
     end
   end
   return changes
@@ -454,7 +458,7 @@ function M.diff(path, root)
     trace_path_event("p4.diff", path, root, "invalid-local-file-path")
     return nil, "invalid local file path: " .. tostring(path)
   end
-  local result = M.system(M.p4_cmd("diff", {win_path(path)}))
+  local result = M.system(M.p4_cmd("diff", {"-du", win_path(path)}))
   if vim.v.shell_error ~= 0 then
     return nil, "p4 diff failed"
   end
@@ -641,11 +645,21 @@ function M.login(password)
 end
 
 function M.shelved_changelists(root)
-  local result = M.system(M.p4_cmd("changes", {"-s", "shelved", root_pathspec(root)}))
+  local info = M.info()
+  local user = info and info["user name"]
+  local args = user and {"-s", "shelved", "-u", user} or {"-s", "shelved"}
+  local result = M.system(M.p4_cmd("changes", args))
   if vim.v.shell_error ~= 0 then
     return {}
   end
-  return parse_changes(result)
+  local changes = parse_changes(result)
+  if #changes == 0 and user then
+    result = M.system(M.p4_cmd("changes", {"-s", "shelved"}))
+    if vim.v.shell_error == 0 then
+      changes = parse_changes(result)
+    end
+  end
+  return changes
 end
 
 function M.pending_changelists(root)
@@ -656,7 +670,83 @@ function M.pending_changelists(root)
   return parse_changes(result)
 end
 
-M.shelved_detail = M.changelist_detail
+local WRITABLE_EXTENSIONS = {
+  "h", "hpp", "hh", "cpp", "cc", "cxx", "inl", "ini",
+}
+
+local function is_writable_source_ext(path)
+  local ext = path:lower():match("%.([^%.]+)$")
+  if not ext then return false end
+  for _, e in ipairs(WRITABLE_EXTENSIONS) do
+    if ext == e then return true end
+  end
+  return path:lower():match("%.uproject$") or path:lower():match("%.uplugin$")
+end
+
+local function allwrite_enabled()
+  local result = M.system(M.p4_cmd("client", {"-o"}))
+  if vim.v.shell_error ~= 0 then return false end
+  return result:match("allwrite") and not result:match("noallwrite")
+end
+
+function M.writable_unopened(root)
+  if not root then return {} end
+  if allwrite_enabled() then return {} end
+  local opened = M.opened(root)
+  local opened_set = {}
+  for _, f in ipairs(opened) do
+    local normalized = normalize_path(f.path):lower()
+    opened_set[normalized] = true
+  end
+  local result = M.system(M.p4_cmd("have", { root_pathspec(root) }))
+  if vim.v.shell_error ~= 0 then return {} end
+  local writable = {}
+  for line in result:gmatch("[^\r\n]+") do
+    local local_path = line:match("^%S+#%d+%s+-%s+(.+)$")
+    if local_path then
+      local normalized = normalize_path(local_path):lower()
+      if is_writable_source_ext(local_path) and not opened_set[normalized] then
+        if vim.fn.filewritable(local_path) == 1 then
+          table.insert(writable, {
+            path = local_path,
+            status = "writable?",
+            action = "writable?",
+          })
+        end
+      end
+    end
+  end
+  return writable
+end
+
+function M.writable_unopened_async(root, cb)
+  vim.schedule(function()
+    local result = M.writable_unopened(root)
+    cb(result, nil)
+  end)
+end
+
+function M.shelved_detail(change_num)
+  local result = M.system(M.p4_cmd("describe", {"-S", tostring(change_num)}))
+  if vim.v.shell_error ~= 0 then
+    return nil, "failed to describe shelved changelist " .. tostring(change_num)
+  end
+  local detail = { number = tonumber(change_num), user = "", description = "", files = {}, status = "shelved" }
+  for line in result:gmatch("[^\r\n]+") do
+    local user = line:match("^User:%s*(.+)$")
+    if user then detail.user = user end
+    local desc_line = line:match("^Description:%s*(.+)$")
+    if desc_line then detail.description = desc_line end
+    local cont = line:match("^%s+(.+)$")
+    if cont and detail.description ~= "" and detail.files and not cont:match("^Affected") and not cont:match("^Change") then
+      local status, path = cont:match("^(%S+)%s+(.+)$")
+      if status and path then
+        table.insert(detail.files, { status = status, path = path })
+      end
+    end
+  end
+  return detail, nil
+end
 
 function M.info_async(cb)
   M.system_async(M.p4_cmd("info", {"-s"}), nil, function(stdout, stderr, code)
@@ -735,13 +825,27 @@ function M.pending_changelists_async(root, cb)
 end
 
 function M.shelved_changelists_async(root, cb)
-  local args = {"-s", "shelved", root_pathspec(root)}
-  M.system_async(M.p4_cmd("changes", args), nil, function(stdout, stderr, code)
-    if code ~= 0 then
-      cb({}, (stderr ~= "" and stderr or stdout):match("[^\r\n]+") or "p4 shelved changes failed")
-      return
-    end
-    cb(parse_changes(stdout), nil)
+  M.info_async(function(info, err)
+    local user = info and info["user name"]
+    local args = user and {"-s", "shelved", "-u", user} or {"-s", "shelved"}
+    M.system_async(M.p4_cmd("changes", args), nil, function(stdout, stderr, code)
+      if code ~= 0 then
+        cb({}, (stderr ~= "" and stderr or stdout):match("[^\r\n]+") or "p4 shelved changes failed")
+        return
+      end
+      local changes = parse_changes(stdout)
+      if #changes == 0 and user then
+        M.system_async(M.p4_cmd("changes", {"-s", "shelved"}), nil, function(stdout2, stderr2, code2)
+          if code2 == 0 then
+            cb(parse_changes(stdout2), nil)
+          else
+            cb(changes, nil)
+          end
+        end)
+      else
+        cb(changes, nil)
+      end
+    end)
   end)
 end
 
@@ -771,7 +875,7 @@ function M.diff_async(path, root, cb)
     return
   end
   path = win_path(path)
-  M.system_async(M.p4_cmd("diff", {path}), nil, function(stdout, stderr, code)
+  M.system_async(M.p4_cmd("diff", {"-du", path}), nil, function(stdout, stderr, code)
     if code ~= 0 then
       cb(nil, (stderr ~= "" and stderr or stdout):match("[^\r\n]+") or "p4 diff failed")
       return
@@ -807,6 +911,29 @@ function M.changelist_detail_async(change_num, cb)
   end)
 end
 
-M.shelved_detail_async = M.changelist_detail_async
+function M.shelved_detail_async(change_num, cb)
+  M.system_async(M.p4_cmd("describe", {"-S", tostring(change_num)}), nil, function(stdout, stderr, code)
+    if code ~= 0 then
+      cb(nil, (stderr ~= "" and stderr or stdout):match("[^\r\n]+") or ("failed to describe shelved changelist " .. tostring(change_num)))
+      return
+    end
+
+    local detail = { number = tonumber(change_num), user = "", description = "", files = {}, status = "shelved" }
+    for line in stdout:gmatch("[^\r\n]+") do
+      local user = line:match("^User:%s*(.+)$")
+      if user then detail.user = user end
+      local desc_line = line:match("^Description:%s*(.+)$")
+      if desc_line then detail.description = desc_line end
+      local cont = line:match("^%s+(.+)$")
+      if cont and detail.description ~= "" and detail.files and not cont:match("^Affected") and not cont:match("^Change") then
+        local status, path = cont:match("^(%S+)%s+(.+)$")
+        if status and path then
+          table.insert(detail.files, { status = status, path = path })
+        end
+      end
+    end
+    cb(detail, nil)
+  end)
+end
 
 return M

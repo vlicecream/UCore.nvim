@@ -94,7 +94,7 @@ local function should_show(section)
   end
   local filter = state.filter or "all"
   if filter == "files" then
-    return section == "files"
+    return section == "files" or section == "writable"
   end
   if filter == "changelists" or filter == "pending" then
     return section == "pending"
@@ -131,6 +131,9 @@ local function section_count(section)
   if section == "files" then
     return tostring(count_values(state.data.opened) + count_values(state.data.local_changes))
   end
+  if section == "writable" then
+    return tostring(count_values(state.data.writable_unopened))
+  end
   return "0"
 end
 
@@ -165,6 +168,9 @@ local function loading_message(section)
   end
   if section == "files" then
     return "  (changes loading...)"
+  end
+  if section == "writable" then
+    return "  (scanning writable files...)"
   end
   if section == "pending" then
     return "  (pending changelists loading...)"
@@ -207,7 +213,7 @@ local function rebuild_rows()
 
   if should_show("files") then
     table.insert(rows, { kind = "blank" })
-    table.insert(rows, { kind = "section", label = "Changes" })
+    table.insert(rows, { kind = "section", label = "Workspace Changes" })
     if state.loading.files then
       table.insert(rows, { kind = "empty", text = loading_message("files") })
     elseif data.errors.files then
@@ -265,6 +271,33 @@ local function rebuild_rows()
     end
   end
 
+  if should_show("writable") and count_values(data.writable_unopened) > 0 then
+    table.insert(rows, { kind = "blank" })
+    table.insert(rows, { kind = "section", label = "Writable (Not Checked Out)" })
+    if state.loading.writable then
+      table.insert(rows, { kind = "empty", text = loading_message("writable") })
+    elseif data.errors.writable then
+      table.insert(rows, { kind = "empty", text = error_message("writable") })
+    else
+      for _, f in ipairs(data.writable_unopened or {}) do
+        local file_path = p4.normalize_local_file(f.path, state.root)
+        if file_path then
+          local name, dir = split_path(file_path)
+          table.insert(rows, {
+            kind = "file",
+            section = "writable",
+            checked = false,
+            status = "writable?",
+            raw_status = f.status,
+            path = file_path,
+            filename = name,
+            directory = dir,
+          })
+        end
+      end
+    end
+  end
+
   if should_show("pending") then
     table.insert(rows, { kind = "blank" })
     table.insert(rows, { kind = "section", label = "Pending Changelists" })
@@ -297,7 +330,7 @@ local function rebuild_rows()
 
   if should_show("shelved") then
     table.insert(rows, { kind = "blank" })
-    table.insert(rows, { kind = "section", label = "Shelved Changelists" })
+    table.insert(rows, { kind = "section", label = "Shelves" })
     if state.loading.shelved then
       table.insert(rows, { kind = "empty", text = loading_message("shelved") })
     elseif data.errors.shelved then
@@ -576,23 +609,28 @@ local function pad_to_width(text, width)
   return text .. string.rep(" ", pad)
 end
 
+local HEADER_PADDING = 2
+
 local function compose_header(left, center, right, width)
+  local inner_width = math.max(1, width - HEADER_PADDING * 2)
   local left_w = vim.fn.strdisplaywidth(left)
   local center_w = vim.fn.strdisplaywidth(center)
   local right_w = vim.fn.strdisplaywidth(right)
-  if left_w + center_w + right_w + 4 > width then
+  if left_w + center_w + right_w + 4 > inner_width then
     center = "UCore VCS"
     center_w = vim.fn.strdisplaywidth(center)
   end
 
-  local center_col = math.max(left_w + 2, math.floor((width - center_w) / 2))
-  local right_col = math.max(center_col + center_w + 2, width - right_w)
+  local center_col = math.max(left_w + 2, math.floor((inner_width - center_w) / 2))
+  local right_col = math.max(center_col + center_w + 2, inner_width - right_w)
   local line = " " .. left
   line = pad_to_width(line, center_col)
   line = line .. center
   line = pad_to_width(line, right_col)
   line = line .. right
-  return line
+  local composed_width = vim.fn.strdisplaywidth(line)
+  local right_padding = math.max(0, inner_width - composed_width)
+  return string.rep(" ", HEADER_PADDING) .. line .. string.rep(" ", HEADER_PADDING + right_padding)
 end
 
 local function add_pattern_highlight(buf, line, text, pattern, group)
@@ -657,11 +695,13 @@ function M.render_left()
     if row.kind == "section" then
       local label = row.label
       local suffix = ""
-      if label == "Changes" then
+      if label == "Workspace Changes" then
         suffix = section_count("files") .. " files"
+      elseif label == "Writable (Not Checked Out)" then
+        suffix = section_count("writable") .. " files"
       elseif label == "Pending Changelists" then
         suffix = section_count("pending") .. " changelists"
-      elseif label == "Shelved Changelists" then
+      elseif label == "Shelves" then
         suffix = section_count("shelved") .. " shelves"
       end
       if suffix ~= "" then
@@ -680,7 +720,9 @@ function M.render_left()
       local mark = row.checked and "[x]" or "[ ]"
       local dir = compact_directory(row.directory, 30)
       local change = row.section == "opened" and ("[" .. tostring(row.change or "default") .. "]") or ""
-      if dir ~= "" then
+      if row.section == "writable" then
+        table.insert(text_lines, string.format("%s%s  %s", pointer, mark, row.filename))
+      elseif dir ~= "" then
         table.insert(text_lines, string.format("%s%s  %-7s %-10s %-24s %s", pointer, mark, row.status, change, row.filename, dir))
       else
         table.insert(text_lines, string.format("%s%s  %-7s %-10s %s", pointer, mark, row.status, change, row.filename))
@@ -715,12 +757,14 @@ function M.render_left()
       if mark_begin then
         vim.api.nvim_buf_add_highlight(buf, ns, row.checked and "UCoreVcsChecked" or "UCoreVcsUnchecked", line, mark_begin - 1, mark_begin + 2)
       end
-      local stat_end = (mark_begin or 0) + 4 + 7
-      local sg = "UCoreVcsStatusEdit"
-      if row.status == "add" or row.status == "add?" then sg = "UCoreVcsStatusAdd"
-      elseif row.status == "delete" or row.status == "delete?" then sg = "UCoreVcsStatusDel"
-      elseif row.section == "local" then sg = "UCoreVcsStatusLocal" end
-      vim.api.nvim_buf_add_highlight(buf, ns, sg, line, (mark_begin or 0) + 3, math.min(stat_end, #line_text))
+      if row.section ~= "writable" then
+        local stat_end = (mark_begin or 0) + 4 + 7
+        local sg = "UCoreVcsStatusEdit"
+        if row.status == "add" or row.status == "add?" then sg = "UCoreVcsStatusAdd"
+        elseif row.status == "delete" or row.status == "delete?" then sg = "UCoreVcsStatusDel"
+        elseif row.section == "local" then sg = "UCoreVcsStatusLocal" end
+        vim.api.nvim_buf_add_highlight(buf, ns, sg, line, (mark_begin or 0) + 3, math.min(stat_end, #line_text))
+      end
       local fn_start = line_text:find(row.filename, 1, true)
       if fn_start then
         vim.api.nvim_buf_add_highlight(buf, ns, "UCoreVcsFilename", line, fn_start - 1, fn_start - 1 + #row.filename)
@@ -783,6 +827,29 @@ local function set_right_lines(lines, ft)
 end
 
 local function render_file_summary(item)
+  if item.section == "writable" then
+    local lines = {
+      "File Content / Writable",
+      "",
+      normalize_path(item.path),
+      "",
+      "Status: writable? (not opened in P4)",
+      "",
+      "Press c to checkout (p4 edit).",
+      "",
+    }
+    local ok, content = pcall(vim.fn.readfile, item.path, "", 40)
+    if ok and content and #content > 0 then
+      table.insert(lines, "")
+      table.insert(lines, "-- file content (first 40 lines) --")
+      table.insert(lines, "")
+      for _, l in ipairs(content) do
+        table.insert(lines, l)
+      end
+    end
+    set_right_lines(lines, "ucore-vcs-detail")
+    return
+  end
   set_right_lines({
     "Diff / Preview",
     "",
@@ -942,6 +1009,7 @@ local function set_loading_for_filter()
   state.loading.files = filter == "all" or filter == "files"
   state.loading.pending = filter == "all" or filter == "changelists" or filter == "pending"
   state.loading.shelved = filter == "all" or filter == "shelved"
+  state.loading.writable = filter == "all" or filter == "files"
 end
 
 local function mark_done(section, err)
@@ -955,6 +1023,7 @@ local function is_ready()
       and not state.loading.files
       and not state.loading.pending
       and not state.loading.shelved
+      and not state.loading.writable
 end
 
 local function update_ready_status()
@@ -971,6 +1040,7 @@ function M.load_data()
   state.data.info = {}
   state.data.opened = {}
   state.data.local_changes = {}
+  state.data.writable_unopened = {}
   state.data.pending = {}
   state.data.shelved = {}
   state.data.errors = {}
@@ -985,7 +1055,7 @@ function M.load_data()
   end)
 
   if state.loading.files then
-    local pending_files = 2
+    local pending_files = 3
     local file_errors = {}
     local function done_files(kind, err)
       if err then table.insert(file_errors, kind .. ": " .. tostring(err)) end
@@ -1010,6 +1080,14 @@ function M.load_data()
         return file and is_dashboard_file(file.path)
       end, files or {})
       done_files("status", err)
+    end)
+    p4.writable_unopened_async(root, function(files, err)
+      if not state or state.token ~= token then return end
+      state.data.writable_unopened = vim.tbl_filter(function(file)
+        return file and is_dashboard_file(file.path)
+      end, files or {})
+      mark_done("writable", nil)
+      done_files("writable", err)
     end)
   end
 
@@ -1092,7 +1170,9 @@ local function setup_keymaps()
       vim.notify("UCore: " .. item.filename .. " is already opened", vim.log.levels.INFO)
       return
     end
-    if is_add_candidate(item) then
+    if item.section == "writable" then
+      -- proceed to checkout writable file
+    elseif is_add_candidate(item) then
       vim.notify("UCore: this looks like a new file. Use 'a' to p4 add it.", vim.log.levels.INFO)
       return
     end
@@ -1157,6 +1237,20 @@ local function setup_keymaps()
     end
     if #checked == 0 then
       vim.notify("UCore: no files selected for commit", vim.log.levels.WARN)
+      return
+    end
+
+    local writable_checked = {}
+    for _, row in ipairs(state.rows) do
+      if row.kind == "file" and row.checked and row.section == "writable" then
+        table.insert(writable_checked, row.filename or row.path)
+      end
+    end
+    if #writable_checked > 0 then
+      vim.notify(
+        "UCore: writable files are not opened in P4. Checkout first with 'c':\n  " .. table.concat(writable_checked, "\n  "),
+        vim.log.levels.WARN
+      )
       return
     end
     local root = state.root
@@ -1296,6 +1390,7 @@ function M.open(opts)
       info = {},
       opened = {},
       local_changes = {},
+      writable_unopened = {},
       pending = {},
       shelved = {},
       errors = {},

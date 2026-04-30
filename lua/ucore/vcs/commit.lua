@@ -269,9 +269,6 @@ end
 local COMMIT_FOOTER_ITEMS = {
   { key = "Tab",    label = "toggle" },
   { key = "Ctrl-s", label = "submit" },
-  { key = "d",      label = "diff" },
-  { key = "a",      label = "add" },
-  { key = "r",      label = "revert" },
   { key = "q",      label = "close" },
 }
 
@@ -370,6 +367,9 @@ function M.create_buffer(lines, provider, root, files)
   vim.api.nvim_set_option_value("winhl", "Normal:NormalFloat,FloatBorder:UCoreCommitBorder", { win = win })
   vim.api.nvim_set_option_value("cursorline", true, { win = win })
   vim.b[buf].no_cmp = true
+  vim.b[buf].completion = false
+  vim.b[buf].blink_cmp_disabled = true
+  vim.b[buf].ucore_completion_disabled = true
 
   return buf, win
 end
@@ -705,18 +705,6 @@ function M.setup_keymaps(buf)
   vim.keymap.set("i", "<C-s>", function()
     vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "n", false)
     M.submit(buf)
-  end, opts)
-
-  vim.keymap.set("n", "d", function()
-    M.diff_file(buf)
-  end, opts)
-
-  vim.keymap.set("n", "a", function()
-    M.add_file(buf)
-  end, opts)
-
-  vim.keymap.set("n", "r", function()
-    M.revert_file(buf)
   end, opts)
 
   vim.keymap.set("n", "q", function()
