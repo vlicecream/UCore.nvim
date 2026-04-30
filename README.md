@@ -45,7 +45,7 @@ return {
   {
     "vlicecream/UCore.nvim",
     lazy = false,
-    build = "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1",
+    build = "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1",
     dependencies = {
       {
         "saghen/blink.cmp",
@@ -92,10 +92,6 @@ return {
     end,
   },
   {
-    "vlicecream/UTreeSitter",
-    lazy = false,
-  },
-  {
     "nvim-treesitter/nvim-treesitter",
     lazy = false,
     build = ":TSUpdate",
@@ -124,7 +120,7 @@ return {
     dir = "C:/Unreal-NVIM/UCore.nvim",
     name = "UCore.nvim",
     lazy = false,
-    build = "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1",
+    build = "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1",
     config = function()
       require("ucore").setup({
         auto_boot = true,
@@ -133,11 +129,6 @@ return {
         },
       })
     end,
-  },
-  {
-    dir = "C:/Unreal-NVIM/UTreeSitter",
-    name = "UTreeSitter",
-    lazy = false,
   },
 }
 ```
@@ -259,12 +250,19 @@ If release binaries are missing, UCore falls back to `cargo run`.
 lazy.nvim can build the Rust backend automatically:
 
 ```lua
-build = "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1"
+build = "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1"
 ```
 
 On Windows, the build script loads the MSVC C++ toolchain before building C
 dependencies such as SQLite and tree-sitter. It also retries once after
 `cargo clean` if it detects stale MinGW/GCC-built objects.
+
+If PowerShell 7 (`pwsh`) is not installed, Windows PowerShell can still run the
+same script, but its output encoding may render poorly inside lazy.nvim:
+
+```lua
+build = "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1"
+```
 
 Manual build:
 
@@ -333,11 +331,7 @@ the build fails, UCore keeps the build log open and does not launch the editor.
 
 ## Tree-sitter
 
-UCore registers a custom `unreal_cpp` parser backed by:
-
-```text
-https://github.com/vlicecream/UTreeSitter
-```
+UCore registers a custom `unreal_cpp` parser for Unreal C++ files.
 
 `require("ucore").setup()` registers:
 
@@ -434,7 +428,7 @@ Common fixes:
 
 ```powershell
 cd path\to\UCore.nvim
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build.ps1 -Clean
+pwsh -NoProfile -ExecutionPolicy Bypass -File scripts\build.ps1 -Clean
 
 # Or manually:
 cd u-scanner
