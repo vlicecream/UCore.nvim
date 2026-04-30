@@ -514,6 +514,7 @@ local function move_cursor(delta)
     state.cursor = pos
     M.render_left()
     M.render_right()
+    M.render_footer()
   end
 end
 
@@ -674,6 +675,26 @@ local DASHBOARD_FOOTER_SHORT_ITEMS = {
   { key = "q",   label = "close" },
 }
 
+local function footer_items_for_current()
+  local item = get_current_item()
+  if item and item.kind == "file" and item.section == "writable" then
+    return vim.tbl_filter(function(entry)
+      return entry.key ~= "r"
+    end, DASHBOARD_FOOTER_ITEMS)
+  end
+  return DASHBOARD_FOOTER_ITEMS
+end
+
+local function footer_short_items_for_current()
+  local item = get_current_item()
+  if item and item.kind == "file" and item.section == "writable" then
+    return vim.tbl_filter(function(entry)
+      return entry.key ~= "r"
+    end, DASHBOARD_FOOTER_SHORT_ITEMS)
+  end
+  return DASHBOARD_FOOTER_SHORT_ITEMS
+end
+
 local function build_shortcut_line(width, items, short_items, opts)
   opts = opts or {}
   local padding = opts.padding or 2
@@ -795,7 +816,7 @@ function M.render_footer()
   if not state or not state.wins or not state.wins.footer_buf then return end
   local buf = state.wins.footer_buf
   local width = vim.api.nvim_win_get_width(state.wins.footer_win)
-  local line, spans = build_shortcut_line(width, DASHBOARD_FOOTER_ITEMS, DASHBOARD_FOOTER_SHORT_ITEMS, {
+  local line, spans = build_shortcut_line(width, footer_items_for_current(), footer_short_items_for_current(), {
     padding = 4, min_gap = 2,
   })
   vim.bo[buf].modifiable = true
@@ -1525,6 +1546,10 @@ local function setup_keymaps()
     local item = get_current_item()
     if not item or item.kind ~= "file" then
       vim.notify("UCore: move to a file row", vim.log.levels.INFO)
+      return
+    end
+    if item.section == "writable" then
+      vim.notify("UCore: writable files are not opened in P4. Checkout first with 'c', then revert with 'r'.", vim.log.levels.INFO)
       return
     end
     local confirm = vim.fn.confirm(
