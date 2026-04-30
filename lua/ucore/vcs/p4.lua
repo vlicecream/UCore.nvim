@@ -11,117 +11,6 @@ local function win_path(path)
   return (sanitize(path):gsub("/", "\\"))
 end
 
-local function trace_path_event(op, path, root, reason)
-  local dir = (config.values and config.values.cache_dir) or (vim.fn.stdpath("data") .. "/ucore")
-  pcall(vim.fn.mkdir, dir, "p")
-
-  local lines = {
-    string.rep("=", 80),
-    os.date("%Y-%m-%d %H:%M:%S") .. "  " .. tostring(op),
-    "reason: " .. tostring(reason or ""),
-    "path: " .. vim.inspect(path),
-    "root: " .. vim.inspect(root),
-    "cwd: " .. vim.inspect(vim.fn.getcwd()),
-    "stack:",
-  }
-  vim.list_extend(lines, vim.split(debug.traceback("", 3), "\n", { plain = true }))
-  table.insert(lines, "")
-
-  pcall(vim.fn.writefile, lines, dir .. "/vcs-trace.log", "a")
-end
-
-local function command_has_suspicious_arg(cmd)
-  for _, arg in ipairs(cmd or {}) do
-    local value = sanitize(arg)
-    if value == "0" or value:match("[/\\]0$") or value:match("^%a+://") then
-      return true
-    end
-  end
-  return false
-end
-
-local function command_output_is_suspicious(stdout, stderr)
-  local text = tostring(stdout or "") .. "\n" .. tostring(stderr or "")
-  return text:find("not under client's root", 1, true) ~= nil
-      or text:find("Path '", 1, true) ~= nil and text:find("\\0'", 1, true) ~= nil
-      or text:find("Path '", 1, true) ~= nil and text:find("/0'", 1, true) ~= nil
-end
-
-local function trace_command_event(op, cmd, stdout, stderr, code, reason)
-  local dir = (config.values and config.values.cache_dir) or (vim.fn.stdpath("data") .. "/ucore")
-  pcall(vim.fn.mkdir, dir, "p")
-
-  local lines = {
-    string.rep("=", 80),
-    os.date("%Y-%m-%d %H:%M:%S") .. "  " .. tostring(op),
-    "reason: " .. tostring(reason or ""),
-    "code: " .. tostring(code),
-    "cmd: " .. vim.inspect(cmd),
-    "stdout: " .. tostring(stdout or ""),
-    "stderr: " .. tostring(stderr or ""),
-    "cwd: " .. vim.inspect(vim.fn.getcwd()),
-    "stack:",
-  }
-  vim.list_extend(lines, vim.split(debug.traceback("", 3), "\n", { plain = true }))
-  table.insert(lines, "")
-
-  pcall(vim.fn.writefile, lines, dir .. "/vcs-trace.log", "a")
-end
-
-local function maybe_trace_command(op, cmd, stdout, stderr, code)
-  if command_has_suspicious_arg(cmd) then
-    trace_command_event(op, cmd, stdout, stderr, code, "suspicious-command-arg")
-  elseif command_output_is_suspicious(stdout, stderr) then
-    trace_command_event(op, cmd, stdout, stderr, code, "suspicious-command-output")
-  end
-end
-
-local function trace_reconcile_event(op, root, cmd, stdout, stderr, code, parsed)
-  local dir = (config.values and config.values.cache_dir) or (vim.fn.stdpath("data") .. "/ucore")
-  pcall(vim.fn.mkdir, dir, "p")
-
-  local lines = {
-    string.rep("=", 80),
-    os.date("%Y-%m-%d %H:%M:%S") .. "  " .. tostring(op),
-    "root: " .. vim.inspect(root),
-    "cmd: " .. vim.inspect(cmd),
-    "code: " .. tostring(code),
-    "cwd: " .. vim.inspect(vim.fn.getcwd()),
-    "-- stdout --",
-    tostring(stdout or ""),
-    "-- stderr --",
-    tostring(stderr or ""),
-    "-- parsed --",
-    vim.inspect(parsed or {}),
-    "",
-  }
-
-  pcall(vim.fn.writefile, lines, dir .. "/vcs-reconcile.log", "a")
-end
-
-local function trace_changelist_event(op, root, cmd, stdout, stderr, code, parsed)
-  local dir = (config.values and config.values.cache_dir) or (vim.fn.stdpath("data") .. "/ucore")
-  pcall(vim.fn.mkdir, dir, "p")
-
-  local lines = {
-    string.rep("=", 80),
-    os.date("%Y-%m-%d %H:%M:%S") .. "  " .. tostring(op),
-    "root: " .. vim.inspect(root),
-    "cmd: " .. vim.inspect(cmd),
-    "code: " .. tostring(code),
-    "cwd: " .. vim.inspect(vim.fn.getcwd()),
-    "-- stdout --",
-    tostring(stdout or ""),
-    "-- stderr --",
-    tostring(stderr or ""),
-    "-- parsed --",
-    vim.inspect(parsed or {}),
-    "",
-  }
-
-  pcall(vim.fn.writefile, lines, dir .. "/vcs-changelist-desc.log", "a")
-end
-
 local function is_suspicious_file_arg(path, root)
   path = sanitize(path)
   if path == "" or path == "0" or path:match("[/\\]0$") then
@@ -620,7 +509,6 @@ local function reconcile_preview(root, flags)
   local cmd = M.p4_cmd("reconcile", args)
   local stdout, stderr, code = M.system_err(cmd)
   local parsed = code == 0 and parse_reconcile_output(stdout, root) or {}
-  trace_reconcile_event("p4.reconcile_preview", root, cmd, stdout, stderr, code, parsed)
   return parsed, stdout, stderr, code
 end
 
@@ -634,7 +522,6 @@ local function reconcile_preview_async(root, flags, cb)
   local cmd = M.p4_cmd("reconcile", args)
   M.system_async(cmd, nil, function(stdout, stderr, code)
     local parsed = code == 0 and parse_reconcile_output(stdout, root) or {}
-    trace_reconcile_event("p4.reconcile_async", root, cmd, stdout, stderr, code, parsed)
     cb(parsed, stdout, stderr, code)
   end)
 end
@@ -645,7 +532,6 @@ local function async_result(cmd, cb)
       local stdout = result.stdout or ""
       local stderr = result.stderr or ""
       local code = result.code or 0
-      maybe_trace_command("p4.system_async", cmd, stdout, stderr, code)
       cb(stdout, stderr, code)
     end)
   end
@@ -663,7 +549,6 @@ function M.system(cmd)
   local env = M.build_env()
   if next(env) == nil then
     local result = vim.fn.system(cmd)
-    maybe_trace_command("p4.system", cmd, result, "", vim.v.shell_error)
     return result
   end
   local saved = {}
@@ -675,7 +560,6 @@ function M.system(cmd)
   for k, v in pairs(saved) do
     vim.env[k] = v
   end
-  maybe_trace_command("p4.system", cmd, result, "", vim.v.shell_error)
   return result
 end
 
@@ -685,7 +569,6 @@ function M.system_err(cmd, stdin)
   local env = M.build_env()
   if next(env) == nil then
     local r = vim.system(cmd, opts):wait()
-    maybe_trace_command("p4.system_err", cmd, r.stdout or "", r.stderr or "", r.code)
     return r.stdout or "", r.stderr or "", r.code
   end
   local merged = vim.deepcopy(vim.env)
@@ -694,7 +577,6 @@ function M.system_err(cmd, stdin)
   end
   opts.env = merged
   local r = vim.system(cmd, opts):wait()
-  maybe_trace_command("p4.system_err", cmd, r.stdout or "", r.stderr or "", r.code)
   return r.stdout or "", r.stderr or "", r.code
 end
 
@@ -767,9 +649,8 @@ end
 
 function M.checkout(path, root)
   path = sanitize(path)
-  local suspicious, reason = is_suspicious_file_arg(path, root)
+  local suspicious = is_suspicious_file_arg(path, root)
   if suspicious then
-    trace_path_event("p4.checkout", path, root, reason)
     return true, nil
   end
   if vim.fn.filereadable(path) ~= 1 then
@@ -785,13 +666,11 @@ end
 
 function M.diff(path, root)
   path = sanitize(path)
-  local suspicious, reason = is_suspicious_file_arg(path, root)
+  local suspicious = is_suspicious_file_arg(path, root)
   if suspicious then
-    trace_path_event("p4.diff", path, root, reason)
     return "", nil
   end
   if not is_real_local_path(path, root) then
-    trace_path_event("p4.diff", path, root, "invalid-local-file-path")
     return nil, "invalid local file path: " .. tostring(path)
   end
   local result = M.system(M.p4_cmd("diff", {"-f", "-du", win_path(path)}))
@@ -847,9 +726,8 @@ end
 
 function M.reopen_file(path, change_num)
   path = sanitize(path)
-  local suspicious, reason = is_suspicious_file_arg(path, nil)
+  local suspicious = is_suspicious_file_arg(path, nil)
   if suspicious then
-    trace_path_event("p4.reopen_file", path, nil, reason .. " change=" .. tostring(change_num))
     return true, nil
   end
   local stdout, stderr, code = M.system_err(M.p4_cmd("reopen", {"-c", tostring(change_num), win_path(path)}))
@@ -899,9 +777,8 @@ end
 
 function M.do_revert(path, root)
   path = sanitize(path)
-  local suspicious, reason = is_suspicious_file_arg(path, root)
+  local suspicious = is_suspicious_file_arg(path, root)
   if suspicious then
-    trace_path_event("p4.do_revert", path, root, reason)
     return true, nil
   end
   if vim.fn.filereadable(path) ~= 1 then
@@ -916,13 +793,11 @@ end
 
 function M.add_file(path, root)
   path = sanitize(path)
-  local suspicious, reason = is_suspicious_file_arg(path, root)
+  local suspicious = is_suspicious_file_arg(path, root)
   if suspicious then
-    trace_path_event("p4.add_file", path, root, reason)
     return true, nil
   end
   if not is_real_local_path(path, root) then
-    trace_path_event("p4.add_file", path, root, "invalid-local-file-path")
     return false, "invalid local file path: " .. path
   end
   local stdout, stderr, code = M.system_err(M.p4_cmd("add", {win_path(path)}))
@@ -1000,12 +875,9 @@ function M.pending_changelists(root)
   local cmd = M.p4_cmd("changes", args)
   local result = M.system(cmd)
   if vim.v.shell_error ~= 0 then
-    trace_changelist_event("p4.pending_changelists", root, cmd, result, "", vim.v.shell_error, {})
     return {}
   end
-  local parsed = parse_changes(result)
-  trace_changelist_event("p4.pending_changelists", root, cmd, result, "", vim.v.shell_error, parsed)
-  return parsed
+  return parse_changes(result)
 end
 
 local function allwrite_enabled()
@@ -1147,13 +1019,10 @@ function M.pending_changelists_async(root, cb)
     local cmd = M.p4_cmd("changes", args)
     M.system_async(cmd, nil, function(stdout, stderr, code)
       if code ~= 0 then
-        trace_changelist_event("p4.pending_changelists_async", root, cmd, stdout, stderr, code, {})
         cb({}, (stderr ~= "" and stderr or stdout):match("[^\r\n]+") or "p4 pending changes failed")
         return
       end
-      local parsed = parse_changes(stdout)
-      trace_changelist_event("p4.pending_changelists_async", root, cmd, stdout, stderr, code, parsed)
-      cb(parsed, nil)
+      cb(parse_changes(stdout), nil)
     end)
   end)
 end
@@ -1184,7 +1053,6 @@ function M.shelved_changelists_async(root, cb)
 end
 
 function M.diff_async(path, root, cb)
-  local raw_path = path
   if type(root) == "function" then
     local old_cb = root
     vim.schedule(function()
@@ -1192,9 +1060,8 @@ function M.diff_async(path, root, cb)
     end)
     return
   end
-  local suspicious, reason = is_suspicious_file_arg(path, root)
+  local suspicious = is_suspicious_file_arg(path, root)
   if suspicious then
-    trace_path_event("p4.diff_async", path, root, reason)
     vim.schedule(function()
       cb("", nil)
     end)
@@ -1202,7 +1069,6 @@ function M.diff_async(path, root, cb)
   end
   path = M.normalize_local_file(path, root)
   if not path then
-    trace_path_event("p4.diff_async", raw_path, root, "normalize-local-file-failed")
     vim.schedule(function()
       cb(nil, nil)
     end)

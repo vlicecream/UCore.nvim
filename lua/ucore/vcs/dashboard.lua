@@ -208,21 +208,6 @@ local function trim_display(text, max_width)
   return vim.fn.strcharpart(text, 0, math.max(1, max_width - 1)) .. "…"
 end
 
-local function trace_changelist_desc(op, payload)
-  local ok_config, config = pcall(require, "ucore.config")
-  local dir = ok_config and config.values and config.values.cache_dir or (vim.fn.stdpath("data") .. "/ucore")
-  pcall(vim.fn.mkdir, dir, "p")
-
-  local lines = {
-    string.rep("=", 80),
-    os.date("%Y-%m-%d %H:%M:%S") .. "  " .. tostring(op),
-    vim.inspect(payload or {}),
-    "",
-  }
-
-  pcall(vim.fn.writefile, lines, dir .. "/vcs-changelist-desc.log", "a")
-end
-
 local function loading_message(section)
   if not state or not state.loading[section] then
     return nil
@@ -302,12 +287,6 @@ local function rebuild_rows()
           state.expanded.changelists[change] = expanded
         end
         local desc = pending_description(change)
-        trace_changelist_desc("dashboard.changelist_header_desc", {
-          change = change,
-          desc = desc,
-          pending = data.pending,
-          files = files,
-        })
         has_changes = true
         local fold = expanded and "▾" or "▸"
         local display_name = trim_display(desc, 50)
@@ -1254,12 +1233,6 @@ function M.load_data()
       state.data.opened = vim.tbl_filter(function(file)
         return file and is_dashboard_file(file.path)
       end, files or {})
-      trace_changelist_desc("dashboard.opened_files", {
-        root = root,
-        err = err,
-        raw_files = files,
-        filtered_files = state.data.opened,
-      })
       done_files("opened", err)
     end)
     p4.status_async(root, function(files, err)
@@ -1287,11 +1260,6 @@ function M.load_data()
   p4.pending_changelists_async(root, function(changes, err)
     if not state or state.token ~= token then return end
     state.data.pending = changes or {}
-    trace_changelist_desc("dashboard.pending_changelists", {
-      root = root,
-      err = err,
-      changes = changes,
-    })
     update_ready_status()
     render_all(true)
   end)
