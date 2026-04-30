@@ -667,7 +667,7 @@ function M.diff(path, root)
     trace_path_event("p4.diff", path, root, "invalid-local-file-path")
     return nil, "invalid local file path: " .. tostring(path)
   end
-  local result = M.system(M.p4_cmd("diff", {"-du", win_path(path)}))
+  local result = M.system(M.p4_cmd("diff", {"-f", "-du", win_path(path)}))
   if vim.v.shell_error ~= 0 then
     return nil, "p4 diff failed"
   end
@@ -1075,7 +1075,7 @@ function M.diff_async(path, root, cb)
     return
   end
   path = win_path(path)
-  M.system_async(M.p4_cmd("diff", {"-du", path}), nil, function(stdout, stderr, code)
+  M.system_async(M.p4_cmd("diff", {"-f", "-du", path}), nil, function(stdout, stderr, code)
     if code ~= 0 then
       cb(nil, (stderr ~= "" and stderr or stdout):match("[^\r\n]+") or "p4 diff failed")
       return

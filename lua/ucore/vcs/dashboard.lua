@@ -878,6 +878,28 @@ local function render_change_summary(item)
   }, "ucore-vcs-detail")
 end
 
+function load_file_diff(item)
+  if not state or not item or not item.path then return end
+  if vim.fn.filereadable(item.path) ~= 1 then return end
+  if not is_dashboard_file(item.path) then
+    state.cache.diff[item.path] = { error = "invalid local file path: " .. tostring(item.path) }
+    M.render_right()
+    return
+  end
+  if state.cache.diff[item.path] and state.cache.diff[item.path].text then
+    M.render_right()
+    return
+  end
+  state.cache.diff[item.path] = { loading = true }
+  M.render_right()
+  local token = state.token
+  p4.diff_async(item.path, state.root, function(text, err)
+    if not state or state.token ~= token then return end
+    state.cache.diff[item.path] = err and { error = err } or { text = text or "" }
+    M.render_right()
+  end)
+end
+
 function M.render_right()
   if not state or not state.wins then return end
   local item = get_current_item()
@@ -903,7 +925,7 @@ function M.render_right()
       vim.list_extend(lines, vim.split(cached.text, "\n", { plain = true }))
       set_right_lines(lines, "diff")
     else
-      render_file_summary(item)
+      load_file_diff(item)
     end
     return
   end
@@ -963,28 +985,6 @@ local function render_all(keep_cursor)
   M.render_left()
   M.render_right()
   M.render_footer()
-end
-
-local function load_file_diff(item)
-  if not state or not item or not item.path then return end
-  if vim.fn.filereadable(item.path) ~= 1 then return end
-  if not is_dashboard_file(item.path) then
-    state.cache.diff[item.path] = { error = "invalid local file path: " .. tostring(item.path) }
-    M.render_right()
-    return
-  end
-  if state.cache.diff[item.path] and state.cache.diff[item.path].text then
-    M.render_right()
-    return
-  end
-  state.cache.diff[item.path] = { loading = true }
-  M.render_right()
-  local token = state.token
-  p4.diff_async(item.path, state.root, function(text, err)
-    if not state or state.token ~= token then return end
-    state.cache.diff[item.path] = err and { error = err } or { text = text or "" }
-    M.render_right()
-  end)
 end
 
 local function load_changelist_detail(item)
