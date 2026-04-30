@@ -413,15 +413,22 @@ local function rebuild_rows()
         end
         local fold = expanded and "▾" or "▸"
         local file_count = 0
+        local count_known = false
         local cached = state.data.shelf_files[key]
-        if cached and type(cached.files) == "table" then
-          file_count = #cached.files
+        if cached then
+          if type(cached.files) == "table" and #cached.files > 0 then
+            file_count = #cached.files
+            count_known = true
+          elseif cached.lazy_count and cached.lazy_count > 0 then
+            file_count = cached.lazy_count
+            count_known = true
+          end
         end
         local display_name = tostring(ch.description or ""):gsub("\n", " "):sub(1, 40)
         if #display_name == 0 then
           display_name = "<no description>"
         end
-        local count_str = " (" .. tostring(file_count) .. " file" .. (file_count ~= 1 and "s" or "") .. ")"
+        local count_str = count_known and " (" .. tostring(file_count) .. " file" .. (file_count ~= 1 and "s" or "") .. ")" or ""
         if expanded and not cached then
           count_str = ""
         end
@@ -1088,16 +1095,7 @@ function M.render_right()
       set_right_lines(lines, "diff")
     else
       if item.section == "shelf" then
-        set_right_lines({
-          "Diff / Preview",
-          "",
-          "Shelved File",
-          item.filename or item.path,
-          "Status: " .. tostring(item.status or ""),
-          "Changelist: " .. tostring(item.shelf_number or ""),
-          "",
-          "Press d to load diff.",
-        }, "ucore-vcs-detail")
+        load_shelf_diff(item.shelf_number or 0, item)
       else
         load_file_diff(item)
       end
@@ -1174,6 +1172,9 @@ function M.render_right()
     local entry = state.data.shelf_files[key]
     local files = entry and entry.files or {}
     local file_count = type(files) == "table" and #files or 0
+    if file_count == 0 and entry and entry.lazy_count then
+      file_count = entry.lazy_count
+    end
     local lines = {
       "Diff / Preview",
       "",
@@ -1191,7 +1192,6 @@ function M.render_right()
       table.insert(lines, "Loading shelf files...")
     elseif item.expanded then
       table.insert(lines, "Press Enter to collapse.")
-      table.insert(lines, "Press d to load shelf diff.")
     else
       table.insert(lines, "Press Enter to expand.")
     end
@@ -1350,6 +1350,18 @@ function M.load_data()
     p4.shelved_changelists_async(root, function(changes, err)
       if not state or state.token ~= token then return end
       state.data.shelved = changes or {}
+      for _, ch in ipairs(state.data.shelved or {}) do
+        local key = tostring(ch.number)
+        if not state.data.shelf_files[key] then
+          p4.shelved_detail_async(ch.number, function(detail, err)
+            if not state or state.token ~= token then return end
+            if detail and detail.files then
+              state.data.shelf_files[key] = { files = {}, loading = false, lazy_count = #detail.files }
+            end
+            render_all(true)
+          end)
+        end
+      end
       mark_done("shelved", err and ("p4 shelved failed: " .. tostring(err)) or nil)
       update_ready_status()
       render_all(true)
