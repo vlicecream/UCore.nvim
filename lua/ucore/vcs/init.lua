@@ -145,7 +145,18 @@ function M.open_dashboard(filter)
 end
 
 function M.open_commit_ui(root, preselected_files)
-  require("ucore.vcs.commit").open(root, { files = preselected_files })
+  root = root or require("ucore.project").find_project_root_from_context()
+  if not root then
+    vim.notify("UCore: no Unreal project detected", vim.log.levels.ERROR)
+    return
+  end
+
+  require("ucore.vcs.dirty").confirm_save(root, { action = "commit" }, function(ok)
+    if not ok then
+      return
+    end
+    require("ucore.vcs.commit").open(root, { files = preselected_files })
+  end)
 end
 
 function M.setup()

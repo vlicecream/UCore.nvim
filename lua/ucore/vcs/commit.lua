@@ -535,8 +535,18 @@ function M.get_checked_changelists(files)
   return groups
 end
 
-function M.submit(buf)
+function M.submit(buf, skip_dirty_check)
   if not commit_state then return end
+
+  if not skip_dirty_check then
+    local root = commit_state.root
+    require("ucore.vcs.dirty").confirm_save(root, { action = "commit" }, function(ok)
+      if ok then
+        M.submit(buf, true)
+      end
+    end)
+    return
+  end
 
   local message = M.get_message(buf)
   if message == "" then

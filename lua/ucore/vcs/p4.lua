@@ -607,7 +607,21 @@ end
 function M.is_opened(path)
   path = sanitize(path)
   local result = M.system(M.p4_cmd("opened", {win_path(path)}))
-  return vim.v.shell_error == 0 and result ~= ""
+  if vim.v.shell_error ~= 0 or result == "" then
+    return false
+  end
+
+  for line in result:gmatch("[^\r\n]+") do
+    -- Real opened records look like:
+    -- //depot/path/File.cpp#3 - edit default change (...)
+    -- P4 can also print diagnostic text for unopened files, so do not treat
+    -- any non-empty output as opened.
+    if line:match("^//.-#%d+%s+%-%s+%S+") then
+      return true
+    end
+  end
+
+  return false
 end
 
 function M.opened(root)

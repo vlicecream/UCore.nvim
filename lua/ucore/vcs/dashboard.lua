@@ -1406,7 +1406,6 @@ local function setup_keymaps()
         -- always re-fetch on expand, drop stale cache
         state.data.shelf_files[key] = nil
         local token = state.token
-        local token = state.token
         p4.shelved_detail_async(item.number, function(detail, err)
           if not state or state.token ~= token then return end
           if detail and detail.files then
@@ -1568,9 +1567,16 @@ local function setup_keymaps()
       return
     end
     local root = state.root
+    local dashboard_filter = state.filter
     M.close()
     vim.schedule(function()
-      require("ucore.vcs.commit").open(root, { files = checked })
+      require("ucore.vcs.dirty").confirm_save(root, { action = "commit" }, function(ok)
+        if not ok then
+          require("ucore.vcs.dashboard").open({ root = root, filter = dashboard_filter })
+          return
+        end
+        require("ucore.vcs.commit").open(root, { files = checked })
+      end)
     end)
   end, opts)
 

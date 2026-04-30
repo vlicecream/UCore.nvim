@@ -185,7 +185,15 @@ end
 -- Build the current Unreal Editor target and stream logs into a buffer.
 -- 构建当前 Unreal Editor target，并实时输出日志到 buffer。
 function M.build(args)
-	unreal.build(args)
+	local root = project.find_project_root_from_context()
+	if not root then
+		return unreal.build(args)
+	end
+	require("ucore.vcs.dirty").confirm_save(root, { action = "build" }, function(ok)
+		if ok then
+			unreal.build(args)
+		end
+	end)
 end
 
 -- Cancel the currently running Unreal build.
@@ -197,7 +205,15 @@ end
 -- Open the current Unreal project with its resolved Unreal Editor.
 -- 使用解析到的 Unreal Editor 打开当前 Unreal 工程。
 function M.editor(args)
-	unreal.open_editor(args)
+	local root = project.find_project_root_from_context()
+	if not root then
+		return unreal.open_editor(args)
+	end
+	require("ucore.vcs.dirty").confirm_save(root, { action = "open editor" }, function(ok)
+		if ok then
+			unreal.open_editor(args)
+		end
+	end)
 end
 
 -- Print the resolved Unreal Engine root for the current project.
