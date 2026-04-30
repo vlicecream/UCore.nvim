@@ -76,6 +76,29 @@ local function maybe_trace_command(op, cmd, stdout, stderr, code)
   end
 end
 
+local function trace_reconcile_event(op, root, cmd, stdout, stderr, code, parsed)
+  local dir = (config.values and config.values.cache_dir) or (vim.fn.stdpath("data") .. "/ucore")
+  pcall(vim.fn.mkdir, dir, "p")
+
+  local lines = {
+    string.rep("=", 80),
+    os.date("%Y-%m-%d %H:%M:%S") .. "  " .. tostring(op),
+    "root: " .. vim.inspect(root),
+    "cmd: " .. vim.inspect(cmd),
+    "code: " .. tostring(code),
+    "cwd: " .. vim.inspect(vim.fn.getcwd()),
+    "-- stdout --",
+    tostring(stdout or ""),
+    "-- stderr --",
+    tostring(stderr or ""),
+    "-- parsed --",
+    vim.inspect(parsed or {}),
+    "",
+  }
+
+  pcall(vim.fn.writefile, lines, dir .. "/vcs-reconcile.log", "a")
+end
+
 local function is_suspicious_file_arg(path, root)
   path = sanitize(path)
   if path == "" or path == "0" or path:match("[/\\]0$") then
@@ -207,6 +230,59 @@ local function root_pathspec(root)
   return (root or "."):gsub("/", "\\") .. "\\..."
 end
 
+local function join_path(...)
+  return table.concat(vim.tbl_map(function(part)
+    return tostring(part or ""):gsub("[/\\]+$", ""):gsub("^[/\\]+", "")
+  end, { ... }), "/")
+end
+
+local function existing_pathspecs(root)
+  if not root or root == "" then
+    return { root_pathspec(root) }
+  end
+
+  local specs = {}
+  local normalized_root = root:gsub("[/\\]+$", "")
+
+  local function add_dir(relative)
+    local path = join_path(normalized_root, relative)
+    if vim.fn.isdirectory(path) == 1 then
+      specs[#specs + 1] = win_path(path) .. "\\..."
+    end
+  end
+
+  local function add_file(path)
+    if vim.fn.filereadable(path) == 1 then
+      specs[#specs + 1] = win_path(path)
+    end
+  end
+
+  add_dir("Source")
+  add_dir("Config")
+
+  for _, uproject in ipairs(vim.fn.glob(normalized_root .. "/*.uproject", false, true)) do
+    add_file(uproject)
+  end
+
+  local plugins_root = join_path(normalized_root, "Plugins")
+  if vim.fn.isdirectory(plugins_root) == 1 then
+    for _, plugin_dir in ipairs(vim.fn.glob(plugins_root .. "/*", false, true)) do
+      if vim.fn.isdirectory(plugin_dir) == 1 then
+        add_dir(plugin_dir:sub(#normalized_root + 2) .. "/Source")
+        for _, uplugin in ipairs(vim.fn.glob(plugin_dir .. "/*.uplugin", false, true)) do
+          add_file(uplugin)
+        end
+      end
+    end
+  end
+
+  if #specs == 0 then
+    specs[#specs + 1] = root_pathspec(root)
+  end
+
+  return specs
+end
+
 local function normalize_path(path)
   return tostring(path or ""):gsub("\\", "/")
 end
@@ -271,34 +347,78 @@ local function resolve_local_status_path(path, root)
   return (root:gsub("[/\\]+$", "") .. "/" .. path):gsub("/", "\\")
 end
 
-local function parse_status_output(result, root)
+local function reconcile_action_from_text(text)
+  text = tostring(text or ""):lower()
+  if text:find("edit", 1, true) then
+    return "edit"
+  end
+  if text:find("add", 1, true) then
+    return "add"
+  end
+  if text:find("delete", 1, true) or text:find("deleted", 1, true) then
+    return "delete"
+  end
+  return "reconcile"
+end
+
+local function parse_reconcile_output(result, root)
   local files = {}
-  local valid_status = {
-    ["?"] = true,
-    ["!"] = true,
-    ["m"] = true,
-    ["a"] = true,
-    ["d"] = true,
-    ["r"] = true,
-  }
   for line in tostring(result or ""):gmatch("[^\r\n]+") do
-    line = vim.trim(line)
-    local status, rest = line:match("^(%S+)%s+(.+)$")
-    status = status and status:lower()
-    if status and rest and valid_status[status] then
-      local path = rest
-      path = path:gsub("%s+%-%s+.*$", "")
-      path = path:gsub("%s+%-+%s+.*$", "")
-      path = resolve_local_status_path(path, root)
-      if path then
+    local raw = vim.trim(line)
+    if raw ~= "" then
+      local file_part, action_text = raw:match("^(.-)%s+%-%s+(.+)$")
+      local path = file_part or raw
+      path = path:gsub("#%d+$", "")
+
+      local local_path
+      if is_depot_path(path) then
+        local_path = M.depot_to_local(path)
+      else
+        local_path = resolve_local_status_path(path, root)
+      end
+
+      if local_path and is_real_local_path(local_path, root) then
+        local action = reconcile_action_from_text(action_text or raw)
         table.insert(files, {
-          path = path,
-          status = status,
+          path = local_path,
+          status = action == "add" and "?" or "m",
+          action = action,
+          reconcile = true,
+          raw = raw,
         })
       end
     end
   end
   return files
+end
+
+local function reconcile_preview(root, flags)
+  local args = {"-n"}
+  for _, flag in ipairs(flags or {}) do
+    args[#args + 1] = flag
+  end
+  vim.list_extend(args, existing_pathspecs(root))
+
+  local cmd = M.p4_cmd("reconcile", args)
+  local stdout, stderr, code = M.system_err(cmd)
+  local parsed = code == 0 and parse_reconcile_output(stdout, root) or {}
+  trace_reconcile_event("p4.reconcile_preview", root, cmd, stdout, stderr, code, parsed)
+  return parsed, stdout, stderr, code
+end
+
+local function reconcile_preview_async(root, flags, cb)
+  local args = {"-n"}
+  for _, flag in ipairs(flags or {}) do
+    args[#args + 1] = flag
+  end
+  vim.list_extend(args, existing_pathspecs(root))
+
+  local cmd = M.p4_cmd("reconcile", args)
+  M.system_async(cmd, nil, function(stdout, stderr, code)
+    local parsed = code == 0 and parse_reconcile_output(stdout, root) or {}
+    trace_reconcile_event("p4.reconcile_async", root, cmd, stdout, stderr, code, parsed)
+    cb(parsed, stdout, stderr, code)
+  end)
 end
 
 local function async_result(cmd, cb)
@@ -421,12 +541,11 @@ function M.opened(root)
 end
 
 function M.status(root)
-  local args = {"-s", root_pathspec(root)}
-  local result = M.system(M.p4_cmd("status", args))
-  if vim.v.shell_error ~= 0 then
+  local files, _stdout, _stderr, code = reconcile_preview(root, {})
+  if code ~= 0 then
     return {}
   end
-  return parse_status_output(result, root)
+  return files
 end
 
 function M.checkout(path, root)
@@ -670,19 +789,6 @@ function M.pending_changelists(root)
   return parse_changes(result)
 end
 
-local WRITABLE_EXTENSIONS = {
-  "h", "hpp", "hh", "cpp", "cc", "cxx", "inl", "ini",
-}
-
-local function is_writable_source_ext(path)
-  local ext = path:lower():match("%.([^%.]+)$")
-  if not ext then return false end
-  for _, e in ipairs(WRITABLE_EXTENSIONS) do
-    if ext == e then return true end
-  end
-  return path:lower():match("%.uproject$") or path:lower():match("%.uplugin$")
-end
-
 local function allwrite_enabled()
   local result = M.system(M.p4_cmd("client", {"-o"}))
   if vim.v.shell_error ~= 0 then return false end
@@ -692,37 +798,42 @@ end
 function M.writable_unopened(root)
   if not root then return {} end
   if allwrite_enabled() then return {} end
-  local opened = M.opened(root)
-  local opened_set = {}
-  for _, f in ipairs(opened) do
-    local normalized = normalize_path(f.path):lower()
-    opened_set[normalized] = true
-  end
-  local result = M.system(M.p4_cmd("have", { root_pathspec(root) }))
-  if vim.v.shell_error ~= 0 then return {} end
+  local files, _stdout, _stderr, code = reconcile_preview(root, {"-e"})
+  if code ~= 0 then return {} end
+
   local writable = {}
-  for line in result:gmatch("[^\r\n]+") do
-    local local_path = line:match("^%S+#%d+%s+-%s+(.+)$")
-    if local_path then
-      local normalized = normalize_path(local_path):lower()
-      if is_writable_source_ext(local_path) and not opened_set[normalized] then
-        if vim.fn.filewritable(local_path) == 1 then
-          table.insert(writable, {
-            path = local_path,
-            status = "writable?",
-            action = "writable?",
-          })
-        end
-      end
+  for _, file in ipairs(files or {}) do
+    if file.action == "edit" then
+      table.insert(writable, {
+        path = file.path,
+        status = "writable?",
+        action = "writable?",
+        raw = file.raw,
+      })
     end
   end
   return writable
 end
 
 function M.writable_unopened_async(root, cb)
-  vim.schedule(function()
-    local result = M.writable_unopened(root)
-    cb(result, nil)
+  reconcile_preview_async(root, {"-e"}, function(files, stdout, stderr, code)
+    if code ~= 0 then
+      cb({}, (stderr ~= "" and stderr or stdout):match("[^\r\n]+") or "p4 reconcile edit failed")
+      return
+    end
+
+    local writable = {}
+    for _, file in ipairs(files or {}) do
+      if file.action == "edit" then
+        table.insert(writable, {
+          path = file.path,
+          status = "writable?",
+          action = "writable?",
+          raw = file.raw,
+        })
+      end
+    end
+    cb(writable, nil)
   end)
 end
 
@@ -802,14 +913,13 @@ function M.opened_async(root, cb)
 end
 
 function M.status_async(root, cb)
-  local args = {"-s", root_pathspec(root)}
-  M.system_async(M.p4_cmd("status", args), nil, function(stdout, stderr, code)
+  reconcile_preview_async(root, {}, function(parsed, stdout, stderr, code)
     if code ~= 0 then
-      cb({}, (stderr ~= "" and stderr or stdout):match("[^\r\n]+") or "p4 status failed")
+      cb({}, (stderr ~= "" and stderr or stdout):match("[^\r\n]+") or "p4 reconcile failed")
       return
     end
 
-    cb(parse_status_output(stdout, root), nil)
+    cb(parsed, nil)
   end)
 end
 

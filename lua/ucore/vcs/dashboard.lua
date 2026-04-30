@@ -1055,7 +1055,7 @@ function M.load_data()
   end)
 
   if state.loading.files then
-    local pending_files = 3
+    local pending_files = 2
     local file_errors = {}
     local function done_files(kind, err)
       if err then table.insert(file_errors, kind .. ": " .. tostring(err)) end
@@ -1077,17 +1077,13 @@ function M.load_data()
     p4.status_async(root, function(files, err)
       if not state or state.token ~= token then return end
       state.data.local_changes = vim.tbl_filter(function(file)
-        return file and is_dashboard_file(file.path)
+        return file and file.action ~= "edit" and is_dashboard_file(file.path)
       end, files or {})
-      done_files("status", err)
-    end)
-    p4.writable_unopened_async(root, function(files, err)
-      if not state or state.token ~= token then return end
       state.data.writable_unopened = vim.tbl_filter(function(file)
-        return file and is_dashboard_file(file.path)
+        return file and file.action == "edit" and is_dashboard_file(file.path)
       end, files or {})
       mark_done("writable", nil)
-      done_files("writable", err)
+      done_files("status", err)
     end)
   end
 
