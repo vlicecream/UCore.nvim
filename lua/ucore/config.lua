@@ -110,6 +110,27 @@ M.values = {
 		picker = "auto",
 	},
 
+	-- Left-side project/source/config/VCS explorer.
+	-- 左侧 Project/Source/Config/VCS 目录浏览器。
+	explorer = {
+		width = 36,
+		min_width = 28,
+		max_width = 56,
+		tabs = { "Project", "Source", "Config", "VCS" },
+		default_tab = "Project",
+		auto_open = true,
+		auto_focus = false,
+		auto_open_delay_ms = 120,
+		close_other_explorers = false,
+		show_hidden = false,
+		search_case_sensitive = false,
+		exclude_dirs = {
+			".git",
+			".svn",
+			".p4",
+		},
+	},
+
 	-- Completion integration options.
 	-- 补全集成配置。
 	completion = {

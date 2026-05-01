@@ -82,6 +82,7 @@ local function try_auto_boot(args)
 		local root = project.find_project_root(buffer_path)
 		if root then
 			attempts_scheduled = false
+			require("ucore.explorer").auto_open_for_project(root)
 			schedule_boot(root)
 			return
 		end

@@ -61,7 +61,7 @@ local function dispatch_debug(tail)
 		maps = actions.maps,
 		help = actions.debug_help,
 		complete = actions.complete,
-		goto = actions.goto_definition,
+		["goto"] = actions.goto_definition,
 		references = actions.references,
 		vcs = actions.vcs_debug,
 	}
@@ -91,10 +91,13 @@ function M.dispatch(args)
     editor = function()
       actions.editor(tail)
     end,
+		explorer = actions.explorer,
+		tree = actions.explorer,
+		files = actions.explorer,
     find = function()
       actions.find(tail)
     end,
-    goto = actions.goto_definition,
+    ["goto"] = actions.goto_definition,
 		references = actions.references,
     checkout = actions.checkout,
     commit = actions.commit,
@@ -148,6 +151,9 @@ function M.register()
 				"checkout",
 				"commit",
 				"editor",
+				"explorer",
+				"tree",
+				"files",
 				"find",
 				"goto",
 				"references",

@@ -10,6 +10,7 @@ local bootstrap = require("ucore.bootstrap")
 local completion = require("ucore.completion")
 local navigation = require("ucore.navigation")
 local vcs = require("ucore.vcs")
+local explorer = require("ucore.explorer")
 
 local M = {}
 
@@ -168,6 +169,12 @@ function M.vcs_dispatch(tail)
 -- 打开 VCS Dashboard。
 function M.vcs_dashboard()
   vcs.open_dashboard("all")
+end
+
+-- Open the left-side UCore Explorer tree.
+-- 打开左侧 UCore Explorer 目录树。
+function M.explorer()
+	explorer.open()
 end
 
 -- Jump to definition at the current cursor.
@@ -1206,6 +1213,9 @@ UCore commands:
   :UCore build        Build current Unreal Editor target
   :UCore build-cancel Cancel the currently running Unreal build
   :UCore editor       Open current project in Unreal Editor
+  :UCore explorer     Open the left-side Project/Source/Config/VCS tree
+  :UCore tree         Open the left-side Project/Source/Config/VCS tree
+  :UCore files        Open the left-side Project/Source/Config/VCS tree
   :UCore find         Find indexed symbols, modules, assets, config
    :UCore goto         Go to definition at cursor
   :UCore references   Find references at cursor
