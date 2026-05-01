@@ -608,14 +608,13 @@ local function pick_telescope_find(items, default_text)
 				results = base,
 				entry_maker = function(item)
 					if item.type == "empty" then
-						vim.notify("UCore find: sentinel active (all real results filtered)", vim.log.levels.INFO)
 						local all_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
 						return {
 							value = item,
 							display = "   No results found — try a different search term",
-							ordinal = string.rep(all_chars, 3),
-							filename = "",
-							path = "",
+							ordinal = " " .. string.rep(all_chars, 2),
+							filename = vim.api.nvim_buf_get_name(0) or vim.loop.cwd() or ".",
+							path = vim.api.nvim_buf_get_name(0) or vim.loop.cwd() or ".",
 							lnum = 1,
 							col = 1,
 							text = "No results found",
@@ -668,6 +667,8 @@ local function pick_telescope_find(items, default_text)
 			end,
 		})
 		:find()
+
+	vim.notify("UCore find: picker opened, #items=" .. #base, vim.log.levels.INFO)
 end
 
 -- Open a generic selection UI with a label formatter.
