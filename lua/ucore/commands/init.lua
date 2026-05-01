@@ -96,9 +96,6 @@ function M.dispatch(args)
     globalfind = function()
       actions.global_find(tail)
     end,
-    find = function()
-      actions.find(tail)
-    end,
 		diagnostics = function()
 			require("ucore.diagnostics").dispatch(tail)
 		end,
@@ -160,7 +157,6 @@ function M.register()
 				"explorer",
 				"tree",
 				"files",
-				"find",
 				"globalfind",
 				"diagnostics",
 				"goto",

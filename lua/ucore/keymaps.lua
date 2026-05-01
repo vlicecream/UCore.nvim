@@ -51,6 +51,13 @@ local function setup_buffer(args)
 
 	local bufnr = args.buf
 	local path = vim.api.nvim_buf_get_name(bufnr)
+
+	-- Global find works without project context.
+	-- gf 不需要项目上下文，总是注册。
+	set_buffer_map(bufnr, keymaps.global_find, navigation.global_find, "UCore global find")
+
+	-- Navigation keymaps need an Unreal project root.
+	-- 导航快捷键需要 Unreal 项目根目录。
 	if path == "" or not project.find_project_root(path) then
 		return
 	end
@@ -60,7 +67,6 @@ local function setup_buffer(args)
 	set_buffer_map(bufnr, keymaps.references, navigation.references, "UCore references")
 	set_buffer_map(bufnr, keymaps.implementation or keymaps.goto_implementation, navigation.goto_implementation, "UCore implementation")
 	set_buffer_map(bufnr, keymaps.source_toggle, navigation.toggle_source, "UCore toggle source/header")
-	set_buffer_map(bufnr, keymaps.global_find, navigation.global_find, "UCore global find")
 end
 
 function M.setup()
