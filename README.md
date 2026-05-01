@@ -53,6 +53,26 @@ return {
         opts = {},
       },
       {
+        "nvim-treesitter/nvim-treesitter",
+        lazy = false,
+        build = ":TSUpdate",
+        opts = function(_, opts)
+          opts = opts or {}
+          opts.auto_install = true
+          opts.ensure_installed = opts.ensure_installed or {}
+          opts.indent = { enable = true }
+
+          if not vim.tbl_contains(opts.ensure_installed, "unreal_cpp") then
+            table.insert(opts.ensure_installed, "unreal_cpp")
+          end
+          if not vim.tbl_contains(opts.ensure_installed, "cpp") then
+            table.insert(opts.ensure_installed, "cpp")
+          end
+
+          return opts
+        end,
+      },
+      {
         "saghen/blink.cmp",
         opts = function(_, opts)
           opts.sources = opts.sources or {}
@@ -88,27 +108,9 @@ return {
       })
     end,
   },
-  {
-    "nvim-treesitter/nvim-treesitter",
-    lazy = false,
-    build = ":TSUpdate",
-    opts = function(_, opts)
-      opts = opts or {}
-      opts.auto_install = true
-      opts.ensure_installed = opts.ensure_installed or {}
-      opts.indent = { enable = true }
-
-      if not vim.tbl_contains(opts.ensure_installed, "unreal_cpp") then
-        table.insert(opts.ensure_installed, "unreal_cpp")
-      end
-      if not vim.tbl_contains(opts.ensure_installed, "cpp") then
-        table.insert(opts.ensure_installed, "cpp")
-      end
-
-      return opts
-    end,
-  },
 }
+
+## English
 ```
 
 #### Local development
@@ -384,6 +386,26 @@ return {
         opts = {},
       },
       {
+        "nvim-treesitter/nvim-treesitter",
+        lazy = false,
+        build = ":TSUpdate",
+        opts = function(_, opts)
+          opts = opts or {}
+          opts.auto_install = true
+          opts.ensure_installed = opts.ensure_installed or {}
+          opts.indent = { enable = true }
+
+          if not vim.tbl_contains(opts.ensure_installed, "unreal_cpp") then
+            table.insert(opts.ensure_installed, "unreal_cpp")
+          end
+          if not vim.tbl_contains(opts.ensure_installed, "cpp") then
+            table.insert(opts.ensure_installed, "cpp")
+          end
+
+          return opts
+        end,
+      },
+      {
         "saghen/blink.cmp",
         opts = function(_, opts)
           opts.sources = opts.sources or {}
@@ -419,27 +441,9 @@ return {
       })
     end,
   },
-  {
-    "nvim-treesitter/nvim-treesitter",
-    lazy = false,
-    build = ":TSUpdate",
-    opts = function(_, opts)
-      opts = opts or {}
-      opts.auto_install = true
-      opts.ensure_installed = opts.ensure_installed or {}
-      opts.indent = { enable = true }
-
-      if not vim.tbl_contains(opts.ensure_installed, "unreal_cpp") then
-        table.insert(opts.ensure_installed, "unreal_cpp")
-      end
-      if not vim.tbl_contains(opts.ensure_installed, "cpp") then
-        table.insert(opts.ensure_installed, "cpp")
-      end
-
-      return opts
-    end,
-  },
 }
+
+## English
 ```
 
 #### 本地开发
