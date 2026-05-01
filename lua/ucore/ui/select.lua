@@ -408,8 +408,12 @@ local function preview_find_item(entry, bufnr)
 	local path = item.path or item.file_path
 
 	if path and path ~= vim.NIL and vim.fn.filereadable(path) == 1 then
-		local ok, lines = pcall(vim.fn.readfile, path, "", 500)
-		if ok then
+		local ok, raw = pcall(vim.fn.readfile, path, "", 500)
+		if ok and raw then
+			local lines = raw
+			if #lines == 0 then
+				lines = { "" }
+			end
 			vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
 			vim.bo[bufnr].filetype = vim.filetype.match({ filename = path }) or ""
 			return
@@ -587,6 +591,17 @@ local function pick_telescope_find(items, default_text)
 
 	items = prepare_find_items(items)
 
+	-- Ensure at least one result so Telescope doesn't crash setting
+	-- cursor on an empty results buffer.
+	-- 保证至少一条结果，避免 Telescope 在空结果上设光标崩溃。
+	if #items == 0 then
+		table.insert(items, {
+			name = "No results found",
+			type = "empty",
+			source = "",
+		})
+	end
+
 	pickers
 		.new({}, {
 			prompt_title = "UCore find",
@@ -594,6 +609,19 @@ local function pick_telescope_find(items, default_text)
 			finder = finders.new_table({
 				results = items,
 				entry_maker = function(item)
+					if item.type == "empty" then
+						return {
+							value = item,
+							display = "   No results found — try a different search term",
+							ordinal = "zzz_no_results",
+							filename = "",
+							path = "",
+							lnum = 1,
+							col = 1,
+							text = "No results found",
+						}
+					end
+
 					local name = tostring(item.name or item.symbol_name or "<unknown>")
 					local kind = normalize_kind(item.symbol_type or item.type)
 					local source = normalize_source(item.source)
@@ -624,7 +652,11 @@ local function pick_telescope_find(items, default_text)
 					}
 				end,
 			}),
-			previewer = false,
+			previewer = previewers.new_buffer_previewer({
+				define_preview = function(self, entry)
+					preview_find_item(entry, self.state.bufnr)
+				end,
+			}),
 			sorter = conf.generic_sorter({}),
 			attach_mappings = function(prompt_bufnr)
 				actions.select_default:replace(function()
