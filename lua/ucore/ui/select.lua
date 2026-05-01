@@ -581,7 +581,7 @@ end
 
 -- Open project-wide find using a Telescope grep-style file preview.
 -- 使用 Telescope grep 风格预览打开项目全局查找�?
-local function pick_telescope_find(items, default_text)
+	local function pick_telescope_find(items, default_text)
 	local pickers = require("telescope.pickers")
 	local finders = require("telescope.finders")
 	local conf = require("telescope.config").values
@@ -600,21 +600,15 @@ local function pick_telescope_find(items, default_text)
 		}}
 	end
 
+	local sample = base[1] or {}
 	vim.notify(
-		string.format("UCore find: opening picker with %d items. Sample: type=%s path=%s",
+		string.format("UCore find: picker %d items. Name=%s Type=%s Path=%s Line=%s",
 			#base,
-			tostring((base[1] or {}).type or (base[1] or {}).symbol_type or "?"),
-			tostring((base[1] or {}).path or (base[1] or {}).file_path or "?")),
+			tostring(sample.name or sample.symbol_name or ""),
+			tostring(sample.type or sample.symbol_type or ""),
+			tostring(sample.path or sample.file_path or ""),
+			tostring(sample.line or sample.line_number or "")),
 		vim.log.levels.INFO)
-
-	if #base < 5 then
-		for i, item in ipairs(base) do
-			vim.notify(string.format("  item[%d]: name=%s type=%s path=%s line=%s",
-				i, tostring(item.name or "?"), tostring(item.type or item.symbol_type or "?"),
-				tostring(item.path or item.file_path or "?"), tostring(item.line or item.line_number or "?")),
-				vim.log.levels.INFO)
-		end
-	end
 
 	pickers
 		.new({}, {
