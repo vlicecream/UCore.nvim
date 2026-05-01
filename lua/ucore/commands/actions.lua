@@ -501,6 +501,7 @@ end
 -- 智能入口：不在项目中选择，未注册则注册+boot，已注册则打开 Dashboard。
 function M.smart_entry()
 	local root = project.find_project_root_from_context()
+	vim.notify("UCore smart_entry: root=" .. tostring(root) .. " buf=" .. (vim.api.nvim_buf_get_name(0) or "?") .. " cwd=" .. (vim.loop.cwd() or "?"), vim.log.levels.INFO)
 	if not root then
 		local items = project.list_registered_projects()
 		ui.select.projects(items, function(item)
