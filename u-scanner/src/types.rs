@@ -572,6 +572,13 @@ pub enum QueryRequest {
         #[serde(default)]
         file_path: Option<String>,
     },
+    GotoImplementation {
+        content: String,
+        line: u32,
+        character: u32,
+        #[serde(default)]
+        file_path: Option<String>,
+    },
     GetCompletions {
         content: String,
         line: u32,

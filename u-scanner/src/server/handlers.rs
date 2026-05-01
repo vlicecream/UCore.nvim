@@ -294,6 +294,25 @@ fn handle_state_query(
             Ok(Some(value))
         }
 
+        QueryRequest::GotoImplementation {
+            content,
+            line,
+            character,
+            file_path,
+        } => {
+            let value = goto_implementation_with_engine(
+                state,
+                conn,
+                engine_db_path,
+                content,
+                line,
+                character,
+                file_path,
+            )?;
+
+            Ok(Some(value))
+        }
+
         QueryRequest::GetAssetUsages { asset_path } => {
             Ok(Some(get_asset_usages(&state, root_key, &asset_path)))
         }
@@ -443,6 +462,68 @@ fn goto_definition_with_engine(
         Ok(value) => value,
         Err(err) => {
             warn!("Failed to query Engine DB goto definition: {}", err);
+            return Ok(Value::Null);
+        }
+    };
+
+    if !engine_result.is_null() {
+        tag_value_source(&mut engine_result, "engine");
+    }
+
+    Ok(engine_result)
+}
+
+/// Go to implementation in the project DB, then fall back to the shared Engine DB.
+/// 先在项目 DB 里跳转实现，找不到时回退到共享 Engine DB。
+fn goto_implementation_with_engine(
+    state: Arc<AppState>,
+    project_conn: &rusqlite::Connection,
+    engine_db_path: Option<String>,
+    content: String,
+    line: u32,
+    character: u32,
+    file_path: Option<String>,
+) -> Result<Value> {
+    let mut project_result = query::goto::goto_implementation(
+        project_conn,
+        content.clone(),
+        line,
+        character,
+        file_path.clone(),
+    )?;
+
+    if !project_result.is_null() {
+        tag_value_source(&mut project_result, "project");
+        return Ok(project_result);
+    }
+
+    let Some(engine_db_path) = engine_db_path else {
+        return Ok(Value::Null);
+    };
+
+    let engine_db_path = normalize_to_native(&engine_db_path);
+    if !Path::new(&engine_db_path).is_file() {
+        return Ok(Value::Null);
+    }
+
+    let engine_conn = match state.get_read_only_connection(&engine_db_path) {
+        Ok(conn) => conn,
+        Err(err) => {
+            warn!("Failed to open Engine DB for goto implementation: {}", err);
+            return Ok(Value::Null);
+        }
+    };
+
+    let mut engine_result = match query::goto::goto_implementation(
+        &engine_conn,
+        content,
+        line,
+        character,
+        file_path,
+    ) {
+        Ok(value) => value,
+        Err(err) => {
+            warn!("Failed to query Engine DB goto implementation: {}", err);
             return Ok(Value::Null);
         }
     };

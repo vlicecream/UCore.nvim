@@ -129,6 +129,10 @@ M.values = {
 			-- Find references.
 			-- 查找引用。
 			references = "grr",
+
+			-- Go to implementation (.h -> .cpp). Only active when source is a header.
+			-- 跳转到实现（.h -> .cpp）。仅在源文件为 header 时有效果。
+			goto_implementation = "gh",
 		},
 	},
 

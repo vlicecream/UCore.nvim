@@ -104,6 +104,13 @@ function M.goto_definition(project_root, payload, callback)
 	M.query(project_root, payload, callback)
 end
 
+-- Fetch go-to-implementation target (.h -> .cpp).
+-- 获取跳转实现目标（.h -> .cpp）。
+function M.goto_implementation(project_root, payload, callback)
+	payload.kind = "GotoImplementation"
+	M.query(project_root, payload, callback)
+end
+
 -- Find references/usages for one symbol.
 -- 查找某个符号的引用/使用位置。
 function M.find_references(project_root, payload, callback)

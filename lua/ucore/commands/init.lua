@@ -100,7 +100,9 @@ function M.dispatch(args)
 		diagnostics = function()
 			require("ucore.diagnostics").dispatch(tail)
 		end,
-    ["goto"] = actions.goto_definition,
+    ["goto"] = function()
+      actions.goto(tail)
+    end,
 		references = actions.references,
     checkout = actions.checkout,
     commit = actions.commit,
@@ -145,7 +147,7 @@ function M.register()
 	vim.api.nvim_create_user_command("UCore", M.dispatch, {
 		nargs = "*",
 		complete = function(arglead, cmdline, cursorpos)
-			local user_items = {
+		local user_items = {
 				"boot",
 				"build",
 				"build-cancel",
@@ -162,6 +164,15 @@ function M.register()
 				"goto",
 				"references",
 				"debug",
+				"help",
+			}
+
+			local goto_items = {
+				"local",
+				"global",
+				"declaration",
+				"implementation",
+				"references",
 				"help",
 			}
 
@@ -212,12 +223,15 @@ function M.register()
 			local first = tail:match("^(%S+)")
 			local in_debug = first and first:lower() == "debug"
 			local in_vcs = first and first:lower() == "vcs"
+			local in_goto = first and first:lower() == "goto"
 
 			local items
 			if in_debug then
 				items = debug_items
 			elseif in_vcs then
 				items = vcs_items
+			elseif in_goto then
+				items = goto_items
 			elseif first and first:lower() == "diagnostics" then
 				items = diagnostics_items
 			else
@@ -235,6 +249,10 @@ function M.register()
 			end
 
 			if first and first:lower() == "diagnostics" and tail:lower():match("^diagnostics%s*$") then
+				needle = ""
+			end
+
+			if in_goto and (tail:lower() == "goto" or tail:lower():match("^goto%s*$")) then
 				needle = ""
 			end
 

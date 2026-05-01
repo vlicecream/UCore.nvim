@@ -177,8 +177,52 @@ function M.explorer()
 	explorer.open()
 end
 
--- Jump to definition at the current cursor.
--- 跳转当前光标下符号的定义。
+-- :UCore goto <local|global|declaration|implementation|references>
+-- Jump to definition, implementation, or find references at cursor.
+-- 跳转定义、实现或查找引用。
+function M.goto(tail)
+	local sub = (tail or ""):match("^%s*(%S+)")
+	sub = sub and sub:lower() or ""
+
+	local handlers = {
+		["local"] = navigation.local_declaration,
+		l = navigation.local_declaration,
+		["global"] = navigation.global_declaration,
+		g = navigation.global_declaration,
+		["declaration"] = navigation.goto_definition,
+		d = navigation.goto_definition,
+		["implementation"] = navigation.goto_implementation,
+		i = navigation.goto_implementation,
+		["references"] = navigation.references,
+		r = navigation.references,
+	}
+
+	local handler = handlers[sub]
+	if handler then
+		handler()
+		return
+	end
+
+	if sub == "" or sub == "help" then
+		print([[
+UCore goto subcommands:
+  :UCore goto local           Go to local declaration (gd)
+  :UCore goto global          Go to global declaration (gD)
+  :UCore goto declaration     Go to declaration
+  :UCore goto implementation  Go to implementation (.h -> .cpp)
+  :UCore goto references      Find references (grr)
+  :UCore goto help            Show this help
+
+Short aliases: l, g, d, i, r
+]])
+		return
+	end
+
+	vim.notify("Unknown UCore goto subcommand: " .. sub .. "\nSee :UCore goto help", vim.log.levels.WARN)
+end
+
+-- Backward-compatible alias.
+-- 向后兼容别名。
 function M.goto_definition()
 	navigation.goto_definition()
 end
@@ -1217,8 +1261,8 @@ UCore commands:
   :UCore tree         Open the left-side Project/Source/Config/VCS tree
   :UCore files        Open the left-side Project/Source/Config/VCS tree
   :UCore find         Find indexed symbols, modules, assets, config
-   :UCore goto         Go to definition at cursor
-  :UCore references   Find references at cursor
+   :UCore goto         Navigation subcommands (see :UCore goto help)
+   :UCore references   Find references at cursor
    :UCore vcs           Open VCS Dashboard
   :UCore vcs dashboard  Open VCS Dashboard
   :UCore vcs checkout   Checkout current file (p4 edit)

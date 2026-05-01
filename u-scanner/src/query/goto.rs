@@ -563,13 +563,15 @@ impl<'a> GotoCtx<'a> {
 // DB query helpers
 // -----------------------------------------------------------------------------
 
-/// Find a member in a class and prefer declaration in headers.
-/// 在某个类里找成员，优先返回头文件声明。
+/// Find a member in a class, optionally preferring implementation files.
+/// 在某个类里找成员，可优先返回实现文件。
 fn find_member_in_class(
     conn: &Connection,
     class_id: i64,
     symbol_name: &str,
+    prefer_impl: bool,
 ) -> Result<Option<Value>> {
+    let order_by = member_order_by_clause(prefer_impl);
     let sql = format!(
         r#"
         {}
@@ -586,16 +588,11 @@ fn find_member_in_class(
         JOIN strings sf ON f.filename_id = sf.id
         WHERE m.class_id = ?
           AND sm.text = ?
-        ORDER BY
-            CASE WHEN m.access = 'impl' THEN 1 ELSE 0 END,
-            {generated_priority},
-            {header_priority},
-            m.line_number
+        {}
         LIMIT 1
         "#,
         PATH_CTE,
-        generated_priority = GENERATED_PRIORITY_SQL,
-        header_priority = HEADER_PRIORITY_SQL
+        order_by,
     );
 
     let mut result = conn.query_row(&sql, params![class_id, symbol_name], |row| {
@@ -622,6 +619,17 @@ pub fn find_symbol_in_inheritance_chain(
     class_name: &str,
     symbol_name: &str,
 ) -> Result<Option<Value>> {
+    find_symbol_in_inheritance_chain_inner(conn, class_name, symbol_name, false)
+}
+
+/// Same as find_symbol_in_inheritance_chain but with configurable direction.
+/// 同上，但可配置跳转方向。
+fn find_symbol_in_inheritance_chain_inner(
+    conn: &Connection,
+    class_name: &str,
+    symbol_name: &str,
+    prefer_impl: bool,
+) -> Result<Option<Value>> {
     let mut ctx = GotoCtx::new(conn);
     let start_ids = ctx.get_class_ids(class_name)?;
 
@@ -637,7 +645,7 @@ pub fn find_symbol_in_inheritance_chain(
             continue;
         }
 
-        if let Some(result) = find_member_in_class(conn, class_id, symbol_name)? {
+        if let Some(result) = find_member_in_class(conn, class_id, symbol_name, prefer_impl)? {
             return Ok(Some(result));
         }
 
@@ -716,7 +724,7 @@ pub fn find_symbol_in_module(
         return Ok(Some(result));
     }
 
-    find_member_in_module(conn, module_name, symbol_name)
+    find_member_in_module(conn, module_name, symbol_name, false)
 }
 
 /// Find a type definition inside a module.
@@ -777,7 +785,9 @@ fn find_member_in_module(
     conn: &Connection,
     module_name: &str,
     symbol_name: &str,
+    prefer_impl: bool,
 ) -> Result<Option<Value>> {
+    let order_by = member_order_by_clause(prefer_impl);
     let sql = format!(
         r#"
         {}
@@ -796,16 +806,11 @@ fn find_member_in_module(
         JOIN strings smod ON m.name_id = smod.id
         WHERE smod.text = ?
           AND smem.text = ?
-        ORDER BY
-            CASE WHEN mem.access = 'impl' THEN 1 ELSE 0 END,
-            {generated_priority},
-            {header_priority},
-            mem.line_number
+        {}
         LIMIT 1
         "#,
         PATH_CTE,
-        generated_priority = GENERATED_PRIORITY_SQL,
-        header_priority = HEADER_PRIORITY_SQL
+        order_by,
     );
 
     let mut result = conn
@@ -828,7 +833,8 @@ fn find_member_in_module(
 
 /// Final fallback: find a member by name anywhere.
 /// 最终兜底：在全工程按成员名查找。
-fn find_member_anywhere(conn: &Connection, symbol_name: &str) -> Result<Option<Value>> {
+fn find_member_anywhere(conn: &Connection, symbol_name: &str, prefer_impl: bool) -> Result<Option<Value>> {
+    let order_by = member_order_by_clause(prefer_impl);
     let sql = format!(
         r#"
         {}
@@ -844,16 +850,11 @@ fn find_member_anywhere(conn: &Connection, symbol_name: &str) -> Result<Option<V
         JOIN dir_paths dp ON f.directory_id = dp.id
         JOIN strings sf ON f.filename_id = sf.id
         WHERE sm.text = ?
-        ORDER BY
-            CASE WHEN m.access = 'impl' THEN 1 ELSE 0 END,
-            {generated_priority},
-            {header_priority},
-            m.line_number
+        {}
         LIMIT 1
         "#,
         PATH_CTE,
-        generated_priority = GENERATED_PRIORITY_SQL,
-        header_priority = HEADER_PRIORITY_SQL
+        order_by,
     );
 
     let mut result = conn
@@ -875,24 +876,84 @@ fn find_member_anywhere(conn: &Connection, symbol_name: &str) -> Result<Option<V
 }
 
 // -----------------------------------------------------------------------------
+// ORDER BY helpers
+// -----------------------------------------------------------------------------
+
+/// Build ORDER BY clause for member queries based on direction.
+/// 根据跳转方向构造成员的 ORDER BY 子句。
+fn member_order_by_clause(prefer_impl: bool) -> String {
+    if prefer_impl {
+        r#"
+    ORDER BY
+        CASE WHEN m.access = 'impl' THEN 0 ELSE 1 END,
+        CASE
+            WHEN sf.text LIKE '%.cpp' THEN 0
+            WHEN sf.text LIKE '%.cc' THEN 1
+            WHEN sf.text LIKE '%.cxx' THEN 2
+            ELSE 3
+        END,
+        m.line_number
+    "#
+        .to_string()
+    } else {
+        format!(
+            r#"
+    ORDER BY
+        CASE WHEN m.access = 'impl' THEN 1 ELSE 0 END,
+        {},
+        {},
+        m.line_number
+    "#,
+            GENERATED_PRIORITY_SQL.trim(),
+            HEADER_PRIORITY_SQL.trim(),
+        )
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Main entry
 // -----------------------------------------------------------------------------
 
-/// Main Go to Definition entry point.
-/// Go to Definition 的主入口。
+/// Main Go to Definition entry point (prefers header declarations).
+/// Go to Definition 的主入口（优先头文件声明）。
 pub fn goto_definition(
     conn: &Connection,
     content: String,
     line: u32,
     character: u32,
+    file_path: Option<String>,
+) -> Result<Value> {
+    goto_definition_inner(conn, content, line, character, file_path, false)
+}
+
+/// Go to Implementation entry point (prefers .cpp definitions).
+/// Go to Implementation 主入口（优先 .cpp 实现）。
+pub fn goto_implementation(
+    conn: &Connection,
+    content: String,
+    line: u32,
+    character: u32,
+    file_path: Option<String>,
+) -> Result<Value> {
+    goto_definition_inner(conn, content, line, character, file_path, true)
+}
+
+fn goto_definition_inner(
+    conn: &Connection,
+    content: String,
+    line: u32,
+    character: u32,
     _file_path: Option<String>,
+    prefer_impl: bool,
 ) -> Result<Value> {
     let Some(ctx) = extract_cursor_context(&content, line, character) else {
         return Ok(Value::Null);
     };
 
+    let mode = if prefer_impl { "implementation" } else { "definition" };
     tracing::debug!(
-        "goto_definition: symbol='{}', qualifier={:?}, op={:?}, enclosing={:?}",
+        "goto_{}: symbol='{}', qualifier={:?}, op={:?}, enclosing={:?}",
+        mode,
         ctx.symbol,
         ctx.qualifier,
         ctx.qualifier_op,
@@ -924,7 +985,7 @@ pub fn goto_definition(
         };
 
         if let Some(result) =
-            find_symbol_in_inheritance_chain(conn, &resolved_class, &ctx.symbol)?
+            find_symbol_in_inheritance_chain_inner(conn, &resolved_class, &ctx.symbol, prefer_impl)?
         {
             return Ok(result);
         }
@@ -934,21 +995,23 @@ pub fn goto_definition(
     // 2. 尝试从当前所在类里查成员。
     if let Some(ref enclosing_class) = ctx.enclosing_class {
         if let Some(result) =
-            find_symbol_in_inheritance_chain(conn, enclosing_class, &ctx.symbol)?
+            find_symbol_in_inheritance_chain_inner(conn, enclosing_class, &ctx.symbol, prefer_impl)?
         {
             return Ok(result);
         }
     }
 
-    // 3. Try type definition lookup.
-    // 3. 尝试按类型定义查找。
-    if let Some(result) = find_type_definition(conn, &ctx.symbol)? {
-        return Ok(result);
+    // 3. Try type definition lookup (only for definition mode).
+    // 3. 尝试按类型定义查找（仅定义模式）。
+    if !prefer_impl {
+        if let Some(result) = find_type_definition(conn, &ctx.symbol)? {
+            return Ok(result);
+        }
     }
 
     // 4. Final fallback: member search across the whole project.
     // 4. 最终兜底：全工程成员名搜索。
-    if let Some(result) = find_member_anywhere(conn, &ctx.symbol)? {
+    if let Some(result) = find_member_anywhere(conn, &ctx.symbol, prefer_impl)? {
         return Ok(result);
     }
 

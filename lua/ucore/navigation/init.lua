@@ -136,6 +136,39 @@ function M.global_declaration()
 	return M.goto_definition({ fallback = "gD" })
 end
 
+-- Go to implementation at the current cursor position.
+-- 从当前光标位置跳转到实现（.h -> .cpp）。
+function M.goto_implementation()
+	local root = project.find_project_root()
+	if not root then
+		return vim.notify("Could not find .uproject", vim.log.levels.ERROR)
+	end
+
+	local file_path = vim.api.nvim_buf_get_name(0)
+	if file_path == "" then
+		return vim.notify("UCore goto_implementation: current buffer has no file path", vim.log.levels.WARN)
+	end
+
+	local cursor = vim.api.nvim_win_get_cursor(0)
+	local line = cursor[1] - 1
+	local character = cursor[2]
+
+	remote.goto_implementation(root, {
+		content = current_content(),
+		line = line,
+		character = character,
+		file_path = file_path:gsub("\\", "/"),
+	}, function(result, err)
+		if err then
+			return vim.notify("UCore goto implementation failed:\n" .. tostring(err), vim.log.levels.ERROR)
+		end
+
+		open_result(result)
+	end)
+
+	return true
+end
+
 -- Find references for the symbol under the cursor.
 -- 查找当前光标下符号的引用位置。
 function M.references()

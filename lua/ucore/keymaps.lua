@@ -63,6 +63,7 @@ local function setup_buffer(args)
 	)
 	set_buffer_map(bufnr, keymaps.global_declaration, navigation.global_declaration, "UCore global declaration")
 	set_buffer_map(bufnr, keymaps.references, navigation.references, "UCore references")
+	set_buffer_map(bufnr, keymaps.goto_implementation, navigation.goto_implementation, "UCore goto implementation (.h -> .cpp)")
 end
 
 function M.setup()

@@ -124,6 +124,13 @@ pub fn process_query(conn: &Connection, request: QueryRequest) -> Result<Value> 
             file_path,
         } => goto::goto_definition(conn, content, line, character, file_path),
 
+        QueryRequest::GotoImplementation {
+            content,
+            line,
+            character,
+            file_path,
+        } => goto::goto_implementation(conn, content, line, character, file_path),
+
         QueryRequest::FindSymbolInInheritanceChain {
             class_name,
             symbol_name,
