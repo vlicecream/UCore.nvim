@@ -290,6 +290,9 @@ local function fill_quickfix()
 	end
 
 	vim.fn.setqflist(build_diagnostics, "r")
+	pcall(function()
+		require("ucore.diagnostics").from_quickfix(build_diagnostics)
+	end)
 
 	if config.values.build.open_quickfix_on_error and build_error_count > 0 then
 		vim.cmd("botright copen")

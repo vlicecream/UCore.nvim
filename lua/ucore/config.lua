@@ -179,6 +179,34 @@ M.values = {
 		color_log = true,
 	},
 
+	-- UCore diagnostics rendered through vim.diagnostic.
+	-- 通过 vim.diagnostic 渲染 UCore 诊断。
+	diagnostics = {
+		-- Enable UCore diagnostics.
+		-- 是否启用 UCore 诊断。
+		enable = true,
+
+		-- Show underline for diagnostics.
+		-- 是否显示红线/黄线下划线。
+		underline = true,
+
+		-- Show inline virtual text. Disabled by default to avoid noisy C++ buffers.
+		-- 是否显示行内虚拟文本，默认关闭以减少 C++ buffer 噪音。
+		virtual_text = false,
+
+		-- Show sign column markers.
+		-- 是否显示 sign column 标记。
+		signs = true,
+
+		-- Update diagnostics while typing in Insert mode.
+		-- 插入模式输入时是否更新诊断。
+		update_in_insert = false,
+
+		-- Debounce delay for diagnostics refresh.
+		-- 诊断刷新的防抖延迟。
+		debounce_ms = 300,
+	},
+
 	-- Semantic highlight overlay powered by the UCore index.
 	-- 基于 UCore 索引的语义高亮覆盖层。
 	semantic = {

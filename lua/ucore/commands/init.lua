@@ -97,6 +97,9 @@ function M.dispatch(args)
     find = function()
       actions.find(tail)
     end,
+		diagnostics = function()
+			require("ucore.diagnostics").dispatch(tail)
+		end,
     ["goto"] = actions.goto_definition,
 		references = actions.references,
     checkout = actions.checkout,
@@ -155,6 +158,7 @@ function M.register()
 				"tree",
 				"files",
 				"find",
+				"diagnostics",
 				"goto",
 				"references",
 				"debug",
@@ -166,6 +170,14 @@ function M.register()
 				"checkout",
 				"commit",
 				"login",
+			}
+
+			local diagnostics_items = {
+				"refresh",
+				"clear",
+				"fix",
+				"qflist",
+				"toggle",
 			}
 
 			local debug_items = {
@@ -206,6 +218,8 @@ function M.register()
 				items = debug_items
 			elseif in_vcs then
 				items = vcs_items
+			elseif first and first:lower() == "diagnostics" then
+				items = diagnostics_items
 			else
 				items = user_items
 			end
@@ -217,6 +231,10 @@ function M.register()
 			end
 
 			if in_vcs and (tail:lower() == "vcs" or tail:lower():match("^vcs%s*$")) then
+				needle = ""
+			end
+
+			if first and first:lower() == "diagnostics" and tail:lower():match("^diagnostics%s*$") then
 				needle = ""
 			end
 

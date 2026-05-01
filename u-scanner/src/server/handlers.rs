@@ -346,6 +346,15 @@ fn handle_state_query(
             Ok(Some(value))
         }
 
+        QueryRequest::GetDiagnostics { content, file_path } => {
+            let value = crate::diagnostics::process_diagnostics(conn, &content, file_path)?;
+            Ok(Some(value))
+        }
+
+        QueryRequest::ParseBuildDiagnostics { output } => {
+            Ok(Some(crate::diagnostics::parse_build_diagnostics(&output)))
+        }
+
         _ => Ok(None),
     }
 }

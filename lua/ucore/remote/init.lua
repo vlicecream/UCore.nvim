@@ -81,6 +81,22 @@ function M.get_completions(project_root, payload, callback)
 	M.query(project_root, payload, callback)
 end
 
+-- Fetch UCore diagnostics for the current buffer.
+-- 获取当前 buffer 的 UCore 诊断。
+function M.get_diagnostics(project_root, payload, callback)
+	payload.kind = "GetDiagnostics"
+	M.query(project_root, payload, callback)
+end
+
+-- Parse build output into diagnostics.
+-- 将构建输出解析为诊断。
+function M.parse_build_diagnostics(project_root, output, callback)
+	M.query(project_root, {
+		kind = "ParseBuildDiagnostics",
+		output = output,
+	}, callback)
+end
+
 -- Fetch go-to-definition target for the current buffer context.
 -- 根据当前 buffer 上下文获取跳转定义目标。
 function M.goto_definition(project_root, payload, callback)

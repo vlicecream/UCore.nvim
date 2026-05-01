@@ -579,6 +579,14 @@ pub enum QueryRequest {
         #[serde(default)]
         file_path: Option<String>,
     },
+    GetDiagnostics {
+        content: String,
+        #[serde(default)]
+        file_path: Option<String>,
+    },
+    ParseBuildDiagnostics {
+        output: String,
+    },
 
     // Asset queries.
     // 资产查询。

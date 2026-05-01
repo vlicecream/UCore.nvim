@@ -6,6 +6,7 @@
 
 pub mod completion;
 pub mod db;
+pub mod diagnostics;
 pub mod edit;
 pub mod parser;
 pub mod query;
