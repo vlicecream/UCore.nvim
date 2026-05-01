@@ -624,11 +624,7 @@ local function pick_telescope_find(items, default_text)
 					}
 				end,
 			}),
-			previewer = previewers.new_buffer_previewer({
-				define_preview = function(self, entry)
-					preview_find_item(entry, self.state.bufnr)
-				end,
-			}),
+			previewer = false,
 			sorter = conf.generic_sorter({}),
 			attach_mappings = function(prompt_bufnr)
 				actions.select_default:replace(function()
