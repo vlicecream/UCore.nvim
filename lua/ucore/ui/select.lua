@@ -363,7 +363,7 @@ local function open_reference(item)
 
 	if path and path ~= vim.NIL and vim.fn.filereadable(path) == 1 then
 		vim.cmd.edit(vim.fn.fnameescape(path))
-		local last_line = vim.api.nvim_buf_line_count(0)
+		local last_line = math.max(1, vim.api.nvim_buf_line_count(0))
 		line = math.max(1, math.min(line, last_line))
 		local line_text = vim.api.nvim_buf_get_lines(0, line - 1, line, false)[1] or ""
 		col = math.max(0, math.min(col, #line_text))
@@ -388,7 +388,7 @@ local function open_source_item(item)
 
 	if path and path ~= vim.NIL and vim.fn.filereadable(path) == 1 then
 		vim.cmd.edit(vim.fn.fnameescape(path))
-		local last_line = vim.api.nvim_buf_line_count(0)
+		local last_line = math.max(1, vim.api.nvim_buf_line_count(0))
 		line = math.max(1, math.min(line, last_line))
 		local line_text = vim.api.nvim_buf_get_lines(0, line - 1, line, false)[1] or ""
 		col = math.max(0, math.min(col, #line_text))
