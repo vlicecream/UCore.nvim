@@ -591,31 +591,21 @@ end
 
 	items = prepare_find_items(items)
 
-	local base = items
-	if #base == 0 then
-		base = {{
-			name = "No results found",
-			type = "empty",
-			source = "",
-		}}
-	end
-
-	local sample = base[1] or {}
-	vim.notify(
-		string.format("UCore find: picker %d items. Name=%s Type=%s Path=%s Line=%s",
-			#base,
-			tostring(sample.name or sample.symbol_name or ""),
-			tostring(sample.type or sample.symbol_type or ""),
-			tostring(sample.path or sample.file_path or ""),
-			tostring(sample.line or sample.line_number or "")),
-		vim.log.levels.INFO)
+	-- Sentinel: always present so Telescope never gets 0 results (avoids
+	-- nvim_win_set_cursor crash when filtering removes all real items).
+	-- 兜底条目：始终存在，避免 Telescope 在空结果上崩溃。
+	table.insert(items, {
+		name = "No results found",
+		type = "empty",
+		source = "",
+	})
 
 	pickers
 		.new({}, {
 			prompt_title = "UCore find",
 			default_text = default_text,
 			finder = finders.new_table({
-				results = base,
+				results = items,
 				entry_maker = function(item)
 					if item.type == "empty" then
 						local all_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
