@@ -1095,14 +1095,19 @@ fn goto_definition_inner(
         ctx.enclosing_class
     );
 
-    // For implementation mode, search by class name instead of class_id so
-    // both .h and .cpp class records are matched. Falls back to global search.
-    // 实现模式：按类名搜索（.h 和 .cpp 的 class 共享同一个 name_id），
-    // 兜底走全局搜索。
+    // For implementation mode, search by class name so both .h and .cpp
+    // class records match. If no impl found, fall back to declaration within
+    // the same class, then global search as last resort.
+    // 实现模式：按类名搜。无 impl 时退化到同类的 declaration，最后全局兜底。
     if prefer_impl {
         let class_name = resolve_impl_class(&ctx, &content, line);
-        if let Some(name) = class_name {
-            if let Some(result) = find_impl_in_inheritance(conn, &name, &ctx.symbol)? {
+        if let Some(ref name) = class_name {
+            if let Some(result) = find_impl_in_inheritance(conn, name, &ctx.symbol)? {
+                return Ok(result);
+            }
+            // Fallback to declaration within the same class scope.
+            // 同 scope 内退化到 declaration。
+            if let Some(result) = find_member_by_class_name(conn, name, &ctx.symbol, false)? {
                 return Ok(result);
             }
         }

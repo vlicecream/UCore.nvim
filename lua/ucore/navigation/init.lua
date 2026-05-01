@@ -72,6 +72,7 @@ local function fallback_normal(keys)
 	end
 
 	vim.cmd("normal! " .. keys)
+	vim.cmd("nohlsearch")
 end
 
 -- Go to definition with Vim-compatible fallback.
