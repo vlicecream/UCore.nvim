@@ -1,6 +1,5 @@
 local config = require("ucore.config")
 local project = require("ucore.project")
-local autocmd = require("ucore.autocmd")
 
 local M = {}
 
@@ -85,7 +84,9 @@ function M.start(callback, opts)
 		-- Allow auto_boot to re-trigger (e.g. after lazy sync rebuild kills server).
 		-- 允许 auto_boot 重新触发（如 lazy sync 重构杀掉了 server）。
 		vim.schedule(function()
-			autocmd.reset()
+			pcall(function()
+				require("ucore.autocmd").reset()
+			end)
 		end)
 
 		if result.code ~= 0 then
