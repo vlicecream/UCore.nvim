@@ -3,14 +3,14 @@ local config = require("ucore.config")
 local M = {}
 
 -- Check whether a Lua module can be required.
--- 检查某�?Lua 模块是否可用�?
+-- 检查某个 Lua 模块是否可用。
 local function has_module(name)
 	local ok = pcall(require, name)
 	return ok
 end
 
 -- Pick the best available picker backend.
--- 选择当前可用的最�?picker 后端�?
+-- 选择当前可用的最佳 picker 后端。
 local function picker_backend()
 	local ui_config = config.values.ui or {}
 	local requested = ui_config.picker or "auto"
@@ -41,7 +41,7 @@ local function picker_backend()
 end
 
 -- Build stable display entries for picker backends.
--- �?picker 后端构造稳定展示项�?
+-- 为 picker 后端构造稳定展示项。
 local function build_entries(items, format_item)
 	local entries = {}
 
@@ -61,7 +61,7 @@ local function build_entries(items, format_item)
 end
 
 -- Trim a string to a display width while keeping the useful tail.
--- 按显示宽度裁剪字符串，并保留更有用的尾部路径信息�?
+-- 按显示宽度裁剪字符串，并保留更有用的尾部路径信息。
 local function truncate_left(text, max_width)
 	text = tostring(text or "")
 
@@ -89,7 +89,7 @@ local function truncate_left(text, max_width)
 end
 
 -- Pad a string on the right using display width instead of byte length.
--- 按显示宽度右侧补空格，避免中文或宽字符导致列错位�?
+-- 按显示宽度右侧补空格，避免中文或宽字符导致列错位。
 local function pad_right(text, width)
 	text = tostring(text or "")
 	local padding = math.max(0, width - vim.fn.strdisplaywidth(text))
@@ -101,7 +101,7 @@ local function normalize_path(path)
 end
 
 -- Prefer a cwd-relative path in picker displays.
--- picker 里优先显示相对当前工作目录的路径�?
+-- picker 里优先显示相对当前工作目录的路径。
 local function display_path(path)
 	path = tostring(path or ""):gsub("\\", "/")
 	local cwd = vim.loop.cwd()
@@ -362,15 +362,13 @@ local function open_reference(item)
 	local col = tonumber(item.col or item.column or 0) or 0
 
 	if path and path ~= vim.NIL and vim.fn.filereadable(path) == 1 then
-		vim.schedule(function()
-			vim.cmd.edit(vim.fn.fnameescape(path))
-			local last_line = math.max(1, vim.api.nvim_buf_line_count(0))
-			line = math.max(1, math.min(line, last_line))
-			local line_text = vim.api.nvim_buf_get_lines(0, line - 1, line, false)[1] or ""
-			col = math.max(0, math.min(col, #line_text))
-			vim.api.nvim_win_set_cursor(0, { line, col })
-			vim.cmd("normal! zz")
-		end)
+		vim.cmd.edit(vim.fn.fnameescape(path))
+		local last_line = vim.api.nvim_buf_line_count(0)
+		line = math.max(1, math.min(line, last_line))
+		local line_text = vim.api.nvim_buf_get_lines(0, line - 1, line, false)[1] or ""
+		col = math.max(0, math.min(col, #line_text))
+		vim.api.nvim_win_set_cursor(0, { line, col })
+		vim.cmd("normal! zz")
 	else
 		print(vim.inspect(item))
 	end
@@ -389,15 +387,13 @@ local function open_source_item(item)
 	local col = tonumber(item.col or item.column or 0) or 0
 
 	if path and path ~= vim.NIL and vim.fn.filereadable(path) == 1 then
-		vim.schedule(function()
-			vim.cmd.edit(vim.fn.fnameescape(path))
-			local last_line = math.max(1, vim.api.nvim_buf_line_count(0))
-			line = math.max(1, math.min(line, last_line))
-			local line_text = vim.api.nvim_buf_get_lines(0, line - 1, line, false)[1] or ""
-			col = math.max(0, math.min(col, #line_text))
-			vim.api.nvim_win_set_cursor(0, { line, col })
-			vim.cmd("normal! zz")
-		end)
+		vim.cmd.edit(vim.fn.fnameescape(path))
+		local last_line = vim.api.nvim_buf_line_count(0)
+		line = math.max(1, math.min(line, last_line))
+		local line_text = vim.api.nvim_buf_get_lines(0, line - 1, line, false)[1] or ""
+		col = math.max(0, math.min(col, #line_text))
+		vim.api.nvim_win_set_cursor(0, { line, col })
+		vim.cmd("normal! zz")
 	else
 		print(vim.inspect(item))
 	end
@@ -408,12 +404,8 @@ local function preview_find_item(entry, bufnr)
 	local path = item.path or item.file_path
 
 	if path and path ~= vim.NIL and vim.fn.filereadable(path) == 1 then
-		local ok, raw = pcall(vim.fn.readfile, path, "", 500)
-		if ok and raw then
-			local lines = raw
-			if #lines == 0 then
-				lines = { "" }
-			end
+		local ok, lines = pcall(vim.fn.readfile, path, "", 500)
+		if ok then
 			vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
 			vim.bo[bufnr].filetype = vim.filetype.match({ filename = path }) or ""
 			return
@@ -447,7 +439,7 @@ local function preview_find_item(entry, bufnr)
 end
 
 -- Open the built-in vim.ui.select picker.
--- 打开内置 vim.ui.select 选择器�?
+-- 打开内置 vim.ui.select 选择器。
 local function pick_vim(title, items, format_item, on_choice)
 	vim.ui.select(items, {
 		prompt = title,
@@ -460,7 +452,7 @@ local function pick_vim(title, items, format_item, on_choice)
 end
 
 -- Open fzf-lua picker.
--- 打开 fzf-lua 选择器�?
+-- 打开 fzf-lua 选择器。
 local function pick_fzf(title, items, format_item, on_choice)
 	local fzf = require("fzf-lua")
 	local entries = build_entries(items, format_item)
@@ -485,7 +477,7 @@ local function pick_fzf(title, items, format_item, on_choice)
 end
 
 -- Open telescope picker.
--- 打开 telescope 选择器�?
+-- 打开 telescope 选择器。
 local function pick_telescope(title, items, format_item, on_choice)
 	local pickers = require("telescope.pickers")
 	local finders = require("telescope.finders")
@@ -527,8 +519,8 @@ end
 
 -- Open references using a grep-like Telescope layout:
 -- left side lists locations, right side previews the whole file.
--- 使用类似全局搜索�?Telescope 布局�?
--- 左侧列出定位信息，右侧预览整个文件内容�?
+-- 使用类似全局搜索的 Telescope 布局：
+-- 左侧列出定位信息，右侧预览整个文件内容。
 local function pick_telescope_references(references)
 	local pickers = require("telescope.pickers")
 	local finders = require("telescope.finders")
@@ -560,8 +552,8 @@ local function pick_telescope_references(references)
 						text = context,
 					}
 				end,
-		}),
-			previewer = false,
+			}),
+			previewer = conf.grep_previewer({}),
 			sorter = conf.generic_sorter({}),
 			attach_mappings = function(prompt_bufnr)
 				actions.select_default:replace(function()
@@ -580,8 +572,8 @@ local function pick_telescope_references(references)
 end
 
 -- Open project-wide find using a Telescope grep-style file preview.
--- 使用 Telescope grep 风格预览打开项目全局查找�?
-	local function pick_telescope_find(items, default_text)
+-- 使用 Telescope grep 风格预览打开项目全局查找。
+local function pick_telescope_find(items, default_text)
 	local pickers = require("telescope.pickers")
 	local finders = require("telescope.finders")
 	local conf = require("telescope.config").values
@@ -591,15 +583,6 @@ end
 
 	items = prepare_find_items(items)
 
-	-- Sentinel: always present so Telescope never gets 0 results (avoids
-	-- nvim_win_set_cursor crash when filtering removes all real items).
-	-- 兜底条目：始终存在，避免 Telescope 在空结果上崩溃。
-	table.insert(items, {
-		name = "No results found",
-		type = "empty",
-		source = "",
-	})
-
 	pickers
 		.new({}, {
 			prompt_title = "UCore find",
@@ -607,20 +590,6 @@ end
 			finder = finders.new_table({
 				results = items,
 				entry_maker = function(item)
-					if item.type == "empty" then
-						local all_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
-						return {
-							value = item,
-							display = "   No results found �?try a different search term",
-							ordinal = " " .. string.rep(all_chars, 2),
-							filename = vim.api.nvim_buf_get_name(0) or vim.loop.cwd() or ".",
-							path = vim.api.nvim_buf_get_name(0) or vim.loop.cwd() or ".",
-							lnum = 1,
-							col = 1,
-							text = "No results found",
-						}
-					end
-
 					local name = tostring(item.name or item.symbol_name or "<unknown>")
 					local kind = normalize_kind(item.symbol_type or item.type)
 					local source = normalize_source(item.source)
@@ -651,8 +620,12 @@ end
 					}
 				end,
 			}),
-			previewer = conf.grep_previewer({}),
-			sorter = require("telescope.sorters").get_fzy_sorter({}),
+			previewer = previewers.new_buffer_previewer({
+				define_preview = function(self, entry)
+					preview_find_item(entry, self.state.bufnr)
+				end,
+			}),
+			sorter = conf.generic_sorter({}),
 			attach_mappings = function(prompt_bufnr)
 				actions.select_default:replace(function()
 					local selection = action_state.get_selected_entry()
@@ -667,12 +640,10 @@ end
 			end,
 		})
 		:find()
-
-	vim.notify("UCore find: picker created, items=" .. #items, vim.log.levels.INFO)
 end
 
 -- Open a generic selection UI with a label formatter.
--- 打开一个通用选择 UI，并支持自定义显示文本�?
+-- 打开一个通用选择 UI，并支持自定义显示文本。
 local function pick(title, items, format_item, on_choice)
 	if type(items) ~= "table" or vim.tbl_isempty(items) then
 		vim.notify(title .. ": no results", vim.log.levels.WARN)
@@ -693,7 +664,7 @@ local function pick(title, items, format_item, on_choice)
 end
 
 -- Pick generic action items.
--- 选择通用动作项�?
+-- 选择通用动作项。
 function M.items(title, items, opts)
 	opts = opts or {}
 
@@ -703,7 +674,7 @@ function M.items(title, items, opts)
 end
 
 -- Pick a registered Unreal project.
--- 选择一个已注册 Unreal 项目�?
+-- 选择一个已注册 Unreal 项目。
 function M.projects(items, on_choice)
 	pick("UCore projects", items, function(item)
 		local engine = item.engine_association and (" [" .. item.engine_association .. "]") or ""
@@ -712,7 +683,7 @@ function M.projects(items, on_choice)
 end
 
 -- Pick a module and open its Build.cs or module root.
--- 选择一个模块，并打开它的 Build.cs 或模块目录�?
+-- 选择一个模块，并打开它的 Build.cs 或模块目录。
 function M.modules(modules)
 	pick("UCore modules", modules, function(item)
 		local name = tostring(item.name or "<unknown>")
@@ -743,7 +714,7 @@ function M.modules(modules)
 end
 
 -- Pick an asset path and copy it to the clipboard.
--- 选择一个资产路径，并复制到剪贴板�?
+-- 选择一个资产路径，并复制到剪贴板。
 function M.assets(assets)
 	pick("UCore assets", assets, function(item)
 		return tostring(item)
@@ -755,7 +726,7 @@ function M.assets(assets)
 end
 
 -- Pick a symbol and open its source file when possible.
--- 选择一个符号，并尽量打开它所在的源码文件�?
+-- 选择一个符号，并尽量打开它所在的源码文件。
 function M.find(items, opts)
 	opts = opts or {}
 
@@ -778,13 +749,13 @@ function M.find(items, opts)
 end
 
 -- Backward-compatible alias for older callers.
--- 兼容旧调用方�?
+-- 兼容旧调用方。
 function M.symbols(symbols)
 	M.find(symbols)
 end
 
 -- Pick a reference result and open its source location.
--- 选择一个引用结果，并打开对应源码位置�?
+-- 选择一个引用结果，并打开对应源码位置。
 function M.references(references)
 	if type(references) ~= "table" or vim.tbl_isempty(references) then
 		vim.notify("UCore references: no results", vim.log.levels.WARN)
@@ -806,7 +777,7 @@ function M.references(references)
 		location = pad_right(truncate_left(location, 72), 72)
 
 		if context ~= "" then
-			return string.format("%s �?%s", location, context)
+			return string.format("%s │ %s", location, context)
 		end
 
 		return location
