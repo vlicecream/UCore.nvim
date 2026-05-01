@@ -500,8 +500,12 @@ end
 -- Smart entry: pick project if outside, register+boot if unregistered, Dashboard if ready.
 -- 智能入口：不在项目中选择，未注册则注册+boot，已注册则打开 Dashboard。
 function M.smart_entry()
-	local root = project.find_project_root_from_context()
-	vim.notify("UCore smart_entry: root=" .. tostring(root) .. " buf=" .. (vim.api.nvim_buf_get_name(0) or "?") .. " cwd=" .. (vim.loop.cwd() or "?"), vim.log.levels.INFO)
+	-- Only use the current buffer for context. Scanning all open buffers
+	-- causes false positives when another buffer is in a project but the
+	-- current buffer is not.
+	-- 只用当前 buffer 判断。扫描所有 buffer 会导致当前不在项目中时误判。
+	local buf_path = vim.api.nvim_buf_get_name(0)
+	local root = buf_path ~= "" and project.find_project_root(buf_path) or nil
 	if not root then
 		local items = project.list_registered_projects()
 		ui.select.projects(items, function(item)
