@@ -1248,6 +1248,10 @@ function M.vcs_debug()
   vim.bo[buf].modified = false
 end
 
+function M.editing_debug()
+	open_scratch("UCore Editing Debug", require("ucore.editing").info())
+end
+
 -- Print :UCore command help.
 -- 打印 :UCore 命令帮助。
 function M.help()
@@ -1301,6 +1305,7 @@ UCore debug commands:
    :UCore debug goto         Go to definition at cursor
    :UCore debug complete     Trigger manual completion in Insert mode
   :UCore debug maps         Print Lua-side component/module maps
+  :UCore debug editing      Print indent/autopairs diagnostics
   :UCore debug vcs          Print VCS diagnostics
   :UCore debug p4-changes   Print pending P4 changelists
   :UCore debug help         Show this help

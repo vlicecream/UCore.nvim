@@ -59,6 +59,7 @@ local function dispatch_debug(tail)
 		stop = actions.stop,
 		restart = actions.restart,
 		maps = actions.maps,
+		editing = actions.editing_debug,
 		help = actions.debug_help,
 		complete = actions.complete,
 		["goto"] = actions.goto_definition,

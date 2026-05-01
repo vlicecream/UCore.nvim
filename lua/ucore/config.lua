@@ -231,6 +231,15 @@ M.values = {
 
 	-- Auto-pairs integration via nvim-autopairs.
 	-- nvim-autopairs 自动配对集成。
+	editing = {
+		enable = true,
+		indent = {
+			enable = true,
+			inherit_cpp = true,
+			fallback_cindent = true,
+		},
+	},
+
 	autopairs = {
 		-- Enable nvim-autopairs integration. Disable if using your own config.
 		-- 启用 nvim-autopairs 集成。若自行配置，可关闭。
