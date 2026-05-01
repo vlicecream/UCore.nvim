@@ -93,6 +93,9 @@ function M.dispatch(args)
 		explorer = actions.explorer,
 		tree = actions.explorer,
 		files = actions.explorer,
+    globalfind = function()
+      actions.global_find(tail)
+    end,
     find = function()
       actions.find(tail)
     end,
@@ -158,6 +161,7 @@ function M.register()
 				"tree",
 				"files",
 				"find",
+				"globalfind",
 				"diagnostics",
 				"goto",
 				"debug",

@@ -60,6 +60,7 @@ local function setup_buffer(args)
 	set_buffer_map(bufnr, keymaps.references, navigation.references, "UCore references")
 	set_buffer_map(bufnr, keymaps.implementation or keymaps.goto_implementation, navigation.goto_implementation, "UCore implementation")
 	set_buffer_map(bufnr, keymaps.source_toggle, navigation.toggle_source, "UCore toggle source/header")
+	set_buffer_map(bufnr, keymaps.global_find, navigation.global_find, "UCore global find")
 end
 
 function M.setup()

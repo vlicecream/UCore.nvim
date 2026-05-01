@@ -547,7 +547,7 @@ function M.dashboard()
 			badge = index_label(s),
 			description = "Search symbols, modules, assets, config",
 			run = index_guard(function()
-				M.find("")
+				M.global_find("")
 			end),
 		},
 		{
@@ -1098,6 +1098,13 @@ function M.find(pattern)
 	end)
 end
 
+-- :UCore globalfind [pattern]
+-- Global find: fuzzy search indexed symbols, modules, assets, config.
+-- 全局搜索：模糊查找已索引的符号、模块、资产、配置。
+function M.global_find(pattern)
+	M.find(pattern)
+end
+
 -- Backward-compatible debug alias for the old command name.
 -- 旧命令名保留为 debug 兼容入口。
 function M.search_symbols(pattern)
@@ -1257,7 +1264,7 @@ UCore commands:
   :UCore explorer     Open the left-side Project/Source/Config/VCS tree
   :UCore tree         Open the left-side Project/Source/Config/VCS tree
   :UCore files        Open the left-side Project/Source/Config/VCS tree
-  :UCore find         Find indexed symbols, modules, assets, config
+   :UCore globalfind   Find indexed symbols, modules, assets, config
    :UCore goto         Navigation subcommands (see :UCore goto help)
    :UCore vcs           Open VCS Dashboard
   :UCore vcs dashboard  Open VCS Dashboard

@@ -249,4 +249,15 @@ function M.references()
 	end)
 end
 
+-- Global find: fuzzy search indexed items.
+-- 全局搜索：模糊查找已索引内容。
+function M.global_find()
+	local root = project.find_project_root()
+	if not root then
+		return vim.notify("Could not find .uproject", vim.log.levels.ERROR)
+	end
+
+	require("ucore.commands.actions").global_find("")
+end
+
 return M

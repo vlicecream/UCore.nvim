@@ -137,6 +137,10 @@ M.values = {
 			-- Toggle between source (.cpp) and header (.h) file.
 			-- 在 .cpp 和 .h 文件之间切换。
 			source_toggle = "gs",
+
+			-- Global find: fuzzy search indexed symbols, modules, assets, config.
+			-- 全局搜索：模糊查找已索引的符号、模块、资产、配置。
+			global_find = "gf",
 		},
 	},
 
