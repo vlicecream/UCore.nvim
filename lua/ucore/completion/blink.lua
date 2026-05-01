@@ -43,30 +43,42 @@ function M:get_trigger_characters()
 		".",
 		">",
 		":",
+		'"',
+		"<",
 	}
 end
 
 -- Convert Vim complete-item shape into LSP/blink completion item shape.
 -- 把 Vim complete-item 结构转换成 LSP/blink completion item 结构。
 local function to_blink_item(item)
-	local label = item.label or item.name or item.word or item.insert_text or item.insertText or item.text or ""
+	local raw = item
+	if type(item.user_data) == "string" and item.user_data ~= "" then
+		local ok, decoded = pcall(vim.json.decode, item.user_data)
+		if ok and type(decoded) == "table" then
+			raw = vim.tbl_deep_extend("force", item, decoded)
+		end
+	end
+
+	local label = raw.label or raw.name or raw.word or raw.insert_text or raw.insertText or raw.text or ""
 	if label == "" then
 		return nil
 	end
 
-	local insert_text = item.insert_text or item.insertText or item.word or item.name or label
-	local kind = tonumber(item.kind) or item.kind
+	local insert_text = raw.insert_text or raw.insertText or raw.word or raw.name or label
+	local kind = tonumber(raw.kind) or raw.kind
+	local insert_text_format = tonumber(raw.insertTextFormat or raw.insert_text_format)
+		or vim.lsp.protocol.InsertTextFormat.PlainText
 
 	return {
 		label = tostring(label),
 		kind = kind,
-		detail = item.detail or item.menu,
-		labelDetails = item.labelDetails,
-		documentation = item.documentation or item.info,
-		filterText = tostring(item.filterText or item.filter_text or label),
+		detail = raw.detail or raw.menu,
+		labelDetails = raw.labelDetails,
+		documentation = raw.documentation or raw.info,
+		filterText = tostring(raw.filterText or raw.filter_text or label),
 		insertText = tostring(insert_text),
-		insertTextFormat = vim.lsp.protocol.InsertTextFormat.PlainText,
-		sortText = tostring(item.sortText or item.sort_text or label),
+		insertTextFormat = insert_text_format,
+		sortText = tostring(raw.sortText or raw.sort_text or label),
 	}
 end
 
@@ -86,6 +98,10 @@ function M:get_completions(_, callback)
 
   completion.request(function(items, err)
 		if cancelled then
+			return
+		end
+
+		if err == "stale" then
 			return
 		end
 

@@ -4,6 +4,7 @@ local remote = require("ucore.remote")
 
 local M = {}
 local auto_sequence = 0
+local request_sequence = 0
 
 -- Return true when the current mode can show insert completion.
 -- 判断当前模式是否适合弹出插入模式补全菜单。
@@ -61,6 +62,33 @@ local function current_prefix()
 	return segment:match("[_%w]*$") or ""
 end
 
+local function in_comment_or_string()
+	local row, col = unpack(vim.api.nvim_win_get_cursor(0))
+	local ok, captures = pcall(vim.treesitter.get_captures_at_pos, 0, row - 1, math.max(col - 1, 0))
+	if not ok then
+		return false
+	end
+
+	for _, capture in ipairs(captures or {}) do
+		local name = capture.capture
+		if type(name) == "string" and (name:find("comment", 1, true) or name:find("string", 1, true)) then
+			return true
+		end
+	end
+
+	return false
+end
+
+local function in_include_context()
+	local before = before_cursor()
+	return before:match("^%s*#%s*include%s*[<\"][^>\"]*$") ~= nil
+end
+
+local function in_macro_context()
+	local before = before_cursor()
+	return before:match("%f[%w_]U[A-Z_]+%s*%([^)]*$") ~= nil
+end
+
 -- Find a conservative completion start column.
 -- 查找一个保守的补全起始列。
 local function completion_start_col()
@@ -83,6 +111,14 @@ local function should_auto_trigger()
 	local completion_config = config.values.completion or {}
 	local min_chars = completion_config.min_chars or 2
 	local before = before_cursor()
+
+	if in_comment_or_string() and not in_include_context() then
+		return false
+	end
+
+	if in_include_context() or in_macro_context() then
+		return true
+	end
 
 	if before:match("%-%>$") or before:match("::$") or before:match("%.$") then
 		return true
@@ -113,6 +149,9 @@ local function to_complete_item(item)
 	local label = item.label or item.name or item.word or item.insert_text or item.insertText or item.text or ""
 
 	local insert_text = item.insert_text or item.insertText or item.word or item.name or label
+	if tonumber(item.insertTextFormat or item.insert_text_format) == vim.lsp.protocol.InsertTextFormat.Snippet then
+		insert_text = label
+	end
 
 	local kind = item.kind or item.type or item.symbol_type or ""
 
@@ -169,6 +208,10 @@ function M.request(callback)
 	local cursor = vim.api.nvim_win_get_cursor(0)
 	local line = cursor[1] - 1
 	local character = cursor[2]
+	local bufnr = vim.api.nvim_get_current_buf()
+	local changedtick = vim.api.nvim_buf_get_changedtick(bufnr)
+	request_sequence = request_sequence + 1
+	local sequence = request_sequence
 
 	remote.get_completions(root, {
 		content = current_content(),
@@ -176,6 +219,13 @@ function M.request(callback)
 		character = character,
 		file_path = file_path:gsub("\\", "/"),
 	}, function(result, err)
+		if sequence ~= request_sequence
+			or not vim.api.nvim_buf_is_valid(bufnr)
+			or vim.api.nvim_buf_get_changedtick(bufnr) ~= changedtick
+		then
+			return callback(nil, "stale")
+		end
+
 		if err then
 			return callback(nil, err)
 		end
@@ -204,6 +254,10 @@ function M.complete(opts)
 
 	M.request(function(items, err)
 		if err then
+			if err == "stale" then
+				return
+			end
+
 			if not opts.silent then
 				vim.notify("UCore complete failed:\n" .. tostring(err), vim.log.levels.ERROR)
 			end

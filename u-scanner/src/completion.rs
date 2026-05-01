@@ -200,6 +200,14 @@ pub fn process_completion(
     let cursor_node = cursor_node(root, line, character)
         .ok_or_else(|| anyhow::anyhow!("no tree-sitter node at cursor"))?;
 
+    if let Some(items) = complete_include_paths(&mut ctx, content, line, character)? {
+        return Ok(json!(items));
+    }
+
+    if let Some(items) = complete_macro_specifiers_at(content, line, character) {
+        return Ok(items);
+    }
+
     if let Some(items) = complete_macro_specifiers(cursor_node, content) {
         return Ok(items);
     }
@@ -268,7 +276,9 @@ pub fn process_completion(
         }
     }
 
-    items.extend(ue_snippets(&prefix));
+    if should_offer_ue_snippets(&prefix) {
+        items.extend(ue_snippets(&prefix));
+    }
 
     if prefix.chars().count() >= MIN_GLOBAL_PREFIX_LEN {
         items.extend(fetch_global_symbols(conn, &prefix)?);
@@ -627,6 +637,12 @@ fn infer_variable_type(
 
     if let Some((_, ty)) = best {
         if ty == "auto" {
+            if let Some(ty) =
+                infer_from_declaration_initializer(target_name, root, content, cursor_row)
+            {
+                return Ok(Some(ty));
+            }
+
             return infer_from_assignment_text(ctx, target_name, root, content, cursor_row);
         }
 
@@ -684,6 +700,60 @@ fn declaration_contains_name(node: Node, content: &str, target_name: &str) -> bo
     false
 }
 
+fn infer_from_declaration_initializer(
+    target_name: &str,
+    root: Node,
+    content: &str,
+    cursor_row: usize,
+) -> Option<String> {
+    let mut result = None;
+    scan_declaration_initializers(root, content, cursor_row, target_name, &mut result);
+    result
+}
+
+fn scan_declaration_initializers(
+    node: Node,
+    content: &str,
+    cursor_row: usize,
+    target_name: &str,
+    result: &mut Option<String>,
+) {
+    if node.start_position().row > cursor_row || result.is_some() {
+        return;
+    }
+
+    if matches!(node.kind(), "declaration" | "init_declarator") {
+        let text = node_text(node, content);
+
+        if declaration_text_names_variable(text, target_name) {
+            if let Some(initializer) = initializer_text(text) {
+                *result = infer_type_from_value_text(initializer);
+                return;
+            }
+        }
+    }
+
+    for child in node_children(node) {
+        scan_declaration_initializers(child, content, cursor_row, target_name, result);
+    }
+}
+
+fn declaration_text_names_variable(text: &str, target_name: &str) -> bool {
+    let Some(before_equal) = text.split('=').next() else {
+        return false;
+    };
+
+    before_equal
+        .split(|ch: char| !matches!(ch, '_' | 'A'..='Z' | 'a'..='z' | '0'..='9'))
+        .any(|part| part == target_name)
+}
+
+fn initializer_text(text: &str) -> Option<&str> {
+    text.split_once('=')
+        .map(|(_, right)| right.trim().trim_end_matches(';').trim())
+        .filter(|text| !text.is_empty())
+}
+
 /// Infer type from assignment expression text.
 /// 根据赋值表达式文本推断类型。
 fn infer_from_assignment_text(
@@ -739,11 +809,29 @@ fn infer_type_from_value_text(text: &str) -> Option<String> {
 
     let head = text.split('(').next()?.trim();
 
+    if let Some(known) = known_call_return_type(head) {
+        return Some(known.to_string());
+    }
+
     if head.contains("::") {
         return Some(clean_type(head.rsplit_once("::")?.0));
     }
 
     Some(clean_type(head)).filter(|s| !s.is_empty())
+}
+
+fn known_call_return_type(function_name: &str) -> Option<&'static str> {
+    match function_name.trim() {
+        "GetWorld" => Some("UWorld"),
+        "GetGameInstance" => Some("UGameInstance"),
+        "GetOwner" => Some("AActor"),
+        "GetController" => Some("AController"),
+        "GetPawn" => Some("APawn"),
+        "GetPlayerController" => Some("APlayerController"),
+        "GetComponentByClass" => Some("UActorComponent"),
+        "FindComponentByClass" => Some("UActorComponent"),
+        _ => None,
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -1273,6 +1361,114 @@ fn fetch_global_symbols(conn: &Connection, prefix: &str) -> Result<Vec<Value>> {
     Ok(rows.filter_map(|row| row.ok()).collect())
 }
 
+/// Complete indexed headers inside an unfinished #include string.
+/// 在未完成的 #include 字符串内补全已索引头文件。
+fn complete_include_paths(
+    ctx: &mut CompletionContext,
+    content: &str,
+    line: u32,
+    character: u32,
+) -> Result<Option<Vec<Value>>> {
+    let Some(offset) = byte_offset_at(content, line as usize, character as usize) else {
+        return Ok(None);
+    };
+
+    let line_start = content[..offset].rfind('\n').map(|index| index + 1).unwrap_or(0);
+    let before = &content[line_start..offset];
+    let trimmed = before.trim_start();
+
+    if !trimmed.starts_with("#include") {
+        return Ok(None);
+    }
+
+    let Some(prefix) = include_prefix(before) else {
+        return Ok(None);
+    };
+
+    fetch_include_paths(ctx, &prefix).map(Some)
+}
+
+fn include_prefix(before_cursor: &str) -> Option<String> {
+    let quote = before_cursor.rfind('"');
+    let angle = before_cursor.rfind('<');
+    let start = match (quote, angle) {
+        (Some(q), Some(a)) => q.max(a),
+        (Some(q), None) => q,
+        (None, Some(a)) => a,
+        (None, None) => return None,
+    };
+
+    let prefix = &before_cursor[start + 1..];
+
+    if prefix.contains('"') || prefix.contains('>') {
+        return None;
+    }
+
+    Some(prefix.trim_start().replace('\\', "/"))
+}
+
+fn fetch_include_paths(ctx: &mut CompletionContext, prefix: &str) -> Result<Vec<Value>> {
+    let pattern = format!("{}%", prefix);
+    let basename_pattern = format!("%/{}%", prefix);
+    let mut stmt = ctx.conn.prepare(
+        r#"
+        SELECT
+            CASE
+                WHEN dp.full_path = '/' THEN '/' || sn.text
+                WHEN substr(dp.full_path, -1) = '/' THEN dp.full_path || sn.text
+                ELSE dp.full_path || '/' || sn.text
+            END AS path,
+            sn.text
+        FROM files f
+        JOIN strings sn ON f.filename_id = sn.id
+        JOIN dir_paths dp ON f.directory_id = dp.id
+        WHERE f.is_header = 1
+          AND (path LIKE ? OR path LIKE ?)
+        ORDER BY
+          CASE
+            WHEN path LIKE '%/Public/%' THEN 0
+            WHEN path LIKE '%/Classes/%' THEN 1
+            WHEN path LIKE '%/Private/%' THEN 2
+            ELSE 3
+          END,
+          length(path),
+          path
+        LIMIT 80
+        "#,
+    )?;
+
+    let rows = stmt.query_map(params![pattern, basename_pattern], |row| {
+        let path: String = row.get(0)?;
+        let filename: String = row.get(1)?;
+        let insert_text = include_insert_path(&path);
+        Ok(json!({
+            "label": insert_text,
+            "kind": 17,
+            "detail": "include",
+            "documentation": path,
+            "filterText": filename,
+            "insertText": insert_text,
+            "sortText": completion_sort_text(10, 17, &path),
+        }))
+    })?;
+
+    Ok(rows.filter_map(|row| row.ok()).collect())
+}
+
+fn include_insert_path(path: &str) -> String {
+    for marker in ["/Public/", "/Classes/", "/Private/"] {
+        if let Some(index) = path.find(marker) {
+            return path[index + marker.len()..].to_string();
+        }
+    }
+
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path)
+        .to_string()
+}
+
 /// Complete Unreal macro specifiers.
 /// 补全 Unreal 宏参数 specifier。
 fn complete_macro_specifiers(node: Node, content: &str) -> Option<Value> {
@@ -1283,7 +1479,8 @@ fn complete_macro_specifiers(node: Node, content: &str) -> Option<Value> {
             let parent = n.parent()?;
             let text = node_text(parent, content);
             let macro_name = text.split('(').next()?.trim();
-            return macro_specifiers(macro_name);
+            let prefix = completion_prefix(node, content);
+            return macro_specifiers(macro_name, &prefix, false);
         }
 
         current = n.parent();
@@ -1292,39 +1489,60 @@ fn complete_macro_specifiers(node: Node, content: &str) -> Option<Value> {
     None
 }
 
+/// Complete macro specifiers while the macro argument list is syntactically incomplete.
+/// 当宏参数列表还没形成完整语法节点时，用光标前文本兜底补全 specifier。
+fn complete_macro_specifiers_at(content: &str, line: u32, character: u32) -> Option<Value> {
+    let offset = byte_offset_at(content, line as usize, character as usize)?;
+    let before = &content[..offset];
+    let (macro_name, macro_open) = unreal_macro_call_before_cursor(before)?;
+    let after_open = &before[macro_open + 1..];
+
+    if after_open.contains(')') || after_open.contains(';') || after_open.contains('{') {
+        return None;
+    }
+
+    let prefix = before
+        .rsplit(['(', ',', '='])
+        .next()
+        .unwrap_or("")
+        .rsplit(|ch: char| !matches!(ch, '_' | 'A'..='Z' | 'a'..='z' | '0'..='9'))
+        .next()
+        .unwrap_or("");
+
+    macro_specifiers(macro_name, prefix, is_in_meta_argument(after_open))
+}
+
+fn unreal_macro_call_before_cursor(before: &str) -> Option<(&'static str, usize)> {
+    [
+        "UPROPERTY",
+        "UFUNCTION",
+        "UCLASS",
+        "USTRUCT",
+        "UENUM",
+        "UPARAM",
+        "UMETA",
+    ]
+    .iter()
+    .filter_map(|name| {
+        let pattern = format!("{}(", name);
+        before.rfind(&pattern).map(|index| (*name, index + name.len()))
+    })
+    .max_by_key(|(_, open)| *open)
+}
+
 /// Return macro specifier items.
 /// 返回宏参数补全项。
-fn macro_specifiers(macro_name: &str) -> Option<Value> {
-    let labels = match macro_name {
-        "UPROPERTY" => vec![
-            ("EditAnywhere", "property specifier"),
-            ("EditDefaultsOnly", "property specifier"),
-            ("BlueprintReadOnly", "property specifier"),
-            ("BlueprintReadWrite", "property specifier"),
-            ("Category", "property key"),
-            ("meta", "metadata key"),
-            ("VisibleAnywhere", "property specifier"),
-            ("Transient", "property specifier"),
-        ],
-
-        "UFUNCTION" => vec![
-            ("BlueprintCallable", "function specifier"),
-            ("BlueprintPure", "function specifier"),
-            ("BlueprintImplementableEvent", "function specifier"),
-            ("BlueprintNativeEvent", "function specifier"),
-            ("Category", "function key"),
-            ("meta", "metadata key"),
-        ],
-
-        "UCLASS" | "USTRUCT" => vec![
-            ("Blueprintable", "type specifier"),
-            ("BlueprintType", "type specifier"),
-            ("Abstract", "type specifier"),
-            ("meta", "metadata key"),
-        ],
-
-        _ => return None,
+fn macro_specifiers(macro_name: &str, prefix: &str, in_meta: bool) -> Option<Value> {
+    let mut labels = if in_meta {
+        meta_specifier_labels(macro_name)?
+    } else {
+        macro_specifier_labels(macro_name)?
     };
+
+    if !prefix.is_empty() {
+        let lower = prefix.to_ascii_lowercase();
+        labels.retain(|(label, _)| label.to_ascii_lowercase().starts_with(&lower));
+    }
 
     Some(json!(
         labels
@@ -1339,6 +1557,191 @@ fn macro_specifiers(macro_name: &str) -> Option<Value> {
             })
             .collect::<Vec<_>>()
     ))
+}
+
+/// Unreal snippets and common helpers.
+/// Unreal 常用 snippet 和 helper 补全。
+fn should_offer_ue_snippets(prefix: &str) -> bool {
+    let prefix = prefix.trim();
+
+    if prefix.chars().count() < 2 {
+        return false;
+    }
+
+    let lower = prefix.to_ascii_lowercase();
+    let starts_upper = prefix
+        .chars()
+        .next()
+        .map(|ch| ch.is_ascii_uppercase())
+        .unwrap_or(false);
+
+    if starts_upper && matches!(lower.chars().next(), Some('u' | 't' | 'f')) {
+        return true;
+    }
+
+    if lower.starts_with("ue") {
+        return true;
+    }
+
+    if prefix.chars().count() < 3 {
+        return false;
+    }
+
+    [
+        "add", "bin", "cas", "che", "cre", "dec", "def", "ens", "fin", "for", "gen", "get",
+        "imp", "inv", "isv", "loa", "loc", "mak", "mov", "new", "nsl", "sta", "sup", "tex",
+        "ver",
+    ]
+    .iter()
+    .any(|known| lower.starts_with(known))
+}
+
+fn is_in_meta_argument(text_after_open: &str) -> bool {
+    let lower = text_after_open.to_ascii_lowercase();
+    let Some(meta_index) = lower.rfind("meta") else {
+        return false;
+    };
+
+    let after_meta = lower[meta_index + "meta".len()..].trim_start();
+    after_meta.starts_with('=') || after_meta.starts_with('(')
+}
+
+fn macro_specifier_labels(macro_name: &str) -> Option<Vec<(&'static str, &'static str)>> {
+    Some(match macro_name {
+        "UPROPERTY" => vec![
+            ("EditAnywhere", "property specifier"),
+            ("EditDefaultsOnly", "property specifier"),
+            ("EditInstanceOnly", "property specifier"),
+            ("VisibleAnywhere", "property specifier"),
+            ("VisibleDefaultsOnly", "property specifier"),
+            ("VisibleInstanceOnly", "property specifier"),
+            ("BlueprintReadOnly", "property specifier"),
+            ("BlueprintReadWrite", "property specifier"),
+            ("BlueprintAssignable", "property specifier"),
+            ("BlueprintCallable", "property specifier"),
+            ("Config", "property specifier"),
+            ("GlobalConfig", "property specifier"),
+            ("Transient", "property specifier"),
+            ("DuplicateTransient", "property specifier"),
+            ("SaveGame", "property specifier"),
+            ("Instanced", "property specifier"),
+            ("Replicated", "property specifier"),
+            ("ReplicatedUsing", "property specifier"),
+            ("Category", "property key"),
+            ("meta", "metadata key"),
+        ],
+
+        "UFUNCTION" => vec![
+            ("BlueprintCallable", "function specifier"),
+            ("BlueprintPure", "function specifier"),
+            ("BlueprintImplementableEvent", "function specifier"),
+            ("BlueprintNativeEvent", "function specifier"),
+            ("BlueprintAuthorityOnly", "function specifier"),
+            ("BlueprintCosmetic", "function specifier"),
+            ("CallInEditor", "function specifier"),
+            ("Client", "network specifier"),
+            ("Server", "network specifier"),
+            ("NetMulticast", "network specifier"),
+            ("Reliable", "network specifier"),
+            ("Unreliable", "network specifier"),
+            ("Exec", "function specifier"),
+            ("Category", "function key"),
+            ("meta", "metadata key"),
+        ],
+
+        "UCLASS" => vec![
+            ("Blueprintable", "type specifier"),
+            ("BlueprintType", "type specifier"),
+            ("Abstract", "type specifier"),
+            ("NotBlueprintable", "type specifier"),
+            ("Config", "type specifier"),
+            ("DefaultConfig", "type specifier"),
+            ("EditInlineNew", "type specifier"),
+            ("CollapseCategories", "type specifier"),
+            ("HideCategories", "type key"),
+            ("ShowCategories", "type key"),
+            ("ClassGroup", "type key"),
+            ("meta", "metadata key"),
+        ],
+
+        "USTRUCT" => vec![
+            ("BlueprintType", "type specifier"),
+            ("Atomic", "type specifier"),
+            ("NoExport", "type specifier"),
+            ("meta", "metadata key"),
+        ],
+
+        "UENUM" => vec![
+            ("BlueprintType", "enum specifier"),
+            ("ScriptName", "enum key"),
+            ("meta", "metadata key"),
+        ],
+
+        "UPARAM" | "UMETA" => meta_specifier_labels(macro_name)?,
+
+        _ => return None,
+    })
+}
+
+fn meta_specifier_labels(macro_name: &str) -> Option<Vec<(&'static str, &'static str)>> {
+    let common = vec![
+        ("DisplayName", "metadata key"),
+        ("ToolTip", "metadata key"),
+        ("ShortToolTip", "metadata key"),
+        ("DeprecatedFunction", "metadata key"),
+        ("DeprecationMessage", "metadata key"),
+        ("DevelopmentOnly", "metadata key"),
+        ("ScriptName", "metadata key"),
+    ];
+
+    let labels = match macro_name {
+        "UPROPERTY" => vec![
+            ("AllowPrivateAccess", "metadata key"),
+            ("ClampMin", "metadata key"),
+            ("ClampMax", "metadata key"),
+            ("UIMin", "metadata key"),
+            ("UIMax", "metadata key"),
+            ("Units", "metadata key"),
+            ("EditCondition", "metadata key"),
+            ("EditConditionHides", "metadata key"),
+            ("BindWidget", "metadata key"),
+            ("BindWidgetOptional", "metadata key"),
+            ("ExposeOnSpawn", "metadata key"),
+            ("MakeEditWidget", "metadata key"),
+            ("MultiLine", "metadata key"),
+            ("AllowedClasses", "metadata key"),
+            ("DisallowedClasses", "metadata key"),
+        ],
+
+        "UFUNCTION" => vec![
+            ("WorldContext", "metadata key"),
+            ("CallableWithoutWorldContext", "metadata key"),
+            ("DefaultToSelf", "metadata key"),
+            ("HidePin", "metadata key"),
+            ("AdvancedDisplay", "metadata key"),
+            ("AutoCreateRefTerm", "metadata key"),
+            ("DeterminesOutputType", "metadata key"),
+            ("ExpandEnumAsExecs", "metadata key"),
+            ("Latent", "metadata key"),
+            ("LatentInfo", "metadata key"),
+            ("CompactNodeTitle", "metadata key"),
+            ("Keywords", "metadata key"),
+        ],
+
+        "UCLASS" => vec![
+            ("BlueprintSpawnableComponent", "metadata key"),
+            ("ChildCanTick", "metadata key"),
+            ("ChildCannotTick", "metadata key"),
+            ("ShowWorldContextPin", "metadata key"),
+            ("DontUseGenericSpawnObject", "metadata key"),
+        ],
+
+        "USTRUCT" => vec![("HasNativeMake", "metadata key"), ("HasNativeBreak", "metadata key")],
+        "UENUM" | "UMETA" | "UPARAM" => Vec::new(),
+        _ => return None,
+    };
+
+    Some(common.into_iter().chain(labels).collect())
 }
 
 /// Unreal snippets and common helpers.
@@ -1454,8 +1857,9 @@ fn snippet(label: &str, insert_text: &str, detail: &str) -> Value {
         "kind": 15,
         "detail": detail,
         "insertText": insert_text,
+        "insertTextFormat": 2,
         "filterText": label,
-        "sortText": completion_sort_text(200, 15, label),
+        "sortText": completion_sort_text(900, 15, label),
     })
 }
 
@@ -1794,6 +2198,26 @@ fn node_text<'a>(node: Node, content: &'a str) -> &'a str {
     node.utf8_text(content.as_bytes()).unwrap_or("")
 }
 
+/// Convert zero-based line and byte column to a byte offset.
+/// 把 0-based 行号和字节列转换成全文 byte offset。
+fn byte_offset_at(content: &str, line: usize, character: usize) -> Option<usize> {
+    let mut offset = 0usize;
+
+    for (row, text) in content.split_inclusive('\n').enumerate() {
+        if row == line {
+            return Some(offset + character.min(text.len()));
+        }
+
+        offset += text.len();
+    }
+
+    if line == content.lines().count() {
+        Some(content.len())
+    } else {
+        None
+    }
+}
+
 /// Collect node children.
 /// 收集 node 子节点。
 fn node_children(node: Node) -> Vec<Node> {
@@ -1855,20 +2279,324 @@ fn unix_timestamp() -> i64 {
 /// 根据完整路径解析 DB file_id。
 fn get_file_id_by_full_path(conn: &Connection, file_path: &str) -> Option<i64> {
     let normalized = file_path.replace('\\', "/");
-    let path = std::path::Path::new(&normalized);
-    let filename = path.file_name()?.to_str()?;
 
     let sql = r#"
         SELECT f.id
         FROM files f
-        JOIN directories d ON f.directory_id = d.id
+        JOIN dir_paths dp ON f.directory_id = dp.id
         JOIN strings sf ON f.filename_id = sf.id
-        WHERE sf.text = ?
+        WHERE
+            CASE
+                WHEN dp.full_path = '/' THEN '/' || sf.text
+                WHEN substr(dp.full_path, -1) = '/' THEN dp.full_path || sf.text
+                ELSE dp.full_path || '/' || sf.text
+            END = ?
         LIMIT 1
     "#;
 
-    conn.query_row(sql, [filename], |row| row.get::<_, i64>(0))
+    conn.query_row(sql, [&normalized], |row| row.get::<_, i64>(0))
         .optional()
         .ok()
         .flatten()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    const TEST_FILE: &str = "C:/Project/Source/Game/MyActor.cpp";
+
+    fn completion_at(conn: &Connection, source: &str) -> Vec<Value> {
+        let (content, line, character) = source_with_cursor(source);
+        process_completion(
+            conn,
+            &content,
+            line,
+            character,
+            Some(TEST_FILE.to_string()),
+            None,
+            None,
+        )
+        .unwrap()
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+    }
+
+    fn source_with_cursor(source: &str) -> (String, u32, u32) {
+        let marker = "/*cursor*/";
+        let offset = source.find(marker).expect("fixture must contain cursor marker");
+        let content = source.replacen(marker, "", 1);
+        let before = &source[..offset];
+        let line = before.bytes().filter(|byte| *byte == b'\n').count() as u32;
+        let character = before
+            .rsplit_once('\n')
+            .map(|(_, tail)| tail.len())
+            .unwrap_or(before.len()) as u32;
+
+        (content, line, character)
+    }
+
+    fn labels(items: &[Value]) -> Vec<String> {
+        items
+            .iter()
+            .filter_map(|item| item.get("label").and_then(|label| label.as_str()))
+            .map(|label| label.to_string())
+            .collect()
+    }
+
+    fn has_label(items: &[Value], label: &str) -> bool {
+        labels(items).iter().any(|item| item == label)
+    }
+
+    fn test_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let drive = insert_string(&conn, "C:");
+        let project_name = insert_string(&conn, "Project");
+        let source_name = insert_string(&conn, "Source");
+        let game = insert_string(&conn, "Game");
+        let public = insert_string(&conn, "Public");
+        let file_name = insert_string(&conn, "MyActor.cpp");
+        let header_name = insert_string(&conn, "MyActor.h");
+
+        conn.execute(
+            "INSERT INTO directories (parent_id, name_id) VALUES (NULL, ?)",
+            [drive],
+        )
+        .unwrap();
+        let c_dir = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO directories (parent_id, name_id) VALUES (?, ?)",
+            [c_dir, project_name],
+        )
+        .unwrap();
+        let project_dir = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO directories (parent_id, name_id) VALUES (?, ?)",
+            [project_dir, source_name],
+        )
+        .unwrap();
+        let source_dir = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO directories (parent_id, name_id) VALUES (?, ?)",
+            [source_dir, game],
+        )
+        .unwrap();
+        let game_dir = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO directories (parent_id, name_id) VALUES (?, ?)",
+            [game_dir, public],
+        )
+        .unwrap();
+        let public_dir = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO files (directory_id, filename_id, extension, is_header) VALUES (?, ?, 'cpp', 0)",
+            [game_dir, file_name],
+        )
+        .unwrap();
+        let file_id = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO files (directory_id, filename_id, extension, is_header) VALUES (?, ?, 'h', 1)",
+            [public_dir, header_name],
+        )
+        .unwrap();
+
+        let base_id = insert_class(&conn, "UBase", file_id);
+        let actor_id = insert_class(&conn, "AMyActor", file_id);
+        let widget_id = insert_class(&conn, "UMyWidget", file_id);
+
+        insert_inheritance(&conn, actor_id, "UBase", base_id);
+        insert_member(&conn, base_id, "ParentOnly", "function", Some("void"), "public", file_id);
+        insert_member(&conn, actor_id, "LocalAction", "function", Some("void"), "public", file_id);
+        insert_member(&conn, actor_id, "LocalValue", "property", Some("int"), "public", file_id);
+        insert_member(&conn, widget_id, "WidgetAction", "function", Some("void"), "public", file_id);
+
+        conn
+    }
+
+    fn insert_string(conn: &Connection, text: &str) -> i64 {
+        conn.execute("INSERT OR IGNORE INTO strings (text) VALUES (?)", [text])
+            .unwrap();
+        conn.query_row("SELECT id FROM strings WHERE text = ?", [text], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    }
+
+    fn insert_class(conn: &Connection, name: &str, file_id: i64) -> i64 {
+        let name_id = insert_string(conn, name);
+        conn.execute(
+            "INSERT INTO classes (name_id, file_id, line_number, symbol_type) VALUES (?, ?, 1, 'class')",
+            [name_id, file_id],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn insert_inheritance(conn: &Connection, child_id: i64, parent_name: &str, parent_id: i64) {
+        let parent_name_id = insert_string(conn, parent_name);
+        conn.execute(
+            "INSERT INTO inheritance (child_id, parent_name_id, parent_class_id) VALUES (?, ?, ?)",
+            [child_id, parent_name_id, parent_id],
+        )
+        .unwrap();
+    }
+
+    fn insert_member(
+        conn: &Connection,
+        class_id: i64,
+        name: &str,
+        member_type: &str,
+        return_type: Option<&str>,
+        access: &str,
+        file_id: i64,
+    ) {
+        let name_id = insert_string(conn, name);
+        let type_id = insert_string(conn, member_type);
+        let return_type_id = return_type.map(|text| insert_string(conn, text));
+
+        conn.execute(
+            "INSERT INTO members
+             (class_id, name_id, type_id, access, return_type_id, line_number, file_id)
+             VALUES (?, ?, ?, ?, ?, 1, ?)",
+            rusqlite::params![class_id, name_id, type_id, access, return_type_id, file_id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn member_completion_returns_members_without_snippets() {
+        let conn = test_db();
+        let items = completion_at(
+            &conn,
+            r#"
+class AMyActor {
+public:
+    void Test() {
+        this->/*cursor*/
+    }
+};
+"#,
+        );
+
+        assert!(has_label(&items, "LocalAction"));
+        assert!(has_label(&items, "LocalValue"));
+        assert!(has_label(&items, "ParentOnly"));
+        assert!(!has_label(&items, "UPROPERTY"));
+        assert!(!has_label(&items, "Cast"));
+    }
+
+    #[test]
+    fn macro_completion_filters_specifiers_by_prefix() {
+        let conn = test_db();
+        let items = completion_at(
+            &conn,
+            r#"
+UCLASS(Blue/*cursor*/)
+class AMyActor {};
+"#,
+        );
+
+        assert!(has_label(&items, "Blueprintable"));
+        assert!(has_label(&items, "BlueprintType"));
+        assert!(!has_label(&items, "Abstract"));
+        assert!(!has_label(&items, "UCLASS"));
+    }
+
+    #[test]
+    fn plain_lowercase_prefix_does_not_offer_ue_snippets() {
+        let conn = test_db();
+        let items = completion_at(
+            &conn,
+            r#"
+void Test() {
+    in/*cursor*/
+}
+"#,
+        );
+
+        assert!(!has_label(&items, "INVTEXT"));
+        assert!(!has_label(&items, "IMPLEMENT_MODULE"));
+        assert!(!has_label(&items, "UPROPERTY"));
+    }
+
+    #[test]
+    fn unreal_like_prefix_offers_snippets() {
+        let conn = test_db();
+        let items = completion_at(
+            &conn,
+            r#"
+void Test() {
+    UPR/*cursor*/
+}
+"#,
+        );
+
+        assert!(has_label(&items, "UPROPERTY"));
+        let property = items
+            .iter()
+            .find(|item| item.get("label").and_then(|label| label.as_str()) == Some("UPROPERTY"))
+            .unwrap();
+        assert_eq!(
+            property
+                .get("insertTextFormat")
+                .and_then(|value| value.as_i64()),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn include_context_returns_header_paths() {
+        let conn = test_db();
+        let items = completion_at(
+            &conn,
+            r#"
+#include "My/*cursor*/"
+"#,
+        );
+
+        assert!(has_label(&items, "MyActor.h"));
+        assert!(!has_label(&items, "UPROPERTY"));
+    }
+
+    #[test]
+    fn meta_context_returns_metadata_keys() {
+        let conn = test_db();
+        let items = completion_at(
+            &conn,
+            r#"
+UPROPERTY(meta=(Allow/*cursor*/))
+int32 Value;
+"#,
+        );
+
+        assert!(has_label(&items, "AllowPrivateAccess"));
+        assert!(!has_label(&items, "EditAnywhere"));
+    }
+
+    #[test]
+    fn auto_cast_initializer_drives_member_completion() {
+        let conn = test_db();
+        let items = completion_at(
+            &conn,
+            r#"
+void Test(UObject* Object) {
+    auto Widget = Cast<UMyWidget>(Object);
+    Widget->/*cursor*/
+}
+"#,
+        );
+
+        assert!(has_label(&items, "WidgetAction"));
+        assert!(!has_label(&items, "LocalAction"));
+    }
 }
