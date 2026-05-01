@@ -504,8 +504,7 @@ function M.smart_entry()
 	-- causes false positives when another buffer is in a project but the
 	-- current buffer is not.
 	-- 只用当前 buffer 判断。扫描所有 buffer 会导致当前不在项目中时误判。
-	local buf_path = vim.api.nvim_buf_get_name(0)
-	local root = buf_path ~= "" and project.find_project_root(buf_path) or nil
+	local root = project.find_project_root()
 	if not root then
 		local items = project.list_registered_projects()
 		ui.select.projects(items, function(item)
@@ -1162,8 +1161,9 @@ end
 -- Print pending P4 changelists.
 -- 打印 P4 pending changelist 简表。
 function M.pending_changelists()
-  local root = project.find_project_root()
-  if not root then
+	local buf_path = vim.api.nvim_buf_get_name(0)
+	local root = buf_path ~= "" and project.find_project_root(buf_path) or nil
+	if not root then
     return vim.notify("Could not find .uproject", vim.log.levels.ERROR)
   end
   local provider = vcs.detect(root)
