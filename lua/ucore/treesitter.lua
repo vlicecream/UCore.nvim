@@ -230,6 +230,7 @@ local function install_with_retry(remaining)
 	status_progress("installing unreal_cpp parser")
 
 	pcall(vim.cmd, "TSInstallSync " .. parser_name)
+	pcall(vim.cmd, "TSInstallSync cpp")
 
 	if parser_installed() or any_pending_can_attach() then
 		installing = false
