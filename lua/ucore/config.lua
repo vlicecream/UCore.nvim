@@ -185,18 +185,6 @@ M.values = {
 		debounce_ms = 180,
 	},
 
-	-- Tree-sitter parser auto-install and activation options.
-	-- Treesitter parser 自动安装与激活配置。
-	treesitter = {
-		-- Auto-install unreal_cpp when first opening an Unreal file.
-		-- 首次打开 Unreal 文件时自动安装 unreal_cpp parser。
-		auto_install = true,
-
-		-- Auto-start treesitter highlighting on unreal_cpp buffers.
-		-- 自动对 unreal_cpp buffer 启动 treesitter 高亮。
-		auto_start = true,
-	},
-
 	-- Build diagnostics and quickfix options.
 	-- 构建诊断与 quickfix 配置。
 	build = {

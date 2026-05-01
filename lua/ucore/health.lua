@@ -339,54 +339,20 @@ local function report_completion_checks()
 end
 
 local function report_treesitter_checks()
-	start("UCore Treesitter")
+	start("Unreal C++ highlighting")
 
-	local ok_parsers, parsers = pcall(require, "nvim-treesitter.parsers")
-	if not ok_parsers then
-		warn("nvim-treesitter.parsers cannot be required", {
-			"Install nvim-treesitter if you want Unreal C++ highlighting.",
-		})
-		return
-	end
-
-	local configs = type(parsers.get_parser_configs) == "function" and parsers.get_parser_configs() or parsers
-	if configs and configs.unreal_cpp then
-		ok("unreal_cpp parser config registered")
+	if has_module("utreesitter") then
+		ok("UTreeSitter.nvim available")
+		info("Highlighting is managed by UTreeSitter.nvim; run :checkhealth utreesitter for parser/query diagnostics.")
 	else
-		warn("unreal_cpp parser config is not registered", {
-			"Call require('ucore.treesitter').setup() before nvim-treesitter setup.",
+		warn("UTreeSitter.nvim is not available", {
+			"Install vlicecream/UTreeSitter.nvim for Unreal C++ tree-sitter highlighting.",
+			"UCore.nvim does not register parsers or manage highlight activation.",
 		})
 	end
 
 	local buffer = vim.api.nvim_get_current_buf()
-	local filetype = vim.bo[buffer].filetype
-	info("current buffer filetype: " .. tostring(filetype))
-
-	-- Try to attach on any real unreal_cpp buffer in the session.
-	-- 尝试在当前会话中找到真实 unreal_cpp buffer 并 attach。
-	local found_unreal_buf
-	for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
-		if vim.bo[bufnr].filetype == "unreal_cpp" and vim.api.nvim_buf_get_name(bufnr) ~= "" then
-			found_unreal_buf = bufnr
-			break
-		end
-	end
-
-	if found_unreal_buf then
-		local ok_parser, parser_or_err = pcall(vim.treesitter.get_parser, found_unreal_buf, "unreal_cpp")
-		if ok_parser and parser_or_err then
-			ok("unreal_cpp parser can attach to buffer " .. found_unreal_buf)
-		else
-			warn("unreal_cpp parser binary may be missing or outdated", {
-				"Run :TSInstallSync unreal_cpp to install or update the parser.",
-				"Error: " .. tostring(parser_or_err),
-			})
-		end
-	else
-		info("Open a file inside an Unreal project to validate tree-sitter attach.", {
-			"Without an unreal_cpp buffer, attach cannot be tested.",
-		})
-	end
+	info("current buffer filetype: " .. tostring(vim.bo[buffer].filetype))
 end
 
 local function report_vcs_checks()
