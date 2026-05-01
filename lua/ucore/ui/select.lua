@@ -560,8 +560,8 @@ local function pick_telescope_references(references)
 						text = context,
 					}
 				end,
-			}),
-			previewer = conf.grep_previewer({}),
+		}),
+			previewer = false,
 			sorter = conf.generic_sorter({}),
 			attach_mappings = function(prompt_bufnr)
 				actions.select_default:replace(function()
@@ -668,7 +668,7 @@ end
 		})
 		:find()
 
-	vim.notify("UCore find: picker opened, #items=" .. #base, vim.log.levels.INFO)
+	vim.notify("UCore find: picker created, items=" .. #items, vim.log.levels.INFO)
 end
 
 -- Open a generic selection UI with a label formatter.
