@@ -113,4 +113,19 @@ if ($exit_code -ne 0) {
 }
 
 Remove-Item -LiteralPath $log_path -ErrorAction SilentlyContinue
+
+# Restart server after successful build so Neovim auto-reconnects.
+# 构建成功后重启 server，让 Neovim 自动重连。
+if ($exit_code -eq 0) {
+  $server_exe = Join-Path $plugin_root "u-scanner\target\release\u_core_server.exe"
+  if (Test-Path $server_exe) {
+    $registry = Join-Path $env:LOCALAPPDATA "nvim-data\ucore\server-registry.json"
+    if (Test-Path $registry) {
+      Write-Host "UCore build: restarting server..."
+      Start-Process -WindowStyle Hidden -FilePath $server_exe -ArgumentList "30110", $registry
+      Start-Sleep -Milliseconds 500
+    }
+  }
+}
+
 exit $exit_code
