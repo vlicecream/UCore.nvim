@@ -497,19 +497,12 @@ local function dashboard_format(item)
 	)
 end
 
--- Smart entry: boot new project, pick registered, or open Dashboard.
--- 三段式智能入口：新项目 boot，有注册项目选择，已注册项目打开 Dashboard。
+-- Smart entry: pick project if outside, register+boot if unregistered, Dashboard if ready.
+-- 智能入口：不在项目中选择，未注册则注册+boot，已注册则打开 Dashboard。
 function M.smart_entry()
 	local root = project.find_project_root_from_context()
 	if not root then
 		local items = project.list_registered_projects()
-		if vim.tbl_isempty(items) then
-			vim.notify(
-				"Not inside an Unreal project.\nOpen a .uproject file and run :UCore boot first.",
-				vim.log.levels.WARN
-			)
-			return
-		end
 		ui.select.projects(items, function(item)
 			if not item then
 				return
