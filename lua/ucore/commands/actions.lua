@@ -1006,9 +1006,8 @@ function M.find(pattern)
 			return
 		end
 
-		if vim.tbl_isempty(items) then
-			local msg = not vim.tbl_isempty(errors) and table.concat(errors, "\n") or "No results found"
-			return vim.notify("UCore find: " .. msg, vim.log.levels.INFO)
+		if vim.tbl_isempty(items) and not vim.tbl_isempty(errors) then
+			return vim.notify("UCore find failed:\n" .. table.concat(errors, "\n"), vim.log.levels.ERROR)
 		end
 
 		find_cache = {
