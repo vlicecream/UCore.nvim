@@ -960,6 +960,20 @@ fn goto_definition_inner(
         ctx.enclosing_class
     );
 
+    // For implementation mode, skip class-scoped lookups (step 1-2) and type
+    // lookup (step 3). .cpp impl-class members live under a different class_id
+    // than .h declarations, so searching by class_id misses them. Go directly
+    // to global member search (step 4) which hits access='impl' entries.
+    // 实现模式：跳过 class 域搜索（1-2）和类型搜索（3）。
+    // .cpp 的 impl-class member 挂在不同 class_id 下，按 class_id 搜不到。
+    // 直接走全局成员搜索（4）命中 access='impl' 的条目。
+    if prefer_impl {
+        if let Some(result) = find_member_anywhere(conn, &ctx.symbol, true)? {
+            return Ok(result);
+        }
+        return Ok(Value::Null);
+    }
+
     // 1. If there is an explicit qualifier, resolve through that first.
     // 1. 如果存在显式修饰对象，优先通过它解析。
     if let Some(ref qualifier) = ctx.qualifier {
@@ -985,7 +999,7 @@ fn goto_definition_inner(
         };
 
         if let Some(result) =
-            find_symbol_in_inheritance_chain_inner(conn, &resolved_class, &ctx.symbol, prefer_impl)?
+            find_symbol_in_inheritance_chain(conn, &resolved_class, &ctx.symbol)?
         {
             return Ok(result);
         }
@@ -995,23 +1009,21 @@ fn goto_definition_inner(
     // 2. 尝试从当前所在类里查成员。
     if let Some(ref enclosing_class) = ctx.enclosing_class {
         if let Some(result) =
-            find_symbol_in_inheritance_chain_inner(conn, enclosing_class, &ctx.symbol, prefer_impl)?
+            find_symbol_in_inheritance_chain(conn, enclosing_class, &ctx.symbol)?
         {
             return Ok(result);
         }
     }
 
-    // 3. Try type definition lookup (only for definition mode).
-    // 3. 尝试按类型定义查找（仅定义模式）。
-    if !prefer_impl {
-        if let Some(result) = find_type_definition(conn, &ctx.symbol)? {
-            return Ok(result);
-        }
+    // 3. Try type definition lookup.
+    // 3. 尝试按类型定义查找。
+    if let Some(result) = find_type_definition(conn, &ctx.symbol)? {
+        return Ok(result);
     }
 
     // 4. Final fallback: member search across the whole project.
     // 4. 最终兜底：全工程成员名搜索。
-    if let Some(result) = find_member_anywhere(conn, &ctx.symbol, prefer_impl)? {
+    if let Some(result) = find_member_anywhere(conn, &ctx.symbol, false)? {
         return Ok(result);
     }
 
