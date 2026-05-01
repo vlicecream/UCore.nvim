@@ -674,23 +674,19 @@ local function pick_telescope_find(items, default_text)
 		:find()
 end
 
-	vim.notify(string.format("UCore telescope find: %d items", #items), vim.log.levels.INFO)
-
-	local ok, result_or_err = pcall(function()
-	vim.notify(string.format("UCore find picker: opening with %d items", #base), vim.log.levels.INFO)
-
 	pickers
 		.new({}, {
 			prompt_title = "UCore find",
 			default_text = default_text,
 			finder = finders.new_table({
-				results = items,
+				results = base,
 				entry_maker = function(item)
 					if item.type == "empty" then
+						local all_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
 						return {
 							value = item,
 							display = "   No results found — try a different search term",
-							ordinal = "zzz_no_results",
+							ordinal = string.rep(all_chars, 3),
 							filename = "",
 							path = "",
 							lnum = 1,
