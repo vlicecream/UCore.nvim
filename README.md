@@ -96,9 +96,12 @@ return {
       opts = opts or {}
       opts.auto_install = true
       opts.ensure_installed = opts.ensure_installed or {}
+      opts.indent = { enable = true }
+
       if not vim.tbl_contains(opts.ensure_installed, "unreal_cpp") then
         table.insert(opts.ensure_installed, "unreal_cpp")
       end
+
       return opts
     end,
   },
@@ -421,9 +424,12 @@ return {
       opts = opts or {}
       opts.auto_install = true
       opts.ensure_installed = opts.ensure_installed or {}
+      opts.indent = { enable = true }
+
       if not vim.tbl_contains(opts.ensure_installed, "unreal_cpp") then
         table.insert(opts.ensure_installed, "unreal_cpp")
       end
+
       return opts
     end,
   },
