@@ -591,18 +591,92 @@ local function pick_telescope_find(items, default_text)
 
 	items = prepare_find_items(items)
 
-	-- Ensure at least one result so Telescope doesn't crash setting
-	-- cursor on an empty results buffer.
-	-- 保证至少一条结果，避免 Telescope 在空结果上设光标崩溃。
-	if #items == 0 then
-		table.insert(items, {
+	local base = items
+	if #base == 0 then
+		base = {{
 			name = "No results found",
 			type = "empty",
 			source = "",
-		})
+		}}
 	end
 
 	pickers
+		.new({}, {
+			prompt_title = "UCore find",
+			default_text = default_text,
+			finder = finders.new_table({
+				results = base,
+				entry_maker = function(item)
+					if item.type == "empty" then
+						local all_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+						return {
+							value = item,
+							display = "   No results found — try a different search term",
+							ordinal = string.rep(all_chars, 3),
+							filename = "",
+							path = "",
+							lnum = 1,
+							col = 1,
+							text = "No results found",
+						}
+					end
+
+					local name = tostring(item.name or item.symbol_name or "<unknown>")
+					local kind = normalize_kind(item.symbol_type or item.type)
+					local source = normalize_source(item.source)
+					local path = tostring(item.path or item.file_path or item.asset_path or "")
+					local line = tonumber(item.line or item.line_number or 1) or 1
+					local label = find_category_label(item)
+					local group = find_group(item)
+					local source_label = source ~= "" and source or "index"
+					local location = find_display_location(item, path, line)
+					local display = string.format(
+						"%s  %s  %s  %s  %s",
+						pad_right(group, 7),
+						pad_right(label, 9),
+						pad_right(truncate_left(name, 34), 34),
+						pad_right(source_label, 7),
+						location
+					)
+
+					return {
+						value = item,
+						display = display,
+						ordinal = find_search_text(item, name, kind, label, path),
+						filename = path,
+						path = path,
+						lnum = line,
+						col = 1,
+						text = name,
+					}
+				end,
+			}),
+			previewer = previewers.new_buffer_previewer({
+				define_preview = function(self, entry)
+					preview_find_item(entry, self.state.bufnr)
+				end,
+			}),
+			sorter = conf.generic_sorter({}),
+			attach_mappings = function(prompt_bufnr)
+				actions.select_default:replace(function()
+					local selection = action_state.get_selected_entry()
+					actions.close(prompt_bufnr)
+
+					if selection and selection.value then
+						open_source_item(selection.value)
+					end
+				end)
+
+				return true
+			end,
+		})
+		:find()
+end
+
+	vim.notify(string.format("UCore telescope find: %d items", #items), vim.log.levels.INFO)
+
+	local ok, result_or_err = pcall(function()
+		pickers
 		.new({}, {
 			prompt_title = "UCore find",
 			default_text = default_text,
