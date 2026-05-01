@@ -101,6 +101,9 @@ return {
       if not vim.tbl_contains(opts.ensure_installed, "unreal_cpp") then
         table.insert(opts.ensure_installed, "unreal_cpp")
       end
+      if not vim.tbl_contains(opts.ensure_installed, "cpp") then
+        table.insert(opts.ensure_installed, "cpp")
+      end
 
       return opts
     end,
@@ -428,6 +431,9 @@ return {
 
       if not vim.tbl_contains(opts.ensure_installed, "unreal_cpp") then
         table.insert(opts.ensure_installed, "unreal_cpp")
+      end
+      if not vim.tbl_contains(opts.ensure_installed, "cpp") then
+        table.insert(opts.ensure_installed, "cpp")
       end
 
       return opts

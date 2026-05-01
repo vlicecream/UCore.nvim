@@ -20,6 +20,20 @@ function M.setup()
 	local Rule = require("nvim-autopairs.rule")
 	local cond = require("nvim-autopairs.conds")
 
+	-- {} multiline expansion with correct indentation.
+	-- {} 回车展开 + 正确缩进。
+	local RuleN = require("nvim-autopairs.rule")
+	local cond = require("nvim-autopairs.conds")
+
+	npairs.add_rules({
+		RuleN("(", ")", { "cpp", "unreal_cpp" })
+			:with_cr(cond.done())
+			:with_indent(cond.done()),
+		RuleN("{", "}", { "cpp", "unreal_cpp" })
+			:with_cr(cond.done())
+			:with_indent(cond.done()),
+	})
+
 	-- UE macro auto-complete: UFUNCTION( → UFUNCTION()
 	-- UE 宏自动补全：UFUNCTION( → UFUNCTION()
 	npairs.add_rules({
