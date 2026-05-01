@@ -303,16 +303,6 @@ function M.setup()
 	vim.defer_fn(register_parser, 100)
 	vim.defer_fn(register_parser, 500)
 
-	-- Enable nvim-treesitter highlight for unreal_cpp.
-	-- 确保 unreal_cpp 启用 treesitter 高亮。
-	pcall(function()
-		local configs = require("nvim-treesitter.configs")
-		configs.setup({
-			highlight = { enable = true },
-			indent = { enable = true },
-		})
-	end)
-
 	apply_highlight_links()
 	vim.api.nvim_create_autocmd("ColorScheme", {
 		group = vim.api.nvim_create_augroup("UCoreUnrealHighlights", { clear = true }),
