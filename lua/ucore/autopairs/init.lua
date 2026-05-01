@@ -15,6 +15,8 @@ function M.setup()
 	npairs.setup({
 		enable_check_bracket_line = false,
 		fast_wrap = {},
+		map_cr = config.values.autopairs.map_cr ~= false,
+		check_ts = config.values.autopairs.check_ts ~= false,
 	})
 
 	local Rule = require("nvim-autopairs.rule")
@@ -22,14 +24,11 @@ function M.setup()
 
 	-- {} multiline expansion with correct indentation.
 	-- {} 回车展开 + 正确缩进。
-	local RuleN = require("nvim-autopairs.rule")
-	local cond = require("nvim-autopairs.conds")
-
 	npairs.add_rules({
-		RuleN("(", ")", { "cpp", "unreal_cpp" })
+		Rule("(", ")", { "cpp", "unreal_cpp" })
 			:with_cr(cond.done())
 			:with_indent(cond.done()),
-		RuleN("{", "}", { "cpp", "unreal_cpp" })
+		Rule("{", "}", { "cpp", "unreal_cpp" })
 			:with_cr(cond.done())
 			:with_indent(cond.done()),
 	})

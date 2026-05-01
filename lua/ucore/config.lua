@@ -235,6 +235,14 @@ M.values = {
 		-- Enable nvim-autopairs integration. Disable if using your own config.
 		-- 启用 nvim-autopairs 集成。若自行配置，可关闭。
 		enable = true,
+
+		-- Let nvim-autopairs handle <CR> inside pairs such as {|}.
+		-- 允许 nvim-autopairs 处理 {|} 中的回车展开。
+		map_cr = true,
+
+		-- Use treesitter context checks when available.
+		-- parser 可用时使用 treesitter 上下文检查。
+		check_ts = true,
 	},
 
 	-- Semantic highlight overlay powered by the UCore index.
