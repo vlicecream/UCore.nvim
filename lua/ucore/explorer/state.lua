@@ -18,7 +18,7 @@ M.counts = {
 }
 
 function M.tabs()
-	return (config.values.explorer and config.values.explorer.tabs) or { "Project", "Source", "Config", "VCS" }
+	return (config.values.explorer and config.values.explorer.tabs) or { "Project", "Source", "Config" }
 end
 
 function M.is_valid_win()

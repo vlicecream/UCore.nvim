@@ -3,21 +3,15 @@ local config = require("ucore.config")
 
 local M = {}
 
--- Convert subcommands to lowercase for case-insensitive dispatch.
--- 把子命令转成小写，从而支持大小写不敏感。
 local function normalize_subcommand(args)
 	local sub = (args.args or ""):match("^%s*(%S+)")
 	return sub and sub:lower() or "smart_entry"
 end
 
--- Return the rest of the command line after the subcommand.
--- 返回子命令后面的剩余参数。
 local function command_tail(args)
 	return (args.args or ""):match("^%s*%S+%s*(.-)%s*$") or ""
 end
 
--- Return the first token and remaining tail from a command fragment.
--- 从命令片段中取出第一个 token 和剩余参数。
 local function split_first(text)
 	local head, tail = (text or ""):match("^%s*(%S*)%s*(.-)%s*$")
 	if head == "" then
@@ -27,8 +21,6 @@ local function split_first(text)
 	return head:lower(), tail or ""
 end
 
--- Dispatch debug-only subcommands.
--- 分发仅用于调试的子命令。
 local function dispatch_debug(tail)
 	local sub, rest = split_first(tail)
 
@@ -42,8 +34,6 @@ local function dispatch_debug(tail)
 		projects = actions.projects,
 		modules = actions.modules,
 		assets = actions.assets,
-		["p4-changes"] = actions.pending_changelists,
-		p4changes = actions.pending_changelists,
 		["search-symbols"] = function()
 			actions.search_symbols(rest)
 		end,
@@ -63,7 +53,6 @@ local function dispatch_debug(tail)
 		help = actions.debug_help,
 		complete = actions.complete,
 		["goto"] = actions.goto_definition,
-		vcs = actions.vcs_debug,
 	}
 
 	local handler = handlers[sub]
@@ -76,58 +65,49 @@ local function dispatch_debug(tail)
 end
 
 function M.dispatch(args)
-  local sub = normalize_subcommand(args)
-  local tail = command_tail(args)
+	local sub = normalize_subcommand(args)
+	local tail = command_tail(args)
 
-  local handlers = {
-    smart_entry = actions.smart_entry,
-    dashboard = actions.dashboard,
-    boot = actions.boot,
-    build = function()
-      actions.build(tail)
-    end,
-    ["build-cancel"] = actions.build_cancel,
-    buildcancel = actions.build_cancel,
-    editor = function()
-      actions.editor(tail)
-    end,
+	local handlers = {
+		smart_entry = actions.smart_entry,
+		dashboard = actions.dashboard,
+		boot = actions.boot,
+		build = function()
+			actions.build(tail)
+		end,
+		["build-cancel"] = actions.build_cancel,
+		buildcancel = actions.build_cancel,
+		editor = function()
+			actions.editor(tail)
+		end,
 		explorer = actions.explorer,
 		tree = actions.explorer,
 		files = actions.explorer,
-    globalfind = function()
-      actions.global_find(tail)
-    end,
+		globalfind = function()
+			actions.global_find(tail)
+		end,
 		diagnostics = function()
 			require("ucore.diagnostics").dispatch(tail)
 		end,
-    ["goto"] = function()
-      actions.goto(tail)
-    end,
-    checkout = actions.checkout,
-    commit = actions.commit,
-		vcs = function()
-			actions.vcs_dispatch(tail)
+		["goto"] = function()
+			actions.goto(tail)
 		end,
 		debug = function()
 			dispatch_debug(tail)
 		end,
 		help = actions.help,
-  }
+	}
 
-  local handler = handlers[sub]
-  if not handler then
-    vim.notify("Unknown UCore command: " .. sub, vim.log.levels.ERROR)
-    return actions.help()
-  end
+	local handler = handlers[sub]
+	if not handler then
+		vim.notify("Unknown UCore command: " .. sub, vim.log.levels.ERROR)
+		return actions.help()
+	end
 
-  handler()
+	handler()
 end
 
--- Register a single user command with subcommands.
--- 注册一个带子命令的用户命令。
 function M.register()
-	-- Provide a simple manual insert-mode completion mapping.
-	-- 提供一个简单的插入模式手动补全快捷键。
 	local function complete()
 		require("ucore.completion").complete()
 	end
@@ -136,8 +116,6 @@ function M.register()
 	local keymap = completion_config.keymap
 
 	if completion_config.enable ~= false and keymap and keymap ~= "" then
-		-- Manual completion mapping, configurable by users.
-		-- 用户可配置的手动补全快捷键。
 		vim.keymap.set("i", keymap, complete, {
 			desc = "UCore complete",
 		})
@@ -150,10 +128,6 @@ function M.register()
 				"boot",
 				"build",
 				"build-cancel",
-				"vcs",
-				"changelists",
-				"checkout",
-				"commit",
 				"editor",
 				"explorer",
 				"tree",
@@ -163,13 +137,6 @@ function M.register()
 				"goto",
 				"debug",
 				"help",
-			}
-
-			local vcs_items = {
-				"dashboard",
-				"checkout",
-				"commit",
-				"login",
 			}
 
 			local diagnostics_items = {
@@ -189,7 +156,6 @@ function M.register()
 				"projects",
 				"modules",
 				"assets",
-				"p4-changes",
 				"search-symbols",
 				"status",
 				"rpc-status",
@@ -201,7 +167,6 @@ function M.register()
 				"maps",
 				"complete",
 				"goto",
-				"vcs",
 				"help",
 			}
 
@@ -214,69 +179,16 @@ function M.register()
 				"help",
 			}
 
-			local goto_items = {
-				"local",
-				"global",
-				"declaration",
-				"implementation",
-				"references",
-				"help",
-			}
-
-			local vcs_items = {
-				"dashboard",
-				"checkout",
-				"commit",
-				"login",
-			}
-
-			local diagnostics_items = {
-				"refresh",
-				"clear",
-				"fix",
-				"qflist",
-				"toggle",
-			}
-
-			local debug_items = {
-				"logs",
-				"engine",
-				"engine-refresh",
-				"open",
-				"register",
-				"projects",
-				"modules",
-				"assets",
-				"p4-changes",
-				"search-symbols",
-				"status",
-				"rpc-status",
-				"setup",
-				"refresh",
-				"start",
-				"stop",
-				"restart",
-				"maps",
-				"complete",
-				"goto",
-				"references",
-				"vcs",
-				"help",
-			}
-
 			local line = cmdline or ""
 			local before_cursor = line:sub(1, (cursorpos or (#line + 1)) - 1)
 			local tail = before_cursor:match("^%s*UCore%s*(.-)%s*$") or ""
 			local first = tail:match("^(%S+)")
 			local in_debug = first and first:lower() == "debug"
-			local in_vcs = first and first:lower() == "vcs"
 			local in_goto = first and first:lower() == "goto"
 
 			local items
 			if in_debug then
 				items = debug_items
-			elseif in_vcs then
-				items = vcs_items
 			elseif in_goto then
 				items = goto_items
 			elseif first and first:lower() == "diagnostics" then
@@ -288,10 +200,6 @@ function M.register()
 			local needle = (arglead or ""):lower()
 
 			if in_debug and (tail:lower() == "debug" or tail:lower():match("^debug%s*$")) then
-				needle = ""
-			end
-
-			if in_vcs and (tail:lower() == "vcs" or tail:lower():match("^vcs%s*$")) then
 				needle = ""
 			end
 

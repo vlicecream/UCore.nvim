@@ -11,7 +11,6 @@ local providers = {
 	Project = "ucore.explorer.providers.project",
 	Source = "ucore.explorer.providers.source",
 	Config = "ucore.explorer.providers.config",
-	VCS = "ucore.explorer.providers.vcs",
 }
 
 local function explorer_config()

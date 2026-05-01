@@ -144,13 +144,13 @@ M.values = {
 		},
 	},
 
-	-- Left-side project/source/config/VCS explorer.
-	-- 左侧 Project/Source/Config/VCS 目录浏览器。
+	-- Left-side project/source/config explorer.
+	-- 左侧 Project/Source/Config 目录浏览器。
 	explorer = {
 		width = 36,
 		min_width = 28,
 		max_width = 56,
-		tabs = { "Project", "Source", "Config", "VCS" },
+		tabs = { "Project", "Source", "Config" },
 		default_tab = "Project",
 		auto_open = true,
 		auto_focus = false,
@@ -264,43 +264,6 @@ M.values = {
 		-- Debounce delay for buffer semantic refresh.
 		-- buffer 语义高亮刷新的防抖延迟。
 		debounce_ms = 120,
-	},
-
-	-- VCS integration options.
-	-- 版本控制系统（VCS）集成配置。
-	vcs = {
-		-- Enable VCS features: detect, status, checkout, readonly prompt.
-		-- 是否启用 VCS 功能：检测、状态、checkout、只读保存提示。
-		enable = true,
-
-		-- Show a prompt when saving a read-only P4 file.
-		-- 保存 P4 只读文件时是否弹出确认对话框。
-		prompt_on_readonly_save = true,
-
-		-- VCS provider: "auto" for auto-detect (currently P4-only).
-		-- VCS 提供者："auto" 自动检测（当前仅支持 P4）。
-		provider = "auto",
-
-		-- P4-specific options.
-		-- P4 专有选项。
-		p4 = {
-			-- Path to the p4 executable.
-			-- p4 可执行文件路径。
-			command = "p4",
-
-			-- nil means use the normal P4 environment:
-			-- P4PORT, P4USER, P4CLIENT, P4CONFIG, P4PASSWD, etc.
-			-- 默认 nil 表示使用 P4 标准环境变量。
-			env = nil,
-
-			-- Optional explicit overrides. Only applied when set.
-			-- 可选显式覆盖。仅在设置时生效。
-			port = nil,
-			user = nil,
-			client = nil,
-			charset = nil,
-			config = nil,
-		},
 	},
 
 	-- Development mode: call Cargo directly so code changes are picked up.
