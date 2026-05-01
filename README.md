@@ -18,6 +18,7 @@ UCore.nvim is a Neovim plugin for Unreal Engine C++ development. It uses a Rust 
 - **One-command boot**: `:UCore` starts the server and indexes your project automatically
 - **Unreal Editor integration**: `:UCore build` builds with live log streaming; `:UCore editor` launches the editor
 - **High-performance Rust index**: SQLite-backed database with tree-sitter C++ parsing for fast symbol lookup across large projects
+- **Auto-pairs**: nvim-autopairs integration with UE-macro-aware rules (UFUNCTION, UPROPERTY)
 - **blink.cmp completion source**: Context-aware Unreal-aware completions
 - **Unreal C++ Tree-sitter parser**: Automatic registration, installation, and highlighting
 - **VCS Dashboard**: Perforce integration with pending changelists, checkout, commit
@@ -46,6 +47,11 @@ return {
     lazy = false,
     build = "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1",
     dependencies = {
+      {
+        "windwp/nvim-autopairs",
+        event = "InsertEnter",
+        opts = {},
+      },
       {
         "saghen/blink.cmp",
         opts = function(_, opts)
@@ -366,6 +372,11 @@ return {
     lazy = false,
     build = "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1",
     dependencies = {
+      {
+        "windwp/nvim-autopairs",
+        event = "InsertEnter",
+        opts = {},
+      },
       {
         "saghen/blink.cmp",
         opts = function(_, opts)

@@ -241,6 +241,14 @@ M.values = {
 		debounce_ms = 300,
 	},
 
+	-- Auto-pairs integration via nvim-autopairs.
+	-- nvim-autopairs 自动配对集成。
+	autopairs = {
+		-- Enable nvim-autopairs integration. Disable if using your own config.
+		-- 启用 nvim-autopairs 集成。若自行配置，可关闭。
+		enable = true,
+	},
+
 	-- Semantic highlight overlay powered by the UCore index.
 	-- 基于 UCore 索引的语义高亮覆盖层。
 	semantic = {

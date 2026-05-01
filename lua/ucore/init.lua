@@ -16,6 +16,9 @@ function M.setup(opts)
 	pcall(function()
 		require("ucore.vcs").setup()
 	end)
+	pcall(function()
+		require("ucore.autopairs").setup()
+	end)
 end
 
 return M
