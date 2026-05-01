@@ -1,6 +1,6 @@
 # UCore.nvim
 
-Unreal Engine Neovim Library
+Unreal Engine project index and workflow companion for Neovim.
 
 [English](#english) | [中文](#中文)
 
@@ -8,41 +8,87 @@ Unreal Engine Neovim Library
 
 ## English
 
-UCore.nvim is a Neovim plugin for Unreal Engine C++ development. It uses a Rust backend (`u_scanner` + `u_core_server`) to index source files, modules, assets, config, symbols, and references — then exposes everything through Neovim commands, keymaps, pickers, and completion sources.
+`UCore.nvim` is the project/index layer in the U-series stack.
 
-> Status: actively developed. Core workflows are stable.
+It focuses on:
+
+- Unreal project boot and registry
+- Rust-backed indexing for symbols, modules, assets, and config
+- definition / declaration / implementation / references navigation
+- build + Unreal Editor launch
+- project explorer, global search, completion, diagnostics, semantic overlay
+
+It does **not** own syntax highlighting or VCS anymore:
+
+- highlighting lives in [`UTreeSitter.nvim`](https://github.com/vlicecream/UTreeSitter.nvim)
+- version control lives in [`UVersionControlSystem.nvim`](https://github.com/vlicecream/UVersionControlSystem.nvim)
 
 ### Features
 
-- **Smart Navigation**: `gd` (definition), `gD` (declaration), `gi` (implementation), `gr` (references), `gs` (source/header toggle), `gf` (global fuzzy find)
-- **One-command boot**: `:UCore` starts the server and indexes your project automatically
-- **Unreal Editor integration**: `:UCore build` builds with live log streaming; `:UCore editor` launches the editor
-- **High-performance Rust index**: SQLite-backed database with tree-sitter C++ parsing for fast symbol lookup across large projects
-- **Editing support**: Unreal C++ indentation plus nvim-autopairs integration for `{}` newlines and UE macro rules
-- **blink.cmp completion source**: Context-aware Unreal-aware completions
-- **Unreal C++ highlighting companion**: use `UTreeSitter.nvim` for parser registration, queries, and highlight activation
-- **Project Dashboard**: `:UCore` opens a smart project console with live state badges
+- `:UCore` smart entry for booting the current Unreal project
+- Rust backend (`u_scanner` + `u_core_server`) with SQLite caches
+- `gd` / `gD` / `gi` / `gr` / `gs` / `gf` navigation workflow
+- Unreal build integration with live log streaming
+- Unreal Editor launch from Neovim
+- explorer for `Project / Source / Config`
+- `blink.cmp` completion source
+- buffer diagnostics and semantic highlights from the UCore index
+- `nvim-autopairs` integration for common Unreal C++ editing flow
 
 ### Requirements
 
 - Neovim 0.10+
 - Rust toolchain with `cargo`
 - An Unreal Engine project with a `.uproject` file
-- `UTreeSitter.nvim` (optional, for Unreal C++ highlighting)
-- `UTreeSitter.nvim` handles Unreal C++ highlighting automatically; no separate parser config is required
-- `telescope.nvim` or `fzf-lua` (optional, for richer picker UI)
-- `blink.cmp` (optional, for UCore completion source)
-
-Windows is the primary development target.
+- `telescope.nvim` or `fzf-lua` if you want richer picker UI
+- `blink.cmp` if you want the UCore completion source
+- `nvim-autopairs` if you want pair/newline integration
 
 ### Installation
 
-#### lazy.nvim
+#### Recommended Stack
 
 ```lua
 return {
   {
+    "vlicecream/UTreeSitter.nvim",
+    main = "utreesitter",
+    lazy = false,
+    dependencies = {
+      {
+        "nvim-treesitter/nvim-treesitter",
+        build = ":TSUpdate",
+        opts = function(_, opts)
+          opts = opts or {}
+          opts.auto_install = true
+          opts.indent = { enable = true }
+          return opts
+        end,
+      },
+    },
+    opts = {},
+  },
+
+  {
+    "vlicecream/UVersionControlSystem.nvim",
+    main = "uvcs",
+    lazy = false,
+    opts = {
+      enable = true,
+      prompt_on_readonly_save = true,
+      provider = "auto",
+      p4 = {
+        command = "p4",
+        -- port = "127.0.0.1:1666",
+        -- user = "YourUser",
+        -- client = "YourWorkspace",
+      },
+    },
+  },
+
+  {
     "vlicecream/UCore.nvim",
+    main = "ucore",
     lazy = false,
     build = "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1",
     dependencies = {
@@ -51,20 +97,17 @@ return {
         event = "InsertEnter",
         opts = {},
       },
-      {
-        "vlicecream/UTreeSitter.nvim",
-        lazy = false,
-        dependencies = { "nvim-treesitter/nvim-treesitter" },
-        opts = {},
-      },
+
       {
         "saghen/blink.cmp",
         opts = function(_, opts)
           opts.sources = opts.sources or {}
           opts.sources.default = opts.sources.default or { "lsp", "path", "snippets", "buffer" }
+
           if not vim.tbl_contains(opts.sources.default, "ucore") then
             table.insert(opts.sources.default, "ucore")
           end
+
           opts.sources.providers = opts.sources.providers or {}
           opts.sources.providers.ucore = {
             name = "UCore",
@@ -74,9 +117,11 @@ return {
             min_keyword_length = 0,
             score_offset = 50,
           }
+
           return opts
         end,
       },
+
       {
         "nvim-telescope/telescope.nvim",
         dependencies = {
@@ -85,32 +130,21 @@ return {
         },
       },
     },
-    config = function()
-      require("ucore").setup({
-        auto_boot = true,
-        ui = { picker = "telescope" },
-        completion = { enable = true, keymap = "<C-l>" },
-      })
-    end,
+    opts = {
+      auto_boot = true,
+      completion = {
+        enable = true,
+        keymap = "<C-l>",
+      },
+      ui = {
+        picker = "telescope",
+      },
+    },
   },
 }
 ```
 
-#### Local development
-
-```lua
-return {
-  {
-    dir = "C:/Unreal-NVIM/UCore.nvim",
-    name = "UCore.nvim",
-    lazy = false,
-    build = "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1",
-    config = function()
-      require("ucore").setup({ auto_boot = true, ui = { picker = "telescope" } })
-    end,
-  },
-}
-```
+`UTreeSitter.nvim` and `UVersionControlSystem.nvim` are separate top-level plugins. `UCore.nvim` no longer bundles either layer.
 
 ### Quick Start
 
@@ -120,105 +154,51 @@ Open any file inside an Unreal project and run:
 :UCore
 ```
 
-This opens the **Dashboard** — a smart project console. Select `Boot current project` to start the server and index your project. With `auto_boot = true`, this happens automatically when you open a file.
-
-### Keymaps
-
-Default buffer-local navigation keymaps for Unreal C++ files:
-
-| Key | Action | Description |
-|-----|--------|-------------|
-| `gd` | Definition | Jump to definition (header preferred) |
-| `gD` | Declaration | Jump specifically to header declaration |
-| `gi` | Implementation | Jump to .cpp implementation |
-| `gr` | References | Find all usages in the project |
-| `gs` | Source toggle | Switch between .h and .cpp |
-| `gf` | Global find | Fuzzy search symbols, modules, assets, config |
-
-All keymaps are configurable or can be disabled:
-
-```lua
-require("ucore").setup({
-  navigation = {
-    keymaps = {
-      enable = true,
-      definition = "gd",
-      declaration = "gD",
-      implementation = "gi",
-      references = "gr",
-      source_toggle = "gs",
-      global_find = "gf",
-    },
-  },
-})
-```
+With `auto_boot = true`, UCore boots automatically when you enter the project.
 
 ### Commands
 
 ```vim
-:UCore                          " Open project Dashboard
-:UCore boot                     " Boot current project or pick a registered one
-:UCore build [config] [plat]    " Build Unreal Editor target with live logs
-:UCore build-cancel             " Cancel running build
-:UCore editor                   " Build then launch Unreal Editor
-:UCore globalfind [pattern]     " Fuzzy find symbols, modules, assets, config
-:UCore goto <subcommand>        " Navigation subcommands
+:UCore
+:UCore boot
+:UCore build [configuration] [platform] [target]
+:UCore build-cancel
+:UCore editor
+:UCore explorer
+:UCore globalfind [pattern]
+:UCore goto <definition|declaration|implementation|references|source>
+:UCore debug status
+:UCore debug logs
+:UCore debug rpc-status
+:checkhealth ucore
 ```
 
-`:UCore goto` subcommands:
+### Default Keymaps
 
-```vim
-:UCore goto definition          " Go to definition (gd)
-:UCore goto declaration         " Go to declaration (gD)
-:UCore goto implementation      " Go to implementation (gi)
-:UCore goto references          " Find references (gr)
-:UCore goto source              " Toggle .h/.cpp (gs)
-:UCore goto help                " Show subcommand help
-```
-
-Diagnostics:
-
-```vim
-:UCore status                   " Open readable runtime status report
-:UCore logs                     " Open the latest server log
-:checkhealth ucore              " Environment diagnostics
-```
+| Key | Action |
+| --- | --- |
+| `gd` | go to definition |
+| `gD` | go to declaration |
+| `gi` | go to implementation |
+| `gr` | find references |
+| `gs` | toggle `.h` / `.cpp` |
+| `gf` | global find |
 
 ### Configuration
 
 ```lua
 require("ucore").setup({
-  auto_boot = true,             -- Auto-boot on entering an Unreal project
-  port = 30110,                 -- RPC server port
-  use_release_binary = true,    -- Prefer release builds over cargo run
+  auto_boot = true,
+  port = 30110,
+  use_release_binary = true,
   ui = {
-    picker = "auto",            -- "auto", "telescope", "fzf-lua", or "vim"
-  },
-  navigation = {
-    keymaps = {
-      enable = true,
-      definition = "gd",
-      declaration = "gD",
-      implementation = "gi",
-      references = "gr",
-      source_toggle = "gs",
-      global_find = "gf",
-    },
+    picker = "telescope",
   },
   completion = {
     enable = true,
     keymap = "<C-l>",
     min_chars = 2,
     debounce_ms = 180,
-  },
-  build = {
-    open_quickfix_on_error = true,
-    include_warnings = true,
-    color_log = true,
-  },
-  semantic = {
-    enable = true,
-    debounce_ms = 120,
   },
   diagnostics = {
     enable = true,
@@ -227,81 +207,52 @@ require("ucore").setup({
     signs = true,
     debounce_ms = 300,
   },
+  semantic = {
+    enable = true,
+    debounce_ms = 120,
+  },
+  autopairs = {
+    enable = true,
+    map_cr = true,
+    check_ts = true,
+  },
 })
 ```
 
 ### Architecture
 
-UCore.nvim has two layers:
-
-```
-Neovim (Lua)
-  ├── CLI bridge (u_scanner)    — lifecycle: setup, refresh, watch
-  └── TCP + MsgPack RPC (u_core_server) — interactive: goto, references, completions
-         │
-         └── SQLite database     — indexed symbols, classes, members, modules, assets
-```
-
-The Rust backend parses Unreal C++ source files with a custom tree-sitter grammar (`unreal_cpp`), extracts classes, members, inheritance, includes, and calls — then stores everything in SQLite. The Lua frontend queries this database through the RPC server or CLI bridge.
-
-Two backend binaries:
-
 ```text
-u_scanner       CLI tool for setup, refresh, watch, and queries
-u_core_server   Long-running TCP server for interactive features (port 30110)
+Neovim (Lua)
+  ├── CLI bridge: u_scanner
+  └── TCP + MsgPack RPC: u_core_server
+          └── SQLite caches / project index
 ```
 
-### Rust Backend Build
-
-The build script handles MSVC toolchain detection, stale object cleanup, and automatic server restart:
-
-```powershell
-pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1
-```
-
-If the first release build times out in lazy.nvim (default 120s), raise the timeout:
-
-```lua
-require("lazy").setup(spec, {
-  git = { timeout = 600 },
-})
-```
-
-Manual build:
-
-```powershell
-cargo build --release --manifest-path u-scanner/Cargo.toml --bin u_core_server --bin u_scanner
-```
-
-### Runtime Data
-
-```
-stdpath("data")/ucore/registry.json
-stdpath("data")/ucore/server-registry.json
-stdpath("data")/ucore/projects/<name>-<hash>/ucore.db
-stdpath("data")/ucore/projects/<name>-<hash>/ucore-cache.db
-stdpath("data")/ucore/projects/<name>-<hash>/u_core_server.log
-stdpath("data")/ucore/engines/<id>/engine.db
-```
-
-Use `:UCore status` to inspect current paths.
+The backend prefers release binaries under `u-scanner/target/release/` and falls back to `cargo run` when needed.
 
 ### Troubleshooting
 
 ```vim
-:checkhealth ucore     " Environment check
-:UCore status           " Runtime state
-:UCore logs             " Server logs
+:checkhealth ucore
+:UCore debug status
+:UCore debug logs
 ```
 
-Common fixes:
+Common cases:
 
-- **Rust missing**: Install from `https://rustup.rs/`
-- **Server offline**: Run `:UCore`
-- **Database missing**: Run `:UCore` inside the project and wait for indexing
-- **Engine DB missing**: Keep Neovim open until background Engine index finishes
-- **Build fails with MinGW errors**: Run `scripts/build.ps1 -Clean` to purge stale objects
-- **Keymap conflicts**: Disable individual keymaps by setting them to `false` in config
+- Rust missing: install from `https://rustup.rs/`
+- project not indexed yet: run `:UCore` and wait for boot/indexing
+- server not ready: check `:UCore debug logs`
+- no syntax highlight: install `UTreeSitter.nvim`, then run `:checkhealth utreesitter`
+
+### Related Repositories
+
+```text
+UTreeSitter                  grammar + queries + parser tests
+UTreeSitter.nvim             Neovim parser/filetype/highlight integration
+UVersionControlSystem.nvim   Unreal VCS dashboard and actions
+UCore.nvim                   Unreal project index, RPC, navigation, completion
+```
 
 ### License
 
@@ -311,41 +262,87 @@ MIT
 
 ## 中文
 
-UCore.nvim 是一个面向 Unreal Engine C++ 开发的 Neovim 插件。Rust 后端索引源码、模块、资产、配置、符号和引用，Lua 前端通过命令、快捷键、选择器和补全源暴露这些索引。
+`UCore.nvim` 是 U 系列里的项目索引和工作流层。
 
-> 状态：积极开发中，核心工作流稳定。
+它主要负责：
+
+- Unreal 项目启动和注册
+- Rust 后端索引符号、模块、资产、配置
+- 定义 / 声明 / 实现 / 引用跳转
+- 构建和 Unreal Editor 启动
+- 项目浏览器、全局搜索、补全、诊断、语义高亮
+
+它**不再**负责语法高亮和版本控制：
+
+- 高亮由 [`UTreeSitter.nvim`](https://github.com/vlicecream/UTreeSitter.nvim) 负责
+- 版本控制由 [`UVersionControlSystem.nvim`](https://github.com/vlicecream/UVersionControlSystem.nvim) 负责
 
 ### 特性
 
-- **智能导航**：`gd`（定义）、`gD`（声明）、`gi`（实现）、`gr`（引用）、`gs`（.h/.cpp 切换）、`gf`（全局搜索）
-- **一键启动**：`:UCore` 自动启动服务器并索引项目
-- **Unreal Editor 集成**：`:UCore build` 构建并实时显示日志；`:UCore editor` 构建后启动编辑器
-- **高性能 Rust 索引**：SQLite 数据库 + tree-sitter C++ 解析，大项目秒级符号查找
-- **编辑支持**：Unreal C++ 缩进继承 + nvim-autopairs，支持 `{}` 回车展开和 UE 宏规则
-- **blink.cmp 补全源**：Unreal 感知的上下文补全
-- **Unreal C++ 高亮 companion**：使用 `UTreeSitter.nvim` 负责 parser 注册、queries 和高亮启动
-- **项目仪表盘**：`:UCore` 打开带实时状态徽章的项目控制台
+- `:UCore` 作为当前 Unreal 项目的智能入口
+- Rust 后端（`u_scanner` + `u_core_server`）+ SQLite 缓存
+- `gd` / `gD` / `gi` / `gr` / `gs` / `gf` 导航工作流
+- Unreal 构建集成，实时日志输出
+- 从 Neovim 内直接启动 Unreal Editor
+- `Project / Source / Config` 三栏浏览器
+- `blink.cmp` 补全源
+- 基于 UCore 索引的 buffer 诊断和语义高亮
+- `nvim-autopairs` 的 Unreal C++ 编辑集成
 
 ### 依赖
 
 - Neovim 0.10+
-- Rust 工具链（含 `cargo`）
+- Rust 工具链和 `cargo`
 - 含 `.uproject` 的 Unreal Engine 项目
-- `UTreeSitter.nvim`（可选，Unreal C++ 高亮需要）
-- `UTreeSitter.nvim` 会自动处理 Unreal C++ 高亮，不需要额外的 parser 配置
-- `telescope.nvim` 或 `fzf-lua`（可选，更丰富的选择器 UI）
-- `blink.cmp`（可选，UCore 补全源）
-
-Windows 是主要开发目标平台。
+- `telescope.nvim` 或 `fzf-lua`（需要更完整的 picker 时）
+- `blink.cmp`（需要 UCore 补全源时）
+- `nvim-autopairs`（需要自动配对和回车展开时）
 
 ### 安装
 
-#### lazy.nvim
+#### 推荐组合
 
 ```lua
 return {
   {
+    "vlicecream/UTreeSitter.nvim",
+    main = "utreesitter",
+    lazy = false,
+    dependencies = {
+      {
+        "nvim-treesitter/nvim-treesitter",
+        build = ":TSUpdate",
+        opts = function(_, opts)
+          opts = opts or {}
+          opts.auto_install = true
+          opts.indent = { enable = true }
+          return opts
+        end,
+      },
+    },
+    opts = {},
+  },
+
+  {
+    "vlicecream/UVersionControlSystem.nvim",
+    main = "uvcs",
+    lazy = false,
+    opts = {
+      enable = true,
+      prompt_on_readonly_save = true,
+      provider = "auto",
+      p4 = {
+        command = "p4",
+        -- port = "127.0.0.1:1666",
+        -- user = "YourUser",
+        -- client = "YourWorkspace",
+      },
+    },
+  },
+
+  {
     "vlicecream/UCore.nvim",
+    main = "ucore",
     lazy = false,
     build = "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1",
     dependencies = {
@@ -354,20 +351,17 @@ return {
         event = "InsertEnter",
         opts = {},
       },
-      {
-        "vlicecream/UTreeSitter.nvim",
-        lazy = false,
-        dependencies = { "nvim-treesitter/nvim-treesitter" },
-        opts = {},
-      },
+
       {
         "saghen/blink.cmp",
         opts = function(_, opts)
           opts.sources = opts.sources or {}
           opts.sources.default = opts.sources.default or { "lsp", "path", "snippets", "buffer" }
+
           if not vim.tbl_contains(opts.sources.default, "ucore") then
             table.insert(opts.sources.default, "ucore")
           end
+
           opts.sources.providers = opts.sources.providers or {}
           opts.sources.providers.ucore = {
             name = "UCore",
@@ -377,9 +371,11 @@ return {
             min_keyword_length = 0,
             score_offset = 50,
           }
+
           return opts
         end,
       },
+
       {
         "nvim-telescope/telescope.nvim",
         dependencies = {
@@ -388,140 +384,75 @@ return {
         },
       },
     },
-    config = function()
-      require("ucore").setup({
-        auto_boot = true,
-        ui = { picker = "telescope" },
-        completion = { enable = true, keymap = "<C-l>" },
-      })
-    end,
+    opts = {
+      auto_boot = true,
+      completion = {
+        enable = true,
+        keymap = "<C-l>",
+      },
+      ui = {
+        picker = "telescope",
+      },
+    },
   },
 }
 ```
 
-#### 本地开发
-
-```lua
-return {
-  {
-    dir = "C:/Unreal-NVIM/UCore.nvim",
-    name = "UCore.nvim",
-    lazy = false,
-    build = "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1",
-    config = function()
-      require("ucore").setup({ auto_boot = true, ui = { picker = "telescope" } })
-    end,
-  },
-}
-```
+`UTreeSitter.nvim` 和 `UVersionControlSystem.nvim` 现在都是独立的顶层插件，`UCore.nvim` 不再内置这两层。
 
 ### 快速开始
 
-在 Unreal 项目中打开任意文件后运行：
+在 Unreal 项目里打开任意文件后运行：
 
 ```vim
 :UCore
 ```
 
-这将打开 **Dashboard**（仪表盘）。选择 `Boot current project` 启动服务器并索引项目。设置 `auto_boot = true` 后，打开文件时会自动启动。
-
-### 快捷键
-
-Unreal C++ 文件的默认 buffer-local 导航快捷键：
-
-| 按键 | 功能 | 说明 |
-|------|------|------|
-| `gd` | 定义跳转 | 跳转到定义，优先 header |
-| `gD` | 声明跳转 | 专门跳转到 header 声明 |
-| `gi` | 实现跳转 | 跳转到 .cpp 实现 |
-| `gr` | 查找引用 | 全工程搜索使用位置 |
-| `gs` | 源文件切换 | .h 和 .cpp 间切换 |
-| `gf` | 全局搜索 | 模糊搜索符号、模块、资产、配置 |
-
-所有快捷键均可配置或关闭：
-
-```lua
-require("ucore").setup({
-  navigation = {
-    keymaps = {
-      enable = true,
-      definition = "gd",
-      declaration = "gD",
-      implementation = "gi",
-      references = "gr",
-      source_toggle = "gs",
-      global_find = "gf",
-    },
-  },
-})
-```
+如果启用了 `auto_boot = true`，进入项目时会自动启动。
 
 ### 命令
 
 ```vim
-:UCore                          " 打开项目仪表盘
-:UCore boot                     " 启动当前项目或选择已注册项目
-:UCore build [配置] [平台]      " 构建 Editor 目标，实时日志
-:UCore build-cancel             " 取消正在运行的构建
-:UCore editor                   " 构建后启动 Unreal Editor
-:UCore globalfind [pattern]     " 模糊搜索符号、模块、资产、配置
-:UCore goto <subcommand>        " 导航子命令
+:UCore
+:UCore boot
+:UCore build [configuration] [platform] [target]
+:UCore build-cancel
+:UCore editor
+:UCore explorer
+:UCore globalfind [pattern]
+:UCore goto <definition|declaration|implementation|references|source>
+:UCore debug status
+:UCore debug logs
+:UCore debug rpc-status
+:checkhealth ucore
 ```
 
-`:UCore goto` 子命令：
+### 默认快捷键
 
-```vim
-:UCore goto definition          " 跳转定义 (gd)
-:UCore goto declaration         " 跳转声明 (gD)
-:UCore goto implementation      " 跳转实现 (gi)
-:UCore goto references          " 查找引用 (gr)
-:UCore goto source              " 切换 .h/.cpp (gs)
-:UCore goto help                " 显示子命令帮助
-```
-
-诊断：
-
-```vim
-:UCore status                   " 查看运行时状态
-:UCore logs                     " 打开最新服务器日志
-:checkhealth ucore              " 环境诊断
-```
+| 按键 | 功能 |
+| --- | --- |
+| `gd` | 跳转定义 |
+| `gD` | 跳转声明 |
+| `gi` | 跳转实现 |
+| `gr` | 查找引用 |
+| `gs` | `.h` / `.cpp` 切换 |
+| `gf` | 全局搜索 |
 
 ### 配置
 
 ```lua
 require("ucore").setup({
-  auto_boot = true,             -- 进入 Unreal 项目时自动启动
-  port = 30110,                 -- RPC 服务器端口
-  use_release_binary = true,    -- 优先使用 release 构建
+  auto_boot = true,
+  port = 30110,
+  use_release_binary = true,
   ui = {
-    picker = "auto",            -- "auto", "telescope", "fzf-lua", "vim"
-  },
-  navigation = {
-    keymaps = {
-      enable = true,
-      definition = "gd",
-      declaration = "gD",
-      implementation = "gi",
-      references = "gr",
-      source_toggle = "gs",
-      global_find = "gf",
-    },
+    picker = "telescope",
   },
   completion = {
     enable = true,
     keymap = "<C-l>",
     min_chars = 2,
     debounce_ms = 180,
-  },
-  build = {
-    open_quickfix_on_error = true,
-    include_warnings = true,
-    color_log = true,
-  },
-  semantic = {
-    enable = true,
-    debounce_ms = 120,
   },
   diagnostics = {
     enable = true,
@@ -530,71 +461,52 @@ require("ucore").setup({
     signs = true,
     debounce_ms = 300,
   },
+  semantic = {
+    enable = true,
+    debounce_ms = 120,
+  },
+  autopairs = {
+    enable = true,
+    map_cr = true,
+    check_ts = true,
+  },
 })
 ```
 
 ### 架构
 
-```
-Neovim (Lua)
-  ├── CLI 桥接 (u_scanner)     — 生命周期：setup, refresh, watch
-  └── TCP + MsgPack RPC (u_core_server) — 交互：goto, references, completions
-         │
-         └── SQLite 数据库     — 索引：符号、类、成员、模块、资产
-```
-
-Rust 后端使用自定义 tree-sitter 语法解析 Unreal C++ 源码，提取类、成员、继承、包含和调用信息，存入 SQLite。Lua 前端通过 RPC 或 CLI 查询该数据库。
-
-两个后端二进制文件：
-
 ```text
-u_scanner       设置、刷新、监听和查询的 CLI 工具
-u_core_server   交互功能的长时间运行 TCP 服务器（端口 30110）
+Neovim (Lua)
+  ├── CLI 桥接: u_scanner
+  └── TCP + MsgPack RPC: u_core_server
+          └── SQLite 缓存 / 项目索引
 ```
 
-### 后端构建
+后端优先使用 `u-scanner/target/release/` 下的 release 二进制，缺失时回退到 `cargo run`。
 
-构建脚本自动处理 MSVC 工具链检测、过时对象清理和服务器自动重启：
-
-```powershell
-pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1
-```
-
-手动构建：
-
-```powershell
-cargo build --release --manifest-path u-scanner/Cargo.toml --bin u_core_server --bin u_scanner
-```
-
-### 运行时数据
-
-```
-stdpath("data")/ucore/registry.json
-stdpath("data")/ucore/server-registry.json
-stdpath("data")/ucore/projects/<name>-<hash>/ucore.db
-stdpath("data")/ucore/projects/<name>-<hash>/ucore-cache.db
-stdpath("data")/ucore/projects/<name>-<hash>/u_core_server.log
-stdpath("data")/ucore/engines/<id>/engine.db
-```
-
-使用 `:UCore status` 查看当前路径。
-
-### 故障排除
+### 排查
 
 ```vim
-:checkhealth ucore     " 环境检查
-:UCore status           " 运行时状态
-:UCore logs             " 服务器日志
+:checkhealth ucore
+:UCore debug status
+:UCore debug logs
 ```
 
-常见问题：
+常见情况：
 
-- **缺少 Rust**：从 `https://rustup.rs/` 安装
-- **服务器离线**：运行 `:UCore`
-- **数据库缺失**：在项目中运行 `:UCore` 并等待索引
-- **引擎 DB 缺失**：保持 Neovim 打开直到后台索引完成
-- **MinGW 构建失败**：运行 `scripts/build.ps1 -Clean` 清理过时对象
-- **快捷键冲突**：在配置中将对应快捷键设为 `false` 关闭
+- 没装 Rust：从 `https://rustup.rs/` 安装
+- 项目还没建索引：运行 `:UCore` 并等待 boot/index 完成
+- 服务没有起来：查看 `:UCore debug logs`
+- 没有语法高亮：安装 `UTreeSitter.nvim`，然后运行 `:checkhealth utreesitter`
+
+### 相关仓库
+
+```text
+UTreeSitter                  grammar + queries + parser tests
+UTreeSitter.nvim             Neovim parser/filetype/highlight integration
+UVersionControlSystem.nvim   Unreal VCS dashboard and actions
+UCore.nvim                   Unreal project index, RPC, navigation, completion
+```
 
 ### 许可
 
