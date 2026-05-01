@@ -28,7 +28,11 @@ function M.apply_indent(bufnr)
 		end
 
 		if config.values.editing.indent.fallback_cindent ~= false then
+			-- Some distros install a tree-sitter indentexpr for unknown filetypes.
+			-- unreal_cpp should fall back to stock C++ indentation instead.
+			vim.bo.indentexpr = ""
 			vim.bo.autoindent = true
+			vim.bo.smartindent = false
 			vim.bo.cindent = true
 		end
 	end)
@@ -73,11 +77,15 @@ function M.setup()
 	end
 
 	local group = vim.api.nvim_create_augroup("UCoreEditing", { clear = true })
-	vim.api.nvim_create_autocmd("FileType", {
+	vim.api.nvim_create_autocmd({ "FileType", "BufEnter" }, {
 		group = group,
 		pattern = "unreal_cpp",
 		callback = function(ev)
-			M.apply_indent(ev.buf)
+			vim.schedule(function()
+				if vim.api.nvim_buf_is_valid(ev.buf) then
+					M.apply_indent(ev.buf)
+				end
+			end)
 		end,
 	})
 
