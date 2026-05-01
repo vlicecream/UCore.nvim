@@ -74,28 +74,65 @@ local function fallback_normal(keys)
 	vim.cmd("normal! " .. keys)
 end
 
--- Go to definition at the current cursor position.
--- 跳转当前光标下符号的定义。
-function M.goto_definition(opts)
+-- Go to definition with Vim-compatible fallback.
+-- 跳转到定义；UCore 无结果时回退到 Vim 原生 gd。
+function M.goto_definition()
+	M._goto_definition_inner({ fallback = "gd" })
+end
+
+-- Go to declaration with Vim-compatible fallback.
+-- 跳转到声明；UCore 无结果时回退到 Vim 原生 gD。
+function M.goto_declaration()
+	M._goto_definition_inner({ fallback = "gD" })
+end
+
+-- Go to implementation at the current cursor position.
+-- 从当前光标位置跳转到实现（.h -> .cpp）。
+function M.goto_implementation()
+	local root = project.find_project_root()
+	if not root then
+		return vim.notify("Could not find .uproject", vim.log.levels.ERROR)
+	end
+
+	local file_path = vim.api.nvim_buf_get_name(0)
+	if file_path == "" then
+		return vim.notify("UCore goto_implementation: current buffer has no file path", vim.log.levels.WARN)
+	end
+
+	local cursor = vim.api.nvim_win_get_cursor(0)
+	remote.goto_implementation(root, {
+		content = current_content(),
+		line = cursor[1] - 1,
+		character = cursor[2],
+		file_path = file_path:gsub("\\", "/"),
+	}, function(result, err)
+		if err then
+			return vim.notify("UCore goto implementation failed:\n" .. tostring(err), vim.log.levels.ERROR)
+		end
+		open_result(result)
+	end)
+end
+
+-- Internal dispatcher with fallback.
+-- 内部调度，带回退机制。
+function M._goto_definition_inner(opts)
 	opts = opts or {}
 	local root = project.find_project_root()
 	if not root then
 		if opts.fallback then
 			fallback_normal(opts.fallback)
-			return false
+			return
 		end
-		vim.notify("Could not find .uproject", vim.log.levels.ERROR)
-		return false
+		return vim.notify("Could not find .uproject", vim.log.levels.ERROR)
 	end
 
 	local file_path = vim.api.nvim_buf_get_name(0)
 	if file_path == "" then
 		if opts.fallback then
 			fallback_normal(opts.fallback)
-			return false
+			return
 		end
-		vim.notify("UCore goto: current buffer has no file path", vim.log.levels.WARN)
-		return false
+		return vim.notify("UCore goto: current buffer has no file path", vim.log.levels.WARN)
 	end
 
 	local cursor = vim.api.nvim_win_get_cursor(0)
@@ -120,53 +157,57 @@ function M.goto_definition(opts)
 			fallback_normal(opts.fallback)
 		end
 	end)
-
-	return true
 end
 
--- Go to local declaration with Vim-compatible fallback.
--- 跳转局部声明；UCore 无结果时回退到 Vim 原生 gd。
-function M.local_declaration()
-	return M.goto_definition({ fallback = "gd" })
-end
-
--- Go to global declaration with Vim-compatible fallback.
--- 跳转全局声明；UCore 无结果时回退到 Vim 原生 gD。
-function M.global_declaration()
-	return M.goto_definition({ fallback = "gD" })
-end
-
--- Go to implementation at the current cursor position.
--- 从当前光标位置跳转到实现（.h -> .cpp）。
-function M.goto_implementation()
-	local root = project.find_project_root()
-	if not root then
-		return vim.notify("Could not find .uproject", vim.log.levels.ERROR)
+-- Toggle between source (.cpp) and header (.h) file.
+-- 在 .cpp 和 .h 文件之间切换。
+function M.toggle_source()
+	local path = vim.api.nvim_buf_get_name(0)
+	if path == "" then
+		return vim.notify("UCore: buffer has no file path", vim.log.levels.WARN)
 	end
 
-	local file_path = vim.api.nvim_buf_get_name(0)
-	if file_path == "" then
-		return vim.notify("UCore goto_implementation: current buffer has no file path", vim.log.levels.WARN)
+	local alt = find_alternate_source(path)
+	if alt and vim.fn.filereadable(alt) == 1 then
+		vim.cmd.edit(vim.fn.fnameescape(alt))
+	else
+		vim.notify("UCore: no matching source/header file found", vim.log.levels.INFO)
+	end
+end
+
+local function find_alternate_source(path)
+	local normalized = path:gsub("\\", "/")
+	local ext = normalized:match("%.([^.]*)$")
+	if not ext then return nil end
+
+	local lower = ext:lower()
+	local is_header = lower == "h" or lower == "hpp" or lower == "hh" or lower == "hxx" or lower == "inl"
+	local is_source = lower == "cpp" or lower == "cc" or lower == "cxx"
+
+	if not is_header and not is_source then return nil end
+
+	local target_ext = is_header and "cpp" or "h"
+	local base = normalized:sub(1, -(#ext + 2))
+
+	-- Exact match
+	local candidate = base .. "." .. target_ext
+	if vim.fn.filereadable(candidate) == 1 then return candidate end
+	if is_source then
+		local hpp = base .. ".hpp"
+		if vim.fn.filereadable(hpp) == 1 then return hpp end
 	end
 
-	local cursor = vim.api.nvim_win_get_cursor(0)
-	local line = cursor[1] - 1
-	local character = cursor[2]
+	-- Classes/ → Private/ directory mapping
+	local alt_base = normalized:gsub("Classes", "Private"):gsub("Public", "Private")
+	alt_base = alt_base:sub(1, -(#ext + 2))
+	candidate = alt_base .. "." .. target_ext
+	if vim.fn.filereadable(candidate) == 1 then return candidate end
+	if is_source then
+		local hpp = alt_base .. ".hpp"
+		if vim.fn.filereadable(hpp) == 1 then return hpp end
+	end
 
-	remote.goto_implementation(root, {
-		content = current_content(),
-		line = line,
-		character = character,
-		file_path = file_path:gsub("\\", "/"),
-	}, function(result, err)
-		if err then
-			return vim.notify("UCore goto implementation failed:\n" .. tostring(err), vim.log.levels.ERROR)
-		end
-
-		open_result(result)
-	end)
-
-	return true
+	return nil
 end
 
 -- Find references for the symbol under the cursor.

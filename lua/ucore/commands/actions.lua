@@ -177,24 +177,19 @@ function M.explorer()
 	explorer.open()
 end
 
--- :UCore goto <local|global|declaration|implementation|references>
--- Jump to definition, implementation, or find references at cursor.
--- 跳转定义、实现或查找引用。
+-- :UCore goto <definition|declaration|implementation|references|source>
+-- Jump to definition, declaration, implementation, or find references at cursor.
+-- 跳转定义、声明、实现或查找引用。
 function M.goto(tail)
 	local sub = (tail or ""):match("^%s*(%S+)")
 	sub = sub and sub:lower() or ""
 
 	local handlers = {
-		["local"] = navigation.local_declaration,
-		l = navigation.local_declaration,
-		["global"] = navigation.global_declaration,
-		g = navigation.global_declaration,
-		["declaration"] = navigation.goto_definition,
-		d = navigation.goto_definition,
+		["definition"] = navigation.goto_definition,
+		["declaration"] = navigation.goto_declaration,
 		["implementation"] = navigation.goto_implementation,
-		i = navigation.goto_implementation,
 		["references"] = navigation.references,
-		r = navigation.references,
+		["source"] = navigation.toggle_source,
 	}
 
 	local handler = handlers[sub]
@@ -206,14 +201,12 @@ function M.goto(tail)
 	if sub == "" or sub == "help" then
 		print([[
 UCore goto subcommands:
-  :UCore goto local           Go to local declaration (gd)
-  :UCore goto global          Go to global declaration (gD)
-  :UCore goto declaration     Go to declaration
-  :UCore goto implementation  Go to implementation (.h -> .cpp)
-  :UCore goto references      Find references (grr)
+  :UCore goto definition      Go to definition (gd)
+  :UCore goto declaration     Go to declaration, specifically .h (gD)
+  :UCore goto implementation  Go to implementation (.h -> .cpp) (gi)
+  :UCore goto references      Find references (gr)
+  :UCore goto source          Toggle between .cpp and .h (gs)
   :UCore goto help            Show this help
-
-Short aliases: l, g, d, i, r
 ]])
 		return
 	end
@@ -221,14 +214,18 @@ Short aliases: l, g, d, i, r
 	vim.notify("Unknown UCore goto subcommand: " .. sub .. "\nSee :UCore goto help", vim.log.levels.WARN)
 end
 
--- Backward-compatible alias.
--- 向后兼容别名。
+-- Toggle between source (.cpp) and header (.h) file.
+-- 在 .cpp 和 .h 文件之间切换。
+function M.toggle_source()
+	navigation.toggle_source()
+end
+
+-- Backward-compatible aliases used by dashboard.
+-- Dashboard 使用的向后兼容别名。
 function M.goto_definition()
 	navigation.goto_definition()
 end
 
--- Find references for the symbol at the current cursor.
--- 查找当前光标下符号的引用。
 function M.references()
 	navigation.references()
 end
@@ -1262,7 +1259,6 @@ UCore commands:
   :UCore files        Open the left-side Project/Source/Config/VCS tree
   :UCore find         Find indexed symbols, modules, assets, config
    :UCore goto         Navigation subcommands (see :UCore goto help)
-   :UCore references   Find references at cursor
    :UCore vcs           Open VCS Dashboard
   :UCore vcs dashboard  Open VCS Dashboard
   :UCore vcs checkout   Checkout current file (p4 edit)
@@ -1297,9 +1293,8 @@ UCore debug commands:
   :UCore debug assets       Pick indexed assets
   :UCore debug search-symbols <pattern>
                             Search indexed symbols
-  :UCore debug goto         Go to definition at cursor
-  :UCore debug references   Find references at cursor
-  :UCore debug complete     Trigger manual completion in Insert mode
+   :UCore debug goto         Go to definition at cursor
+   :UCore debug complete     Trigger manual completion in Insert mode
   :UCore debug maps         Print Lua-side component/module maps
   :UCore debug vcs          Print VCS diagnostics
   :UCore debug p4-changes   Print pending P4 changelists

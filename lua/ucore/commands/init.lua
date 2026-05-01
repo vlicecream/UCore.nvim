@@ -62,7 +62,6 @@ local function dispatch_debug(tail)
 		help = actions.debug_help,
 		complete = actions.complete,
 		["goto"] = actions.goto_definition,
-		references = actions.references,
 		vcs = actions.vcs_debug,
 	}
 
@@ -103,7 +102,6 @@ function M.dispatch(args)
     ["goto"] = function()
       actions.goto(tail)
     end,
-		references = actions.references,
     checkout = actions.checkout,
     commit = actions.commit,
 		vcs = function()
@@ -147,7 +145,7 @@ function M.register()
 	vim.api.nvim_create_user_command("UCore", M.dispatch, {
 		nargs = "*",
 		complete = function(arglead, cmdline, cursorpos)
-		local user_items = {
+			local user_items = {
 				"boot",
 				"build",
 				"build-cancel",
@@ -162,8 +160,56 @@ function M.register()
 				"find",
 				"diagnostics",
 				"goto",
-				"references",
 				"debug",
+				"help",
+			}
+
+			local vcs_items = {
+				"dashboard",
+				"checkout",
+				"commit",
+				"login",
+			}
+
+			local diagnostics_items = {
+				"refresh",
+				"clear",
+				"fix",
+				"qflist",
+				"toggle",
+			}
+
+			local debug_items = {
+				"logs",
+				"engine",
+				"engine-refresh",
+				"open",
+				"register",
+				"projects",
+				"modules",
+				"assets",
+				"p4-changes",
+				"search-symbols",
+				"status",
+				"rpc-status",
+				"setup",
+				"refresh",
+				"start",
+				"stop",
+				"restart",
+				"maps",
+				"complete",
+				"goto",
+				"vcs",
+				"help",
+			}
+
+			local goto_items = {
+				"definition",
+				"declaration",
+				"implementation",
+				"references",
+				"source",
 				"help",
 			}
 

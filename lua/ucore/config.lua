@@ -118,21 +118,25 @@ M.values = {
 			-- 为 Unreal C++ buffer 注册默认导航快捷键。
 			enable = true,
 
-			-- Go to local declaration. Falls back to Vim's built-in gd if UCore has no result.
-			-- 跳转局部声明。UCore 无结果时回退到 Vim 内置 gd。
-			local_declaration = "gd",
+			-- Go to definition. Core navigation.
+			-- 跳转到定义。核心代码跳转。
+			definition = "gd",
 
-			-- Go to global declaration. Falls back to Vim's built-in gD if UCore has no result.
-			-- 跳转全局声明。UCore 无结果时回退到 Vim 内置 gD。
-			global_declaration = "gD",
+			-- Go to declaration. Specifically jumps to .h declaration.
+			-- 跳转到声明。专门跳转到 .h 的声明。
+			declaration = "gD",
 
-			-- Find references.
-			-- 查找引用。
-			references = "grr",
+			-- Find references. Searches entire project.
+			-- 查找引用。全工程搜索。
+			references = "gr",
 
-			-- Go to implementation (.h -> .cpp). Only active when source is a header.
-			-- 跳转到实现（.h -> .cpp）。仅在源文件为 header 时有效果。
-			goto_implementation = "gh",
+			-- Go to implementation (.h -> .cpp).
+			-- 跳转到实现（.h -> .cpp）。
+			implementation = "gi",
+
+			-- Toggle between source (.cpp) and header (.h) file.
+			-- 在 .cpp 和 .h 文件之间切换。
+			source_toggle = "gs",
 		},
 	},
 

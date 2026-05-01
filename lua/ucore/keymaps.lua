@@ -55,15 +55,11 @@ local function setup_buffer(args)
 		return
 	end
 
-	set_buffer_map(
-		bufnr,
-		keymaps.local_declaration or keymaps.goto_definition,
-		navigation.local_declaration,
-		"UCore local declaration"
-	)
-	set_buffer_map(bufnr, keymaps.global_declaration, navigation.global_declaration, "UCore global declaration")
+	set_buffer_map(bufnr, keymaps.definition or keymaps.goto_definition, navigation.goto_definition, "UCore definition")
+	set_buffer_map(bufnr, keymaps.declaration or keymaps.global_declaration, navigation.goto_declaration, "UCore declaration")
 	set_buffer_map(bufnr, keymaps.references, navigation.references, "UCore references")
-	set_buffer_map(bufnr, keymaps.goto_implementation, navigation.goto_implementation, "UCore goto implementation (.h -> .cpp)")
+	set_buffer_map(bufnr, keymaps.implementation or keymaps.goto_implementation, navigation.goto_implementation, "UCore implementation")
+	set_buffer_map(bufnr, keymaps.source_toggle, navigation.toggle_source, "UCore toggle source/header")
 end
 
 function M.setup()
