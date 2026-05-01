@@ -4,6 +4,11 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Kill any running server before build (Windows file lock issue).
+# 构建前杀掉正在运行的 server（Windows 文件锁问题）。
+taskkill /f /im u_core_server.exe 2>$null
+taskkill /f /im u_scanner.exe 2>$null
+
 $script_dir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $plugin_root = Split-Path -Parent $script_dir
 $scanner_dir = Join-Path $plugin_root "u-scanner"
