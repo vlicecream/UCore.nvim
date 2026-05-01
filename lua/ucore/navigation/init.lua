@@ -47,7 +47,7 @@ local function open_result(result, opts)
 
 	vim.cmd.edit(vim.fn.fnameescape(path))
 
-	local last_line = vim.api.nvim_buf_line_count(0)
+	local last_line = math.max(1, vim.api.nvim_buf_line_count(0))
 	line = line or 1
 
 	-- Rust DB stores line numbers as 1-based in most tables.
