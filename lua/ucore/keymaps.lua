@@ -51,13 +51,6 @@ local function setup_buffer(args)
 
 	local bufnr = args.buf
 	local path = vim.api.nvim_buf_get_name(bufnr)
-
-	-- Global find works without project context.
-	-- gf 不需要项目上下文，总是注册。
-	set_buffer_map(bufnr, keymaps.global_find, navigation.global_find, "UCore global find")
-
-	-- Navigation keymaps need an Unreal project root.
-	-- 导航快捷键需要 Unreal 项目根目录。
 	if path == "" or not project.find_project_root(path) then
 		return
 	end
@@ -69,6 +62,35 @@ local function setup_buffer(args)
 	set_buffer_map(bufnr, keymaps.source_toggle, navigation.toggle_source, "UCore toggle source/header")
 end
 
+-- Register gf for any buffer inside an Unreal project tree, including
+-- .uproject, .uplugin, .build.cs, .ini, engine sources, etc.
+-- gf 在任何 Unreal 项目文件内注册，包括 .uproject、引擎源码等。
+local function setup_global_find(args)
+	local keymaps = keymap_config()
+	if keymaps.enable == false then
+		return
+	end
+
+	local lhs = normalize_lhs(keymaps.global_find)
+	if not lhs then
+		return
+	end
+
+	local bufnr = args.buf
+	vim.keymap.set("n", lhs, navigation.global_find, {
+		buffer = bufnr,
+		desc = "UCore global find",
+		silent = true,
+	})
+end
+
+local function is_unreal_path(path)
+	if path == "" then
+		return false
+	end
+	return project.find_project_root(path) ~= nil
+end
+
 function M.setup()
 	local keymaps = keymap_config()
 	if keymaps.enable == false then
@@ -76,6 +98,21 @@ function M.setup()
 	end
 
 	local group = vim.api.nvim_create_augroup(group_name, { clear = true })
+
+	-- Broad: gf on every file that sits inside an Unreal project tree.
+	-- 宽泛：项目内所有文件都注册 gf。
+	vim.api.nvim_create_autocmd({ "BufReadPost", "BufNewFile" }, {
+		group = group,
+		callback = function(args)
+			local path = vim.api.nvim_buf_get_name(args.buf)
+			if is_unreal_path(path) then
+				setup_global_find(args)
+			end
+		end,
+	})
+
+	-- Restricted: navigation keymaps only for C++ files.
+	-- 严格：导航快捷键仅限 C++ 文件。
 	vim.api.nvim_create_autocmd({ "BufReadPost", "BufNewFile" }, {
 		group = group,
 		pattern = file_patterns,
