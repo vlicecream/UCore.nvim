@@ -608,6 +608,7 @@ local function pick_telescope_find(items, default_text)
 				results = base,
 				entry_maker = function(item)
 					if item.type == "empty" then
+						vim.notify("UCore find: sentinel active (all real results filtered)", vim.log.levels.INFO)
 						local all_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
 						return {
 							value = item,
@@ -676,7 +677,9 @@ end
 	vim.notify(string.format("UCore telescope find: %d items", #items), vim.log.levels.INFO)
 
 	local ok, result_or_err = pcall(function()
-		pickers
+	vim.notify(string.format("UCore find picker: opening with %d items", #base), vim.log.levels.INFO)
+
+	pickers
 		.new({}, {
 			prompt_title = "UCore find",
 			default_text = default_text,
