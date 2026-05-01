@@ -911,6 +911,141 @@ fn member_order_by_clause(prefer_impl: bool) -> String {
 }
 
 // -----------------------------------------------------------------------------
+// Implementation lookup by class name
+// -----------------------------------------------------------------------------
+
+/// Resolve the class name to search for in implementation mode.
+/// 在实现模式下，解析要查找的类名。
+fn resolve_impl_class(ctx: &CursorCtx, content: &str, cursor_line: u32) -> Option<String> {
+    if let Some(ref qualifier) = ctx.qualifier {
+        if ctx.qualifier_op.as_deref() == Some("::") {
+            if qualifier == "Super" {
+                return ctx.enclosing_class.clone();
+            }
+            return Some(qualifier.clone());
+        }
+        if matches!(ctx.qualifier_op.as_deref(), Some(".") | Some("->")) {
+            if qualifier == "this" {
+                return ctx.enclosing_class.clone();
+            }
+            return infer_var_type(content, qualifier, Some(cursor_line));
+        }
+    }
+    ctx.enclosing_class.clone()
+}
+
+/// Find a member by class name, not class_id. Hits both .h and .cpp records.
+/// 按类名查找成员（非 class_id），同时命中 .h 和 .cpp 记录。
+fn find_member_by_class_name(
+    conn: &Connection,
+    class_name: &str,
+    symbol_name: &str,
+    prefer_impl: bool,
+) -> Result<Option<Value>> {
+    let name = strip_namespace(class_name);
+    if name.is_empty() {
+        return Ok(None);
+    }
+
+    let order_by = member_order_by_clause(prefer_impl);
+    let sql = format!(
+        r#"
+        {}
+        SELECT sm.text, m.line_number, dp.full_path || '/' || sf.text, sc.text
+        FROM members m
+        JOIN strings sm ON m.name_id = sm.id
+        JOIN classes c ON m.class_id = c.id
+        JOIN strings sc ON c.name_id = sc.id
+        JOIN files f ON COALESCE(m.file_id, c.file_id) = f.id
+        JOIN dir_paths dp ON f.directory_id = dp.id
+        JOIN strings sf ON f.filename_id = sf.id
+        WHERE c.name_id IN (SELECT id FROM strings WHERE text = ?)
+          AND sm.text = ?
+        {}
+        LIMIT 1
+        "#,
+        PATH_CTE,
+        order_by,
+    );
+    // strip_namespace already handles the name, but let me double-check
+    let key_name = name.clone();
+    let mut result = conn
+        .query_row(&sql, params![key_name, symbol_name], |row| {
+            Ok(json!({
+                "symbol_name": row.get::<_, String>(0)?,
+                "line_number": row.get::<_, i64>(1)?,
+                "file_path": normalize_path(&row.get::<_, String>(2)?),
+                "class_name": row.get::<_, String>(3)?,
+            }))
+        })
+        .optional()?;
+
+    if let Some(value) = result.as_mut() {
+        fix_symbol_location(value, symbol_name);
+    }
+
+    Ok(result)
+}
+
+/// Get class name from class_id.
+fn get_class_name_by_id(conn: &Connection, class_id: i64) -> Result<String> {
+    Ok(conn.query_row(
+        "SELECT s.text FROM classes c JOIN strings s ON c.name_id = s.id WHERE c.id = ?",
+        [class_id],
+        |row| row.get(0),
+    )?)
+}
+
+/// Walk inheritance chain looking for implementation by class name.
+/// 遍历继承链，按类名查找实现。
+fn find_impl_in_inheritance(
+    conn: &Connection,
+    class_name: &str,
+    symbol_name: &str,
+) -> Result<Option<Value>> {
+    let name = strip_namespace(class_name);
+    if name.is_empty() {
+        return Ok(None);
+    }
+
+    if let Some(result) = find_member_by_class_name(conn, &name, symbol_name, true)? {
+        return Ok(Some(result));
+    }
+
+    let mut gctx = GotoCtx::new(conn);
+    let start_ids = gctx.get_class_ids(&name)?;
+    let mut queue = VecDeque::from(start_ids);
+    let mut visited = HashSet::new();
+    let mut tried_names = HashSet::new();
+    tried_names.insert(name.to_string());
+
+    while let Some(class_id) = queue.pop_front() {
+        if !visited.insert(class_id) {
+            continue;
+        }
+
+        for parent_id in gctx.get_parent_ids(class_id)? {
+            if let Ok(parent_name) = get_class_name_by_id(conn, parent_id) {
+                let parent_short = strip_namespace(&parent_name);
+                if !parent_short.is_empty() && tried_names.insert(parent_short.clone()) {
+                    if let Some(result) =
+                        find_member_by_class_name(conn, &parent_short, symbol_name, true)?
+                    {
+                        return Ok(Some(result));
+                    }
+                }
+            }
+
+            if !visited.contains(&parent_id) {
+                queue.push_back(parent_id);
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+// -----------------------------------------------------------------------------
 // Main entry
 // -----------------------------------------------------------------------------
 
@@ -960,14 +1095,17 @@ fn goto_definition_inner(
         ctx.enclosing_class
     );
 
-    // For implementation mode, skip class-scoped lookups (step 1-2) and type
-    // lookup (step 3). .cpp impl-class members live under a different class_id
-    // than .h declarations, so searching by class_id misses them. Go directly
-    // to global member search (step 4) which hits access='impl' entries.
-    // 实现模式：跳过 class 域搜索（1-2）和类型搜索（3）。
-    // .cpp 的 impl-class member 挂在不同 class_id 下，按 class_id 搜不到。
-    // 直接走全局成员搜索（4）命中 access='impl' 的条目。
+    // For implementation mode, search by class name instead of class_id so
+    // both .h and .cpp class records are matched. Falls back to global search.
+    // 实现模式：按类名搜索（.h 和 .cpp 的 class 共享同一个 name_id），
+    // 兜底走全局搜索。
     if prefer_impl {
+        let class_name = resolve_impl_class(&ctx, &content, line);
+        if let Some(name) = class_name {
+            if let Some(result) = find_impl_in_inheritance(conn, &name, &ctx.symbol)? {
+                return Ok(result);
+            }
+        }
         if let Some(result) = find_member_anywhere(conn, &ctx.symbol, true)? {
             return Ok(result);
         }
