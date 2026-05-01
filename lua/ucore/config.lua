@@ -110,6 +110,28 @@ M.values = {
 		picker = "auto",
 	},
 
+	-- Navigation keymaps.
+	-- 导航快捷键。
+	navigation = {
+		keymaps = {
+			-- Register buffer-local default navigation mappings for Unreal C++ files.
+			-- 为 Unreal C++ buffer 注册默认导航快捷键。
+			enable = true,
+
+			-- Go to local declaration. Falls back to Vim's built-in gd if UCore has no result.
+			-- 跳转局部声明。UCore 无结果时回退到 Vim 内置 gd。
+			local_declaration = "gd",
+
+			-- Go to global declaration. Falls back to Vim's built-in gD if UCore has no result.
+			-- 跳转全局声明。UCore 无结果时回退到 Vim 内置 gD。
+			global_declaration = "gD",
+
+			-- Find references.
+			-- 查找引用。
+			references = "grr",
+		},
+	},
+
 	-- Left-side project/source/config/VCS explorer.
 	-- 左侧 Project/Source/Config/VCS 目录浏览器。
 	explorer = {

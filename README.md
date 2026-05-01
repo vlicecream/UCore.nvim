@@ -236,6 +236,14 @@ require("ucore").setup({
   ui = {
     picker = "auto", -- "auto", "telescope", "fzf-lua", or "vim"
   },
+  navigation = {
+    keymaps = {
+      enable = true,
+      local_declaration = "gd",
+      global_declaration = "gD",
+      references = "grr",
+    },
+  },
   completion = {
     enable = true,
     keymap = "<C-l>",
@@ -257,12 +265,49 @@ require("ucore").setup({
 `use_release_binary = true` prefers binaries built by lazy.nvim's `build` step.
 If release binaries are missing, UCore falls back to `cargo run`.
 
+### Navigation Keymaps
+
+UCore registers buffer-local navigation mappings for Unreal C++ files:
+
+```text
+gd    UCore local declaration, fallback to Vim gd
+gD    UCore global declaration, fallback to Vim gD
+grr   UCore references
+```
+
+Override or disable them through:
+
+```lua
+require("ucore").setup({
+  navigation = {
+    keymaps = {
+      enable = true,
+      local_declaration = "gd",
+      global_declaration = "gD",
+      references = "grr",
+    },
+  },
+})
+```
+
 ### Rust Backend
 
 lazy.nvim can build the Rust backend automatically:
 
 ```lua
 build = "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1"
+```
+
+The first release build can take longer than lazy.nvim's default process
+timeout of 120 seconds. If lazy.nvim reports `Process was killed because it
+reached the timeout`, raise lazy.nvim's global timeout:
+
+```lua
+require("lazy").setup(spec, {
+  git = {
+    timeout = 600,
+  },
+})
 ```
 
 On Windows, the build script loads the MSVC C++ toolchain before building C
@@ -734,6 +779,14 @@ require("ucore").setup({
   ui = {
     picker = "auto", -- "auto", "telescope", "fzf-lua", or "vim"
   },
+  navigation = {
+    keymaps = {
+      enable = true,
+      local_declaration = "gd",
+      global_declaration = "gD",
+      references = "grr",
+    },
+  },
   completion = {
     enable = true,
     keymap = "<C-l>",
@@ -755,12 +808,49 @@ require("ucore").setup({
 `use_release_binary = true` 优先使用 lazy.nvim `build` 步骤编译的二进制文件。
 如果 release 二进制文件缺失，UCore 回退到 `cargo run`。
 
+### 导航快捷键
+
+UCore 会为 Unreal C++ 文件注册 buffer-local 导航快捷键：
+
+```text
+gd    UCore 局部声明；无结果时回退到 Vim gd
+gD    UCore 全局声明；无结果时回退到 Vim gD
+grr   UCore 查找引用
+```
+
+可以通过配置覆盖或关闭：
+
+```lua
+require("ucore").setup({
+  navigation = {
+    keymaps = {
+      enable = true,
+      local_declaration = "gd",
+      global_declaration = "gD",
+      references = "grr",
+    },
+  },
+})
+```
+
 ### Rust 后端
 
 lazy.nvim 可以自动构建 Rust 后端：
 
 ```lua
 build = "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1"
+```
+
+首次 release 构建可能超过 lazy.nvim 默认的 120 秒进程超时。如果 lazy.nvim
+提示 `Process was killed because it reached the timeout`，请提高 lazy.nvim 的
+全局超时：
+
+```lua
+require("lazy").setup(spec, {
+  git = {
+    timeout = 600,
+  },
+})
 ```
 
 在 Windows 上，构建脚本会在编译 SQLite、tree-sitter 等 C 依赖之前加载 MSVC C++ 工具链。

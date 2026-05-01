@@ -13,10 +13,13 @@ end
 
 -- Open one goto result returned by Rust.
 -- 打开 Rust 返回的跳转结果。
-local function open_result(result)
+local function open_result(result, opts)
+	opts = opts or {}
 	if not result or result == vim.NIL or vim.tbl_isempty(result) then
-		vim.notify("UCore goto: definition not found", vim.log.levels.WARN)
-		return
+		if not opts.silent then
+			vim.notify("UCore goto: definition not found", vim.log.levels.WARN)
+		end
+		return false
 	end
 
 	local path = result.file_path or result.path
@@ -27,15 +30,19 @@ local function open_result(result)
 	local source = result.source and (" [" .. tostring(result.source) .. "]") or ""
 
 	if not path or path == vim.NIL or path == "" then
-		vim.notify("UCore goto: result has no file path" .. source, vim.log.levels.WARN)
-		print(vim.inspect(result))
-		return
+		if not opts.silent then
+			vim.notify("UCore goto: result has no file path" .. source, vim.log.levels.WARN)
+			print(vim.inspect(result))
+		end
+		return false
 	end
 
 	if vim.fn.filereadable(path) ~= 1 then
-		vim.notify("UCore goto: file is not readable: " .. tostring(path), vim.log.levels.WARN)
-		print(vim.inspect(result))
-		return
+		if not opts.silent then
+			vim.notify("UCore goto: file is not readable: " .. tostring(path), vim.log.levels.WARN)
+			print(vim.inspect(result))
+		end
+		return false
 	end
 
 	vim.cmd.edit(vim.fn.fnameescape(path))
@@ -55,19 +62,40 @@ local function open_result(result)
 	if source ~= "" then
 		vim.notify("UCore goto" .. source .. ": " .. tostring(path) .. ":" .. tostring(line), vim.log.levels.INFO)
 	end
+
+	return true
+end
+
+local function fallback_normal(keys)
+	if not keys or keys == "" then
+		return
+	end
+
+	vim.cmd("normal! " .. keys)
 end
 
 -- Go to definition at the current cursor position.
 -- 跳转当前光标下符号的定义。
-function M.goto_definition()
+function M.goto_definition(opts)
+	opts = opts or {}
 	local root = project.find_project_root()
 	if not root then
-		return vim.notify("Could not find .uproject", vim.log.levels.ERROR)
+		if opts.fallback then
+			fallback_normal(opts.fallback)
+			return false
+		end
+		vim.notify("Could not find .uproject", vim.log.levels.ERROR)
+		return false
 	end
 
 	local file_path = vim.api.nvim_buf_get_name(0)
 	if file_path == "" then
-		return vim.notify("UCore goto: current buffer has no file path", vim.log.levels.WARN)
+		if opts.fallback then
+			fallback_normal(opts.fallback)
+			return false
+		end
+		vim.notify("UCore goto: current buffer has no file path", vim.log.levels.WARN)
+		return false
 	end
 
 	local cursor = vim.api.nvim_win_get_cursor(0)
@@ -81,11 +109,31 @@ function M.goto_definition()
 		file_path = file_path:gsub("\\", "/"),
 	}, function(result, err)
 		if err then
+			if opts.fallback then
+				fallback_normal(opts.fallback)
+				return
+			end
 			return vim.notify("UCore goto failed:\n" .. tostring(err), vim.log.levels.ERROR)
 		end
 
-	open_result(result)
+		if not open_result(result, { silent = opts.fallback ~= nil }) and opts.fallback then
+			fallback_normal(opts.fallback)
+		end
 	end)
+
+	return true
+end
+
+-- Go to local declaration with Vim-compatible fallback.
+-- 跳转局部声明；UCore 无结果时回退到 Vim 原生 gd。
+function M.local_declaration()
+	return M.goto_definition({ fallback = "gd" })
+end
+
+-- Go to global declaration with Vim-compatible fallback.
+-- 跳转全局声明；UCore 无结果时回退到 Vim 原生 gD。
+function M.global_declaration()
+	return M.goto_definition({ fallback = "gD" })
 end
 
 -- Find references for the symbol under the cursor.
