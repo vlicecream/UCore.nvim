@@ -14,11 +14,10 @@ local explorer = require("ucore.explorer")
 
 local M = {}
 
-local FIND_CACHE_TTL_MS = 60000
+local FIND_CACHE_TTL_MS = 10000
 local find_cache = {
 	root = nil,
-	raw_items = nil,
-	prepared_items = nil,
+	items = nil,
 	expires_at = 0,
 }
 
@@ -900,12 +899,8 @@ function M.find(pattern)
 		return vim.notify("Could not find .uproject", vim.log.levels.ERROR)
 	end
 
-	if find_cache.root == root and find_cache.raw_items and find_cache.expires_at > now_ms() then
-		if not find_cache.prepared_items then
-			find_cache.prepared_items = ui.select.prepare_find_items(find_cache.raw_items)
-		end
-
-		return show_find_results(pattern, find_cache.prepared_items)
+	if find_cache.root == root and find_cache.items and find_cache.expires_at > now_ms() then
+		return show_find_results(pattern, find_cache.items)
 	end
 
 	local pending = 4
@@ -928,14 +923,12 @@ function M.find(pattern)
 			return vim.notify("UCore find failed:\n" .. table.concat(errors, "\n"), vim.log.levels.ERROR)
 		end
 
-		local prepared_items = ui.select.prepare_find_items(items)
 		find_cache = {
 			root = root,
-			raw_items = items,
-			prepared_items = prepared_items,
+			items = items,
 			expires_at = now_ms() + FIND_CACHE_TTL_MS,
 		}
-		show_find_results(pattern, prepared_items)
+		show_find_results(pattern, items)
 	end
 
 	remote.search_symbols(root, "", function(result, err)
