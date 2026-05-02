@@ -116,8 +116,12 @@ local function display_path(path)
 	return path
 end
 
-local function compact_search_text(text)
-	return tostring(text or ""):lower():gsub("[^%w]+", "")
+local function compact_path(path, width)
+	return truncate_left(display_path(path), width)
+end
+
+local function current_buffer_path()
+	return normalize_path(vim.api.nvim_buf_get_name(0))
 end
 
 local function normalize_source(source)
@@ -202,6 +206,15 @@ local function find_group(item)
 	return "Code"
 end
 
+local function find_group_order(item)
+	return ({
+		Code = 1,
+		Modules = 2,
+		Assets = 3,
+		Config = 4,
+	})[find_group(item)] or 9
+end
+
 local function find_display_location(item, path, line)
 	path = tostring(path or "")
 
@@ -256,76 +269,43 @@ local function find_item_key(item)
 	return table.concat({ path, line, name, kind }, "\t")
 end
 
-local function find_source_order(item)
+local function find_item_score(item)
 	local source = normalize_source(item.source)
+	local kind = normalize_kind(item.symbol_type or item.type):lower()
+	local path = normalize_path(item.path or item.file_path or item.asset_path or "")
+	local current = current_buffer_path()
+	local score = 0
 
 	if source == "project" then
-		return 1
-	end
-	if source == "engine" then
-		return 3
-	end
-
-	return 2
-end
-
-local function subsequence_match(needle, haystack)
-	needle = tostring(needle or "")
-	haystack = tostring(haystack or "")
-
-	if needle == "" then
-		return true
+		score = score - 300
+	elseif source == "engine" then
+		score = score + 300
 	end
 
-	local needle_index = 1
-	local needle_len = #needle
+	score = score + (find_group_order(item) * 100)
 
-	for index = 1, #haystack do
-		if haystack:sub(index, index) == needle:sub(needle_index, needle_index) then
-			needle_index = needle_index + 1
-			if needle_index > needle_len then
-				return true
-			end
-		end
+	if current ~= "" and path == current then
+		score = score - 120
 	end
 
-	return false
-end
-
-local function find_matches_prompt(prompt, entry)
-	prompt = tostring(prompt or "")
-	if prompt == "" then
-		return true
+	if kind == "class" or kind == "struct" or kind == "enum" then
+		score = score - 80
+	elseif kind == "module" then
+		score = score - 60
+	elseif kind:find("function", 1, true) or kind:find("method", 1, true) then
+		score = score - 40
+	elseif kind == "config" then
+		score = score + 40
+	elseif kind == "asset" then
+		score = score + 60
+	elseif kind:find("property", 1, true) or kind:find("member", 1, true) then
+		score = score + 20
 	end
 
-	local lower_prompt = prompt:lower()
-	local raw_text = tostring(entry._ucore_find_match_text or entry.ordinal or ""):lower()
-
-	if raw_text:find(lower_prompt, 1, true) then
-		return true
-	end
-	if subsequence_match(lower_prompt, raw_text) then
-		return true
-	end
-
-	local compact_prompt = compact_search_text(prompt)
-	if compact_prompt == "" then
-		return true
-	end
-
-	local compact_text = tostring(entry._ucore_find_compact_text or "")
-	if compact_text:find(compact_prompt, 1, true) then
-		return true
-	end
-
-	return subsequence_match(compact_prompt, compact_text)
+	return score
 end
 
 local function prepare_find_items(items)
-	if type(items) == "table" and items.__ucore_prepared then
-		return items
-	end
-
 	local seen = {}
 	local result = {}
 
@@ -338,62 +318,28 @@ local function prepare_find_items(items)
 	end
 
 	table.sort(result, function(left, right)
-		local left_name = tostring(left.name or left.symbol_name or ""):lower()
-		local right_name = tostring(right.name or right.symbol_name or ""):lower()
+		local left_score = find_item_score(left)
+		local right_score = find_item_score(right)
+
+		if left_score ~= right_score then
+			return left_score < right_score
+		end
+
+		local left_group = find_group(left)
+		local right_group = find_group(right)
+		if left_group ~= right_group then
+			return left_group < right_group
+		end
+
+		local left_name = tostring(left.name or left.symbol_name or "")
+		local right_name = tostring(right.name or right.symbol_name or "")
 		if left_name ~= right_name then
 			return left_name < right_name
 		end
 
-		local left_source = find_source_order(left)
-		local right_source = find_source_order(right)
-		if left_source ~= right_source then
-			return left_source < right_source
-		end
-
-		local left_path = normalize_path(left.path or left.file_path or left.asset_path or "")
-		local right_path = normalize_path(right.path or right.file_path or right.asset_path or "")
-		if left_path ~= right_path then
-			return left_path < right_path
-		end
-
-		local left_line = tonumber(left.line or left.line_number or 1) or 1
-		local right_line = tonumber(right.line or right.line_number or 1) or 1
-		if left_line ~= right_line then
-			return left_line < right_line
-		end
-
-		return normalize_kind(left.symbol_type or left.type):lower() < normalize_kind(right.symbol_type or right.type):lower()
+		return display_path(left.path or left.file_path or left.asset_path or "")
+			< display_path(right.path or right.file_path or right.asset_path or "")
 	end)
-
-	for index, item in ipairs(result) do
-		local name = tostring(item.name or item.symbol_name or "<unknown>")
-		local kind = normalize_kind(item.symbol_type or item.type)
-		local source = normalize_source(item.source)
-		local path = tostring(item.path or item.file_path or item.asset_path or "")
-		local line = tonumber(item.line or item.line_number or 1) or 1
-		local label = find_category_label(item)
-		local group = find_group(item)
-		local source_label = source ~= "" and source or "index"
-		local location = find_display_location(item, path, line)
-		local search_text = find_search_text(item, name, kind, label, path)
-
-		item._ucore_find_index = index
-		item._ucore_find_path = path
-		item._ucore_find_line = line
-		item._ucore_find_display = string.format(
-			"%s  %s  %s  %s  %s",
-			pad_right(group, 7),
-			pad_right(label, 9),
-			pad_right(truncate_left(name, 34), 34),
-			pad_right(source_label, 7),
-			location
-		)
-		item._ucore_find_ordinal = search_text
-		item._ucore_find_match_text = search_text
-		item._ucore_find_compact_text = compact_search_text(search_text)
-	end
-
-	result.__ucore_prepared = true
 
 	return result
 end
@@ -635,7 +581,6 @@ local function pick_telescope_find(items, default_text)
 	local actions = require("telescope.actions")
 	local action_state = require("telescope.actions.state")
 	local conf = require("telescope.config").values
-	local sorters = require("telescope.sorters")
 
 	items = prepare_find_items(items)
 
@@ -656,18 +601,32 @@ local function pick_telescope_find(items, default_text)
 			finder = finders.new_table({
 				results = items,
 				entry_maker = function(item)
+					local name = tostring(item.name or item.symbol_name or "<unknown>")
+					local kind = normalize_kind(item.symbol_type or item.type)
+					local source = normalize_source(item.source)
+					local path = tostring(item.path or item.file_path or item.asset_path or "")
+					local line = tonumber(item.line or item.line_number or 1) or 1
+					local label = find_category_label(item)
+					local group = find_group(item)
+					local source_label = source ~= "" and source or "index"
+					local location = find_display_location(item, path, line)
+
 					return {
 						value = item,
-						display = item._ucore_find_display,
-						ordinal = item._ucore_find_ordinal,
-						filename = item._ucore_find_path,
-						path = item._ucore_find_path,
-						lnum = item._ucore_find_line,
+						display = string.format(
+							"%s  %s  %s  %s  %s",
+							pad_right(group, 7),
+							pad_right(label, 9),
+							pad_right(truncate_left(name, 34), 34),
+							pad_right(source_label, 7),
+							location
+						),
+						ordinal = find_search_text(item, name, kind, label, path),
+						filename = path,
+						path = path,
+						lnum = line,
 						col = 1,
-						text = tostring(item.name or item.symbol_name or "<unknown>"),
-						index = item._ucore_find_index,
-						_ucore_find_match_text = item._ucore_find_match_text,
-						_ucore_find_compact_text = item._ucore_find_compact_text,
+						text = name,
 					}
 				end,
 			}),
@@ -676,23 +635,7 @@ local function pick_telescope_find(items, default_text)
 					preview_find_item(entry, self.state.bufnr)
 				end,
 			}),
-			sorter = sorters.Sorter:new({
-				discard = true,
-				scoring_function = function(_, prompt, _, entry)
-					if prompt == "" then
-						return entry.index or 1
-					end
-
-					if find_matches_prompt(prompt, entry) then
-						return entry.index or 1
-					end
-
-					return -1
-				end,
-				highlighter = function()
-					return {}
-				end,
-			}),
+			sorter = conf.generic_sorter({}),
 			attach_mappings = function(prompt_bufnr)
 				actions.select_default:replace(function()
 					local selection = action_state.get_selected_entry()
