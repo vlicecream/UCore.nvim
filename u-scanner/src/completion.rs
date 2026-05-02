@@ -12,6 +12,7 @@ const MAX_COMPLETION_ITEMS: usize = 2000;
 const MAX_MEMBER_ITEMS_PER_CLASS: usize = 250;
 const MAX_TYPEDEF_DEPTH: usize = 4;
 const MIN_GLOBAL_PREFIX_LEN: usize = 2;
+const COMPLETION_MATCH_NONE: usize = usize::MAX;
 
 /// Per-request cache and lookup context.
 /// 单次补全请求里的缓存和查询上下文。
@@ -834,6 +835,154 @@ fn known_call_return_type(function_name: &str) -> Option<&'static str> {
     }
 }
 
+fn split_identifier_words(text: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut prev_is_lower_or_digit = false;
+
+    for ch in text.chars() {
+        if !(ch == '_' || ch.is_ascii_alphanumeric()) {
+            if !current.is_empty() {
+                words.push(current.to_ascii_lowercase());
+                current.clear();
+            }
+            prev_is_lower_or_digit = false;
+            continue;
+        }
+
+        if ch == '_' {
+            if !current.is_empty() {
+                words.push(current.to_ascii_lowercase());
+                current.clear();
+            }
+            prev_is_lower_or_digit = false;
+            continue;
+        }
+
+        if ch.is_ascii_uppercase() && prev_is_lower_or_digit && !current.is_empty() {
+            words.push(current.to_ascii_lowercase());
+            current.clear();
+        }
+
+        current.push(ch);
+        prev_is_lower_or_digit = ch.is_ascii_lowercase() || ch.is_ascii_digit();
+    }
+
+    if !current.is_empty() {
+        words.push(current.to_ascii_lowercase());
+    }
+
+    words
+}
+
+fn compact_identifier(text: &str) -> String {
+    text.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
+}
+
+fn ordered_word_match_rank(candidate_words: &[String], prefix_words: &[String]) -> Option<usize> {
+    if candidate_words.is_empty() || prefix_words.len() < 2 {
+        return None;
+    }
+
+    let mut best_rank: Option<usize> = None;
+
+    for start in 0..candidate_words.len() {
+        if !candidate_words[start].starts_with(&prefix_words[0]) {
+            continue;
+        }
+
+        let mut prev_index = start;
+        let mut gaps = 0usize;
+        let mut matched = true;
+
+        for prefix_word in prefix_words.iter().skip(1) {
+            let mut found_index = None;
+
+            for candidate_index in (prev_index + 1)..candidate_words.len() {
+                if candidate_words[candidate_index].starts_with(prefix_word) {
+                    found_index = Some(candidate_index);
+                    break;
+                }
+            }
+
+            let Some(next_index) = found_index else {
+                matched = false;
+                break;
+            };
+
+            gaps += next_index - prev_index - 1;
+            prev_index = next_index;
+        }
+
+        if matched {
+            let rank = start * 10 + gaps;
+            best_rank = Some(best_rank.map_or(rank, |current| current.min(rank)));
+        }
+    }
+
+    best_rank
+}
+
+fn completion_match_rank(candidate: &str, prefix: &str) -> usize {
+    if prefix.is_empty() {
+        return 0;
+    }
+
+    let candidate_lower = candidate.to_ascii_lowercase();
+    let prefix_lower = prefix.to_ascii_lowercase();
+    let prefix_words = split_identifier_words(prefix);
+
+    if candidate_lower.starts_with(&prefix_lower) {
+        return 0;
+    }
+
+    let words = split_identifier_words(candidate);
+    if !words.is_empty() {
+        let joined = words.join("");
+        if joined.starts_with(&prefix_lower) {
+            return 1;
+        }
+
+        for (index, word) in words.iter().enumerate() {
+            if word.starts_with(&prefix_lower) {
+                return 2 + index;
+            }
+        }
+
+        for start in 0..words.len() {
+            let tail = words[start..].join("");
+            if tail.starts_with(&prefix_lower) {
+                return 10 + start;
+            }
+        }
+
+        if let Some(rank) = ordered_word_match_rank(&words, &prefix_words) {
+            return 20 + rank;
+        }
+    }
+
+    if let Some(pos) = candidate_lower.find(&prefix_lower) {
+        return 40 + pos;
+    }
+
+    let compact_candidate = compact_identifier(candidate);
+    let compact_prefix = compact_identifier(prefix);
+    if !compact_prefix.is_empty() {
+        if compact_candidate.starts_with(&compact_prefix) {
+            return 80;
+        }
+
+        if let Some(pos) = compact_candidate.find(&compact_prefix) {
+            return 100 + pos;
+        }
+    }
+
+    COMPLETION_MATCH_NONE
+}
+
 // -----------------------------------------------------------------------------
 // Member fetch
 // -----------------------------------------------------------------------------
@@ -962,21 +1111,15 @@ fn append_members_for_class(
         "#,
     );
 
-    if !prefix.is_empty() {
-        sql.push_str(" AND smn.text LIKE ?");
-    }
-
     sql.push_str(" ORDER BY smn.text LIMIT ");
 
     sql.push_str(&MAX_MEMBER_ITEMS_PER_CLASS.to_string());
 
     let mut stmt = ctx.conn.prepare(&sql)?;
 
-    let mut rows = if prefix.is_empty() {
-        stmt.query(params![class_id])?
-    } else {
-        stmt.query(params![class_id, format!("{}%", prefix)])?
-    };
+    let mut rows = stmt.query(params![class_id])?;
+
+    let mut matched = Vec::new();
 
     while let Some(row) = rows.next()? {
         let name: String = row.get(0)?;
@@ -986,6 +1129,11 @@ fn append_members_for_class(
         let detail: Option<String> = row.get(4)?;
         let line: Option<usize> = row.get::<_, Option<i64>>(5)?.map(|v| v as usize);
         let file_path: Option<String> = row.get(6).ok().flatten();
+        let match_rank = completion_match_rank(&name, prefix);
+
+        if match_rank == COMPLETION_MATCH_NONE {
+            continue;
+        }
 
         if !is_member_accessible(ctx, owner_class, accessor_class, access.as_deref())? {
             continue;
@@ -1005,9 +1153,9 @@ fn append_members_for_class(
 
         let documentation = merge_docs(documentation, detail);
         let kind = completion_kind(&member_type);
-        let sort_text = completion_sort_text(class_rank, kind, &name);
+        let sort_text = completion_sort_text(class_rank * 1000 + match_rank, kind, &name);
 
-        items.push(json!({
+        matched.push(json!({
             "label": name,
             "kind": kind,
             "detail": detail_text,
@@ -1021,7 +1169,10 @@ fn append_members_for_class(
             },
             "sourceClass": owner_class,
         }));
+    }
 
+    for item in matched.into_iter().take(MAX_MEMBER_ITEMS_PER_CLASS) {
+        items.push(item);
     }
 
     Ok(())
@@ -1085,22 +1236,19 @@ fn append_enum_items(
         "SELECT sen.text FROM enum_values ev JOIN strings sen ON ev.name_id = sen.id WHERE ev.enum_id = ?",
     );
 
-    if !prefix.is_empty() {
-        sql.push_str(" AND sen.text LIKE ?");
-    }
-
     sql.push_str(" ORDER BY sen.text");
 
     let mut stmt = conn.prepare(&sql)?;
 
-    let mut rows = if prefix.is_empty() {
-        stmt.query(params![class_id])?
-    } else {
-        stmt.query(params![class_id, format!("{}%", prefix)])?
-    };
+    let mut rows = stmt.query(params![class_id])?;
 
     while let Some(row) = rows.next()? {
         let name: String = row.get(0)?;
+        let match_rank = completion_match_rank(&name, prefix);
+
+        if match_rank == COMPLETION_MATCH_NONE {
+            continue;
+        }
 
         if seen.insert(format!("enum:{}", name)) {
             let kind = 20;
@@ -1109,7 +1257,7 @@ fn append_enum_items(
                 "kind": kind,
                 "detail": "enum item",
                 "filterText": name,
-                "sortText": completion_sort_text(class_rank, kind, &name),
+                "sortText": completion_sort_text(class_rank * 1000 + match_rank, kind, &name),
                 "insertText": name,
             }));
         }
@@ -1328,37 +1476,52 @@ fn fetch_global_symbols(conn: &Connection, prefix: &str) -> Result<Vec<Value>> {
         SELECT s.text, c.symbol_type
         FROM classes c
         JOIN strings s ON c.name_id = s.id
-        WHERE s.text LIKE ?
-          AND c.symbol_type IN ('class', 'struct', 'UCLASS', 'USTRUCT', 'enum', 'UENUM')
+        WHERE c.symbol_type IN ('class', 'struct', 'UCLASS', 'USTRUCT', 'enum', 'UENUM')
         ORDER BY s.text
-        LIMIT 80
+        LIMIT 400
         "#,
     )?;
 
-    let rows = stmt.query_map([format!("{}%", prefix)], |row| {
+    let rows = stmt.query_map([], |row| {
         let name: String = row.get(0)?;
         let symbol_type: String = row.get(1)?;
+        Ok((name, symbol_type))
+    })?;
+
+    let mut items = Vec::new();
+
+    for row in rows.flatten() {
+        let (name, symbol_type) = row;
+        let match_rank = completion_match_rank(&name, prefix);
+        if match_rank == COMPLETION_MATCH_NONE {
+            continue;
+        }
+
         let kind = if matches!(symbol_type.as_str(), "enum" | "UENUM") {
             13
         } else {
             7
         };
 
-        Ok(json!({
+        items.push(json!({
             "label": name,
             "kind": kind,
             "detail": symbol_type,
             "filterText": name,
-            "sortText": completion_sort_text(100, kind, &name),
+            "sortText": completion_sort_text(100_000 + match_rank, kind, &name),
             "insertText": name,
             "labelDetails": {
                 "detail": format!(" {}", symbol_type),
                 "description": "UCore",
             },
-        }))
-    })?;
+        }));
 
-    Ok(rows.filter_map(|row| row.ok()).collect())
+        if items.len() >= 80 {
+            break;
+        }
+    }
+
+    Ok(items)
 }
 
 /// Complete indexed headers inside an unfinished #include string.
@@ -2473,6 +2636,10 @@ mod tests {
         .unwrap();
     }
 
+    fn label_index(items: &[Value], label: &str) -> Option<usize> {
+        items.iter().position(|item| item.get("label").and_then(|v| v.as_str()) == Some(label))
+    }
+
     #[test]
     fn member_completion_returns_members_without_snippets() {
         let conn = test_db();
@@ -2598,5 +2765,69 @@ void Test(UObject* Object) {
 
         assert!(has_label(&items, "WidgetAction"));
         assert!(!has_label(&items, "LocalAction"));
+    }
+
+    #[test]
+    fn member_completion_keeps_prefix_matches_before_middle_matches() {
+        let conn = test_db();
+        let actor_id: i64 = conn
+            .query_row(
+                "SELECT c.id FROM classes c JOIN strings s ON c.name_id = s.id WHERE s.text = 'AMyActor' LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let file_id: i64 = conn
+            .query_row("SELECT id FROM files WHERE extension = 'cpp' LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+
+        insert_member(&conn, actor_id, "GetActorLocation", "function", Some("FVector"), "public", file_id);
+        insert_member(&conn, actor_id, "GetSocketActor", "function", Some("AActor"), "public", file_id);
+
+        let items = completion_at(
+            &conn,
+            r#"
+class AMyActor {
+public:
+    void Test() {
+        this->GetActor/*cursor*/
+    }
+};
+"#,
+        );
+
+        assert!(has_label(&items, "GetActorLocation"));
+        assert!(has_label(&items, "GetSocketActor"));
+
+        let prefix_index = label_index(&items, "GetActorLocation").unwrap();
+        let middle_index = label_index(&items, "GetSocketActor").unwrap();
+        assert!(prefix_index < middle_index);
+    }
+
+    #[test]
+    fn global_completion_matches_middle_words() {
+        let conn = test_db();
+        let file_id: i64 = conn
+            .query_row("SELECT id FROM files WHERE extension = 'cpp' LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+
+        insert_class(&conn, "GetActorComponent", file_id);
+        insert_class(&conn, "GetMeshActor", file_id);
+
+        let items = completion_at(
+            &conn,
+            r#"
+void Test() {
+    GetActor/*cursor*/
+}
+"#,
+        );
+
+        assert!(has_label(&items, "GetActorComponent"));
+        assert!(has_label(&items, "GetMeshActor"));
+
+        let prefix_index = label_index(&items, "GetActorComponent").unwrap();
+        let middle_index = label_index(&items, "GetMeshActor").unwrap();
+        assert!(prefix_index < middle_index);
     }
 }
