@@ -52,6 +52,13 @@ pub struct CursorCtx {
     pub enclosing_class: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct LocalDeclMatch {
+    row: usize,
+    col: usize,
+    type_name: Option<String>,
+}
+
 // -----------------------------------------------------------------------------
 // Basic tree-sitter helpers
 // -----------------------------------------------------------------------------
@@ -67,6 +74,13 @@ fn node_text<'a>(node: &Node, src: &'a [u8]) -> &'a str {
 fn children_of<'a>(node: Node<'a>) -> Vec<Node<'a>> {
     let mut cursor = node.walk();
     node.children(&mut cursor).collect()
+}
+
+fn is_function_like(kind: &str) -> bool {
+    matches!(
+        kind,
+        "function_definition" | "unreal_function_definition" | "lambda_expression"
+    )
 }
 
 /// Recursively find the first descendant with the given kind.
@@ -257,6 +271,38 @@ fn cursor_node_at(root: Node, row: usize, col: usize) -> Option<Node> {
         .or_else(|| root.descendant_for_point_range(current, current))
 }
 
+fn enclosing_function<'a>(node: Node<'a>) -> Option<Node<'a>> {
+    let mut current = Some(node);
+
+    while let Some(node) = current {
+        if is_function_like(node.kind()) {
+            return Some(node);
+        }
+
+        current = node.parent();
+    }
+
+    None
+}
+
+fn find_enclosing_function_for_row<'a>(node: Node<'a>, row: usize) -> Option<Node<'a>> {
+    if node.start_position().row > row || node.end_position().row < row {
+        return None;
+    }
+
+    for child in children_of(node) {
+        if let Some(found) = find_enclosing_function_for_row(child, row) {
+            return Some(found);
+        }
+    }
+
+    if is_function_like(node.kind()) {
+        return Some(node);
+    }
+
+    None
+}
+
 /// Extract qualifier from expressions like A::B, Obj.Field, Ptr->Field.
 /// 从 A::B、Obj.Field、Ptr->Field 这类表达式中提取 qualifier。
 fn extract_qualifier(node: Node, src: &[u8]) -> (Option<String>, Option<String>) {
@@ -318,7 +364,17 @@ pub fn infer_var_type(content: &str, var_name: &str, cursor_line: Option<u32>) -
     let src = content.as_bytes();
 
     let mut matches = Vec::new();
-    scan_for_var_decl(root, src, var_name, &mut matches);
+    if let Some(line) = cursor_line {
+        let cursor_row = line as usize;
+
+        if let Some(function) = find_enclosing_function_for_row(root, cursor_row) {
+            scan_for_var_decl(function, src, var_name, &mut matches, true);
+        }
+    }
+
+    if matches.is_empty() {
+        scan_for_var_decl(root, src, var_name, &mut matches, false);
+    }
 
     if matches.is_empty() {
         return None;
@@ -327,19 +383,25 @@ pub fn infer_var_type(content: &str, var_name: &str, cursor_line: Option<u32>) -
     if let Some(line) = cursor_line {
         let cursor_row = line as usize;
 
-        matches.sort_by_key(|item| {
-            let distance = cursor_row.saturating_sub(item.0);
-            std::cmp::Reverse(distance)
-        });
-
-        for (row, ty) in &matches {
-            if *row <= cursor_row {
-                return Some(ty.clone());
+        if let Some((row, col, ty)) = select_nearest_type_match(&matches, cursor_row) {
+            if matches.len() > 1 {
+                tracing::info!(
+                    "infer_var_type: var='{}' selected='{}' at {}:{} from {} candidates",
+                    var_name,
+                    ty,
+                    row + 1,
+                    col,
+                    matches.len()
+                );
             }
+            return Some(ty.clone());
         }
     }
 
-    matches.into_iter().next().map(|(_, ty)| ty)
+    matches
+        .into_iter()
+        .min_by_key(|(row, col, _)| (*row, *col))
+        .map(|(_, _, ty)| ty)
 }
 
 /// Scan declarations and collect possible variable types.
@@ -348,18 +410,24 @@ fn scan_for_var_decl(
     node: Node,
     src: &[u8],
     var_name: &str,
-    matches: &mut Vec<(usize, String)>,
+    matches: &mut Vec<(usize, usize, String)>,
+    stop_at_nested_functions: bool,
 ) {
     match node.kind() {
         "declaration" | "parameter_declaration" | "field_declaration" => {
             if let Some(type_node) = node.child_by_field_name("type") {
                 if let Some(decl_node) = node.child_by_field_name("declarator") {
-                    if let Some(name) = extract_decl_name(decl_node, src) {
+                    if let Some(name_node) = extract_decl_name_node(decl_node) {
+                        let name = node_text(&name_node, src).trim();
                         if name == var_name {
                             let raw_type = node_text(&type_node, src).trim();
                             let cleaned = clean_type(raw_type);
                             if !cleaned.is_empty() {
-                                matches.push((node.start_position().row, cleaned));
+                                matches.push((
+                                    name_node.start_position().row,
+                                    name_node.start_position().column,
+                                    cleaned,
+                                ));
                             }
                         }
                     }
@@ -371,15 +439,26 @@ fn scan_for_var_decl(
     }
 
     for child in children_of(node) {
-        scan_for_var_decl(child, src, var_name, matches);
+        if stop_at_nested_functions && is_function_like(child.kind()) {
+            continue;
+        }
+        scan_for_var_decl(child, src, var_name, matches, stop_at_nested_functions);
     }
 }
 
-/// Extract declared variable/function name from a declarator.
-/// 从 declarator 中提取变量名或函数名。
-fn extract_decl_name(node: Node, src: &[u8]) -> Option<String> {
+fn select_nearest_type_match<'a>(
+    matches: &'a [(usize, usize, String)],
+    cursor_row: usize,
+) -> Option<&'a (usize, usize, String)> {
+    matches
+        .iter()
+        .filter(|(row, _, _)| *row <= cursor_row)
+        .max_by_key(|(row, col, _)| (*row, *col))
+}
+
+fn extract_decl_name_node<'a>(node: Node<'a>) -> Option<Node<'a>> {
     match node.kind() {
-        "identifier" | "field_identifier" => Some(node_text(&node, src).trim().to_string()),
+        "identifier" | "field_identifier" => Some(node),
 
         "pointer_declarator"
         | "reference_declarator"
@@ -387,11 +466,11 @@ fn extract_decl_name(node: Node, src: &[u8]) -> Option<String> {
         | "function_declarator"
         | "init_declarator" => {
             if let Some(decl) = node.child_by_field_name("declarator") {
-                return extract_decl_name(decl, src);
+                return extract_decl_name_node(decl);
             }
 
             for child in children_of(node) {
-                if let Some(name) = extract_decl_name(child, src) {
+                if let Some(name) = extract_decl_name_node(child) {
                     return Some(name);
                 }
             }
@@ -401,7 +480,7 @@ fn extract_decl_name(node: Node, src: &[u8]) -> Option<String> {
 
         _ => {
             for child in children_of(node) {
-                if let Some(name) = extract_decl_name(child, src) {
+                if let Some(name) = extract_decl_name_node(child) {
                     return Some(name);
                 }
             }
@@ -934,6 +1013,67 @@ fn resolve_impl_class(ctx: &CursorCtx, content: &str, cursor_line: u32) -> Optio
     ctx.enclosing_class.clone()
 }
 
+fn find_local_declaration(
+    content: &str,
+    symbol_name: &str,
+    line: u32,
+    character: u32,
+) -> Option<LocalDeclMatch> {
+    let language: tree_sitter::Language = tree_sitter_unreal_cpp::LANGUAGE.into();
+    let mut parser = Parser::new();
+    parser.set_language(&language).ok()?;
+
+    let tree = parser.parse(content, None)?;
+    let root = tree.root_node();
+    let src = content.as_bytes();
+    let row = line as usize;
+    let col = character as usize;
+    let raw_node = cursor_node_at(root, row, col)?;
+    let function = enclosing_function(raw_node)?;
+    let mut matches = Vec::new();
+    scan_local_declarations(function, src, symbol_name, &mut matches, true);
+
+    matches
+        .into_iter()
+        .filter(|item| item.row < row || (item.row == row && item.col <= col))
+        .max_by_key(|item| (item.row, item.col))
+}
+
+fn scan_local_declarations(
+    node: Node,
+    src: &[u8],
+    symbol_name: &str,
+    matches: &mut Vec<LocalDeclMatch>,
+    is_root: bool,
+) {
+    if !is_root && is_function_like(node.kind()) {
+        return;
+    }
+
+    if matches!(node.kind(), "declaration" | "parameter_declaration") {
+        if let Some(decl_node) = node.child_by_field_name("declarator") {
+            if let Some(name_node) = extract_decl_name_node(decl_node) {
+                let name = node_text(&name_node, src).trim();
+                if name == symbol_name {
+                    let type_name = node
+                        .child_by_field_name("type")
+                        .map(|type_node| clean_type(node_text(&type_node, src).trim()));
+
+                    matches.push(LocalDeclMatch {
+                        row: name_node.start_position().row,
+                        col: name_node.start_position().column,
+                        type_name,
+                    });
+                }
+            }
+        }
+    }
+
+    for child in children_of(node) {
+        scan_local_declarations(child, src, symbol_name, matches, false);
+    }
+}
+
 /// Find a member by class name, not class_id. Hits both .h and .cpp records.
 /// 按类名查找成员（非 class_id），同时命中 .h 和 .cpp 记录。
 fn find_member_by_class_name(
@@ -1078,7 +1218,7 @@ fn goto_definition_inner(
     content: String,
     line: u32,
     character: u32,
-    _file_path: Option<String>,
+    file_path: Option<String>,
     prefer_impl: bool,
 ) -> Result<Value> {
     let Some(ctx) = extract_cursor_context(&content, line, character) else {
@@ -1086,14 +1226,37 @@ fn goto_definition_inner(
     };
 
     let mode = if prefer_impl { "implementation" } else { "definition" };
-    tracing::debug!(
-        "goto_{}: symbol='{}', qualifier={:?}, op={:?}, enclosing={:?}",
+    tracing::info!(
+        "goto_{}: symbol='{}', qualifier={:?}, op={:?}, enclosing={:?}, line={}, character={}",
         mode,
         ctx.symbol,
         ctx.qualifier,
         ctx.qualifier_op,
-        ctx.enclosing_class
+        ctx.enclosing_class,
+        line + 1,
+        character
     );
+
+    if let Some(local_decl) = find_local_declaration(&content, &ctx.symbol, line, character) {
+        if let Some(ref path) = file_path {
+            tracing::info!(
+                "goto_{}: resolved local symbol '{}' to {}:{} type={:?}",
+                mode,
+                ctx.symbol,
+                local_decl.row + 1,
+                local_decl.col,
+                local_decl.type_name
+            );
+
+            return Ok(json!({
+                "symbol_name": ctx.symbol,
+                "line_number": (local_decl.row + 1) as i64,
+                "col": local_decl.col as i64,
+                "file_path": normalize_path(path),
+                "source": "local",
+            }));
+        }
+    }
 
     // Implementation mode: class-name-based search (hits both .h and .cpp
     // records). No global fallback — members from unrelated classes shouldn't
@@ -1102,12 +1265,25 @@ fn goto_definition_inner(
     if prefer_impl {
         if let Some(ref name) = resolve_impl_class(&ctx, &content, line) {
             if let Some(result) = find_impl_in_inheritance(conn, name, &ctx.symbol)? {
+                tracing::info!(
+                    "goto_{}: resolved '{}' through impl class '{}'",
+                    mode,
+                    ctx.symbol,
+                    name
+                );
                 return Ok(result);
             }
             if let Some(result) = find_member_by_class_name(conn, name, &ctx.symbol, false)? {
+                tracing::info!(
+                    "goto_{}: fell back to class member '{}' on '{}'",
+                    mode,
+                    ctx.symbol,
+                    name
+                );
                 return Ok(result);
             }
         }
+        tracing::info!("goto_{}: no result for '{}'", mode, ctx.symbol);
         return Ok(Value::Null);
     }
 
@@ -1138,6 +1314,12 @@ fn goto_definition_inner(
         if let Some(result) =
             find_symbol_in_inheritance_chain(conn, &resolved_class, &ctx.symbol)?
         {
+            tracing::info!(
+                "goto_{}: resolved '{}' via qualifier class '{}'",
+                mode,
+                ctx.symbol,
+                resolved_class
+            );
             return Ok(result);
         }
     }
@@ -1148,6 +1330,12 @@ fn goto_definition_inner(
         if let Some(result) =
             find_symbol_in_inheritance_chain(conn, enclosing_class, &ctx.symbol)?
         {
+            tracing::info!(
+                "goto_{}: resolved '{}' via enclosing class '{}'",
+                mode,
+                ctx.symbol,
+                enclosing_class
+            );
             return Ok(result);
         }
     }
@@ -1155,15 +1343,26 @@ fn goto_definition_inner(
     // 3. Try type definition lookup.
     // 3. 尝试按类型定义查找。
     if let Some(result) = find_type_definition(conn, &ctx.symbol)? {
+        tracing::info!(
+            "goto_{}: resolved '{}' as type definition",
+            mode,
+            ctx.symbol
+        );
         return Ok(result);
     }
 
     // 4. Final fallback: member search across the whole project.
     // 4. 最终兜底：全工程成员名搜索。
     if let Some(result) = find_member_anywhere(conn, &ctx.symbol, false)? {
+        tracing::info!(
+            "goto_{}: resolved '{}' via global member fallback",
+            mode,
+            ctx.symbol
+        );
         return Ok(result);
     }
 
+    tracing::info!("goto_{}: no result for '{}'", mode, ctx.symbol);
     Ok(Value::Null)
 }
 
@@ -1492,4 +1691,75 @@ fn tokens(text: &str) -> Vec<&str> {
     text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
         .filter(|token| !token.is_empty())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{find_local_declaration, infer_var_type};
+
+    const SAMPLE: &str = r#"
+void StartDeath()
+{
+    UAlphaType* HealthComponent = GetAlpha();
+    HealthComponent->StartDeath();
+}
+
+void FinishDeath()
+{
+    UBetaType* HealthComponent = GetBeta();
+    HealthComponent->FinishDeath();
+}
+
+void ActivateAbility()
+{
+    UAbilitySystemComponent* ASC = GetAbilitySystemComponentFromActorInfo();
+    ASC->CancelAllAbilities();
+}
+"#;
+
+    fn line_and_col(content: &str, needle: &str, occurrence: usize) -> (u32, u32) {
+        let mut found = 0usize;
+
+        for (row, line) in content.lines().enumerate() {
+            let mut offset = 0usize;
+
+            while let Some(col) = line[offset..].find(needle) {
+                if found == occurrence {
+                    return (row as u32, (offset + col) as u32);
+                }
+
+                found += 1;
+                offset += col + needle.len();
+            }
+        }
+
+        panic!("needle not found: {needle} ({occurrence})");
+    }
+
+    #[test]
+    fn infer_var_type_prefers_nearest_preceding_declaration() {
+        let (line, _) = line_and_col(SAMPLE, "HealthComponent->FinishDeath", 0);
+        assert_eq!(
+            infer_var_type(SAMPLE, "HealthComponent", Some(line)),
+            Some("UBetaType".to_string())
+        );
+    }
+
+    #[test]
+    fn find_local_declaration_stays_inside_current_function() {
+        let (line, col) = line_and_col(SAMPLE, "HealthComponent->FinishDeath", 0);
+        let decl = find_local_declaration(SAMPLE, "HealthComponent", line, col)
+            .expect("expected local declaration");
+
+        assert_eq!(decl.row + 1, 10);
+    }
+
+    #[test]
+    fn find_local_declaration_resolves_simple_local_variable() {
+        let (line, col) = line_and_col(SAMPLE, "ASC->CancelAllAbilities", 0);
+        let decl = find_local_declaration(SAMPLE, "ASC", line, col)
+            .expect("expected local declaration");
+
+        assert_eq!(decl.row + 1, 16);
+    }
 }
