@@ -1,4 +1,5 @@
 local completion = require("ucore.completion")
+local config = require("ucore.config")
 local log = require("ucore.log")
 local project = require("ucore.project")
 
@@ -17,6 +18,11 @@ local default_opts = {
 }
 
 local policy_applied = false
+local latest_request_id = 0
+local in_flight_request = nil
+local queued_request = nil
+local scheduled_timer = nil
+local to_blink_item
 
 local function preview_labels(items, limit)
 	local labels = {}
@@ -32,6 +38,129 @@ local function preview_labels(items, limit)
 	end
 
 	return labels
+end
+
+local function current_prefix(ctx)
+	if type(ctx) == "table" then
+		local keyword = ctx.keyword or ctx.query
+		if type(keyword) == "string" and keyword ~= "" then
+			return keyword
+		end
+	end
+
+	return vim.fn.expand("<cword>")
+end
+
+local function blink_delay_ms()
+	local completion_config = config.values.completion or {}
+	local base = tonumber(completion_config.debounce_ms) or 180
+	return math.max(60, math.min(base, 100))
+end
+
+local function stop_timer()
+	if scheduled_timer then
+		pcall(vim.fn.timer_stop, scheduled_timer)
+		scheduled_timer = nil
+	end
+end
+
+local function request_done(request)
+	return not request or request.cancelled
+end
+
+local function dispatch_latest()
+	if in_flight_request then
+		return
+	end
+
+	local request = queued_request
+	queued_request = nil
+
+	if request_done(request) then
+		return
+	end
+
+	in_flight_request = request
+	log.write("completion.blink.dispatch", {
+		request_id = request.id,
+		prefix = request.prefix,
+	})
+
+	completion.request(function(items, err)
+		local active = in_flight_request
+		in_flight_request = nil
+
+		if not active or active.id ~= request.id or active.cancelled then
+			log.write("completion.blink.cancelled", {
+				reason = "inactive_or_cancelled",
+				request_id = request.id,
+			})
+			if queued_request and not queued_request.cancelled then
+				dispatch_latest()
+			end
+			return
+		end
+
+		if err == "stale" then
+			log.write("completion.blink.finish", {
+				status = "stale",
+				request_id = request.id,
+				prefix = request.prefix,
+			})
+			if queued_request and not queued_request.cancelled then
+				dispatch_latest()
+			end
+			return
+		end
+
+		if err or not items then
+			log.write("completion.blink.finish", {
+				status = "error",
+				error = err,
+				request_id = request.id,
+				prefix = request.prefix,
+			})
+			request.callback({
+				is_incomplete_forward = false,
+				is_incomplete_backward = false,
+				items = {},
+			})
+			if queued_request and not queued_request.cancelled then
+				dispatch_latest()
+			end
+			return
+		end
+
+		local blink_items = {}
+		for _, item in ipairs(items) do
+			local converted = to_blink_item(item)
+			if converted then
+				table.insert(blink_items, converted)
+			end
+		end
+
+		local converted_count = #blink_items
+		blink_items = prune_items(blink_items)
+		log.write("completion.blink.finish", {
+			status = "ok",
+			request_id = request.id,
+			prefix = request.prefix,
+			raw_count = #(items or {}),
+			converted_count = converted_count,
+			pruned_count = #blink_items,
+			preview = preview_labels(blink_items, 8),
+		})
+
+		request.callback({
+			is_incomplete_forward = false,
+			is_incomplete_backward = false,
+			items = blink_items,
+		})
+
+		if queued_request and not queued_request.cancelled then
+			dispatch_latest()
+		end
+	end)
 end
 
 local function call_or_value(value, ...)
@@ -194,7 +323,7 @@ end
 
 -- Convert Vim complete-item shape into LSP/blink completion item shape.
 -- 把 Vim complete-item 结构转换成 LSP/blink completion item 结构。
-local function to_blink_item(item)
+function to_blink_item(item)
 	local raw = item
 	if type(item.user_data) == "string" and item.user_data ~= "" then
 		local ok, decoded = pcall(vim.json.decode, item.user_data)
@@ -245,69 +374,43 @@ function M:get_completions(_, callback)
 		return
 	end
 
-	local cancelled = false
+	latest_request_id = latest_request_id + 1
+	local request = {
+		id = latest_request_id,
+		prefix = current_prefix(_),
+		callback = callback,
+		cancelled = false,
+	}
+
 	log.write("completion.blink.start", {
 		filetype = vim.bo.filetype,
-		prefix = vim.fn.expand("<cword>"),
+		prefix = request.prefix,
+		request_id = request.id,
 	})
-
-	completion.request(function(items, err)
-		if cancelled then
-			log.write("completion.blink.cancelled", {
-				reason = "callback_after_cancel",
+	queued_request = request
+	stop_timer()
+	scheduled_timer = vim.fn.timer_start(blink_delay_ms(), function()
+		scheduled_timer = nil
+		if in_flight_request then
+			log.write("completion.blink.defer", {
+				reason = "in_flight",
+				request_id = request.id,
+				prefix = request.prefix,
 			})
 			return
 		end
-
-		if err == "stale" then
-			log.write("completion.blink.finish", {
-				status = "stale",
-			})
-			return
-		end
-
-		if err or not items then
-			log.write("completion.blink.finish", {
-				status = "error",
-				error = err,
-			})
-			callback({
-				is_incomplete_forward = false,
-				is_incomplete_backward = false,
-				items = {},
-			})
-			return
-		end
-
-		local blink_items = {}
-		for _, item in ipairs(items) do
-			local converted = to_blink_item(item)
-			if converted then
-				table.insert(blink_items, converted)
-			end
-		end
-
-		local converted_count = #blink_items
-		blink_items = prune_items(blink_items)
-		log.write("completion.blink.finish", {
-			status = "ok",
-			raw_count = #(items or {}),
-			converted_count = converted_count,
-			pruned_count = #blink_items,
-			preview = preview_labels(blink_items, 8),
-		})
-
-		callback({
-			is_incomplete_forward = false,
-			is_incomplete_backward = false,
-			items = blink_items,
-		})
+		dispatch_latest()
 	end)
 
 	return function()
-		cancelled = true
+		request.cancelled = true
+		if queued_request and queued_request.id == request.id then
+			queued_request = nil
+		end
 		log.write("completion.blink.cancel", {
 			reason = "provider_cancel",
+			request_id = request.id,
+			prefix = request.prefix,
 		})
 	end
 end
