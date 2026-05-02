@@ -123,6 +123,23 @@ local function refresh_native_lsp_buffers()
 	end)
 end
 
+local function restart_clangd_clients(root)
+	root = normalize(root)
+	if not root or root == "" then
+		return false
+	end
+
+	local restarted = false
+	for _, client in ipairs(vim.lsp.get_clients({ name = "clangd" })) do
+		if normalize(client.root_dir) == root then
+			restarted = true
+			vim.lsp.stop_client(client.id)
+		end
+	end
+
+	return restarted
+end
+
 local function refresh_project_buffers(root)
 	root = normalize(root)
 	if not root or root == "" then
@@ -130,27 +147,37 @@ local function refresh_project_buffers(root)
 	end
 
 	vim.schedule(function()
-		refresh_native_lsp_buffers()
+		local restarted = restart_clangd_clients(root)
 
-		local current = vim.api.nvim_get_current_buf()
-		if not vim.api.nvim_buf_is_valid(current) then
-			return
+		local function reattach()
+			refresh_native_lsp_buffers()
+
+			local current = vim.api.nvim_get_current_buf()
+			if not vim.api.nvim_buf_is_valid(current) then
+				return
+			end
+
+			local current_path = normalize(vim.api.nvim_buf_get_name(current))
+			if not current_path or current_path == "" then
+				return
+			end
+
+			if project.find_project_root(current_path) ~= root then
+				return
+			end
+
+			if vim.bo[current].modified or vim.bo[current].buftype ~= "" then
+				return
+			end
+
+			pcall(vim.cmd, "silent edit")
 		end
 
-		local current_path = normalize(vim.api.nvim_buf_get_name(current))
-		if not current_path or current_path == "" then
-			return
+		if restarted then
+			vim.defer_fn(reattach, 200)
+		else
+			reattach()
 		end
-
-		if project.find_project_root(current_path) ~= root then
-			return
-		end
-
-		if vim.bo[current].modified or vim.bo[current].buftype ~= "" then
-			return
-		end
-
-		pcall(vim.cmd, "silent edit")
 	end)
 end
 
@@ -440,9 +467,6 @@ function M.ensure_project_compile_database(root, opts)
 	local cached = has_compile_commands(cache_dir)
 	local root_dir_db = has_compile_commands(root)
 	if cached and not opts.refresh then
-		if opts.remove_source == true and root_dir_db and normalize(root_dir_db) == root then
-			delete_file(path_join(root, "compile_commands.json"))
-		end
 		return cached
 	end
 
@@ -459,10 +483,6 @@ function M.ensure_project_compile_database(root, opts)
 
 	if normalize(source_path) ~= normalize(target_path) and not copy_file(source_path, target_path) then
 		return nil
-	end
-
-	if opts.remove_source == true and source_dir == root and normalize(source_path) ~= normalize(target_path) then
-		delete_file(source_path)
 	end
 
 	return cache_dir
@@ -627,9 +647,30 @@ function M.clangd_config(opts)
 	local cmd = opts.cmd or clangd.cmd
 
 	if not cmd then
-		cmd = { command }
-		for _, arg in ipairs(clangd.args or default_clangd_args) do
-			table.insert(cmd, arg)
+		if has_native_lsp_enable() then
+			cmd = function(dispatchers, client_config)
+				local root = normalize(client_config.root_dir)
+				local resolved = { command }
+				for _, arg in ipairs(clangd.args or default_clangd_args) do
+					table.insert(resolved, arg)
+				end
+
+				local compile_commands_dir = root and M.find_compilation_database(root) or nil
+				if compile_commands_dir then
+					table.insert(resolved, "--compile-commands-dir=" .. normalize(compile_commands_dir))
+				end
+
+				return vim.lsp.rpc.start(resolved, dispatchers, {
+					cwd = root or client_config.cmd_cwd,
+					env = client_config.cmd_env,
+					detached = client_config.detached,
+				})
+			end
+		else
+			cmd = { command }
+			for _, arg in ipairs(clangd.args or default_clangd_args) do
+				table.insert(cmd, arg)
+			end
 		end
 	end
 
@@ -685,10 +726,12 @@ function M.clangd_config(opts)
 
 	merged.on_new_config = function(new_config, new_root_dir)
 		local has_compile_dir = false
-		for _, arg in ipairs(new_config.cmd or {}) do
-			if tostring(arg):find("^%-%-compile%-commands%-dir=", 1) then
-				has_compile_dir = true
-				break
+		if type(new_config.cmd) == "table" then
+			for _, arg in ipairs(new_config.cmd) do
+				if tostring(arg):find("^%-%-compile%-commands%-dir=", 1) then
+					has_compile_dir = true
+					break
+				end
 			end
 		end
 
