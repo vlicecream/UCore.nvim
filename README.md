@@ -47,46 +47,10 @@ It does **not** own syntax highlighting or VCS anymore:
 
 ### Installation
 
-#### Recommended Stack
+#### UCore Only
 
 ```lua
 return {
-  {
-    "vlicecream/UTreeSitter.nvim",
-    main = "utreesitter",
-    lazy = false,
-    dependencies = {
-      {
-        "nvim-treesitter/nvim-treesitter",
-        build = ":TSUpdate",
-        opts = function(_, opts)
-          opts = opts or {}
-          opts.auto_install = true
-          opts.indent = { enable = true }
-          return opts
-        end,
-      },
-    },
-    opts = {},
-  },
-
-  {
-    "vlicecream/UVersionControlSystem.nvim",
-    main = "uvcs",
-    lazy = false,
-    opts = {
-      enable = true,
-      prompt_on_readonly_save = true,
-      provider = "auto",
-      p4 = {
-        command = "p4",
-        -- port = "127.0.0.1:1666",
-        -- user = "YourUser",
-        -- client = "YourWorkspace",
-      },
-    },
-  },
-
   {
     "vlicecream/UCore.nvim",
     main = "ucore",
@@ -131,7 +95,11 @@ return {
 }
 ```
 
-`UTreeSitter.nvim` and `UVersionControlSystem.nvim` are separate top-level plugins. `UCore.nvim` no longer bundles either layer.
+Optional companion plugins:
+
+- install `UTreeSitter.nvim` if you want Unreal tree-sitter highlighting
+- install `UVersionControlSystem.nvim` if you want the Unreal VCS dashboard and actions
+
 `extend_blink_opts()` only prepares `blink.cmp` at config time. UCore does not patch blink at runtime.
 
 ### Semantic Diagnostics
@@ -404,46 +372,10 @@ MIT
 
 ### 安装
 
-#### 推荐组合
+#### 仅安装 UCore
 
 ```lua
 return {
-  {
-    "vlicecream/UTreeSitter.nvim",
-    main = "utreesitter",
-    lazy = false,
-    dependencies = {
-      {
-        "nvim-treesitter/nvim-treesitter",
-        build = ":TSUpdate",
-        opts = function(_, opts)
-          opts = opts or {}
-          opts.auto_install = true
-          opts.indent = { enable = true }
-          return opts
-        end,
-      },
-    },
-    opts = {},
-  },
-
-  {
-    "vlicecream/UVersionControlSystem.nvim",
-    main = "uvcs",
-    lazy = false,
-    opts = {
-      enable = true,
-      prompt_on_readonly_save = true,
-      provider = "auto",
-      p4 = {
-        command = "p4",
-        -- port = "127.0.0.1:1666",
-        -- user = "YourUser",
-        -- client = "YourWorkspace",
-      },
-    },
-  },
-
   {
     "vlicecream/UCore.nvim",
     main = "ucore",
@@ -489,7 +421,11 @@ return {
 }
 ```
 
-`UTreeSitter.nvim` 和 `UVersionControlSystem.nvim` 现在都是独立的顶层插件，`UCore.nvim` 不再内置这两层。
+可选配套插件：
+
+- 需要 Unreal tree-sitter 高亮时再装 `UTreeSitter.nvim`
+- 需要 Unreal VCS 面板和操作时再装 `UVersionControlSystem.nvim`
+
 `extend_blink_opts()` 只在配置阶段补全 `blink.cmp` 选项，UCore 不会在运行时改写 blink 配置。
 
 ### 语义诊断
