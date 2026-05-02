@@ -352,8 +352,24 @@ fn handle_state_query(
             file_path,
         } => {
             let cache = state.get_completion_cache(root_key);
-            let value = crate::completion::process_completion(
+            let engine_conn = match engine_db_path
+                .as_deref()
+                .map(normalize_to_native)
+                .filter(|path| Path::new(path).is_file())
+            {
+                Some(path) => match state.get_read_only_connection(&path) {
+                    Ok(conn) => Some(conn),
+                    Err(err) => {
+                        warn!("Failed to open Engine DB for completions: {}", err);
+                        None
+                    }
+                },
+                None => None,
+            };
+
+            let value = crate::completion::process_completion_with_engine(
                 conn,
+                engine_conn.as_ref(),
                 &content,
                 line,
                 character,

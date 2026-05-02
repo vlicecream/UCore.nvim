@@ -187,7 +187,32 @@ pub fn process_completion(
     cache: Option<Arc<Mutex<CompletionCache>>>,
     persistent_cache: Option<Arc<Mutex<Connection>>>,
 ) -> Result<Value> {
+    process_completion_with_engine(
+        conn,
+        None,
+        content,
+        line,
+        character,
+        file_path,
+        cache,
+        persistent_cache,
+    )
+}
+
+/// Main completion entry point with optional Engine DB fallback.
+/// 带可选 Engine DB 兜底的补全主入口。
+pub fn process_completion_with_engine(
+    conn: &Connection,
+    engine_conn: Option<&Connection>,
+    content: &str,
+    line: u32,
+    character: u32,
+    file_path: Option<String>,
+    cache: Option<Arc<Mutex<CompletionCache>>>,
+    persistent_cache: Option<Arc<Mutex<Connection>>>,
+) -> Result<Value> {
     let mut ctx = CompletionContext::new(conn, file_path.as_deref());
+    let mut engine_ctx = engine_conn.map(|conn| CompletionContext::new(conn, file_path.as_deref()));
 
     let mut parser = Parser::new();
     let language: tree_sitter::Language = tree_sitter_unreal_cpp::LANGUAGE.into();
@@ -219,22 +244,24 @@ pub fn process_completion(
 
         if receiver_text == "Super" {
             if let Some(current_class) = current_class.as_deref() {
-                let members = fetch_super_members(
+                let members = fetch_super_members_with_engine(
                     &mut ctx,
+                    engine_ctx.as_mut(),
                     current_class,
                     request.prefix,
                     cache,
                     persistent_cache,
                 )?;
 
-                return Ok(json!(members));
+                return Ok(json!(dedupe_completion_items(members)));
             }
 
             return Ok(json!([]));
         }
 
-        let ty = resolve_expression_type(
+        let ty = resolve_expression_type_with_engine(
             &mut ctx,
+            engine_ctx.as_mut(),
             request.receiver,
             root,
             content,
@@ -244,54 +271,76 @@ pub fn process_completion(
         if let Some(ty) = ty {
             let ty = resolve_typedef(&mut ctx, &ty)?;
 
-            let members = fetch_members_recursive(
+            let members = fetch_members_with_engine(
                 &mut ctx,
+                engine_ctx.as_mut(),
                 &ty,
                 request.prefix,
                 cache,
                 persistent_cache,
                 current_class.as_deref(),
+                false,
             )?;
 
-            return Ok(json!(members));
+            return Ok(json!(dedupe_completion_items(members)));
         }
 
         return Ok(json!([]));
     }
 
     let prefix = completion_prefix(cursor_node, content);
-    let mut items = Vec::new();
+    let mut items = collect_local_completion_items(
+        cursor_node,
+        content,
+        line as usize,
+        character as usize,
+        &prefix,
+    );
+
+    let buffer_items = collect_buffer_symbol_items(root, content, line as usize, &prefix);
+    merge_completion_items(&mut items, buffer_items, MAX_COMPLETION_ITEMS);
 
     if !prefix.is_empty() {
         if let Some(current_class) = enclosing_class(cursor_node, content) {
-            let members = fetch_members_recursive(
+            let members = fetch_members_with_engine(
                 &mut ctx,
+                engine_ctx.as_mut(),
                 &current_class,
                 Some(prefix.clone()),
                 cache.clone(),
                 persistent_cache.clone(),
                 Some(&current_class),
+                false,
             )?;
 
-            items.extend(members);
+            merge_completion_items(&mut items, members, MAX_COMPLETION_ITEMS);
         }
     }
 
     if should_offer_ue_snippets(&prefix) {
-        items.extend(ue_snippets(&prefix));
+        merge_completion_items(&mut items, ue_snippets(&prefix), MAX_COMPLETION_ITEMS);
     }
 
     if prefix.chars().count() >= MIN_GLOBAL_PREFIX_LEN {
-        items.extend(fetch_global_symbols(conn, &prefix)?);
+        merge_completion_items(&mut items, fetch_global_symbols(conn, &prefix)?, MAX_COMPLETION_ITEMS);
+
+        if let Some(engine_ctx) = engine_ctx.as_ref() {
+            merge_completion_items(
+                &mut items,
+                fetch_global_symbols(engine_ctx.conn, &prefix)?,
+                MAX_COMPLETION_ITEMS,
+            );
+        }
     }
 
     Ok(json!(dedupe_completion_items(items)))
 }
 
-/// Complete members for the direct parent of the current class.
-/// 补全当前类直接父类的成员。
-fn fetch_super_members(
+/// Complete members for the direct parent of the current class with Engine fallback.
+/// 补全当前类直接父类的成员，并带上 Engine 兜底。
+fn fetch_super_members_with_engine(
     ctx: &mut CompletionContext,
+    engine_ctx: Option<&mut CompletionContext>,
     current_class: &str,
     prefix: Option<String>,
     memory_cache: Option<Arc<Mutex<CompletionCache>>>,
@@ -301,14 +350,129 @@ fn fetch_super_members(
         return Ok(Vec::new());
     };
 
-    fetch_members_recursive(
+    fetch_members_with_engine(
         ctx,
+        engine_ctx,
         &parent_class,
         prefix,
         memory_cache,
         persistent_cache,
         Some(current_class),
+        true,
     )
+}
+
+/// Fetch members from the project DB and extend them with Engine parent-chain members.
+/// 先查项目 DB 的成员，再补上 Engine 父类链的成员。
+fn fetch_members_with_engine(
+    ctx: &mut CompletionContext,
+    engine_ctx: Option<&mut CompletionContext>,
+    class_name: &str,
+    prefix: Option<String>,
+    memory_cache: Option<Arc<Mutex<CompletionCache>>>,
+    persistent_cache: Option<Arc<Mutex<Connection>>>,
+    accessor_class: Option<&str>,
+    assume_engine_subclass_access: bool,
+) -> Result<Vec<Value>> {
+    let mut items = fetch_members_recursive(
+        ctx,
+        class_name,
+        prefix.clone(),
+        memory_cache,
+        persistent_cache,
+        accessor_class,
+        false,
+    )?;
+
+    let Some(engine_ctx) = engine_ctx else {
+        return Ok(items);
+    };
+
+    let mut roots = collect_engine_member_roots(ctx, engine_ctx, class_name)?;
+
+    if assume_engine_subclass_access {
+        let resolved = resolve_typedef(ctx, class_name)?;
+        if ctx.class_ids_by_name(&resolved)?.is_empty()
+            && !engine_ctx.class_ids_by_name(&resolved)?.is_empty()
+            && !roots.iter().any(|(name, _)| name == &resolved)
+        {
+            roots.insert(0, (resolved, true));
+        }
+    }
+
+    for (root_name, assume_subclass_access) in roots {
+        let extra = fetch_members_recursive(
+            engine_ctx,
+            &root_name,
+            prefix.clone(),
+            None,
+            None,
+            accessor_class,
+            assume_subclass_access,
+        )?;
+
+        merge_completion_items(&mut items, extra, MAX_COMPLETION_ITEMS);
+    }
+
+    Ok(items)
+}
+
+/// Collect Engine-side parent roots that are referenced by project classes but not indexed locally.
+/// 收集项目类引用到、但本地 DB 没有定义的 Engine 父类根节点。
+fn collect_engine_member_roots(
+    ctx: &mut CompletionContext,
+    engine_ctx: &mut CompletionContext,
+    class_name: &str,
+) -> Result<Vec<(String, bool)>> {
+    let class_name = resolve_typedef(ctx, class_name)?;
+    let class_ids = ctx.class_ids_by_name(&class_name)?;
+
+    if class_ids.is_empty() {
+        if !engine_ctx.class_ids_by_name(&class_name)?.is_empty() {
+            return Ok(vec![(class_name, false)]);
+        }
+
+        return Ok(Vec::new());
+    }
+
+    let mut queue = VecDeque::from(class_ids);
+    let mut visited = HashSet::new();
+    let mut seen_names = HashSet::new();
+    let mut roots = Vec::new();
+
+    while let Some(class_id) = queue.pop_front() {
+        if !visited.insert(class_id) {
+            continue;
+        }
+
+        for (parent_id, parent_name) in parent_classes(ctx.conn, class_id)? {
+            let parent_name = clean_type(&parent_name);
+
+            if parent_name.is_empty() || !seen_names.insert(parent_name.clone()) {
+                if let Some(parent_id) = parent_id {
+                    queue.push_back(parent_id);
+                }
+                continue;
+            }
+
+            let parent_ids = ctx.class_ids_by_name(&parent_name)?;
+            let in_engine = !engine_ctx.class_ids_by_name(&parent_name)?.is_empty();
+
+            if in_engine {
+                roots.push((parent_name, true));
+            }
+
+            if parent_ids.is_empty() {
+                continue;
+            }
+
+            for parent_id in parent_ids {
+                queue.push_back(parent_id);
+            }
+        }
+    }
+
+    Ok(roots)
 }
 
 /// Return the first direct parent class name for a class.
@@ -593,6 +757,286 @@ fn resolve_expression_type(
     }
 }
 
+/// Resolve expression type with optional Engine DB fallback.
+/// 带可选 Engine DB 兜底的表达式类型解析。
+fn resolve_expression_type_with_engine(
+    ctx: &mut CompletionContext,
+    engine_ctx: Option<&mut CompletionContext>,
+    node: Node,
+    root: Node,
+    content: &str,
+    cursor_row: usize,
+) -> Result<Option<String>> {
+    let mut engine_ctx = engine_ctx;
+
+    match node.kind() {
+        "this" => Ok(enclosing_class(node, content)),
+
+        "identifier" | "field_identifier" | "type_identifier" | "namespace_identifier" => {
+            let name = node_text(node, content).trim();
+
+            if name == "this" {
+                return Ok(enclosing_class(node, content));
+            }
+
+            if let Some(ty) = infer_variable_type(ctx, name, root, content, cursor_row)? {
+                return Ok(Some(ty));
+            }
+
+            if let Some(class_name) = enclosing_class(node, content) {
+                if let Some(return_type) = find_member_return_type_with_engine(
+                    ctx,
+                    engine_ctx.as_deref_mut(),
+                    &class_name,
+                    name,
+                )? {
+                    return Ok(Some(return_type));
+                }
+            }
+
+            if is_known_type_with_engine(ctx, engine_ctx.as_deref_mut(), name)? {
+                return Ok(Some(name.to_string()));
+            }
+
+            Ok(None)
+        }
+
+        "qualified_identifier" => {
+            let text = node_text(node, content).trim();
+
+            if is_known_type_with_engine(ctx, engine_ctx.as_deref_mut(), text)? {
+                return Ok(Some(text.to_string()));
+            }
+
+            if let Some((class_name, member_name)) = text.rsplit_once("::") {
+                return find_member_return_type_with_engine(
+                    ctx,
+                    engine_ctx.as_deref_mut(),
+                    class_name,
+                    member_name,
+                );
+            }
+
+            Ok(None)
+        }
+
+        "call_expression" => {
+            let Some(function) = node.child_by_field_name("function") else {
+                return Ok(None);
+            };
+
+            if let Some(ty) = resolve_special_call_type_with_engine(
+                ctx,
+                engine_ctx.as_deref_mut(),
+                function,
+                root,
+                content,
+                cursor_row,
+            )? {
+                return Ok(Some(ty));
+            }
+
+            match function.kind() {
+                "field_expression" => {
+                    let object = function.child_by_field_name("argument").or_else(|| function.child(0));
+                    let field = function.child_by_field_name("field");
+
+                    if let (Some(object), Some(field)) = (object, field) {
+                        if let Some(object_type) = resolve_expression_type_with_engine(
+                            ctx,
+                            engine_ctx.as_deref_mut(),
+                            object,
+                            root,
+                            content,
+                            cursor_row,
+                        )? {
+                            return find_member_return_type_with_engine(
+                                ctx,
+                                engine_ctx.as_deref_mut(),
+                                &object_type,
+                                node_text(field, content).trim(),
+                            );
+                        }
+                    }
+
+                    Ok(None)
+                }
+
+                _ => {
+                    let name = node_text(function, content).trim();
+
+                    if let Some((class_name, method_name)) = name.rsplit_once("::") {
+                        return find_member_return_type_with_engine(
+                            ctx,
+                            engine_ctx.as_deref_mut(),
+                            class_name,
+                            method_name,
+                        );
+                    }
+
+                    if let Some(class_name) = enclosing_class(node, content) {
+                        return find_member_return_type_with_engine(
+                            ctx,
+                            engine_ctx.as_deref_mut(),
+                            &class_name,
+                            name,
+                        );
+                    }
+
+                    Ok(None)
+                }
+            }
+        }
+
+        "field_expression" => {
+            let object = node.child_by_field_name("argument").or_else(|| node.child(0));
+            let field = node.child_by_field_name("field");
+
+            if let (Some(object), Some(field)) = (object, field) {
+                if let Some(object_type) = resolve_expression_type_with_engine(
+                    ctx,
+                    engine_ctx.as_deref_mut(),
+                    object,
+                    root,
+                    content,
+                    cursor_row,
+                )? {
+                    return find_member_return_type_with_engine(
+                        ctx,
+                        engine_ctx.as_deref_mut(),
+                        &object_type,
+                        node_text(field, content).trim(),
+                    );
+                }
+            }
+
+            Ok(None)
+        }
+
+        "subscript_expression" => {
+            let object = node.child_by_field_name("argument").or_else(|| node.child(0));
+
+            if let Some(object) = object {
+                if let Some(object_type) = resolve_expression_type_with_engine(
+                    ctx,
+                    engine_ctx.as_deref_mut(),
+                    object,
+                    root,
+                    content,
+                    cursor_row,
+                )? {
+                    return Ok(Some(unwrap_container_type(&object_type)));
+                }
+            }
+
+            Ok(None)
+        }
+
+        "parenthesized_expression" | "pointer_expression" | "reference_declarator" => {
+            for child in node_children(node) {
+                if !matches!(child.kind(), "(" | ")" | "*" | "&") {
+                    return resolve_expression_type_with_engine(
+                        ctx,
+                        engine_ctx.as_deref_mut(),
+                        child,
+                        root,
+                        content,
+                        cursor_row,
+                    );
+                }
+            }
+
+            Ok(None)
+        }
+
+        _ => resolve_expression_type(ctx, node, root, content, cursor_row),
+    }
+}
+
+/// Resolve known Unreal factory/cast calls with optional Engine fallback.
+/// 带可选 Engine 兜底地解析 Unreal 常见工厂函数或 Cast 调用。
+fn resolve_special_call_type_with_engine(
+    ctx: &mut CompletionContext,
+    engine_ctx: Option<&mut CompletionContext>,
+    function: Node,
+    root: Node,
+    content: &str,
+    cursor_row: usize,
+) -> Result<Option<String>> {
+    let text = node_text(function, content).trim();
+
+    if let Some(template_type) = extract_template_call_type(text) {
+        let function_name = text.split('<').next().unwrap_or("");
+
+        if matches!(
+            function_name,
+            "Cast"
+                | "CastChecked"
+                | "ExactCast"
+                | "NewObject"
+                | "CreateWidget"
+                | "CreateDefaultSubobject"
+        ) {
+            return Ok(Some(template_type));
+        }
+    }
+
+    resolve_expression_type_with_engine(ctx, engine_ctx, function, root, content, cursor_row)
+}
+
+/// Find a member return type with optional Engine parent-chain fallback.
+/// 查找成员返回类型，并支持 Engine 父类链兜底。
+fn find_member_return_type_with_engine(
+    ctx: &mut CompletionContext,
+    engine_ctx: Option<&mut CompletionContext>,
+    class_name: &str,
+    member_name: &str,
+) -> Result<Option<String>> {
+    if let Some(ty) = find_member_return_type(ctx, class_name, member_name)? {
+        return Ok(Some(ty));
+    }
+
+    let Some(engine_ctx) = engine_ctx else {
+        return Ok(None);
+    };
+
+    let resolved = resolve_typedef(ctx, class_name)?;
+    let mut roots = collect_engine_member_roots(ctx, engine_ctx, &resolved)?;
+
+    if ctx.class_ids_by_name(&resolved)?.is_empty()
+        && !engine_ctx.class_ids_by_name(&resolved)?.is_empty()
+        && !roots.iter().any(|(name, _)| name == &resolved)
+    {
+        roots.insert(0, (resolved, false));
+    }
+
+    for (root_name, _) in roots {
+        if let Some(ty) = find_member_return_type(engine_ctx, &root_name, member_name)? {
+            return Ok(Some(ty));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Check whether a type exists in either the project DB or the Engine DB.
+/// 检查某个类型是否存在于项目 DB 或 Engine DB。
+fn is_known_type_with_engine(
+    ctx: &mut CompletionContext,
+    engine_ctx: Option<&mut CompletionContext>,
+    name: &str,
+) -> Result<bool> {
+    if is_known_type(ctx, name)? {
+        return Ok(true);
+    }
+
+    let Some(engine_ctx) = engine_ctx else {
+        return Ok(false);
+    };
+
+    is_known_type(engine_ctx, name)
+}
+
 /// Resolve known Unreal factory/cast calls.
 /// 解析 Unreal 常见工厂函数或 Cast 调用的返回类型。
 fn resolve_special_call_type(
@@ -835,6 +1279,435 @@ fn known_call_return_type(function_name: &str) -> Option<&'static str> {
     }
 }
 
+struct DeclaratorIdentity {
+    name: String,
+    is_function: bool,
+    has_scope: bool,
+}
+
+/// Collect visible local variables and parameters for ordinary completion.
+/// 为普通补全收集当前可见的局部变量和参数。
+fn collect_local_completion_items(
+    cursor_node: Node,
+    content: &str,
+    cursor_row: usize,
+    cursor_col: usize,
+    prefix: &str,
+) -> Vec<Value> {
+    if prefix.is_empty() {
+        return Vec::new();
+    }
+
+    let Some(scope_root) = enclosing_callable(cursor_node) else {
+        return Vec::new();
+    };
+
+    let cursor_point = Point::new(cursor_row, cursor_col);
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Some(declarator) = scope_root.child_by_field_name("declarator") {
+        collect_parameter_completion_items(declarator, content, prefix, &mut seen, &mut items);
+    }
+
+    collect_visible_local_declarations(
+        scope_root,
+        cursor_point,
+        content,
+        prefix,
+        &mut seen,
+        &mut items,
+    );
+
+    items
+}
+
+/// Collect current-buffer free functions and unsaved type symbols.
+/// 收集当前 buffer 里的自由函数和未落盘类型符号。
+fn collect_buffer_symbol_items(
+    root: Node,
+    content: &str,
+    cursor_row: usize,
+    prefix: &str,
+) -> Vec<Value> {
+    if prefix.is_empty() {
+        return Vec::new();
+    }
+
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+
+    collect_buffer_symbols_recursive(root, content, cursor_row, &mut seen, &mut items, prefix);
+
+    items
+}
+
+/// Merge completion items while preserving existing order and deduplicating by label.
+/// 合并补全项，保持已有顺序，并按 label 去重。
+fn merge_completion_items(target: &mut Vec<Value>, extra: Vec<Value>, limit: usize) {
+    let mut seen = target
+        .iter()
+        .filter_map(|item| item.get("label").and_then(Value::as_str))
+        .map(|label| label.to_string())
+        .collect::<HashSet<_>>();
+
+    for item in extra {
+        if target.len() >= limit {
+            break;
+        }
+
+        let Some(label) = item.get("label").and_then(Value::as_str) else {
+            continue;
+        };
+
+        if seen.insert(label.to_string()) {
+            target.push(item);
+        }
+    }
+}
+
+fn collect_parameter_completion_items(
+    node: Node,
+    content: &str,
+    prefix: &str,
+    seen: &mut HashSet<String>,
+    items: &mut Vec<Value>,
+) {
+    if node.kind() == "parameter_declaration" {
+        append_declaration_completion_items(node, content, prefix, seen, items, "parameter", 0);
+        return;
+    }
+
+    for child in node_children(node) {
+        collect_parameter_completion_items(child, content, prefix, seen, items);
+    }
+}
+
+fn collect_visible_local_declarations(
+    node: Node,
+    cursor_point: Point,
+    content: &str,
+    prefix: &str,
+    seen: &mut HashSet<String>,
+    items: &mut Vec<Value>,
+) {
+    for child in node_children(node) {
+        if point_is_before(cursor_point, child.start_position()) {
+            continue;
+        }
+
+        if child.kind() == "declaration" {
+            append_declaration_completion_items(child, content, prefix, seen, items, "local", 5);
+        }
+
+        if node_contains_point(child, cursor_point)
+            && !matches!(
+                child.kind(),
+                "class_specifier"
+                    | "struct_specifier"
+                    | "unreal_reflected_class_declaration"
+                    | "unreal_reflected_struct_declaration"
+                    | "enum_specifier"
+            )
+        {
+            collect_visible_local_declarations(child, cursor_point, content, prefix, seen, items);
+        }
+    }
+}
+
+fn append_declaration_completion_items(
+    node: Node,
+    content: &str,
+    prefix: &str,
+    seen: &mut HashSet<String>,
+    items: &mut Vec<Value>,
+    description: &str,
+    rank_base: usize,
+) {
+    let Some(declarator) = node.child_by_field_name("declarator") else {
+        return;
+    };
+
+    let type_text = completion_decl_type(node, content);
+    let mut identities = Vec::new();
+    collect_declarator_identities(declarator, content, false, false, &mut identities);
+
+    for identity in identities {
+        if identity.is_function || identity.has_scope || identity.name.is_empty() {
+            continue;
+        }
+
+        let match_rank = completion_match_rank(&identity.name, prefix);
+        if match_rank == COMPLETION_MATCH_NONE || !seen.insert(identity.name.clone()) {
+            continue;
+        }
+
+        let detail = if type_text.is_empty() {
+            description.to_string()
+        } else {
+            format!("{} {}", type_text, description)
+        };
+
+        items.push(json!({
+            "label": identity.name,
+            "kind": 6,
+            "detail": detail,
+            "filterText": identity.name,
+            "insertText": identity.name,
+            "sortText": completion_sort_text(rank_base + match_rank, 6, &identity.name),
+        }));
+    }
+}
+
+fn collect_buffer_symbols_recursive(
+    node: Node,
+    content: &str,
+    cursor_row: usize,
+    seen: &mut HashSet<String>,
+    items: &mut Vec<Value>,
+    prefix: &str,
+) {
+    for child in node_children(node) {
+        if child.start_position().row > cursor_row {
+            continue;
+        }
+
+        match child.kind() {
+            "class_specifier"
+            | "struct_specifier"
+            | "enum_specifier"
+            | "unreal_reflected_class_declaration"
+            | "unreal_reflected_struct_declaration"
+            | "unreal_reflected_enum_declaration" => {
+                append_buffer_type_item(child, content, prefix, seen, items);
+            }
+
+            "function_definition" => {
+                append_buffer_function_item(child, content, prefix, seen, items);
+            }
+
+            "declaration" => {
+                append_buffer_function_item(child, content, prefix, seen, items);
+            }
+
+            "namespace_definition" => {
+                collect_buffer_symbols_recursive(child, content, cursor_row, seen, items, prefix);
+            }
+
+            _ => {}
+        }
+    }
+}
+
+fn append_buffer_type_item(
+    node: Node,
+    content: &str,
+    prefix: &str,
+    seen: &mut HashSet<String>,
+    items: &mut Vec<Value>,
+) {
+    let Some(name) = node.child_by_field_name("name") else {
+        return;
+    };
+
+    let label = clean_type(node_text(name, content));
+    if label.is_empty() {
+        return;
+    }
+
+    let match_rank = completion_match_rank(&label, prefix);
+    if match_rank == COMPLETION_MATCH_NONE || !seen.insert(label.clone()) {
+        return;
+    }
+
+    let (detail, kind) = match node.kind() {
+        "enum_specifier" | "unreal_reflected_enum_declaration" => ("enum", 13),
+        "struct_specifier" | "unreal_reflected_struct_declaration" => ("struct", 7),
+        _ => ("class", 7),
+    };
+
+    items.push(json!({
+        "label": label,
+        "kind": kind,
+        "detail": detail,
+        "filterText": label,
+        "insertText": label,
+        "sortText": completion_sort_text(200 + match_rank, kind, &label),
+    }));
+}
+
+fn append_buffer_function_item(
+    node: Node,
+    content: &str,
+    prefix: &str,
+    seen: &mut HashSet<String>,
+    items: &mut Vec<Value>,
+) {
+    if is_inside_class_like(node) {
+        return;
+    }
+
+    let Some(declarator) = node.child_by_field_name("declarator") else {
+        return;
+    };
+
+    let mut identities = Vec::new();
+    collect_declarator_identities(declarator, content, false, false, &mut identities);
+
+    let Some(identity) = identities
+        .into_iter()
+        .find(|identity| identity.is_function && !identity.has_scope)
+    else {
+        return;
+    };
+
+    let match_rank = completion_match_rank(&identity.name, prefix);
+    if match_rank == COMPLETION_MATCH_NONE || !seen.insert(identity.name.clone()) {
+        return;
+    }
+
+    let return_type = node
+        .child_by_field_name("type")
+        .map(|type_node| clean_type(node_text(type_node, content)))
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| "function".to_string());
+
+    items.push(json!({
+        "label": identity.name,
+        "kind": 2,
+        "detail": return_type,
+        "filterText": identity.name,
+        "insertText": identity.name,
+        "sortText": completion_sort_text(250 + match_rank, 2, &identity.name),
+    }));
+}
+
+fn completion_decl_type(node: Node, content: &str) -> String {
+    let declared = node
+        .child_by_field_name("type")
+        .map(|type_node| clean_type(node_text(type_node, content)))
+        .unwrap_or_default();
+
+    if declared == "auto" {
+        let text = node_text(node, content);
+        if let Some(initializer) = initializer_text(text) {
+            if let Some(inferred) = infer_type_from_value_text(initializer) {
+                return inferred;
+            }
+        }
+    }
+
+    declared
+}
+
+fn collect_declarator_identities(
+    node: Node,
+    content: &str,
+    is_function: bool,
+    has_scope: bool,
+    out: &mut Vec<DeclaratorIdentity>,
+) {
+    match node.kind() {
+        "identifier" | "field_identifier" => {
+            let name = node_text(node, content).trim();
+            if !name.is_empty() {
+                out.push(DeclaratorIdentity {
+                    name: name.to_string(),
+                    is_function,
+                    has_scope,
+                });
+            }
+        }
+
+        "qualified_identifier" => {
+            let name = node
+                .child_by_field_name("name")
+                .map(|child| node_text(child, content).trim().to_string())
+                .unwrap_or_default();
+
+            if !name.is_empty() {
+                out.push(DeclaratorIdentity {
+                    name,
+                    is_function,
+                    has_scope: true,
+                });
+            }
+        }
+
+        "function_declarator" => {
+            if let Some(next) = node.child_by_field_name("declarator") {
+                collect_declarator_identities(next, content, true, has_scope, out);
+            }
+        }
+
+        "init_declarator"
+        | "pointer_declarator"
+        | "reference_declarator"
+        | "array_declarator"
+        | "parenthesized_declarator" => {
+            if let Some(next) = node.child_by_field_name("declarator") {
+                collect_declarator_identities(next, content, is_function, has_scope, out);
+                return;
+            }
+
+            for child in node_children(node) {
+                collect_declarator_identities(child, content, is_function, has_scope, out);
+            }
+        }
+
+        _ => {
+            for child in node_children(node) {
+                collect_declarator_identities(child, content, is_function, has_scope, out);
+            }
+        }
+    }
+}
+
+fn enclosing_callable(node: Node) -> Option<Node> {
+    let mut current = Some(node);
+
+    while let Some(node) = current {
+        if matches!(
+            node.kind(),
+            "function_definition" | "unreal_function_definition" | "lambda_expression"
+        ) {
+            return Some(node);
+        }
+
+        current = node.parent();
+    }
+
+    None
+}
+
+fn is_inside_class_like(node: Node) -> bool {
+    let mut current = node.parent();
+
+    while let Some(node) = current {
+        if matches!(
+            node.kind(),
+            "class_specifier"
+                | "struct_specifier"
+                | "unreal_reflected_class_declaration"
+                | "unreal_reflected_struct_declaration"
+        ) {
+            return true;
+        }
+
+        current = node.parent();
+    }
+
+    false
+}
+
+fn node_contains_point(node: Node, point: Point) -> bool {
+    !point_is_before(point, node.start_position()) && !point_is_before(node.end_position(), point)
+}
+
+fn point_is_before(left: Point, right: Point) -> bool {
+    left.row < right.row || (left.row == right.row && left.column < right.column)
+}
+
 fn split_identifier_words(text: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut current = String::new();
@@ -996,11 +1869,18 @@ fn fetch_members_recursive(
     memory_cache: Option<Arc<Mutex<CompletionCache>>>,
     persistent_cache: Option<Arc<Mutex<Connection>>>,
     accessor_class: Option<&str>,
+    assume_subclass_access: bool,
 ) -> Result<Vec<Value>> {
     let class_name = resolve_typedef(ctx, class_name)?;
     let prefix = prefix.unwrap_or_default();
     let accessor = accessor_class.unwrap_or("");
-    let cache_key = format!("completion:{}:{}:{}", class_name, prefix, accessor);
+    let cache_key = format!(
+        "completion:{}:{}:{}:{}",
+        class_name,
+        prefix,
+        accessor,
+        assume_subclass_access as u8
+    );
 
     if let Some(items) = read_completion_cache(&cache_key, &memory_cache, &persistent_cache)? {
         return Ok(items);
@@ -1040,6 +1920,7 @@ fn fetch_members_recursive(
             class_rank,
             &prefix,
             accessor,
+            assume_subclass_access,
             &mut seen_items,
             &mut items,
         )?;
@@ -1086,6 +1967,7 @@ fn append_members_for_class(
     class_rank: usize,
     prefix: &str,
     accessor_class: &str,
+    assume_subclass_access: bool,
     seen: &mut HashSet<String>,
     items: &mut Vec<Value>,
 ) -> Result<()> {
@@ -1135,7 +2017,13 @@ fn append_members_for_class(
             continue;
         }
 
-        if !is_member_accessible(ctx, owner_class, accessor_class, access.as_deref())? {
+        if !is_member_accessible(
+            ctx,
+            owner_class,
+            accessor_class,
+            access.as_deref(),
+            assume_subclass_access,
+        )? {
             continue;
         }
 
@@ -1200,6 +2088,7 @@ fn is_member_accessible(
     owner_class: &str,
     accessor_class: &str,
     access: Option<&str>,
+    assume_subclass_access: bool,
 ) -> Result<bool> {
     let access = access.unwrap_or("");
 
@@ -1216,6 +2105,9 @@ fn is_member_accessible(
     }
 
     if access == "protected" {
+        if assume_subclass_access {
+            return Ok(true);
+        }
         return is_subclass_of(ctx, accessor_class, owner_class);
     }
 
@@ -1471,12 +2363,27 @@ fn is_known_type(ctx: &mut CompletionContext, name: &str) -> Result<bool> {
 /// Fetch global class/struct/enum completions.
 /// 获取全局 class/struct/enum 补全。
 fn fetch_global_symbols(conn: &Connection, prefix: &str) -> Result<Vec<Value>> {
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+
+    append_global_type_items(conn, prefix, &mut seen, &mut items)?;
+    append_global_enum_value_items(conn, prefix, &mut seen, &mut items)?;
+
+    Ok(items)
+}
+
+fn append_global_type_items(
+    conn: &Connection,
+    prefix: &str,
+    seen: &mut HashSet<String>,
+    items: &mut Vec<Value>,
+) -> Result<()> {
     let mut stmt = conn.prepare(
         r#"
         SELECT s.text, c.symbol_type
         FROM classes c
         JOIN strings s ON c.name_id = s.id
-        WHERE c.symbol_type IN ('class', 'struct', 'UCLASS', 'USTRUCT', 'enum', 'UENUM')
+        WHERE c.symbol_type IN ('class', 'struct', 'UCLASS', 'USTRUCT', 'enum', 'UENUM', 'typedef')
         ORDER BY s.text
         LIMIT 400
         "#,
@@ -1488,12 +2395,10 @@ fn fetch_global_symbols(conn: &Connection, prefix: &str) -> Result<Vec<Value>> {
         Ok((name, symbol_type))
     })?;
 
-    let mut items = Vec::new();
-
     for row in rows.flatten() {
         let (name, symbol_type) = row;
         let match_rank = completion_match_rank(&name, prefix);
-        if match_rank == COMPLETION_MATCH_NONE {
+        if match_rank == COMPLETION_MATCH_NONE || !seen.insert(name.clone()) {
             continue;
         }
 
@@ -1521,7 +2426,59 @@ fn fetch_global_symbols(conn: &Connection, prefix: &str) -> Result<Vec<Value>> {
         }
     }
 
-    Ok(items)
+    Ok(())
+}
+
+fn append_global_enum_value_items(
+    conn: &Connection,
+    prefix: &str,
+    seen: &mut HashSet<String>,
+    items: &mut Vec<Value>,
+) -> Result<()> {
+    if items.len() >= 80 {
+        return Ok(());
+    }
+
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT sen.text, sclass.text
+        FROM enum_values ev
+        JOIN strings sen ON ev.name_id = sen.id
+        JOIN classes c ON ev.enum_id = c.id
+        JOIN strings sclass ON c.name_id = sclass.id
+        ORDER BY sen.text
+        LIMIT 200
+        "#,
+    )?;
+
+    let rows = stmt.query_map([], |row| {
+        let name: String = row.get(0)?;
+        let owner: String = row.get(1)?;
+        Ok((name, owner))
+    })?;
+
+    for row in rows.flatten() {
+        let (name, owner) = row;
+        let match_rank = completion_match_rank(&name, prefix);
+        if match_rank == COMPLETION_MATCH_NONE || !seen.insert(name.clone()) {
+            continue;
+        }
+
+        items.push(json!({
+            "label": name,
+            "kind": 20,
+            "detail": format!("enum item - {}", owner),
+            "filterText": name,
+            "sortText": completion_sort_text(100_500 + match_rank, 20, &name),
+            "insertText": name,
+        }));
+
+        if items.len() >= 80 {
+            break;
+        }
+    }
+
+    Ok(())
 }
 
 /// Complete indexed headers inside an unfinished #include string.
@@ -2487,6 +3444,28 @@ mod tests {
         .unwrap_or_default()
     }
 
+    fn completion_at_with_engine(
+        conn: &Connection,
+        engine_conn: &Connection,
+        source: &str,
+    ) -> Vec<Value> {
+        let (content, line, character) = source_with_cursor(source);
+        process_completion_with_engine(
+            conn,
+            Some(engine_conn),
+            &content,
+            line,
+            character,
+            Some(TEST_FILE.to_string()),
+            None,
+            None,
+        )
+        .unwrap()
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+    }
+
     fn source_with_cursor(source: &str) -> (String, u32, u32) {
         let marker = "/*cursor*/";
         let offset = source.find(marker).expect("fixture must contain cursor marker");
@@ -2610,6 +3589,15 @@ mod tests {
         conn.execute(
             "INSERT INTO inheritance (child_id, parent_name_id, parent_class_id) VALUES (?, ?, ?)",
             [child_id, parent_name_id, parent_id],
+        )
+        .unwrap();
+    }
+
+    fn insert_external_inheritance(conn: &Connection, child_id: i64, parent_name: &str) {
+        let parent_name_id = insert_string(conn, parent_name);
+        conn.execute(
+            "INSERT INTO inheritance (child_id, parent_name_id, parent_class_id) VALUES (?, ?, NULL)",
+            [child_id, parent_name_id],
         )
         .unwrap();
     }
@@ -2829,5 +3817,134 @@ void Test() {
         let prefix_index = label_index(&items, "GetActorComponent").unwrap();
         let middle_index = label_index(&items, "GetMeshActor").unwrap();
         assert!(prefix_index < middle_index);
+    }
+
+    #[test]
+    fn local_completion_returns_parameters_and_locals() {
+        let conn = test_db();
+        let items = completion_at(
+            &conn,
+            r#"
+void Test(UAbilitySystemComponent* AbilitySystem)
+{
+    auto Widget = CreateWidget<UMyWidget>(Object);
+    Abili/*cursor*/
+}
+"#,
+        );
+
+        assert!(has_label(&items, "AbilitySystem"));
+
+        let widget_items = completion_at(
+            &conn,
+            r#"
+void Test(UAbilitySystemComponent* AbilitySystem)
+{
+    auto Widget = CreateWidget<UMyWidget>(Object);
+    Widg/*cursor*/
+}
+"#,
+        );
+
+        assert!(has_label(&widget_items, "Widget"));
+    }
+
+    #[test]
+    fn buffer_completion_returns_free_functions() {
+        let conn = test_db();
+        let items = completion_at(
+            &conn,
+            r#"
+void HelperAbility();
+
+void Test()
+{
+    Help/*cursor*/
+}
+"#,
+        );
+
+        assert!(has_label(&items, "HelperAbility"));
+    }
+
+    #[test]
+    fn engine_parent_members_extend_project_completion() {
+        let project_conn = test_db();
+        let engine_conn = test_db();
+
+        let file_id: i64 = project_conn
+            .query_row("SELECT id FROM files WHERE extension = 'cpp' LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let engine_file_id: i64 = engine_conn
+            .query_row("SELECT id FROM files WHERE extension = 'cpp' LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+
+        let ability_child_id = insert_class(&project_conn, "UMyAbility", file_id);
+        insert_external_inheritance(&project_conn, ability_child_id, "UGameplayAbility");
+
+        let gameplay_ability_id = insert_class(&engine_conn, "UGameplayAbility", engine_file_id);
+        insert_member(
+            &engine_conn,
+            gameplay_ability_id,
+            "EndAbility",
+            "function",
+            Some("void"),
+            "protected",
+            engine_file_id,
+        );
+        insert_member(
+            &engine_conn,
+            gameplay_ability_id,
+            "AbilitySystem",
+            "property",
+            Some("UAbilitySystemComponent"),
+            "protected",
+            engine_file_id,
+        );
+
+        let asc_id = insert_class(&engine_conn, "UAbilitySystemComponent", engine_file_id);
+        insert_member(
+            &engine_conn,
+            asc_id,
+            "CancelAllAbilities",
+            "function",
+            Some("void"),
+            "public",
+            engine_file_id,
+        );
+
+        let items = completion_at_with_engine(
+            &project_conn,
+            &engine_conn,
+            r#"
+class UMyAbility : public UGameplayAbility
+{
+public:
+    void Test()
+    {
+        EndAb/*cursor*/
+    }
+};
+"#,
+        );
+
+        assert!(has_label(&items, "EndAbility"));
+
+        let member_items = completion_at_with_engine(
+            &project_conn,
+            &engine_conn,
+            r#"
+class UMyAbility : public UGameplayAbility
+{
+public:
+    void Test()
+    {
+        AbilitySystem->Cancel/*cursor*/
+    }
+};
+"#,
+        );
+
+        assert!(has_label(&member_items, "CancelAllAbilities"));
     }
 }
