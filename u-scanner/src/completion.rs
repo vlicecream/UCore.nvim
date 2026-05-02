@@ -385,12 +385,12 @@ fn fetch_members_with_engine(
     )?;
 
     let Some(engine_ctx) = engine_ctx else {
-        eprintln!("COMPLETION_DEBUG: engine_ctx is None for class={class_name}");
+        tracing::info!("COMPLETION_DEBUG: engine_ctx is None for class={class_name}");
         return Ok(items);
     };
 
     let mut roots = collect_engine_member_roots(ctx, engine_ctx, class_name)?;
-    eprintln!("COMPLETION_DEBUG: class={class_name} roots_count={} roots={:?}", roots.len(), roots);
+    tracing::info!("COMPLETION_DEBUG: class={class_name} roots_count={} roots={:?}", roots.len(), roots);
 
     if assume_engine_subclass_access {
         let resolved = resolve_typedef(ctx, class_name)?;
