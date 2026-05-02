@@ -348,6 +348,7 @@ local function report_lsp_checks()
 	info("configured clangd command: " .. tostring(lsp_config.command or "clangd"))
 	info("resolved clangd command: " .. tostring(clangd_cmd))
 	info("auto setup: " .. yes_no((config.values.lsp or {}).auto_setup ~= false))
+	info("auto generate compile_commands.json: " .. yes_no(status.auto_generate_compile_commands))
 
 	if executable(clangd_cmd) or readable(clangd_cmd) then
 		ok("clangd executable available")
@@ -372,6 +373,7 @@ local function report_lsp_checks()
 		else
 			warn("compile_commands.json not found for current project", {
 				"With the default UCore clangd policy, clangd will not attach until a compilation database is available.",
+				"During normal :UCore boot, UCore can try to generate and cache the database automatically when UnrealBuildTool is available.",
 				"Run :UCore debug generate-db to let UnrealBuildTool generate it for the current project.",
 				"Set require('ucore').setup({ lsp = { clangd = { compile_commands_dir = '...' } } }) if your database lives outside the project root.",
 				"Or set require('ucore').setup({ lsp = { clangd = { require_compile_commands = false } } }) if you want clangd to attach anyway.",

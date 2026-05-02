@@ -1,5 +1,6 @@
 local client = require("ucore.client")
 local config = require("ucore.config")
+local lsp = require("ucore.lsp")
 local project = require("ucore.project")
 local server = require("ucore.server")
 local status = require("ucore.status")
@@ -21,6 +22,13 @@ local function other_progress(percent)
 	status.progress(
 		"UCore other initialization",
 		string.format("UCore other initialization %d%%", percent)
+	)
+end
+
+local function clangd_progress(percent)
+	status.progress(
+		"UCore clangd database",
+		string.format("UCore clangd database %d%%", percent)
 	)
 end
 
@@ -186,6 +194,38 @@ local function run_watch(payload, callback)
 	end)
 end
 
+-- Prepare clangd compile_commands.json during boot so semantic diagnostics can
+-- attach without requiring a separate manual command.
+-- 在 boot 期间准备 clangd 的 compile_commands.json，避免再手动跑命令。
+local function run_clangd_prepare(payload, callback)
+	local clangd = (config.values.lsp and config.values.lsp.clangd) or {}
+	if clangd.auto_generate_compile_commands == false then
+		status.progress_finish("UCore clangd database", "UCore clangd database skipped")
+		return callback(true)
+	end
+
+	clangd_progress(0)
+	clangd_progress(50)
+
+	lsp.prepare_compile_commands(payload.project_root, {
+		remove_source = true,
+	}, function(ok, result)
+		if ok then
+			status.progress_finish("UCore clangd database", "UCore clangd database 100%")
+			return callback(true, result)
+		end
+
+		status.progress_fail("UCore clangd database", "UCore clangd database failed")
+		vim.schedule(function()
+			vim.notify(
+				"UCore clangd database generation failed:\n" .. tostring(result),
+				vim.log.levels.WARN
+			)
+		end)
+		callback(true)
+	end)
+end
+
 -- Boot the whole UCore stack for the current Unreal project.
 -- 为当前 Unreal 工程一键启动完整 UCore 流程。
 function M.boot(callback, opts)
@@ -244,16 +284,19 @@ function M.boot(callback, opts)
 					end
 
 					run_watch(payload, function(watch_ok, watch_err)
-						booting = false
-
 						if not watch_ok then
+							booting = false
 							fail(tostring(watch_err))
 							return callback(false, watch_err)
 						end
-						other_progress(100)
+						other_progress(80)
 
-						callback(true)
-						run_engine_refresh_in_background(payload)
+						run_clangd_prepare(payload, function()
+							booting = false
+							other_progress(100)
+							callback(true)
+							run_engine_refresh_in_background(payload)
+						end)
 					end)
 				end)
 			end)

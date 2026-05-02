@@ -123,6 +123,37 @@ local function refresh_native_lsp_buffers()
 	end)
 end
 
+local function refresh_project_buffers(root)
+	root = normalize(root)
+	if not root or root == "" then
+		return
+	end
+
+	vim.schedule(function()
+		refresh_native_lsp_buffers()
+
+		local current = vim.api.nvim_get_current_buf()
+		if not vim.api.nvim_buf_is_valid(current) then
+			return
+		end
+
+		local current_path = normalize(vim.api.nvim_buf_get_name(current))
+		if not current_path or current_path == "" then
+			return
+		end
+
+		if project.find_project_root(current_path) ~= root then
+			return
+		end
+
+		if vim.bo[current].modified or vim.bo[current].buftype ~= "" then
+			return
+		end
+
+		pcall(vim.cmd, "silent edit")
+	end)
+end
+
 local function windows_clangd_candidates()
 	local candidates = {
 		"C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/Llvm/x64/bin/clangd.exe",
@@ -449,6 +480,7 @@ function M.clangd_status(root)
 
 	return {
 		auto_setup = configured_auto_setup(),
+		auto_generate_compile_commands = clangd.auto_generate_compile_commands ~= false,
 		command = command,
 		command_available = executable(command),
 		require_compile_commands = clangd.require_compile_commands ~= false,
@@ -513,7 +545,7 @@ function M.generate_compile_commands(root, opts, callback)
 		local ok = result.code == 0
 		if ok then
 			M.ensure_project_compile_database(root, { refresh = true, remove_source = true })
-			refresh_native_lsp_buffers()
+			refresh_project_buffers(root)
 		end
 		local compile_commands_dir = M.find_compilation_database(root)
 		local payload = {
@@ -542,6 +574,34 @@ function M.generate_compile_commands(root, opts, callback)
 
 		callback(false, output ~= "" and output or ("GenerateClangDatabase failed with exit code " .. tostring(result.code)))
 	end)
+end
+
+function M.prepare_compile_commands(root, opts, callback)
+	opts = opts or {}
+	callback = callback or function() end
+	root = normalize(root or project.find_project_root())
+	if not root or root == "" then
+		return callback(false, "Could not find .uproject")
+	end
+
+	local ready_dir = M.ensure_project_compile_database(root, {
+		remove_source = opts.remove_source ~= false,
+	})
+	if ready_dir then
+		refresh_project_buffers(root)
+		return callback(true, {
+			compile_commands_dir = ready_dir,
+			generated = false,
+			staged = true,
+		})
+	end
+
+	local clangd = configured_lsp()
+	if opts.auto_generate == false or clangd.auto_generate_compile_commands == false then
+		return callback(false, "compile_commands.json not found")
+	end
+
+	M.generate_compile_commands(root, opts, callback)
 end
 
 function M.get_capabilities(capabilities)

@@ -9,6 +9,7 @@ local notify_id = "ucore.status"
 local ordered_keys = {
 	"boot",
 	"progress:UCore other initialization",
+	"progress:UCore clangd database",
 	"progress:UCore syntax highlight",
 	"progress:UCore project index",
 	"progress:UCore engine index",

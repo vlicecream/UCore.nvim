@@ -250,6 +250,7 @@ M.values = {
 			single_file_support = false,
 			compile_commands_dir = nil,
 			require_compile_commands = true,
+			auto_generate_compile_commands = true,
 			auto_detect_windows = true,
 		},
 	},
