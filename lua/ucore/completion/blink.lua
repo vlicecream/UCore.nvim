@@ -79,6 +79,7 @@ local function to_blink_item(item)
 		insertText = tostring(insert_text),
 		insertTextFormat = insert_text_format,
 		sortText = tostring(raw.sortText or raw.sort_text or label),
+		score_offset = tonumber(raw.score_offset or raw.scoreOffset) or 0,
 	}
 end
 

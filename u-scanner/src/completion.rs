@@ -1455,6 +1455,7 @@ fn append_declaration_completion_items(
             "filterText": identity.name,
             "insertText": identity.name,
             "sortText": completion_sort_text(rank_base + match_rank, 6, &identity.name),
+            "score_offset": completion_score_offset(match_rank),
         }));
     }
 }
@@ -1533,6 +1534,7 @@ fn append_buffer_type_item(
         "filterText": label,
         "insertText": label,
         "sortText": completion_sort_text(200 + match_rank, kind, &label),
+        "score_offset": completion_score_offset(match_rank),
     }));
 }
 
@@ -1579,6 +1581,7 @@ fn append_buffer_function_item(
         "filterText": identity.name,
         "insertText": identity.name,
         "sortText": completion_sort_text(250 + match_rank, 2, &identity.name),
+        "score_offset": completion_score_offset(match_rank),
     }));
 }
 
@@ -1856,6 +1859,17 @@ fn completion_match_rank(candidate: &str, prefix: &str) -> usize {
     COMPLETION_MATCH_NONE
 }
 
+fn completion_score_offset(match_rank: usize) -> i64 {
+    match match_rank {
+        0 => 24,
+        1 => 18,
+        2..=19 => 10,
+        20..=39 => 2,
+        40..=79 => -8,
+        _ => -14,
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Member fetch
 // -----------------------------------------------------------------------------
@@ -2051,6 +2065,7 @@ fn append_members_for_class(
             "insertText": name,
             "filterText": name,
             "sortText": sort_text,
+            "score_offset": completion_score_offset(match_rank),
             "labelDetails": {
                 "detail": format!(" {}", detail_text),
                 "description": owner_class,
@@ -2151,6 +2166,7 @@ fn append_enum_items(
                 "filterText": name,
                 "sortText": completion_sort_text(class_rank * 1000 + match_rank, kind, &name),
                 "insertText": name,
+                "score_offset": completion_score_offset(match_rank),
             }));
         }
     }
@@ -2415,6 +2431,7 @@ fn append_global_type_items(
             "filterText": name,
             "sortText": completion_sort_text(100_000 + match_rank, kind, &name),
             "insertText": name,
+            "score_offset": completion_score_offset(match_rank),
             "labelDetails": {
                 "detail": format!(" {}", symbol_type),
                 "description": "UCore",
@@ -2471,6 +2488,7 @@ fn append_global_enum_value_items(
             "filterText": name,
             "sortText": completion_sort_text(100_500 + match_rank, 20, &name),
             "insertText": name,
+            "score_offset": completion_score_offset(match_rank),
         }));
 
         if items.len() >= 80 {
@@ -3628,6 +3646,13 @@ mod tests {
         items.iter().position(|item| item.get("label").and_then(|v| v.as_str()) == Some(label))
     }
 
+    fn label_score_offset(items: &[Value], label: &str) -> Option<i64> {
+        items.iter()
+            .find(|item| item.get("label").and_then(|v| v.as_str()) == Some(label))
+            .and_then(|item| item.get("score_offset"))
+            .and_then(Value::as_i64)
+    }
+
     #[test]
     fn member_completion_returns_members_without_snippets() {
         let conn = test_db();
@@ -3817,6 +3842,33 @@ void Test() {
         let prefix_index = label_index(&items, "GetActorComponent").unwrap();
         let middle_index = label_index(&items, "GetMeshActor").unwrap();
         assert!(prefix_index < middle_index);
+        assert!(
+            label_score_offset(&items, "GetActorComponent").unwrap()
+                > label_score_offset(&items, "GetMeshActor").unwrap()
+        );
+    }
+
+    #[test]
+    fn global_completion_does_not_surface_missing_get_prefix_candidates() {
+        let conn = test_db();
+        let file_id: i64 = conn
+            .query_row("SELECT id FROM files WHERE extension = 'cpp' LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+
+        insert_class(&conn, "GetAbilitySystemComponent", file_id);
+        insert_class(&conn, "AbilitySystemComponent", file_id);
+
+        let items = completion_at(
+            &conn,
+            r#"
+void Test() {
+    GetAbilitySystem/*cursor*/
+}
+"#,
+        );
+
+        assert!(has_label(&items, "GetAbilitySystemComponent"));
+        assert!(!has_label(&items, "AbilitySystemComponent"));
     }
 
     #[test]
