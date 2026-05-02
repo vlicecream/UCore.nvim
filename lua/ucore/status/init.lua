@@ -87,6 +87,13 @@ local function render()
 	end
 end
 
+local function reset_notification()
+	items = {}
+	boot_active = false
+	state = "running"
+	render()
+end
+
 -- Set or replace one status line.
 -- 设置或替换一条状态行。
 function M.set(key, message)
@@ -104,15 +111,13 @@ end
 -- Clear the whole status panel.
 -- 清理整个状态面板。
 function M.clear_all()
-	items = {}
-	boot_active = false
-	state = "running"
-	render()
+	reset_notification()
 end
 
 -- Start a persistent initialization status.
 -- 开始一条不会自动消失的初始化状态。
 function M.start(message)
+	reset_notification()
 	boot_active = true
 	state = "running"
 	M.set("boot", message or "UCore initializing...")

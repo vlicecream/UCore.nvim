@@ -32,6 +32,15 @@ local function clangd_progress(percent)
 	)
 end
 
+local function clangd_progress_done(result)
+	if type(result) == "table" and result.generated == false then
+		status.progress_finish("UCore clangd database", "UCore clangd database 100% (cached)")
+		return
+	end
+
+	status.progress_finish("UCore clangd database", "UCore clangd database 100%")
+end
+
 -- Build a setup/refresh/watch payload for the current Unreal project.
 -- 为当前 Unreal 工程构造 setup/refresh/watch 请求体。
 local function current_project_payload(project_root)
@@ -211,7 +220,7 @@ local function run_clangd_prepare(payload, callback)
 		remove_source = true,
 	}, function(ok, result)
 		if ok then
-			status.progress_finish("UCore clangd database", "UCore clangd database 100%")
+			clangd_progress_done(result)
 			return callback(true, result)
 		end
 
