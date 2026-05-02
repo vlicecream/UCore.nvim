@@ -459,6 +459,10 @@ fn collect_engine_member_roots(
 
             let parent_ids = ctx.class_ids_by_name(&parent_name)?;
             let in_engine = !engine_ctx.class_ids_by_name(&parent_name)?.is_empty();
+            tracing::info!(
+                "COMPLETION_DEBUG: parent={parent_name} project_has={} engine_has={in_engine}",
+                !parent_ids.is_empty()
+            );
 
             if in_engine {
                 roots.push((parent_name, true));
