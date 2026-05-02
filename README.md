@@ -130,6 +130,51 @@ return {
 `UTreeSitter.nvim` and `UVersionControlSystem.nvim` are separate top-level plugins. `UCore.nvim` no longer bundles either layer.
 `extend_blink_opts()` only prepares `blink.cmp` at config time. UCore does not patch blink at runtime.
 
+### blink.cmp Keymaps
+
+`extend_blink_opts()` also fills in a small default keymap only when you have not already set one:
+
+- `<Tab>` selects the next completion item
+- `<S-Tab>` selects the previous completion item
+- `<CR>` accepts the selected completion item
+- when the completion menu is not visible, mappings fall back to your normal key behavior
+
+If you want your own `Tab` behavior, override it after calling `extend_blink_opts()`:
+
+```lua
+{
+  "saghen/blink.cmp",
+  opts = function(_, opts)
+    opts = require("ucore.completion.blink").extend_blink_opts(opts)
+
+    opts.keymap["<Tab>"] = {
+      function(cmp)
+        if cmp.is_menu_visible() then
+          return cmp.accept()
+        end
+        if cmp.snippet_active() then
+          return cmp.snippet_forward()
+        end
+      end,
+      "fallback",
+    }
+
+    opts.keymap["<S-Tab>"] = {
+      function(cmp)
+        if cmp.snippet_active() then
+          return cmp.snippet_backward()
+        end
+      end,
+      "fallback",
+    }
+
+    opts.keymap["<CR>"] = { "fallback" }
+
+    return opts
+  end,
+}
+```
+
 ### Quick Start
 
 Open any file inside an Unreal project and run:
@@ -367,6 +412,51 @@ return {
 
 `UTreeSitter.nvim` 和 `UVersionControlSystem.nvim` 现在都是独立的顶层插件，`UCore.nvim` 不再内置这两层。
 `extend_blink_opts()` 只在配置阶段补全 `blink.cmp` 选项，UCore 不会在运行时改写 blink 配置。
+
+### blink.cmp 按键
+
+`extend_blink_opts()` 还会补上一套很小的默认按键，但前提是你自己没有先写：
+
+- `<Tab>` 选择下一个补全项
+- `<S-Tab>` 选择上一个补全项
+- `<CR>` 确认当前补全项
+- 当补全菜单没打开时，这些按键会回退到你原本的按键行为
+
+如果你想完全接管自己的 `Tab` 行为，可以在调用 `extend_blink_opts()` 之后覆盖：
+
+```lua
+{
+  "saghen/blink.cmp",
+  opts = function(_, opts)
+    opts = require("ucore.completion.blink").extend_blink_opts(opts)
+
+    opts.keymap["<Tab>"] = {
+      function(cmp)
+        if cmp.is_menu_visible() then
+          return cmp.accept()
+        end
+        if cmp.snippet_active() then
+          return cmp.snippet_forward()
+        end
+      end,
+      "fallback",
+    }
+
+    opts.keymap["<S-Tab>"] = {
+      function(cmp)
+        if cmp.snippet_active() then
+          return cmp.snippet_backward()
+        end
+      end,
+      "fallback",
+    }
+
+    opts.keymap["<CR>"] = { "fallback" }
+
+    return opts
+  end,
+}
+```
 
 ### 快速开始
 
