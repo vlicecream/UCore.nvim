@@ -263,6 +263,7 @@ fn declaration_node_to_json(node: Node, content: &str) -> Value {
         .unwrap_or_else(|| extract_prefix_type(node, declarator, content));
 
     let class_name = find_enclosing_class_name(node, content).unwrap_or_default();
+    let generated_definitions = generated_definitions_json(&name, &return_type, text);
 
     json!({
         "kind": node.kind(),
@@ -274,7 +275,93 @@ fn declaration_node_to_json(node: Node, content: &str) -> Value {
         "is_static": contains_token(text, "static"),
         "is_const": is_const_member_function(node, content),
         "full_text": text,
+        "generated_definitions": generated_definitions,
     })
+}
+
+fn generated_definitions_json(name: &str, return_type: &str, full_text: &str) -> Vec<Value> {
+    let spec = parse_ufunction_spec(full_text);
+    let base_name = base_unreal_function_name(name);
+    let implementation_name = if spec.requires_implementation {
+        format!("{}_Implementation", base_name)
+    } else {
+        name.to_string()
+    };
+
+    let mut items = vec![json!({
+        "name": implementation_name,
+        "return_type": return_type.trim(),
+        "kind": if spec.requires_implementation { "implementation" } else { "definition" },
+    })];
+
+    if spec.requires_validate {
+        items.push(json!({
+            "name": format!("{}_Validate", base_name),
+            "return_type": "bool",
+            "kind": "validation",
+        }));
+    }
+
+    items
+}
+
+#[derive(Default)]
+struct UnrealFunctionSpec {
+    requires_implementation: bool,
+    requires_validate: bool,
+}
+
+fn base_unreal_function_name(name: &str) -> &str {
+    if let Some(stripped) = name.strip_suffix("_Implementation") {
+        return stripped;
+    }
+
+    if let Some(stripped) = name.strip_suffix("_Validate") {
+        return stripped;
+    }
+
+    name
+}
+
+fn parse_ufunction_spec(text: &str) -> UnrealFunctionSpec {
+    let Some(specifiers) = extract_macro_arguments(text, "UFUNCTION") else {
+        return UnrealFunctionSpec::default();
+    };
+
+    let has_token = |token: &str| contains_token(&specifiers, token);
+
+    UnrealFunctionSpec {
+        requires_implementation: has_token("BlueprintNativeEvent")
+            || has_token("Server")
+            || has_token("Client")
+            || has_token("NetMulticast"),
+        requires_validate: has_token("WithValidation"),
+    }
+}
+
+fn extract_macro_arguments(text: &str, macro_name: &str) -> Option<String> {
+    let start = text.find(macro_name)?;
+    let after_name = text.get(start + macro_name.len()..)?;
+    let open_offset = after_name.find('(')?;
+    let open_index = start + macro_name.len() + open_offset;
+    let mut depth = 0i32;
+
+    for (offset, ch) in text[open_index..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    let begin = open_index + 1;
+                    let end = open_index + offset;
+                    return text.get(begin..end).map(|value| value.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
 }
 
 /// Return true for declaration nodes we care about.

@@ -264,10 +264,12 @@ function M.request(callback)
 		end
 
 		local callbacks = pending and pending.callbacks or { callback }
+		local valid_buf = vim.api.nvim_buf_is_valid(bufnr)
+		local current_tick = valid_buf and vim.api.nvim_buf_get_changedtick(bufnr) or -1
 
 		if sequence ~= request_sequence
-			or not vim.api.nvim_buf_is_valid(bufnr)
-			or vim.api.nvim_buf_get_changedtick(bufnr) ~= changedtick
+			or not valid_buf
+			or current_tick ~= changedtick
 		then
 			for _, cb in ipairs(callbacks) do
 				cb(nil, "stale")

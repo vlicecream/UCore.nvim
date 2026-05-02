@@ -374,7 +374,6 @@ pub fn process_completion_with_engine(
     }
 
     let final_items = dedupe_completion_items(items);
-
     Ok(json!(final_items))
 }
 
@@ -3149,26 +3148,30 @@ fn unreal_macro_call_before_cursor(before: &str) -> Option<(&'static str, usize)
 /// Return macro specifier items.
 /// 返回宏参数补全项。
 fn macro_specifiers(macro_name: &str, prefix: &str, in_meta: bool) -> Option<Value> {
-    let mut labels = if in_meta {
-        meta_specifier_labels(macro_name)?
+    let mut specs = if in_meta {
+        meta_specifier_specs(macro_name)?
     } else {
-        macro_specifier_labels(macro_name)?
+        macro_specifier_specs(macro_name)?
     };
 
     if !prefix.is_empty() {
         let lower = prefix.to_ascii_lowercase();
-        labels.retain(|(label, _)| label.to_ascii_lowercase().starts_with(&lower));
+        specs.retain(|spec| spec.label.to_ascii_lowercase().starts_with(&lower));
     }
 
     Some(json!(
-        labels
+        specs
             .into_iter()
-            .map(|(label, detail)| {
+            .map(|spec| {
                 json!({
-                    "label": label,
+                    "label": spec.label,
                     "kind": 12,
-                    "detail": detail,
-                    "insertText": label,
+                    "detail": spec.detail,
+                    "insertText": spec.insert_text,
+                    "insertTextFormat": spec.insert_text_format,
+                    "filterText": spec.label,
+                    "sortText": completion_sort_text(80, 12, spec.label),
+                    "score_offset": 16,
                 })
             })
             .collect::<Vec<_>>()
@@ -3220,137 +3223,183 @@ fn is_in_meta_argument(text_after_open: &str) -> bool {
     after_meta.starts_with('=') || after_meta.starts_with('(')
 }
 
-fn macro_specifier_labels(macro_name: &str) -> Option<Vec<(&'static str, &'static str)>> {
+#[derive(Clone, Copy)]
+struct MacroSpecifierSpec {
+    label: &'static str,
+    detail: &'static str,
+    insert_text: &'static str,
+    insert_text_format: i64,
+}
+
+fn macro_plain(label: &'static str, detail: &'static str) -> MacroSpecifierSpec {
+    MacroSpecifierSpec {
+        label,
+        detail,
+        insert_text: label,
+        insert_text_format: 1,
+    }
+}
+
+fn macro_snippet(
+    label: &'static str,
+    detail: &'static str,
+    insert_text: &'static str,
+) -> MacroSpecifierSpec {
+    MacroSpecifierSpec {
+        label,
+        detail,
+        insert_text,
+        insert_text_format: 2,
+    }
+}
+
+fn macro_specifier_specs(macro_name: &str) -> Option<Vec<MacroSpecifierSpec>> {
     Some(match macro_name {
         "UPROPERTY" => vec![
-            ("EditAnywhere", "property specifier"),
-            ("EditDefaultsOnly", "property specifier"),
-            ("EditInstanceOnly", "property specifier"),
-            ("VisibleAnywhere", "property specifier"),
-            ("VisibleDefaultsOnly", "property specifier"),
-            ("VisibleInstanceOnly", "property specifier"),
-            ("BlueprintReadOnly", "property specifier"),
-            ("BlueprintReadWrite", "property specifier"),
-            ("BlueprintAssignable", "property specifier"),
-            ("BlueprintCallable", "property specifier"),
-            ("Config", "property specifier"),
-            ("GlobalConfig", "property specifier"),
-            ("Transient", "property specifier"),
-            ("DuplicateTransient", "property specifier"),
-            ("SaveGame", "property specifier"),
-            ("Instanced", "property specifier"),
-            ("Replicated", "property specifier"),
-            ("ReplicatedUsing", "property specifier"),
-            ("Category", "property key"),
-            ("meta", "metadata key"),
+            macro_plain("EditAnywhere", "property specifier"),
+            macro_plain("EditDefaultsOnly", "property specifier"),
+            macro_plain("EditInstanceOnly", "property specifier"),
+            macro_plain("VisibleAnywhere", "property specifier"),
+            macro_plain("VisibleDefaultsOnly", "property specifier"),
+            macro_plain("VisibleInstanceOnly", "property specifier"),
+            macro_plain("BlueprintReadOnly", "property specifier"),
+            macro_plain("BlueprintReadWrite", "property specifier"),
+            macro_plain("BlueprintAssignable", "property specifier"),
+            macro_plain("BlueprintCallable", "property specifier"),
+            macro_plain("Config", "property specifier"),
+            macro_plain("GlobalConfig", "property specifier"),
+            macro_plain("Transient", "property specifier"),
+            macro_plain("DuplicateTransient", "property specifier"),
+            macro_plain("SaveGame", "property specifier"),
+            macro_plain("Instanced", "property specifier"),
+            macro_plain("Replicated", "property specifier"),
+            macro_snippet(
+                "ReplicatedUsing",
+                "property specifier",
+                "ReplicatedUsing=${1:OnRep_Function}",
+            ),
+            macro_snippet("Category", "property key", "Category=\"${1:Default}\""),
+            macro_snippet("meta", "metadata key", "meta=(${1})"),
         ],
 
         "UFUNCTION" => vec![
-            ("BlueprintCallable", "function specifier"),
-            ("BlueprintPure", "function specifier"),
-            ("BlueprintImplementableEvent", "function specifier"),
-            ("BlueprintNativeEvent", "function specifier"),
-            ("BlueprintAuthorityOnly", "function specifier"),
-            ("BlueprintCosmetic", "function specifier"),
-            ("CallInEditor", "function specifier"),
-            ("Client", "network specifier"),
-            ("Server", "network specifier"),
-            ("NetMulticast", "network specifier"),
-            ("Reliable", "network specifier"),
-            ("Unreliable", "network specifier"),
-            ("Exec", "function specifier"),
-            ("Category", "function key"),
-            ("meta", "metadata key"),
+            macro_plain("BlueprintCallable", "function specifier"),
+            macro_plain("BlueprintPure", "function specifier"),
+            macro_plain("BlueprintImplementableEvent", "function specifier"),
+            macro_plain("BlueprintNativeEvent", "function specifier"),
+            macro_plain("BlueprintAuthorityOnly", "function specifier"),
+            macro_plain("BlueprintCosmetic", "function specifier"),
+            macro_plain("CallInEditor", "function specifier"),
+            macro_plain("Client", "network specifier"),
+            macro_plain("Server", "network specifier"),
+            macro_plain("NetMulticast", "network specifier"),
+            macro_plain("Reliable", "network specifier"),
+            macro_plain("Unreliable", "network specifier"),
+            macro_plain("WithValidation", "network specifier"),
+            macro_plain("Exec", "function specifier"),
+            macro_snippet("Category", "function key", "Category=\"${1:Default}\""),
+            macro_snippet("meta", "metadata key", "meta=(${1})"),
         ],
 
         "UCLASS" => vec![
-            ("Blueprintable", "type specifier"),
-            ("BlueprintType", "type specifier"),
-            ("Abstract", "type specifier"),
-            ("NotBlueprintable", "type specifier"),
-            ("Config", "type specifier"),
-            ("DefaultConfig", "type specifier"),
-            ("EditInlineNew", "type specifier"),
-            ("CollapseCategories", "type specifier"),
-            ("HideCategories", "type key"),
-            ("ShowCategories", "type key"),
-            ("ClassGroup", "type key"),
-            ("meta", "metadata key"),
+            macro_plain("Blueprintable", "type specifier"),
+            macro_plain("BlueprintType", "type specifier"),
+            macro_plain("Abstract", "type specifier"),
+            macro_plain("NotBlueprintable", "type specifier"),
+            macro_plain("Config", "type specifier"),
+            macro_plain("DefaultConfig", "type specifier"),
+            macro_plain("EditInlineNew", "type specifier"),
+            macro_plain("CollapseCategories", "type specifier"),
+            macro_snippet("HideCategories", "type key", "HideCategories=\"${1:Category}\""),
+            macro_snippet("ShowCategories", "type key", "ShowCategories=\"${1:Category}\""),
+            macro_snippet("ClassGroup", "type key", "ClassGroup=\"${1:Group}\""),
+            macro_snippet("meta", "metadata key", "meta=(${1})"),
         ],
 
         "USTRUCT" => vec![
-            ("BlueprintType", "type specifier"),
-            ("Atomic", "type specifier"),
-            ("NoExport", "type specifier"),
-            ("meta", "metadata key"),
+            macro_plain("BlueprintType", "type specifier"),
+            macro_plain("Atomic", "type specifier"),
+            macro_plain("NoExport", "type specifier"),
+            macro_snippet("meta", "metadata key", "meta=(${1})"),
         ],
 
         "UENUM" => vec![
-            ("BlueprintType", "enum specifier"),
-            ("ScriptName", "enum key"),
-            ("meta", "metadata key"),
+            macro_plain("BlueprintType", "enum specifier"),
+            macro_snippet("ScriptName", "enum key", "ScriptName=\"${1:Name}\""),
+            macro_snippet("meta", "metadata key", "meta=(${1})"),
         ],
 
-        "UPARAM" | "UMETA" => meta_specifier_labels(macro_name)?,
+        "UPARAM" | "UMETA" => meta_specifier_specs(macro_name)?,
 
         _ => return None,
     })
 }
 
-fn meta_specifier_labels(macro_name: &str) -> Option<Vec<(&'static str, &'static str)>> {
+fn meta_specifier_specs(macro_name: &str) -> Option<Vec<MacroSpecifierSpec>> {
     let common = vec![
-        ("DisplayName", "metadata key"),
-        ("ToolTip", "metadata key"),
-        ("ShortToolTip", "metadata key"),
-        ("DeprecatedFunction", "metadata key"),
-        ("DeprecationMessage", "metadata key"),
-        ("DevelopmentOnly", "metadata key"),
-        ("ScriptName", "metadata key"),
+        macro_snippet("DisplayName", "metadata key", "DisplayName=\"${1:Name}\""),
+        macro_snippet("ToolTip", "metadata key", "ToolTip=\"${1:Description}\""),
+        macro_snippet("ShortToolTip", "metadata key", "ShortToolTip=\"${1:Description}\""),
+        macro_plain("DeprecatedFunction", "metadata key"),
+        macro_snippet(
+            "DeprecationMessage",
+            "metadata key",
+            "DeprecationMessage=\"${1:Message}\"",
+        ),
+        macro_plain("DevelopmentOnly", "metadata key"),
+        macro_snippet("ScriptName", "metadata key", "ScriptName=\"${1:Name}\""),
     ];
 
     let labels = match macro_name {
         "UPROPERTY" => vec![
-            ("AllowPrivateAccess", "metadata key"),
-            ("ClampMin", "metadata key"),
-            ("ClampMax", "metadata key"),
-            ("UIMin", "metadata key"),
-            ("UIMax", "metadata key"),
-            ("Units", "metadata key"),
-            ("EditCondition", "metadata key"),
-            ("EditConditionHides", "metadata key"),
-            ("BindWidget", "metadata key"),
-            ("BindWidgetOptional", "metadata key"),
-            ("ExposeOnSpawn", "metadata key"),
-            ("MakeEditWidget", "metadata key"),
-            ("MultiLine", "metadata key"),
-            ("AllowedClasses", "metadata key"),
-            ("DisallowedClasses", "metadata key"),
+            macro_snippet(
+                "AllowPrivateAccess",
+                "metadata key",
+                "AllowPrivateAccess=\"${1:true}\"",
+            ),
+            macro_snippet("ClampMin", "metadata key", "ClampMin=\"${1:0}\""),
+            macro_snippet("ClampMax", "metadata key", "ClampMax=\"${1:100}\""),
+            macro_snippet("UIMin", "metadata key", "UIMin=\"${1:0}\""),
+            macro_snippet("UIMax", "metadata key", "UIMax=\"${1:100}\""),
+            macro_snippet("Units", "metadata key", "Units=\"${1:cm}\""),
+            macro_snippet("EditCondition", "metadata key", "EditCondition=\"${1:bEnabled}\""),
+            macro_plain("EditConditionHides", "metadata key"),
+            macro_plain("BindWidget", "metadata key"),
+            macro_plain("BindWidgetOptional", "metadata key"),
+            macro_plain("ExposeOnSpawn", "metadata key"),
+            macro_plain("MakeEditWidget", "metadata key"),
+            macro_plain("MultiLine", "metadata key"),
+            macro_snippet("AllowedClasses", "metadata key", "AllowedClasses=\"${1:Class}\""),
+            macro_snippet("DisallowedClasses", "metadata key", "DisallowedClasses=\"${1:Class}\""),
         ],
 
         "UFUNCTION" => vec![
-            ("WorldContext", "metadata key"),
-            ("CallableWithoutWorldContext", "metadata key"),
-            ("DefaultToSelf", "metadata key"),
-            ("HidePin", "metadata key"),
-            ("AdvancedDisplay", "metadata key"),
-            ("AutoCreateRefTerm", "metadata key"),
-            ("DeterminesOutputType", "metadata key"),
-            ("ExpandEnumAsExecs", "metadata key"),
-            ("Latent", "metadata key"),
-            ("LatentInfo", "metadata key"),
-            ("CompactNodeTitle", "metadata key"),
-            ("Keywords", "metadata key"),
+            macro_snippet("WorldContext", "metadata key", "WorldContext=\"${1:WorldContextObject}\""),
+            macro_plain("CallableWithoutWorldContext", "metadata key"),
+            macro_snippet("DefaultToSelf", "metadata key", "DefaultToSelf=\"${1:Target}\""),
+            macro_snippet("HidePin", "metadata key", "HidePin=\"${1:PinName}\""),
+            macro_plain("AdvancedDisplay", "metadata key"),
+            macro_snippet("AutoCreateRefTerm", "metadata key", "AutoCreateRefTerm=\"${1:Param}\""),
+            macro_snippet("DeterminesOutputType", "metadata key", "DeterminesOutputType=\"${1:ClassParam}\""),
+            macro_snippet("ExpandEnumAsExecs", "metadata key", "ExpandEnumAsExecs=\"${1:EnumParam}\""),
+            macro_plain("Latent", "metadata key"),
+            macro_snippet("LatentInfo", "metadata key", "LatentInfo=\"${1:LatentInfo}\""),
+            macro_snippet("CompactNodeTitle", "metadata key", "CompactNodeTitle=\"${1:Title}\""),
+            macro_snippet("Keywords", "metadata key", "Keywords=\"${1:Keyword1 Keyword2}\""),
         ],
 
         "UCLASS" => vec![
-            ("BlueprintSpawnableComponent", "metadata key"),
-            ("ChildCanTick", "metadata key"),
-            ("ChildCannotTick", "metadata key"),
-            ("ShowWorldContextPin", "metadata key"),
-            ("DontUseGenericSpawnObject", "metadata key"),
+            macro_plain("BlueprintSpawnableComponent", "metadata key"),
+            macro_plain("ChildCanTick", "metadata key"),
+            macro_plain("ChildCannotTick", "metadata key"),
+            macro_plain("ShowWorldContextPin", "metadata key"),
+            macro_plain("DontUseGenericSpawnObject", "metadata key"),
         ],
 
-        "USTRUCT" => vec![("HasNativeMake", "metadata key"), ("HasNativeBreak", "metadata key")],
+        "USTRUCT" => vec![
+            macro_snippet("HasNativeMake", "metadata key", "HasNativeMake=\"${1:Module.Function}\""),
+            macro_snippet("HasNativeBreak", "metadata key", "HasNativeBreak=\"${1:Module.Function}\""),
+        ],
         "UENUM" | "UMETA" | "UPARAM" => Vec::new(),
         _ => return None,
     };
@@ -3365,11 +3414,15 @@ fn ue_snippets(prefix: &str) -> Vec<Value> {
         snippet("UCLASS", "UCLASS($1)", "Unreal class macro"),
         snippet("USTRUCT", "USTRUCT($1)", "Unreal struct macro"),
         snippet("UENUM", "UENUM($1)", "Unreal enum macro"),
+        snippet("UDELEGATE", "UDELEGATE($1)", "Unreal delegate macro"),
         snippet("UINTERFACE", "UINTERFACE($1)", "Unreal interface macro"),
         snippet("UPROPERTY", "UPROPERTY($1)", "Unreal property macro"),
         snippet("UFUNCTION", "UFUNCTION($1)", "Unreal function macro"),
+        snippet("UPARAM", "UPARAM($1)", "Unreal parameter macro"),
+        snippet("UMETA", "UMETA($1)", "Unreal enum metadata macro"),
         snippet("GENERATED_BODY", "GENERATED_BODY()", "Unreal generated body"),
         snippet("GENERATED_UCLASS_BODY", "GENERATED_UCLASS_BODY()", "Legacy generated body"),
+        snippet("GENERATED_UINTERFACE_BODY", "GENERATED_UINTERFACE_BODY()", "Legacy interface generated body"),
         snippet("DECLARE_LOG_CATEGORY_EXTERN", "DECLARE_LOG_CATEGORY_EXTERN($1, Log, All)", "Declare log category"),
         snippet("DEFINE_LOG_CATEGORY", "DEFINE_LOG_CATEGORY($1)", "Define log category"),
         snippet("UE_DEFINE_GAME_MODULE", "UE_DEFINE_GAME_MODULE($1, $2, $3)", "Define Unreal game module"),
@@ -3712,6 +3765,7 @@ fn snippet(label: &str, insert_text: &str, detail: &str) -> Value {
         "insertTextFormat": 2,
         "filterText": label,
         "sortText": completion_sort_text(900, 15, label),
+        "score_offset": 18,
     })
 }
 

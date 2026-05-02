@@ -9,6 +9,9 @@ local group_name = "UCoreDiagnostics"
 local enabled = true
 local refresh_sequence = 0
 local try_include_symbol
+local float_sequence = 0
+local float_winid = nil
+local last_float_key = nil
 
 local severity_map = {
 	error = vim.diagnostic.severity.ERROR,
@@ -27,12 +30,37 @@ local function normalize_path(path)
 	return path and path:gsub("\\", "/") or nil
 end
 
+local function resolve_bufnr_for_path(file_path, fallback_bufnr)
+	local normalized = normalize_path(file_path)
+	if not normalized or normalized == "" then
+		return fallback_bufnr
+	end
+
+	if fallback_bufnr and vim.api.nvim_buf_is_valid(fallback_bufnr) then
+		local fallback_name = normalize_path(vim.api.nvim_buf_get_name(fallback_bufnr))
+		if fallback_name == normalized then
+			return fallback_bufnr
+		end
+	end
+
+	for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+		if vim.api.nvim_buf_is_valid(bufnr) then
+			local name = normalize_path(vim.api.nvim_buf_get_name(bufnr))
+			if name == normalized then
+				return bufnr
+			end
+		end
+	end
+
+	return vim.fn.bufadd(normalized)
+end
+
 local function diagnostic_from_item(item, fallback_bufnr)
 	local file_path = normalize_path(item.file_path)
 	local bufnr = fallback_bufnr
 
 	if file_path and file_path ~= "" then
-		bufnr = vim.fn.bufadd(file_path)
+		bufnr = resolve_bufnr_for_path(file_path, fallback_bufnr)
 	end
 
 	return bufnr, {
@@ -136,6 +164,95 @@ function M.toggle()
 		M.clear()
 	end
 	vim.notify("UCore diagnostics " .. (enabled and "enabled" or "disabled"), vim.log.levels.INFO)
+end
+
+local function close_cursor_float()
+	if float_winid and vim.api.nvim_win_is_valid(float_winid) then
+		pcall(vim.api.nvim_win_close, float_winid, true)
+	end
+
+	float_winid = nil
+	last_float_key = nil
+end
+
+local function in_insert_mode()
+	local mode = vim.api.nvim_get_mode().mode
+	return mode == "i" or mode == "ic" or mode == "ix" or mode:sub(1, 2) == "ni"
+end
+
+local function show_cursor_float(bufnr)
+	local diagnostics_config = config.values.diagnostics or {}
+	if diagnostics_config.enable == false or diagnostics_config.float_on_cursor == false then
+		return
+	end
+
+	if not vim.api.nvim_buf_is_valid(bufnr) or vim.api.nvim_get_current_buf() ~= bufnr then
+		return
+	end
+
+	if in_insert_mode() and diagnostics_config.float_in_insert ~= true then
+		return
+	end
+
+	local cursor = vim.api.nvim_win_get_cursor(0)
+	local row = cursor[1] - 1
+	local diagnostics = vim.diagnostic.get(bufnr, { lnum = row })
+	if vim.tbl_isempty(diagnostics) then
+		close_cursor_float()
+		return
+	end
+
+	local key = table.concat({ bufnr, row, cursor[2] }, ":")
+	if key == last_float_key and float_winid and vim.api.nvim_win_is_valid(float_winid) then
+		return
+	end
+
+	close_cursor_float()
+
+	local _, winid = vim.diagnostic.open_float(bufnr, {
+		scope = "cursor",
+		focusable = false,
+		border = "rounded",
+		source = true,
+		close_events = {
+			"CursorMoved",
+			"CursorMovedI",
+			"BufLeave",
+			"WinLeave",
+			"InsertEnter",
+		},
+	})
+
+	float_winid = winid
+	last_float_key = key
+end
+
+local function schedule_cursor_float(bufnr)
+	local diagnostics_config = config.values.diagnostics or {}
+	if diagnostics_config.enable == false or diagnostics_config.float_on_cursor == false then
+		return
+	end
+
+	if in_insert_mode() and diagnostics_config.float_in_insert ~= true then
+		return
+	end
+
+	float_sequence = float_sequence + 1
+	local sequence = float_sequence
+	local delay = tonumber(diagnostics_config.float_delay_ms) or 200
+
+	vim.defer_fn(function()
+		if sequence ~= float_sequence then
+			return
+		end
+
+		vim.schedule(function()
+			if sequence ~= float_sequence then
+				return
+			end
+			show_cursor_float(bufnr)
+		end)
+	end, math.max(delay, 0))
 end
 
 function M.to_qflist()
@@ -539,7 +656,22 @@ local function definition_suffix(cursor_info)
 	return " " .. table.concat(suffixes, " ")
 end
 
-local function build_definition_lines(cursor_info)
+local function definition_targets(cursor_info)
+	local targets = {}
+	for _, item in ipairs(cursor_info.generated_definitions or {}) do
+		if type(item) == "table" and tostring(item.name or "") ~= "" then
+			table.insert(targets, {
+				name = tostring(item.name),
+				return_type = vim.trim(tostring(item.return_type or "")),
+				kind = tostring(item.kind or "definition"),
+			})
+		end
+	end
+
+	return targets
+end
+
+local function build_definition_specs(cursor_info)
 	local kind = tostring(cursor_info.kind or "")
 	local class_name = tostring(cursor_info.class_name or "")
 	local name = tostring(cursor_info.name or "")
@@ -559,21 +691,58 @@ local function build_definition_lines(cursor_info)
 		return nil, "Current declaration should not generate an out-of-line definition"
 	end
 
-	local signature
-	if return_type ~= "" then
-		signature = string.format("%s %s::%s%s", return_type, class_name, name, params)
-	else
-		signature = string.format("%s::%s%s", class_name, name, params)
+	local targets = definition_targets(cursor_info)
+	if vim.tbl_isempty(targets) then
+		targets = {
+			{
+				name = name,
+				return_type = return_type,
+				kind = "definition",
+			},
+		}
 	end
 
-	signature = signature .. definition_suffix(cursor_info)
+	local suffix = definition_suffix(cursor_info)
+	local specs = {}
+	for _, target in ipairs(targets) do
+		local target_return_type = target.return_type
+		if target.kind == "validation" and target_return_type == "" then
+			target_return_type = "bool"
+		end
 
-	return {
-		signature,
-		"{",
-		"\t",
-		"}",
-	}, nil
+		local signature
+		if target_return_type ~= "" then
+			signature = string.format("%s %s::%s%s", target_return_type, class_name, target.name, params)
+		else
+			signature = string.format("%s::%s%s", class_name, target.name, params)
+		end
+
+		signature = signature .. suffix
+		table.insert(specs, {
+			name = target.name,
+			kind = target.kind,
+			signature = signature,
+			lines = {
+				signature,
+				"{",
+				target.kind == "validation" and "\treturn true;" or "\t",
+				"}",
+			},
+		})
+	end
+
+	return specs, nil
+end
+
+local function flatten_definition_lines(definition_specs)
+	local lines = {}
+	for index, spec in ipairs(definition_specs) do
+		if index > 1 then
+			table.insert(lines, "")
+		end
+		vim.list_extend(lines, spec.lines)
+	end
+	return lines
 end
 
 local function try_generate_definition(bufnr)
@@ -606,8 +775,8 @@ local function try_generate_definition(bufnr)
 		end
 
 		local cursor_info = type(result) == "table" and result.cursor_info or {}
-		local definition_lines, reason = build_definition_lines(cursor_info or {})
-		if not definition_lines then
+		local definition_specs, reason = build_definition_specs(cursor_info or {})
+		if not definition_specs then
 			if reason == "Current declaration is not a supported member function" then
 				return try_include_symbol(bufnr)
 			end
@@ -616,14 +785,22 @@ local function try_generate_definition(bufnr)
 		end
 
 		local source_lines = file_lines(target_path)
-		if has_definition_text(source_lines, definition_lines[1]) then
+		local missing_specs = {}
+		for _, spec in ipairs(definition_specs) do
+			if not has_definition_text(source_lines, spec.signature) then
+				table.insert(missing_specs, spec)
+			end
+		end
+
+		if vim.tbl_isempty(missing_specs) then
 			local ok = pcall(vim.cmd, "edit " .. vim.fn.fnameescape(target_path))
 			if ok then
-				vim.fn.search(cursor_info.class_name .. "::" .. cursor_info.name, "W")
+				vim.fn.search(cursor_info.class_name .. "::" .. definition_specs[1].name, "W")
 			end
 			return vim.notify("Definition already exists in source file: " .. target_path, vim.log.levels.INFO)
 		end
 
+		local definition_lines = flatten_definition_lines(missing_specs)
 		local start_line = append_definition(target_path, header_path, definition_lines, should_create)
 		local ok = pcall(vim.cmd, "edit " .. vim.fn.fnameescape(target_path))
 		if ok then
@@ -995,7 +1172,12 @@ function M.setup()
 	vim.diagnostic.config(display_config, ns)
 
 	local group = vim.api.nvim_create_augroup(group_name, { clear = true })
-	vim.api.nvim_create_autocmd({ "BufWritePost", "TextChanged" }, {
+	local refresh_events = { "BufWritePost", "TextChanged" }
+	if diagnostics_config.update_in_insert == true then
+		table.insert(refresh_events, "TextChangedI")
+	end
+
+	vim.api.nvim_create_autocmd(refresh_events, {
 		group = group,
 		pattern = { "*.h", "*.hpp", "*.cpp", "*.cc", "*.cxx" },
 		callback = schedule_refresh,
@@ -1006,6 +1188,35 @@ function M.setup()
 		pattern = { "*.h", "*.hpp", "*.cpp", "*.cc", "*.cxx" },
 		callback = function(args)
 			M.refresh(args.buf, { silent = true })
+		end,
+	})
+
+	vim.api.nvim_create_autocmd({ "CursorMoved", "BufEnter" }, {
+		group = group,
+		pattern = { "*.h", "*.hpp", "*.cpp", "*.cc", "*.cxx" },
+		callback = function(args)
+			close_cursor_float()
+			schedule_cursor_float(args.buf)
+		end,
+	})
+
+	vim.api.nvim_create_autocmd("CursorMovedI", {
+		group = group,
+		pattern = { "*.h", "*.hpp", "*.cpp", "*.cc", "*.cxx" },
+		callback = function(args)
+			close_cursor_float()
+			if diagnostics_config.float_in_insert == true then
+				schedule_cursor_float(args.buf)
+			end
+		end,
+	})
+
+	vim.api.nvim_create_autocmd({ "InsertEnter", "BufLeave", "WinLeave" }, {
+		group = group,
+		pattern = { "*.h", "*.hpp", "*.cpp", "*.cc", "*.cxx" },
+		callback = function()
+			float_sequence = float_sequence + 1
+			close_cursor_float()
 		end,
 	})
 end

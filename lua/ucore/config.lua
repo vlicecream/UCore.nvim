@@ -220,6 +220,18 @@ M.values = {
 		-- 是否显示 sign column 标记。
 		signs = true,
 
+		-- Show a diagnostic float when the cursor stays on a red/yellow line.
+		-- 光标停留在红线/黄线上时是否自动弹出诊断浮窗。
+		float_on_cursor = true,
+
+		-- Also show the diagnostic float while typing in Insert mode.
+		-- 插入模式下是否也自动弹出诊断浮窗。
+		float_in_insert = false,
+
+		-- Delay before showing the cursor diagnostic float.
+		-- 光标诊断浮窗的延迟时间。
+		float_delay_ms = 200,
+
 		-- Update diagnostics while typing in Insert mode.
 		-- 插入模式输入时是否更新诊断。
 		update_in_insert = true,
@@ -248,6 +260,13 @@ M.values = {
 			require_compile_commands = true,
 			auto_generate_compile_commands = true,
 			auto_detect_windows = true,
+
+			-- Suppress clangd IncludeCleaner "unused include" diagnostics in
+			-- Unreal projects when needed. Disabled by default so users can
+			-- inspect the raw clangd warnings first.
+			-- 需要时可屏蔽 clangd IncludeCleaner 的“unused include”诊断。
+			-- 默认关闭，先保留 clangd 原始 warning 方便观察。
+			suppress_unused_include_warnings = false,
 		},
 	},
 

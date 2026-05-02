@@ -395,7 +395,27 @@ fn handle_state_query(
         }
 
         QueryRequest::GetDiagnostics { content, file_path } => {
-            let value = crate::diagnostics::process_diagnostics(conn, &content, file_path)?;
+            let engine_conn = match engine_db_path
+                .as_deref()
+                .map(normalize_to_native)
+                .filter(|path| Path::new(path).is_file())
+            {
+                Some(path) => match state.get_read_only_connection(&path) {
+                    Ok(conn) => Some(conn),
+                    Err(err) => {
+                        warn!("Failed to open Engine DB for diagnostics: {}", err);
+                        None
+                    }
+                },
+                None => None,
+            };
+
+            let value = crate::diagnostics::process_diagnostics(
+                conn,
+                engine_conn.as_ref(),
+                &content,
+                file_path,
+            )?;
             Ok(Some(value))
         }
 

@@ -351,6 +351,171 @@ local function build_base_capabilities()
 	}
 end
 
+local function should_filter_clangd_diagnostic(diagnostic, clangd)
+	if clangd.suppress_unused_include_warnings == false then
+		return false
+	end
+
+	if type(diagnostic) ~= "table" then
+		return false
+	end
+
+	local source = tostring(diagnostic.source or ""):lower()
+	if source ~= "" and source ~= "clangd" then
+		return false
+	end
+
+	local code = diagnostic.code
+	if type(code) == "table" then
+		code = code.value
+	end
+	code = tostring(code or ""):lower()
+
+	local message = tostring(diagnostic.message or ""):lower()
+
+	if code:find("unused%-includes", 1, false) then
+		return true
+	end
+
+	if message:find("unused include", 1, true) then
+		return true
+	end
+
+	if message:find("included header", 1, true) and message:find("not used", 1, true) then
+		return true
+	end
+
+	if message:find("not used directly", 1, true) and message:find("include", 1, true) then
+		return true
+	end
+
+	return false
+end
+
+local function clangd_diagnostic_code(diagnostic)
+	local code = diagnostic and diagnostic.code
+	if type(code) == "table" then
+		code = code.value
+	end
+	return tostring(code or ""):lower()
+end
+
+local function clangd_diagnostic_message(diagnostic)
+	return tostring(diagnostic and diagnostic.message or ""):lower()
+end
+
+local function should_expand_clangd_range(diagnostic)
+	local code = clangd_diagnostic_code(diagnostic)
+	local message = clangd_diagnostic_message(diagnostic)
+
+	if code:find("unused", 1, true) then
+		return true
+	end
+
+	if code == "c4189" then
+		return true
+	end
+
+	return message:find("unused variable", 1, true) ~= nil
+		or message:find("unused parameter", 1, true) ~= nil
+		or message:find("unused field", 1, true) ~= nil
+		or message:find("private field", 1, true) ~= nil and message:find("not used", 1, true) ~= nil
+end
+
+local function expand_clangd_diagnostic_range(bufnr, diagnostic)
+	if not should_expand_clangd_range(diagnostic) then
+		return diagnostic
+	end
+
+	local filetype = vim.bo[bufnr] and vim.bo[bufnr].filetype or ""
+	if filetype ~= "unreal_cpp" and filetype ~= "cpp" and filetype ~= "c" then
+		return diagnostic
+	end
+
+	local ok_parser, parser = pcall(vim.treesitter.get_parser, bufnr, filetype)
+	if not ok_parser or not parser then
+		return diagnostic
+	end
+
+	local trees = parser:parse()
+	local tree = trees and trees[1]
+	if not tree then
+		return diagnostic
+	end
+
+	local range = diagnostic.range or {}
+	local start_range = range.start or {}
+	local finish_range = range["end"] or start_range
+	local start_row = tonumber(start_range.line)
+	local start_col = tonumber(start_range.character)
+	local end_row = tonumber(finish_range.line or start_row)
+	local end_col = tonumber(finish_range.character or start_col)
+	if not start_row or not start_col then
+		return diagnostic
+	end
+
+	local root = tree:root()
+	local node = root:descendant_for_range(start_row, start_col, end_row, math.max(end_col, start_col + 1))
+	if not node then
+		return diagnostic
+	end
+
+	local preferred = {
+		init_declarator = true,
+		parameter_declaration = true,
+		field_declaration = true,
+		declaration = true,
+	}
+
+	while node do
+		local kind = node:type()
+		if preferred[kind] then
+			local srow, scol, erow, ecol = node:range()
+			local expanded = vim.deepcopy(diagnostic)
+			expanded.range = {
+				start = { line = srow, character = scol },
+				["end"] = { line = erow, character = ecol },
+			}
+			return expanded
+		end
+		node = node:parent()
+	end
+
+	return diagnostic
+end
+
+local function filtered_publish_diagnostics_handler(user_handler)
+	local base = user_handler or vim.lsp.handlers["textDocument/publishDiagnostics"]
+
+	return function(err, result, ctx, cfg)
+		local clangd = configured_lsp()
+		if result and type(result.diagnostics) == "table" then
+			local bufnr = ctx and ctx.bufnr or nil
+			if not bufnr and result.uri then
+				local ok_uri, resolved = pcall(vim.uri_to_bufnr, result.uri)
+				if ok_uri then
+					bufnr = resolved
+				end
+			end
+
+			local filtered = {}
+			for _, diagnostic in ipairs(result.diagnostics) do
+				if not should_filter_clangd_diagnostic(diagnostic, clangd) then
+					table.insert(
+						filtered,
+						bufnr and vim.api.nvim_buf_is_valid(bufnr)
+							and expand_clangd_diagnostic_range(bufnr, diagnostic)
+							or diagnostic
+					)
+				end
+			end
+			result = vim.tbl_extend("force", result, { diagnostics = filtered })
+		end
+
+		return base(err, result, ctx, cfg)
+	end
+end
+
 function M.find_root(fname)
 	if type(fname) == "number" then
 		fname = vim.api.nvim_buf_get_name(fname)
@@ -710,6 +875,10 @@ function M.clangd_config(opts)
 
 	local capabilities = M.get_capabilities(opts.capabilities or clangd.capabilities)
 	local user_on_new_config = opts.on_new_config or clangd.on_new_config
+	local user_handlers = deep_copy(opts.handlers or clangd.handlers or {})
+	user_handlers["textDocument/publishDiagnostics"] = filtered_publish_diagnostics_handler(
+		user_handlers["textDocument/publishDiagnostics"]
+	)
 
 	local merged = vim.tbl_deep_extend("force", {
 		cmd = cmd,
@@ -722,6 +891,7 @@ function M.clangd_config(opts)
 		init_options = vim.tbl_deep_extend("force", {
 			clangdFileStatus = true,
 		}, deep_copy(clangd.init_options or {})),
+		handlers = user_handlers,
 	}, opts)
 
 	merged.on_new_config = function(new_config, new_root_dir)

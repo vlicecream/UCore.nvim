@@ -25,13 +25,33 @@ local prune_items
 
 local function current_prefix(ctx)
 	if type(ctx) == "table" then
+		if type(ctx.get_keyword) == "function" then
+			local ok, keyword = pcall(ctx.get_keyword, ctx)
+			if ok and type(keyword) == "string" and keyword ~= "" then
+				return keyword
+			end
+		end
+
+		if type(ctx.line) == "string" and type(ctx.cursor) == "table" and type(ctx.bounds) == "table" then
+			local start_col = tonumber(ctx.bounds.start_col)
+			local cursor_col = tonumber(ctx.cursor[2])
+			if start_col and cursor_col and cursor_col >= 0 then
+				local keyword = ctx.line:sub(start_col, cursor_col)
+				if keyword ~= "" then
+					return keyword
+				end
+			end
+		end
+
 		local keyword = ctx.keyword or ctx.query
 		if type(keyword) == "string" and keyword ~= "" then
 			return keyword
 		end
 	end
 
-	return vim.fn.expand("<cword>")
+	local row, col = unpack(vim.api.nvim_win_get_cursor(0))
+	local line = vim.api.nvim_buf_get_lines(0, row - 1, row, false)[1] or ""
+	return line:sub(1, col):match("[_%w]*$") or ""
 end
 
 local function blink_delay_ms()
@@ -203,13 +223,6 @@ function M.extend_blink_opts(opts)
 
 	if type(opts.sources.default) == "table" and not vim.tbl_contains(opts.sources.default, "ucore") then
 		table.insert(opts.sources.default, "ucore")
-	end
-
-	if opts.sources.per_filetype.unreal_cpp == nil then
-		opts.sources.per_filetype.unreal_cpp = {
-			"ucore",
-			inherit_defaults = false,
-		}
 	end
 
 	opts.sources.providers.ucore = vim.tbl_deep_extend("force", {
