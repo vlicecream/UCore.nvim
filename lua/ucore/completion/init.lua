@@ -6,6 +6,7 @@ local remote = require("ucore.remote")
 local M = {}
 local auto_sequence = 0
 local request_sequence = 0
+local pending_request = nil
 
 local function hrtime_ms(started_at)
 	return math.floor(((vim.uv or vim.loop).hrtime() - started_at) / 1000000)
@@ -25,6 +26,11 @@ local function preview_labels(items, limit)
 	end
 
 	return labels
+end
+
+local function blink_available()
+	local ok, _ = pcall(require, "blink.cmp")
+	return ok
 end
 
 -- Return true when the current mode can show insert completion.
@@ -257,11 +263,30 @@ function M.request(callback)
 	local character = cursor[2]
 	local bufnr = vim.api.nvim_get_current_buf()
 	local changedtick = vim.api.nvim_buf_get_changedtick(bufnr)
-	request_sequence = request_sequence + 1
-	local sequence = request_sequence
 	local started_at = (vim.uv or vim.loop).hrtime()
 	local prefix = current_prefix()
 	local content = current_content()
+	local request_key = table.concat({
+		bufnr,
+		changedtick,
+		line,
+		character,
+		file_path,
+	}, ":")
+
+	if pending_request and pending_request.key == request_key then
+		table.insert(pending_request.callbacks, callback)
+		log.write("completion.lua.request.join", {
+			pending_sequence = pending_request.sequence,
+			key = request_key,
+			callbacks = #pending_request.callbacks,
+			prefix = prefix,
+		})
+		return
+	end
+
+	request_sequence = request_sequence + 1
+	local sequence = request_sequence
 
 	log.write("completion.lua.request.start", {
 		sequence = sequence,
@@ -276,12 +301,25 @@ function M.request(callback)
 		mode = vim.api.nvim_get_mode().mode,
 	})
 
+	pending_request = {
+		key = request_key,
+		sequence = sequence,
+		callbacks = { callback },
+	}
+
 	remote.get_completions(root, {
 		content = content,
 		line = line,
 		character = character,
 		file_path = file_path:gsub("\\", "/"),
 	}, function(result, err)
+		local pending = pending_request
+		if pending and pending.key == request_key then
+			pending_request = nil
+		end
+
+		local callbacks = pending and pending.callbacks or { callback }
+
 		if sequence ~= request_sequence
 			or not vim.api.nvim_buf_is_valid(bufnr)
 			or vim.api.nvim_buf_get_changedtick(bufnr) ~= changedtick
@@ -292,7 +330,10 @@ function M.request(callback)
 				elapsed_ms = hrtime_ms(started_at),
 				prefix = prefix,
 			})
-			return callback(nil, "stale")
+			for _, cb in ipairs(callbacks) do
+				cb(nil, "stale")
+			end
+			return
 		end
 
 		if err then
@@ -303,7 +344,10 @@ function M.request(callback)
 				elapsed_ms = hrtime_ms(started_at),
 				prefix = prefix,
 			})
-			return callback(nil, err)
+			for _, cb in ipairs(callbacks) do
+				cb(nil, err)
+			end
+			return
 		end
 
 		local items = normalize_items(result)
@@ -316,7 +360,9 @@ function M.request(callback)
 			preview = preview_labels(items, 8),
 		})
 
-		callback(items, nil)
+		for _, cb in ipairs(callbacks) do
+			cb(items, nil)
+		end
 	end)
 end
 
@@ -460,11 +506,18 @@ function M.setup()
 		require("ucore.completion.blink").apply_recommended_blink_policy()
 	end)
 
+	if blink_available() then
+		log.write("completion.lua.auto.disabled", {
+			reason = "blink_available",
+		})
+		return
+	end
+
 	local group = vim.api.nvim_create_augroup("UCoreCompletion", {
 		clear = true,
 	})
 
-	vim.api.nvim_create_autocmd({ "TextChangedI", "TextChangedP" }, {
+	vim.api.nvim_create_autocmd({ "TextChangedI" }, {
 		group = group,
 		callback = schedule_auto_complete,
 	})
