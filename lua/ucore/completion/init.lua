@@ -212,6 +212,7 @@ function M.request(callback)
 	local changedtick = vim.api.nvim_buf_get_changedtick(bufnr)
 	request_sequence = request_sequence + 1
 	local sequence = request_sequence
+	vim.notify("UCore comp req: seq=" .. sequence .. " line=" .. line .. " col=" .. character, "INFO")
 
 	remote.get_completions(root, {
 		content = current_content(),
@@ -233,7 +234,7 @@ function M.request(callback)
 		end
 
 		local normalized = normalize_items(result)
-		vim.notify("UCore comp: raw=" .. #(result or {}) .. " normalized=" .. #normalized, "INFO")
+		vim.notify("UCore comp ok: raw=" .. #result .. " normalized=" .. #normalized, "INFO")
 		callback(normalized, nil)
 	end)
 end

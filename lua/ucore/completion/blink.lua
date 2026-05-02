@@ -95,17 +95,21 @@ function M:get_completions(_, callback)
   end
 
   local cancelled = false
+  vim.notify("UCore blink: requesting", "INFO")
 
   completion.request(function(items, err)
 		if cancelled then
+			vim.notify("UCore blink: cancelled", "INFO")
 			return
 		end
 
 		if err == "stale" then
+			vim.notify("UCore blink: stale", "INFO")
 			return
 		end
 
 		if err or not items then
+			vim.notify("UCore blink: err=" .. tostring(err), "WARN")
 			callback({
 				is_incomplete_forward = false,
 				is_incomplete_backward = false,
@@ -122,6 +126,7 @@ function M:get_completions(_, callback)
 			end
 		end
 
+		vim.notify("UCore blink: items=" .. #items .. " converted=" .. #blink_items, "INFO")
 		callback({
 			is_incomplete_forward = false,
 			is_incomplete_backward = false,
