@@ -8,11 +8,14 @@ use tree_sitter::{Node, Parser, Point};
 
 use crate::server::state::CompletionCache;
 
-const MAX_COMPLETION_ITEMS: usize = 2000;
-const MAX_MEMBER_ITEMS_PER_CLASS: usize = 250;
+const MAX_COMPLETION_ITEMS: usize = 128;
+const MAX_MEMBER_ITEMS_PER_CLASS: usize = 96;
 const MAX_TYPEDEF_DEPTH: usize = 4;
-const MIN_GLOBAL_PREFIX_LEN: usize = 2;
+const MIN_GLOBAL_PREFIX_LEN: usize = 3;
+const MIN_ENGINE_GLOBAL_PREFIX_LEN: usize = 4;
 const COMPLETION_MATCH_NONE: usize = usize::MAX;
+const STRONG_MATCH_SCORE_OFFSET: i64 = 10;
+const STRONG_MATCH_TARGET: usize = 24;
 
 /// Per-request cache and lookup context.
 /// 单次补全请求里的缓存和查询上下文。
@@ -321,15 +324,20 @@ pub fn process_completion_with_engine(
         merge_completion_items(&mut items, ue_snippets(&prefix), MAX_COMPLETION_ITEMS);
     }
 
-    if prefix.chars().count() >= MIN_GLOBAL_PREFIX_LEN {
+    let prefix_len = prefix.chars().count();
+    if prefix_len >= MIN_GLOBAL_PREFIX_LEN && strong_item_count(&items) < STRONG_MATCH_TARGET {
         merge_completion_items(&mut items, fetch_global_symbols(conn, &prefix)?, MAX_COMPLETION_ITEMS);
 
-        if let Some(engine_ctx) = engine_ctx.as_ref() {
+        if prefix_len >= MIN_ENGINE_GLOBAL_PREFIX_LEN
+            && strong_item_count(&items) < STRONG_MATCH_TARGET
+        {
+            if let Some(engine_ctx) = engine_ctx.as_ref() {
             merge_completion_items(
                 &mut items,
                 fetch_global_symbols(engine_ctx.conn, &prefix)?,
                 MAX_COMPLETION_ITEMS,
             );
+            }
         }
     }
 
@@ -1758,6 +1766,21 @@ fn compact_identifier(text: &str) -> String {
         .collect()
 }
 
+fn has_multi_word_head_anchor(candidate_words: &[String], prefix_words: &[String]) -> bool {
+    if prefix_words.len() < 2 {
+        return true;
+    }
+
+    let Some(first_prefix_word) = prefix_words.first() else {
+        return true;
+    };
+
+    candidate_words
+        .first()
+        .map(|word| word.starts_with(first_prefix_word))
+        .unwrap_or(false)
+}
+
 fn ordered_word_match_rank(candidate_words: &[String], prefix_words: &[String]) -> Option<usize> {
     if candidate_words.is_empty() || prefix_words.len() < 2 {
         return None;
@@ -1816,6 +1839,7 @@ fn completion_match_rank(candidate: &str, prefix: &str) -> usize {
     }
 
     let words = split_identifier_words(candidate);
+    let head_anchor = has_multi_word_head_anchor(&words, &prefix_words);
     if !words.is_empty() {
         let joined = words.join("");
         if joined.starts_with(&prefix_lower) {
@@ -1828,16 +1852,22 @@ fn completion_match_rank(candidate: &str, prefix: &str) -> usize {
             }
         }
 
-        for start in 0..words.len() {
-            let tail = words[start..].join("");
-            if tail.starts_with(&prefix_lower) {
-                return 10 + start;
+        if head_anchor {
+            for start in 0..words.len() {
+                let tail = words[start..].join("");
+                if tail.starts_with(&prefix_lower) {
+                    return 10 + start;
+                }
+            }
+
+            if let Some(rank) = ordered_word_match_rank(&words, &prefix_words) {
+                return 20 + rank;
             }
         }
+    }
 
-        if let Some(rank) = ordered_word_match_rank(&words, &prefix_words) {
-            return 20 + rank;
-        }
+    if prefix_words.len() >= 2 && !head_anchor {
+        return COMPLETION_MATCH_NONE;
     }
 
     if let Some(pos) = candidate_lower.find(&prefix_lower) {
@@ -1868,6 +1898,17 @@ fn completion_score_offset(match_rank: usize) -> i64 {
         40..=79 => -8,
         _ => -14,
     }
+}
+
+fn strong_item_count(items: &[Value]) -> usize {
+    items.iter()
+        .filter(|item| {
+            item.get("score_offset")
+                .and_then(Value::as_i64)
+                .unwrap_or(0)
+                >= STRONG_MATCH_SCORE_OFFSET
+        })
+        .count()
 }
 
 // -----------------------------------------------------------------------------
@@ -2388,58 +2429,86 @@ fn fetch_global_symbols(conn: &Connection, prefix: &str) -> Result<Vec<Value>> {
     Ok(items)
 }
 
+fn global_search_patterns(prefix: &str) -> Vec<(String, usize)> {
+    let prefix_lower = prefix.trim().to_ascii_lowercase();
+    if prefix_lower.is_empty() {
+        return Vec::new();
+    }
+
+    let prefix_words = split_identifier_words(prefix);
+    let mut patterns = vec![(format!("{}%", prefix_lower), 80usize)];
+
+    let weak_pattern = if prefix_words.len() >= 2 {
+        prefix_words
+            .first()
+            .map(|word| format!("{}%", word))
+            .unwrap_or_else(|| format!("{}%", prefix_lower))
+    } else {
+        format!("%{}%", prefix_lower)
+    };
+
+    if weak_pattern != patterns[0].0 {
+        patterns.push((weak_pattern, 200));
+    }
+
+    patterns
+}
+
 fn append_global_type_items(
     conn: &Connection,
     prefix: &str,
     seen: &mut HashSet<String>,
     items: &mut Vec<Value>,
 ) -> Result<()> {
-    let mut stmt = conn.prepare(
-        r#"
-        SELECT s.text, c.symbol_type
-        FROM classes c
-        JOIN strings s ON c.name_id = s.id
-        WHERE c.symbol_type IN ('class', 'struct', 'UCLASS', 'USTRUCT', 'enum', 'UENUM', 'typedef')
-        ORDER BY s.text
-        LIMIT 400
-        "#,
-    )?;
+    for (pattern, limit) in global_search_patterns(prefix) {
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT s.text, c.symbol_type
+            FROM classes c
+            JOIN strings s ON c.name_id = s.id
+            WHERE c.symbol_type IN ('class', 'struct', 'UCLASS', 'USTRUCT', 'enum', 'UENUM', 'typedef')
+              AND lower(s.text) LIKE ?
+            ORDER BY s.text
+            LIMIT ?
+            "#,
+        )?;
 
-    let rows = stmt.query_map([], |row| {
-        let name: String = row.get(0)?;
-        let symbol_type: String = row.get(1)?;
-        Ok((name, symbol_type))
-    })?;
+        let rows = stmt.query_map(params![pattern, limit as i64], |row| {
+            let name: String = row.get(0)?;
+            let symbol_type: String = row.get(1)?;
+            Ok((name, symbol_type))
+        })?;
 
-    for row in rows.flatten() {
-        let (name, symbol_type) = row;
-        let match_rank = completion_match_rank(&name, prefix);
-        if match_rank == COMPLETION_MATCH_NONE || !seen.insert(name.clone()) {
-            continue;
-        }
+        for row in rows.flatten() {
+            let (name, symbol_type) = row;
+            let match_rank = completion_match_rank(&name, prefix);
+            if match_rank == COMPLETION_MATCH_NONE || !seen.insert(name.clone()) {
+                continue;
+            }
 
-        let kind = if matches!(symbol_type.as_str(), "enum" | "UENUM") {
-            13
-        } else {
-            7
-        };
+            let kind = if matches!(symbol_type.as_str(), "enum" | "UENUM") {
+                13
+            } else {
+                7
+            };
 
-        items.push(json!({
-            "label": name,
-            "kind": kind,
-            "detail": symbol_type,
-            "filterText": name,
-            "sortText": completion_sort_text(100_000 + match_rank, kind, &name),
-            "insertText": name,
-            "score_offset": completion_score_offset(match_rank),
-            "labelDetails": {
-                "detail": format!(" {}", symbol_type),
-                "description": "UCore",
-            },
-        }));
+            items.push(json!({
+                "label": name,
+                "kind": kind,
+                "detail": symbol_type,
+                "filterText": name,
+                "sortText": completion_sort_text(100_000 + match_rank, kind, &name),
+                "insertText": name,
+                "score_offset": completion_score_offset(match_rank),
+                "labelDetails": {
+                    "detail": format!(" {}", symbol_type),
+                    "description": "UCore",
+                },
+            }));
 
-        if items.len() >= 80 {
-            break;
+            if items.len() >= 80 {
+                return Ok(());
+            }
         }
     }
 
@@ -2456,43 +2525,46 @@ fn append_global_enum_value_items(
         return Ok(());
     }
 
-    let mut stmt = conn.prepare(
-        r#"
-        SELECT sen.text, sclass.text
-        FROM enum_values ev
-        JOIN strings sen ON ev.name_id = sen.id
-        JOIN classes c ON ev.enum_id = c.id
-        JOIN strings sclass ON c.name_id = sclass.id
-        ORDER BY sen.text
-        LIMIT 200
-        "#,
-    )?;
+    for (pattern, limit) in global_search_patterns(prefix) {
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT sen.text, sclass.text
+            FROM enum_values ev
+            JOIN strings sen ON ev.name_id = sen.id
+            JOIN classes c ON ev.enum_id = c.id
+            JOIN strings sclass ON c.name_id = sclass.id
+            WHERE lower(sen.text) LIKE ?
+            ORDER BY sen.text
+            LIMIT ?
+            "#,
+        )?;
 
-    let rows = stmt.query_map([], |row| {
-        let name: String = row.get(0)?;
-        let owner: String = row.get(1)?;
-        Ok((name, owner))
-    })?;
+        let rows = stmt.query_map(params![pattern, limit as i64], |row| {
+            let name: String = row.get(0)?;
+            let owner: String = row.get(1)?;
+            Ok((name, owner))
+        })?;
 
-    for row in rows.flatten() {
-        let (name, owner) = row;
-        let match_rank = completion_match_rank(&name, prefix);
-        if match_rank == COMPLETION_MATCH_NONE || !seen.insert(name.clone()) {
-            continue;
-        }
+        for row in rows.flatten() {
+            let (name, owner) = row;
+            let match_rank = completion_match_rank(&name, prefix);
+            if match_rank == COMPLETION_MATCH_NONE || !seen.insert(name.clone()) {
+                continue;
+            }
 
-        items.push(json!({
-            "label": name,
-            "kind": 20,
-            "detail": format!("enum item - {}", owner),
-            "filterText": name,
-            "sortText": completion_sort_text(100_500 + match_rank, 20, &name),
-            "insertText": name,
-            "score_offset": completion_score_offset(match_rank),
-        }));
+            items.push(json!({
+                "label": name,
+                "kind": 20,
+                "detail": format!("enum item - {}", owner),
+                "filterText": name,
+                "sortText": completion_sort_text(100_500 + match_rank, 20, &name),
+                "insertText": name,
+                "score_offset": completion_score_offset(match_rank),
+            }));
 
-        if items.len() >= 80 {
-            break;
+            if items.len() >= 80 {
+                return Ok(());
+            }
         }
     }
 
@@ -3869,6 +3941,27 @@ void Test() {
 
         assert!(has_label(&items, "GetAbilitySystemComponent"));
         assert!(!has_label(&items, "AbilitySystemComponent"));
+    }
+
+    #[test]
+    fn single_word_completion_can_still_match_middle_word_candidates() {
+        let conn = test_db();
+        let file_id: i64 = conn
+            .query_row("SELECT id FROM files WHERE extension = 'cpp' LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+
+        insert_class(&conn, "GetMeshActor", file_id);
+
+        let items = completion_at(
+            &conn,
+            r#"
+void Test() {
+    Actor/*cursor*/
+}
+"#,
+        );
+
+        assert!(has_label(&items, "GetMeshActor"));
     }
 
     #[test]

@@ -15,6 +15,128 @@ local default_opts = {
 	},
 }
 
+local policy_applied = false
+
+local function call_or_value(value, ...)
+	if type(value) == "function" then
+		return value(...)
+	end
+	if value == nil then
+		return true
+	end
+	return value
+end
+
+local function include_like_context(ctx)
+	local line = type(ctx) == "table" and tostring(ctx.line or "") or ""
+	local cursor = type(ctx) == "table" and type(ctx.cursor) == "table" and tonumber(ctx.cursor[2]) or #line
+	local before = line:sub(1, math.max(cursor, 0))
+
+	if before:match("^%s*#%s*include%s*[<\"][^>\"]*$") then
+		return true
+	end
+
+	if before:match("[\"'][^\"']*[\\/]?[^\"']*$") then
+		return true
+	end
+
+	return false
+end
+
+function M.apply_recommended_blink_policy()
+	if policy_applied then
+		return
+	end
+
+	local ok_config, blink_config = pcall(require, "blink.cmp.config")
+	if not ok_config or type(blink_config) ~= "table" then
+		return
+	end
+
+	local sources = blink_config.sources
+	if type(sources) ~= "table" then
+		return
+	end
+
+	sources.per_filetype = sources.per_filetype or {}
+	if sources.per_filetype.unreal_cpp == nil then
+		sources.per_filetype.unreal_cpp = {
+			"ucore",
+			"lsp",
+			"snippets",
+			"path",
+			inherit_defaults = false,
+		}
+	end
+
+	local providers = sources.providers or {}
+
+	if type(providers.buffer) == "table" then
+		local previous_enabled = providers.buffer.enabled
+		providers.buffer.enabled = function()
+			local enabled = call_or_value(previous_enabled)
+			if not enabled then
+				return false
+			end
+			return vim.bo.filetype ~= "unreal_cpp"
+		end
+	end
+
+	if type(providers.path) == "table" then
+		local previous_should_show = providers.path.should_show_items
+		local previous_score_offset = providers.path.score_offset
+
+		providers.path.should_show_items = function(ctx, items)
+			local allowed = call_or_value(previous_should_show, ctx, items)
+			if not allowed then
+				return false
+			end
+			if vim.bo.filetype ~= "unreal_cpp" then
+				return true
+			end
+			return include_like_context(ctx)
+		end
+
+		providers.path.score_offset = function(ctx, enabled_sources)
+			local base = call_or_value(previous_score_offset, ctx, enabled_sources)
+			base = tonumber(base) or 0
+			if vim.bo.filetype == "unreal_cpp" then
+				return base - 2
+			end
+			return base
+		end
+	end
+
+	policy_applied = true
+
+	local ok_blink, blink = pcall(require, "blink.cmp")
+	if ok_blink and blink and blink.reload then
+		pcall(blink.reload)
+	end
+end
+
+local function prune_items(items)
+	local strong = 0
+	for _, item in ipairs(items) do
+		if (tonumber(item.score_offset) or 0) >= 10 then
+			strong = strong + 1
+		end
+	end
+
+	if strong < 12 then
+		return items
+	end
+
+	local pruned = {}
+	for _, item in ipairs(items) do
+		if (tonumber(item.score_offset) or 0) >= 2 then
+			table.insert(pruned, item)
+		end
+	end
+
+	return #pruned > 0 and pruned or items
+end
+
 -- Create a blink.cmp source instance.
 -- 创建 blink.cmp source 实例。
 function M.new(opts)
@@ -122,6 +244,8 @@ function M:get_completions(_, callback)
 				table.insert(blink_items, converted)
 			end
 		end
+
+		blink_items = prune_items(blink_items)
 
 		callback({
 			is_incomplete_forward = false,

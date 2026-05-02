@@ -313,6 +313,10 @@ end
 -- Setup automatic completion autocmds.
 -- 设置自动补全自动命令。
 function M.setup()
+	pcall(function()
+		require("ucore.completion.blink").apply_recommended_blink_policy()
+	end)
+
 	local group = vim.api.nvim_create_augroup("UCoreCompletion", {
 		clear = true,
 	})
