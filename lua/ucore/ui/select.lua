@@ -1,49 +1,12 @@
 local config = require("ucore.config")
 
 local M = {}
-local UI_LOG_NAME = "ucore-ui.log"
 
 -- Check whether a Lua module can be required.
 -- 检查某个 Lua 模块是否可用。
 local function has_module(name)
 	local ok = pcall(require, name)
 	return ok
-end
-
-local function ui_log_path()
-	local cache_dir = tostring(config.values.cache_dir or (vim.fn.stdpath("data") .. "/ucore"))
-	vim.fn.mkdir(cache_dir, "p")
-	return cache_dir .. "/" .. UI_LOG_NAME
-end
-
-local function log_text(value)
-	if value == nil or value == vim.NIL then
-		return "<nil>"
-	end
-
-	return tostring(value):gsub("[%s\r\n\t]+", " ")
-end
-
-local function append_ui_log(tag, fields)
-	local line = os.date("%Y-%m-%d %H:%M:%S") .. " [" .. tostring(tag) .. "]"
-
-	if type(fields) == "table" then
-		local parts = {}
-		local keys = vim.tbl_keys(fields)
-		table.sort(keys)
-
-		for _, key in ipairs(keys) do
-			table.insert(parts, tostring(key) .. "=" .. log_text(fields[key]))
-		end
-
-		if #parts > 0 then
-			line = line .. " " .. table.concat(parts, " ")
-		end
-	elseif fields ~= nil then
-		line = line .. " " .. log_text(fields)
-	end
-
-	pcall(vim.fn.writefile, { line }, ui_log_path(), "a")
 end
 
 -- Pick the best available picker backend.
@@ -159,42 +122,6 @@ end
 
 local function current_buffer_path()
 	return normalize_path(vim.api.nvim_buf_get_name(0))
-end
-
-local function current_picker_state(action_state, prompt_bufnr)
-	local state = {
-		prompt_bufnr = prompt_bufnr,
-	}
-
-	local ok_picker, picker = pcall(action_state.get_current_picker, prompt_bufnr)
-	if not ok_picker or not picker then
-		state.picker = "missing"
-		return state
-	end
-
-	local ok_line, current_line = pcall(action_state.get_current_line)
-	if ok_line then
-		state.prompt = current_line
-	end
-
-	if picker.results_bufnr and vim.api.nvim_buf_is_valid(picker.results_bufnr) then
-		state.results_bufnr = picker.results_bufnr
-		state.results_line_count = vim.api.nvim_buf_line_count(picker.results_bufnr)
-	end
-
-	if picker.results_win and vim.api.nvim_win_is_valid(picker.results_win) then
-		local cursor = vim.api.nvim_win_get_cursor(picker.results_win)
-		state.results_win = picker.results_win
-		state.results_cursor = string.format("%d:%d", cursor[1], cursor[2])
-	end
-
-	if picker.prompt_win and vim.api.nvim_win_is_valid(picker.prompt_win) then
-		local cursor = vim.api.nvim_win_get_cursor(picker.prompt_win)
-		state.prompt_win = picker.prompt_win
-		state.prompt_cursor = string.format("%d:%d", cursor[1], cursor[2])
-	end
-
-	return state
 end
 
 local function normalize_source(source)
@@ -323,13 +250,9 @@ local function find_search_text(item, name, kind, label, path)
 		tostring(item.class_name or ""),
 		tostring(item.module_name or ""),
 		tostring(item.config_section or ""),
-		tostring(item.config_value or ""),
-		tostring(item.config_file or ""),
 		tostring(item.asset_path or ""),
 		vim.fn.fnamemodify(normalized_path, ":t"),
 		display_path(normalized_path),
-		normalized_path,
-		path,
 	}, " ")
 end
 
@@ -379,6 +302,11 @@ local function find_item_score(item)
 end
 
 local function prepare_find_items(items)
+	local current = current_buffer_path()
+	if type(items) == "table" and items.__ucore_prepared and items.__ucore_prepared_for == current then
+		return items
+	end
+
 	local seen = {}
 	local result = {}
 
@@ -412,6 +340,34 @@ local function prepare_find_items(items)
 
 		return display_path(left.path or left.file_path or left.asset_path or "") < display_path(right.path or right.file_path or right.asset_path or "")
 	end)
+
+	for index, item in ipairs(result) do
+		local name = tostring(item.name or item.symbol_name or "<unknown>")
+		local kind = normalize_kind(item.symbol_type or item.type)
+		local source = normalize_source(item.source)
+		local path = tostring(item.path or item.file_path or item.asset_path or "")
+		local line = tonumber(item.line or item.line_number or 1) or 1
+		local label = find_category_label(item)
+		local group = find_group(item)
+		local source_label = source ~= "" and source or "index"
+		local location = find_display_location(item, path, line)
+
+		item._ucore_find_index = index
+		item._ucore_find_path = path
+		item._ucore_find_line = line
+		item._ucore_find_display = string.format(
+			"%s  %s  %s  %s  %s",
+			pad_right(group, 7),
+			pad_right(label, 9),
+			pad_right(truncate_left(name, 34), 34),
+			pad_right(source_label, 7),
+			location
+		)
+		item._ucore_find_ordinal = find_search_text(item, name, kind, label, path)
+	end
+
+	result.__ucore_prepared = true
+	result.__ucore_prepared_for = current
 
 	return result
 end
@@ -649,28 +605,19 @@ end
 local function pick_telescope_find(items, default_text)
 	local pickers = require("telescope.pickers")
 	local finders = require("telescope.finders")
-	local conf = require("telescope.config").values
 	local previewers = require("telescope.previewers")
 	local actions = require("telescope.actions")
 	local action_state = require("telescope.actions.state")
+	local sorters = require("telescope.sorters")
 
 	items = prepare_find_items(items)
-	append_ui_log("gf.open", {
-		backend = "telescope",
-		default_text = default_text or "",
-		item_count = #items,
-		sorting_strategy = "ascending",
-	})
 
 	if vim.tbl_isempty(items) then
-		append_ui_log("gf.no_results", {
-			default_text = default_text or "",
-		})
 		vim.notify("UCore find: no results", vim.log.levels.WARN)
 		return
 	end
-	local picker
-	picker = pickers
+
+	pickers
 		.new({}, {
 			prompt_title = "UCore find",
 			default_text = default_text,
@@ -682,33 +629,16 @@ local function pick_telescope_find(items, default_text)
 			finder = finders.new_table({
 				results = items,
 				entry_maker = function(item)
-					local name = tostring(item.name or item.symbol_name or "<unknown>")
-					local kind = normalize_kind(item.symbol_type or item.type)
-					local source = normalize_source(item.source)
-					local path = tostring(item.path or item.file_path or item.asset_path or "")
-					local line = tonumber(item.line or item.line_number or 1) or 1
-					local label = find_category_label(item)
-					local group = find_group(item)
-					local source_label = source ~= "" and source or "index"
-					local location = find_display_location(item, path, line)
-					local display = string.format(
-						"%s  %s  %s  %s  %s",
-						pad_right(group, 7),
-						pad_right(label, 9),
-						pad_right(truncate_left(name, 34), 34),
-						pad_right(source_label, 7),
-						location
-					)
-
 					return {
 						value = item,
-						display = display,
-						ordinal = find_search_text(item, name, kind, label, path),
-						filename = path,
-						path = path,
-						lnum = line,
+						display = item._ucore_find_display,
+						ordinal = item._ucore_find_ordinal,
+						filename = item._ucore_find_path,
+						path = item._ucore_find_path,
+						lnum = item._ucore_find_line,
 						col = 1,
-						text = name,
+						text = tostring(item.name or item.symbol_name or "<unknown>"),
+						index = item._ucore_find_index,
 					}
 				end,
 			}),
@@ -717,58 +647,10 @@ local function pick_telescope_find(items, default_text)
 					preview_find_item(entry, self.state.bufnr)
 				end,
 			}),
-			sorter = conf.generic_sorter({}),
+			sorter = sorters.get_substr_matcher(),
 			attach_mappings = function(prompt_bufnr)
-				append_ui_log("gf.attach", current_picker_state(action_state, prompt_bufnr))
-
-				local group = vim.api.nvim_create_augroup("UCoreFindLog" .. tostring(prompt_bufnr), { clear = true })
-				local prompt_events = 0
-				local function log_prompt_state(reason)
-					prompt_events = prompt_events + 1
-					if prompt_events > 12 then
-						return
-					end
-
-					local state = current_picker_state(action_state, prompt_bufnr)
-					state.reason = reason
-					state.event_index = prompt_events
-					append_ui_log("gf.prompt", state)
-				end
-
-				vim.api.nvim_create_autocmd({ "TextChangedI", "TextChanged" }, {
-					group = group,
-					buffer = prompt_bufnr,
-					callback = function()
-						log_prompt_state("text_changed")
-					end,
-				})
-
-				vim.api.nvim_create_autocmd("BufWipeout", {
-					group = group,
-					buffer = prompt_bufnr,
-					once = true,
-					callback = function()
-						append_ui_log("gf.close", {
-							prompt_bufnr = prompt_bufnr,
-						})
-						pcall(vim.api.nvim_del_augroup_by_id, group)
-					end,
-				})
-
-				vim.schedule(function()
-					local state = current_picker_state(action_state, prompt_bufnr)
-					state.reason = "scheduled_after_find"
-					append_ui_log("gf.prompt", state)
-				end)
-
 				actions.select_default:replace(function()
 					local selection = action_state.get_selected_entry()
-					append_ui_log("gf.select", {
-						line = selection and (selection.lnum or selection.line) or "",
-						name = selection and selection.text or "",
-						path = selection and (selection.path or selection.filename) or "",
-						prompt_bufnr = prompt_bufnr,
-					})
 					actions.close(prompt_bufnr)
 
 					if selection and selection.value then
@@ -779,15 +661,7 @@ local function pick_telescope_find(items, default_text)
 				return true
 			end,
 		})
-
-	local ok, err = pcall(function()
-		picker:find()
-	end)
-
-	if not ok then
-		append_ui_log("gf.error", err)
-		error(err)
-	end
+		:find()
 end
 
 -- Open a generic selection UI with a label formatter.
@@ -894,6 +768,10 @@ function M.find(items, opts)
 
 		return string.format("%s%s [%s]", name, source, kind)
 	end, open_source_item)
+end
+
+function M.prepare_find_items(items)
+	return prepare_find_items(items)
 end
 
 -- Backward-compatible alias for older callers.

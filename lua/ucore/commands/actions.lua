@@ -17,12 +17,18 @@ local M = {}
 local FIND_CACHE_TTL_MS = 10000
 local find_cache = {
 	root = nil,
-	items = nil,
+	raw_items = nil,
+	prepared_items = nil,
+	prepared_path = nil,
 	expires_at = 0,
 }
 
 local function now_ms()
 	return vim.loop.hrtime() / 1000000
+end
+
+local function current_find_path()
+	return vim.api.nvim_buf_get_name(0):gsub("\\", "/")
 end
 
 local function show_find_results(pattern, items)
@@ -899,8 +905,14 @@ function M.find(pattern)
 		return vim.notify("Could not find .uproject", vim.log.levels.ERROR)
 	end
 
-	if find_cache.root == root and find_cache.items and find_cache.expires_at > now_ms() then
-		return show_find_results(pattern, find_cache.items)
+	local current_path = current_find_path()
+	if find_cache.root == root and find_cache.raw_items and find_cache.expires_at > now_ms() then
+		if find_cache.prepared_path ~= current_path or not find_cache.prepared_items then
+			find_cache.prepared_items = ui.select.prepare_find_items(find_cache.raw_items)
+			find_cache.prepared_path = current_path
+		end
+
+		return show_find_results(pattern, find_cache.prepared_items)
 	end
 
 	local pending = 4
@@ -923,12 +935,15 @@ function M.find(pattern)
 			return vim.notify("UCore find failed:\n" .. table.concat(errors, "\n"), vim.log.levels.ERROR)
 		end
 
+		local prepared_items = ui.select.prepare_find_items(items)
 		find_cache = {
 			root = root,
-			items = items,
+			raw_items = items,
+			prepared_items = prepared_items,
+			prepared_path = current_path,
 			expires_at = now_ms() + FIND_CACHE_TTL_MS,
 		}
-		show_find_results(pattern, items)
+		show_find_results(pattern, prepared_items)
 	end
 
 	remote.search_symbols(root, "", function(result, err)
