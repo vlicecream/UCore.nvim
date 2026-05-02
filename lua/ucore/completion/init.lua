@@ -223,14 +223,18 @@ function M.request(callback)
 			or not vim.api.nvim_buf_is_valid(bufnr)
 			or vim.api.nvim_buf_get_changedtick(bufnr) ~= changedtick
 		then
+			vim.notify("UCore comp stale: seq=" .. sequence .. " cur=" .. request_sequence, "WARN")
 			return callback(nil, "stale")
 		end
 
 		if err then
+			vim.notify("UCore comp err: " .. tostring(err), "ERROR")
 			return callback(nil, err)
 		end
 
-		callback(normalize_items(result), nil)
+		local normalized = normalize_items(result)
+		vim.notify("UCore comp: raw=" .. #(result or {}) .. " normalized=" .. #normalized, "INFO")
+		callback(normalized, nil)
 	end)
 end
 
