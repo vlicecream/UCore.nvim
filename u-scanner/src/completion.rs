@@ -228,6 +228,7 @@ pub fn process_completion_with_engine(
     let root = tree.root_node();
     let cursor_node = cursor_node(root, line, character)
         .ok_or_else(|| anyhow::anyhow!("no tree-sitter node at cursor"))?;
+    let buffer_inheritance = build_buffer_inheritance_map(root, content);
 
     if let Some(items) = complete_include_paths(&mut ctx, content, line, character)? {
         return Ok(json!(items));
@@ -252,6 +253,7 @@ pub fn process_completion_with_engine(
                     engine_ctx.as_mut(),
                     current_class,
                     request.prefix,
+                    &buffer_inheritance,
                     cache,
                     persistent_cache,
                 )?;
@@ -266,6 +268,7 @@ pub fn process_completion_with_engine(
             &mut ctx,
             engine_ctx.as_mut(),
             request.receiver,
+            &buffer_inheritance,
             root,
             content,
             line as usize,
@@ -279,6 +282,7 @@ pub fn process_completion_with_engine(
                 engine_ctx.as_mut(),
                 &ty,
                 request.prefix,
+                &buffer_inheritance,
                 cache,
                 persistent_cache,
                 current_class.as_deref(),
@@ -310,6 +314,7 @@ pub fn process_completion_with_engine(
                 engine_ctx.as_mut(),
                 &current_class,
                 Some(prefix.clone()),
+                &buffer_inheritance,
                 cache.clone(),
                 persistent_cache.clone(),
                 Some(&current_class),
@@ -351,10 +356,11 @@ fn fetch_super_members_with_engine(
     engine_ctx: Option<&mut CompletionContext>,
     current_class: &str,
     prefix: Option<String>,
+    buffer_inheritance: &BufferInheritanceMap,
     memory_cache: Option<Arc<Mutex<CompletionCache>>>,
     persistent_cache: Option<Arc<Mutex<Connection>>>,
 ) -> Result<Vec<Value>> {
-    let Some(parent_class) = direct_parent_class(ctx, current_class)? else {
+    let Some(parent_class) = direct_parent_class(ctx, current_class, buffer_inheritance)? else {
         return Ok(Vec::new());
     };
 
@@ -363,6 +369,7 @@ fn fetch_super_members_with_engine(
         engine_ctx,
         &parent_class,
         prefix,
+        buffer_inheritance,
         memory_cache,
         persistent_cache,
         Some(current_class),
@@ -377,6 +384,7 @@ fn fetch_members_with_engine(
     engine_ctx: Option<&mut CompletionContext>,
     class_name: &str,
     prefix: Option<String>,
+    buffer_inheritance: &BufferInheritanceMap,
     memory_cache: Option<Arc<Mutex<CompletionCache>>>,
     persistent_cache: Option<Arc<Mutex<Connection>>>,
     accessor_class: Option<&str>,
@@ -386,17 +394,31 @@ fn fetch_members_with_engine(
         ctx,
         class_name,
         prefix.clone(),
-        memory_cache,
-        persistent_cache,
+        memory_cache.clone(),
+        persistent_cache.clone(),
         accessor_class,
         false,
     )?;
+
+    for parent_name in direct_buffer_parents(buffer_inheritance, class_name) {
+        let extra = fetch_members_recursive(
+            ctx,
+            &parent_name,
+            prefix.clone(),
+            memory_cache.clone(),
+            persistent_cache.clone(),
+            accessor_class,
+            true,
+        )?;
+
+        merge_completion_items(&mut items, extra, MAX_COMPLETION_ITEMS);
+    }
 
     let Some(engine_ctx) = engine_ctx else {
         return Ok(items);
     };
 
-    let mut roots = collect_engine_member_roots(ctx, engine_ctx, class_name)?;
+    let mut roots = collect_engine_member_roots(ctx, engine_ctx, class_name, buffer_inheritance)?;
 
     if assume_engine_subclass_access {
         let resolved = resolve_typedef(ctx, class_name)?;
@@ -431,51 +453,47 @@ fn collect_engine_member_roots(
     ctx: &mut CompletionContext,
     engine_ctx: &mut CompletionContext,
     class_name: &str,
+    buffer_inheritance: &BufferInheritanceMap,
 ) -> Result<Vec<(String, bool)>> {
-    let class_name = resolve_typedef(ctx, class_name)?;
-    let class_ids = ctx.class_ids_by_name(&class_name)?;
-
-    if class_ids.is_empty() {
-        if !engine_ctx.class_ids_by_name(&class_name)?.is_empty() {
-            return Ok(vec![(class_name, false)]);
-        }
-
-        return Ok(Vec::new());
-    }
-
-    let mut queue = VecDeque::from(class_ids);
+    let root_name = resolve_typedef(ctx, class_name)?;
+    let mut queue = VecDeque::from([root_name.clone()]);
     let mut visited = HashSet::new();
     let mut seen_names = HashSet::new();
     let mut roots = Vec::new();
 
-    while let Some(class_id) = queue.pop_front() {
-        if !visited.insert(class_id) {
+    while let Some(current_name) = queue.pop_front() {
+        let current_name = resolve_typedef(ctx, &current_name)?;
+
+        if !visited.insert(current_name.clone()) {
             continue;
         }
 
-        for (parent_id, parent_name) in parent_classes(ctx.conn, class_id)? {
+        let class_ids = ctx.class_ids_by_name(&current_name)?;
+        let in_engine = !engine_ctx.class_ids_by_name(&current_name)?.is_empty();
+
+        if current_name == root_name {
+            if class_ids.is_empty() && in_engine {
+                roots.push((current_name.clone(), false));
+            }
+        } else if in_engine && seen_names.insert(current_name.clone()) {
+            roots.push((current_name.clone(), true));
+        }
+
+        for class_id in class_ids {
+            for (_, parent_name) in parent_classes(ctx.conn, class_id)? {
+                let parent_name = clean_type(&parent_name);
+
+                if !parent_name.is_empty() {
+                    queue.push_back(parent_name);
+                }
+            }
+        }
+
+        for parent_name in direct_buffer_parents(buffer_inheritance, &current_name) {
             let parent_name = clean_type(&parent_name);
 
-            if parent_name.is_empty() || !seen_names.insert(parent_name.clone()) {
-                if let Some(parent_id) = parent_id {
-                    queue.push_back(parent_id);
-                }
-                continue;
-            }
-
-            let parent_ids = ctx.class_ids_by_name(&parent_name)?;
-            let in_engine = !engine_ctx.class_ids_by_name(&parent_name)?.is_empty();
-
-            if in_engine {
-                roots.push((parent_name, true));
-            }
-
-            if parent_ids.is_empty() {
-                continue;
-            }
-
-            for parent_id in parent_ids {
-                queue.push_back(parent_id);
+            if !parent_name.is_empty() {
+                queue.push_back(parent_name);
             }
         }
     }
@@ -485,7 +503,11 @@ fn collect_engine_member_roots(
 
 /// Return the first direct parent class name for a class.
 /// 返回某个类的第一个直接父类名。
-fn direct_parent_class(ctx: &mut CompletionContext, class_name: &str) -> Result<Option<String>> {
+fn direct_parent_class(
+    ctx: &mut CompletionContext,
+    class_name: &str,
+    buffer_inheritance: &BufferInheritanceMap,
+) -> Result<Option<String>> {
     for class_id in ctx.class_ids_by_name(class_name)? {
         for (_, parent_name) in parent_classes(ctx.conn, class_id)? {
             let parent_name = clean_type(&parent_name);
@@ -496,7 +518,9 @@ fn direct_parent_class(ctx: &mut CompletionContext, class_name: &str) -> Result<
         }
     }
 
-    Ok(None)
+    Ok(direct_buffer_parents(buffer_inheritance, class_name)
+        .into_iter()
+        .next())
 }
 
 // -----------------------------------------------------------------------------
@@ -765,12 +789,15 @@ fn resolve_expression_type(
     }
 }
 
+type BufferInheritanceMap = HashMap<String, Vec<String>>;
+
 /// Resolve expression type with optional Engine DB fallback.
 /// 带可选 Engine DB 兜底的表达式类型解析。
 fn resolve_expression_type_with_engine(
     ctx: &mut CompletionContext,
     engine_ctx: Option<&mut CompletionContext>,
     node: Node,
+    buffer_inheritance: &BufferInheritanceMap,
     root: Node,
     content: &str,
     cursor_row: usize,
@@ -797,6 +824,7 @@ fn resolve_expression_type_with_engine(
                     engine_ctx.as_deref_mut(),
                     &class_name,
                     name,
+                    buffer_inheritance,
                 )? {
                     return Ok(Some(return_type));
                 }
@@ -822,6 +850,7 @@ fn resolve_expression_type_with_engine(
                     engine_ctx.as_deref_mut(),
                     class_name,
                     member_name,
+                    buffer_inheritance,
                 );
             }
 
@@ -837,6 +866,7 @@ fn resolve_expression_type_with_engine(
                 ctx,
                 engine_ctx.as_deref_mut(),
                 function,
+                buffer_inheritance,
                 root,
                 content,
                 cursor_row,
@@ -854,6 +884,7 @@ fn resolve_expression_type_with_engine(
                             ctx,
                             engine_ctx.as_deref_mut(),
                             object,
+                            buffer_inheritance,
                             root,
                             content,
                             cursor_row,
@@ -863,6 +894,7 @@ fn resolve_expression_type_with_engine(
                                 engine_ctx.as_deref_mut(),
                                 &object_type,
                                 node_text(field, content).trim(),
+                                buffer_inheritance,
                             );
                         }
                     }
@@ -879,6 +911,7 @@ fn resolve_expression_type_with_engine(
                             engine_ctx.as_deref_mut(),
                             class_name,
                             method_name,
+                            buffer_inheritance,
                         );
                     }
 
@@ -888,6 +921,7 @@ fn resolve_expression_type_with_engine(
                             engine_ctx.as_deref_mut(),
                             &class_name,
                             name,
+                            buffer_inheritance,
                         );
                     }
 
@@ -905,6 +939,7 @@ fn resolve_expression_type_with_engine(
                     ctx,
                     engine_ctx.as_deref_mut(),
                     object,
+                    buffer_inheritance,
                     root,
                     content,
                     cursor_row,
@@ -914,6 +949,7 @@ fn resolve_expression_type_with_engine(
                         engine_ctx.as_deref_mut(),
                         &object_type,
                         node_text(field, content).trim(),
+                        buffer_inheritance,
                     );
                 }
             }
@@ -929,6 +965,7 @@ fn resolve_expression_type_with_engine(
                     ctx,
                     engine_ctx.as_deref_mut(),
                     object,
+                    buffer_inheritance,
                     root,
                     content,
                     cursor_row,
@@ -947,6 +984,7 @@ fn resolve_expression_type_with_engine(
                         ctx,
                         engine_ctx.as_deref_mut(),
                         child,
+                        buffer_inheritance,
                         root,
                         content,
                         cursor_row,
@@ -967,6 +1005,7 @@ fn resolve_special_call_type_with_engine(
     ctx: &mut CompletionContext,
     engine_ctx: Option<&mut CompletionContext>,
     function: Node,
+    buffer_inheritance: &BufferInheritanceMap,
     root: Node,
     content: &str,
     cursor_row: usize,
@@ -989,7 +1028,15 @@ fn resolve_special_call_type_with_engine(
         }
     }
 
-    resolve_expression_type_with_engine(ctx, engine_ctx, function, root, content, cursor_row)
+    resolve_expression_type_with_engine(
+        ctx,
+        engine_ctx,
+        function,
+        buffer_inheritance,
+        root,
+        content,
+        cursor_row,
+    )
 }
 
 /// Find a member return type with optional Engine parent-chain fallback.
@@ -999,9 +1046,16 @@ fn find_member_return_type_with_engine(
     engine_ctx: Option<&mut CompletionContext>,
     class_name: &str,
     member_name: &str,
+    buffer_inheritance: &BufferInheritanceMap,
 ) -> Result<Option<String>> {
     if let Some(ty) = find_member_return_type(ctx, class_name, member_name)? {
         return Ok(Some(ty));
+    }
+
+    for parent_name in direct_buffer_parents(buffer_inheritance, class_name) {
+        if let Some(ty) = find_member_return_type(ctx, &parent_name, member_name)? {
+            return Ok(Some(ty));
+        }
     }
 
     let Some(engine_ctx) = engine_ctx else {
@@ -1009,7 +1063,7 @@ fn find_member_return_type_with_engine(
     };
 
     let resolved = resolve_typedef(ctx, class_name)?;
-    let mut roots = collect_engine_member_roots(ctx, engine_ctx, &resolved)?;
+    let mut roots = collect_engine_member_roots(ctx, engine_ctx, &resolved, buffer_inheritance)?;
 
     if ctx.class_ids_by_name(&resolved)?.is_empty()
         && !engine_ctx.class_ids_by_name(&resolved)?.is_empty()
@@ -1717,6 +1771,81 @@ fn node_contains_point(node: Node, point: Point) -> bool {
 
 fn point_is_before(left: Point, right: Point) -> bool {
     left.row < right.row || (left.row == right.row && left.column < right.column)
+}
+
+fn build_buffer_inheritance_map(root: Node, content: &str) -> BufferInheritanceMap {
+    let mut map = HashMap::new();
+    collect_buffer_inheritance(root, content, &mut map);
+    map
+}
+
+fn collect_buffer_inheritance(node: Node, content: &str, map: &mut BufferInheritanceMap) {
+    if matches!(
+        node.kind(),
+        "class_specifier"
+            | "struct_specifier"
+            | "unreal_class_declaration"
+            | "unreal_struct_declaration"
+            | "unreal_reflected_class_declaration"
+            | "unreal_reflected_struct_declaration"
+    ) {
+        if let Some(name_node) = node.child_by_field_name("name") {
+            let class_name = clean_type(node_text(name_node, content));
+            let parents = base_class_names(node, content);
+
+            if !class_name.is_empty() && !parents.is_empty() {
+                map.insert(class_name, parents);
+            }
+        }
+    }
+
+    for child in node_children(node) {
+        collect_buffer_inheritance(child, content, map);
+    }
+}
+
+fn base_class_names(node: Node, content: &str) -> Vec<String> {
+    let mut parents = Vec::new();
+    let mut seen = HashSet::new();
+
+    for child in node_children(node) {
+        if child.kind() == "base_class_clause" {
+            collect_base_class_names(child, content, &mut seen, &mut parents);
+        }
+    }
+
+    parents
+}
+
+fn collect_base_class_names(
+    node: Node,
+    content: &str,
+    seen: &mut HashSet<String>,
+    out: &mut Vec<String>,
+) {
+    match node.kind() {
+        "type_identifier" | "qualified_identifier" | "template_type" => {
+            let name = clean_type(node_text(node, content));
+
+            if !name.is_empty() && seen.insert(name.clone()) {
+                out.push(name);
+            }
+            return;
+        }
+
+        _ => {}
+    }
+
+    for child in node_children(node) {
+        collect_base_class_names(child, content, seen, out);
+    }
+}
+
+fn direct_buffer_parents(buffer_inheritance: &BufferInheritanceMap, class_name: &str) -> Vec<String> {
+    buffer_inheritance
+        .get(&clean_type(class_name))
+        .cloned()
+        .unwrap_or_default()
 }
 
 fn split_identifier_words(text: &str) -> Vec<String> {
@@ -4091,5 +4220,132 @@ public:
         );
 
         assert!(has_label(&member_items, "CancelAllAbilities"));
+    }
+
+    #[test]
+    fn current_buffer_inheritance_surfaces_engine_parent_members() {
+        let project_conn = test_db();
+        let engine_conn = test_db();
+
+        let engine_file_id: i64 = engine_conn
+            .query_row("SELECT id FROM files WHERE extension = 'cpp' LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+
+        let gameplay_ability_id = insert_class(&engine_conn, "UGameplayAbility", engine_file_id);
+        insert_member(
+            &engine_conn,
+            gameplay_ability_id,
+            "EndAbility",
+            "function",
+            Some("void"),
+            "protected",
+            engine_file_id,
+        );
+        insert_member(
+            &engine_conn,
+            gameplay_ability_id,
+            "AbilitySystemComponent",
+            "function",
+            Some("UAbilitySystemComponent"),
+            "protected",
+            engine_file_id,
+        );
+
+        let asc_id = insert_class(&engine_conn, "UAbilitySystemComponent", engine_file_id);
+        insert_member(
+            &engine_conn,
+            asc_id,
+            "CancelAllAbilities",
+            "function",
+            Some("void"),
+            "public",
+            engine_file_id,
+        );
+
+        let items = completion_at_with_engine(
+            &project_conn,
+            &engine_conn,
+            r#"
+class UAbility_Death : public UGameplayAbility
+{
+public:
+    void Test()
+    {
+        EndAb/*cursor*/
+    }
+};
+"#,
+        );
+
+        assert!(has_label(&items, "EndAbility"));
+
+        let member_items = completion_at_with_engine(
+            &project_conn,
+            &engine_conn,
+            r#"
+class UAbility_Death : public UGameplayAbility
+{
+public:
+    void Test()
+    {
+        AbilitySystemComponent()->Cancel/*cursor*/
+    }
+};
+"#,
+        );
+
+        assert!(has_label(&member_items, "CancelAllAbilities"));
+    }
+
+    #[test]
+    fn current_buffer_inheritance_surfaces_custom_parent_members() {
+        let conn = test_db();
+        let file_id: i64 = conn
+            .query_row("SELECT id FROM files WHERE extension = 'cpp' LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+
+        let base_id = insert_class(&conn, "UMyGameplayAbilityBase", file_id);
+        insert_member(
+            &conn,
+            base_id,
+            "ActivateCombo",
+            "function",
+            Some("void"),
+            "protected",
+            file_id,
+        );
+
+        let items = completion_at(
+            &conn,
+            r#"
+class UAbility_Death : public UMyGameplayAbilityBase
+{
+public:
+    void Test()
+    {
+        ActivateC/*cursor*/
+    }
+};
+"#,
+        );
+
+        assert!(has_label(&items, "ActivateCombo"));
+
+        let member_items = completion_at(
+            &conn,
+            r#"
+class UAbility_Death : public UMyGameplayAbilityBase
+{
+public:
+    void Test()
+    {
+        UAbility_Death* Ability = this;
+        Ability->ActivateC/*cursor*/
+    }
+};
+"#,
+        );
+
+        assert!(has_label(&member_items, "ActivateCombo"));
     }
 }
