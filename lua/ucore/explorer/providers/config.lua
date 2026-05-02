@@ -7,44 +7,127 @@ local function normalize(path)
 	return path and path:gsub("\\", "/") or nil
 end
 
-local function ini_files(path, label)
+local function sorted_glob(pattern)
+	local entries = vim.fn.glob(pattern, false, true) or {}
+	table.sort(entries, function(a, b)
+		return tostring(a):lower() < tostring(b):lower()
+	end)
+	return entries
+end
+
+local function read_dir(path)
+	path = normalize(path)
+	if not path or vim.fn.isdirectory(path) ~= 1 then
+		return {}
+	end
+
+	local ok, names = pcall(vim.fn.readdir, path)
+	if not ok then
+		return {}
+	end
+
+	local entries = {}
+	for _, name in ipairs(names or {}) do
+		table.insert(entries, normalize(path .. "/" .. name))
+	end
+
+	table.sort(entries, function(a, b)
+		return tostring(a):lower() < tostring(b):lower()
+	end)
+
+	return entries
+end
+
+local function file_node(path)
+	path = normalize(path)
+	return {
+		id = "config-file:" .. tostring(path),
+		label = vim.fn.fnamemodify(path, ":t"),
+		path = path,
+		type = "file",
+		children = {},
+	}
+end
+
+local function config_file_group(path, label, opts)
+	opts = opts or {}
 	path = normalize(path)
 	if not path or vim.fn.isdirectory(path) ~= 1 then
 		return nil
 	end
 
-	local files = {}
-	for _, file in ipairs(vim.fn.glob(path .. "/**/*.ini", false, true) or {}) do
-		file = normalize(file)
-		table.insert(files, {
-			id = "config-file:" .. file,
-			label = vim.fn.fnamemodify(file, ":t"),
-			path = file,
-			type = "file",
-			children = {},
-		})
+	return tree.virtual_group(label, {}, {
+		id = opts.id or ("config-files:" .. label .. ":" .. path),
+		loaded = false,
+		load_children = function()
+			local children = {}
+
+			for _, file in ipairs(read_dir(path)) do
+				file = normalize(file)
+				if vim.fn.isdirectory(file) ~= 1 and file:lower():match("%.ini$") then
+					table.insert(children, file_node(file))
+				end
+			end
+
+			return children
+		end,
+	})
+end
+
+local function config_dir_node(path, label, opts)
+	opts = opts or {}
+	path = normalize(path)
+	if not path or vim.fn.isdirectory(path) ~= 1 then
+		return nil
 	end
 
-	table.sort(files, function(a, b)
-		return (a.path or a.label):lower() < (b.path or b.label):lower()
-	end)
+	return tree.virtual_group(label, {}, {
+		id = opts.id or ("config-dir:" .. label .. ":" .. path),
+		loaded = false,
+		load_children = function()
+			local children = {}
 
-	return tree.virtual_group(label, files, {
-		id = "config-group:" .. label .. ":" .. path,
+			for _, dir in ipairs(read_dir(path)) do
+				dir = normalize(dir)
+				if vim.fn.isdirectory(dir) == 1 then
+					local child = config_dir_node(dir, vim.fn.fnamemodify(dir, ":t"), {
+						id = "config-dir:" .. dir,
+					})
+					if child then
+						table.insert(children, child)
+					end
+				elseif dir:lower():match("%.ini$") then
+					table.insert(children, file_node(dir))
+				end
+			end
+
+			return children
+		end,
 	})
 end
 
 local function plugin_config_groups(root)
 	local groups = {}
-	local plugin_dirs = vim.fn.glob(root .. "/Plugins/*/Config", false, true)
-	for _, dir in ipairs(plugin_dirs or {}) do
-		local plugin_name = vim.fn.fnamemodify(vim.fn.fnamemodify(dir, ":h"), ":t")
-		local group = ini_files(dir, plugin_name .. "/Config")
-		if group then
-			table.insert(groups, group)
+	for _, dir in ipairs(sorted_glob(root .. "/Plugins/*/Config")) do
+		dir = normalize(dir)
+		if vim.fn.isdirectory(dir) == 1 then
+			local plugin_name = vim.fn.fnamemodify(vim.fn.fnamemodify(dir, ":h"), ":t")
+			local group = config_dir_node(dir, plugin_name .. "/Config", {
+				id = "config-plugin:" .. plugin_name .. ":" .. dir,
+			})
+			if group then
+				table.insert(groups, group)
+			end
 		end
 	end
 	return groups
+end
+
+local function grouped_children(label, children, id)
+	return tree.virtual_group(label, children, {
+		id = id,
+		loaded = true,
+	})
 end
 
 function M.load()
@@ -56,55 +139,61 @@ function M.load()
 	root = normalize(root)
 	local children = {}
 
-	local project_config = ini_files(root .. "/Config", "Project Config")
+	local project_config = config_file_group(root .. "/Config", "Project Config", {
+		id = "config-project-root:" .. root,
+	})
 	if project_config then
 		table.insert(children, project_config)
 	end
 
 	local project_platform = {}
-	for _, dir in ipairs(vim.fn.glob(root .. "/Config/*", false, true) or {}) do
+	for _, dir in ipairs(read_dir(root .. "/Config")) do
+		dir = normalize(dir)
 		if vim.fn.isdirectory(dir) == 1 then
-			local group = ini_files(dir, "Config/" .. vim.fn.fnamemodify(dir, ":t"))
+			local group = config_dir_node(dir, "Config/" .. vim.fn.fnamemodify(dir, ":t"), {
+				id = "config-project-platform-dir:" .. dir,
+			})
 			if group then
 				table.insert(project_platform, group)
 			end
 		end
 	end
-	table.insert(children, tree.virtual_group("Project Platform Config", project_platform, {
-		id = "config-project-platform:" .. root,
-	}))
+	table.insert(children, grouped_children("Project Platform Config", project_platform, "config-project-platform:" .. root))
 
-	table.insert(children, tree.virtual_group("Plugin Config", plugin_config_groups(root), {
-		id = "config-plugin:" .. root,
-	}))
+	table.insert(children, grouped_children("Plugin Config", plugin_config_groups(root), "config-plugin-root:" .. root))
 
 	local engine, _ = project.engine_metadata(root)
 	if engine and engine.engine_root then
 		local engine_root = normalize(engine.engine_root)
-		local engine_config = ini_files(engine_root .. "/Engine/Config", "Engine Config")
-			or ini_files(engine_root .. "/Config", "Engine Config")
+		local engine_config = config_file_group(engine_root .. "/Engine/Config", "Engine Config", {
+			id = "config-engine-root:" .. engine_root,
+		}) or config_file_group(engine_root .. "/Config", "Engine Config", {
+			id = "config-engine-root-fallback:" .. engine_root,
+		})
 		if engine_config then
 			table.insert(children, engine_config)
 		end
 
-		local platform_root = engine_root .. "/Engine/Config"
 		local engine_platform = {}
-		for _, dir in ipairs(vim.fn.glob(platform_root .. "/*", false, true) or {}) do
+		local platform_root = normalize(engine_root .. "/Engine/Config")
+		for _, dir in ipairs(read_dir(platform_root)) do
+			dir = normalize(dir)
 			if vim.fn.isdirectory(dir) == 1 then
-				local group = ini_files(dir, "Engine/Config/" .. vim.fn.fnamemodify(dir, ":t"))
+				local group = config_dir_node(dir, "Engine/Config/" .. vim.fn.fnamemodify(dir, ":t"), {
+					id = "config-engine-platform-dir:" .. dir,
+				})
 				if group then
 					table.insert(engine_platform, group)
 				end
 			end
 		end
-		table.insert(children, tree.virtual_group("Engine Platform Config", engine_platform, {
-			id = "config-engine-platform:" .. engine_root,
-		}))
+		table.insert(
+			children,
+			grouped_children("Engine Platform Config", engine_platform, "config-engine-platform:" .. tostring(engine_root))
+		)
 	end
 
-	return tree.virtual_group("Config", children, {
-		id = "config-root:" .. root,
-	})
+	return grouped_children("Config", children, "config-root:" .. root)
 end
 
 return M

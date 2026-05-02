@@ -79,13 +79,15 @@ function M.from_path(path, opts)
 		}
 	end
 
+	local lazy = opts.lazy == true
+
 	return {
 		id = opts.id or path,
 		label = opts.label or basename(path),
 		path = path,
 		type = "directory",
-		children = read_dir(path),
-		loaded = true,
+		children = lazy and {} or read_dir(path),
+		loaded = not lazy,
 	}
 end
 
@@ -97,6 +99,8 @@ function M.virtual_group(label, children, opts)
 		type = "directory",
 		virtual = true,
 		children = children or {},
+		loaded = opts.loaded ~= false,
+		load_children = opts.load_children,
 	}
 end
 
@@ -144,10 +148,18 @@ local function flatten_node(node, state, depth, out, prefix, is_last)
 end
 
 function M.ensure_children(node)
-	if not node or node.type ~= "directory" or node.virtual or node.loaded then
+	if not node or node.type ~= "directory" or node.loaded then
 		return
 	end
-	node.children = read_dir(node.path)
+
+	if type(node.load_children) == "function" then
+		node.children = node.load_children(node) or {}
+	elseif not node.virtual and node.path then
+		node.children = read_dir(node.path)
+	else
+		node.children = node.children or {}
+	end
+
 	node.loaded = true
 end
 
@@ -172,6 +184,9 @@ function M.total_nodes(root)
 			return
 		end
 		total = total + 1
+		if node.type == "directory" and node.loaded == false then
+			return
+		end
 		for _, child in ipairs(node.children or {}) do
 			walk(child)
 		end

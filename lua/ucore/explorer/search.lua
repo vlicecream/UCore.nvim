@@ -1,4 +1,6 @@
 local config = require("ucore.config")
+local state = require("ucore.explorer.state")
+local tree = require("ucore.explorer.tree")
 
 local M = {}
 
@@ -27,6 +29,13 @@ end
 local function filter_node(node, query, expanded, matched_count)
 	if not node then
 		return nil, matched_count
+	end
+
+	if node.type == "directory" and query ~= "" then
+		local key = node.id or node.path or node.label
+		if state.expanded[state.expanded_key(key)] == true then
+			tree.ensure_children(node)
+		end
 	end
 
 	local child_matches = {}

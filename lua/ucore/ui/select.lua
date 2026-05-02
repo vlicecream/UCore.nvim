@@ -1,6 +1,7 @@
 local config = require("ucore.config")
 
 local M = {}
+local FIND_PREVIEW_MAX_LINES = 200
 
 -- Check whether a Lua module can be required.
 -- 检查某个 Lua 模块是否可用。
@@ -269,11 +270,10 @@ local function find_item_key(item)
 	return table.concat({ path, line, name, kind }, "\t")
 end
 
-local function find_item_score(item)
+local function find_item_score(item, current)
 	local source = normalize_source(item.source)
 	local kind = normalize_kind(item.symbol_type or item.type):lower()
 	local path = normalize_path(item.path or item.file_path or item.asset_path or "")
-	local current = current_buffer_path()
 	local score = 0
 
 	if source == "project" then
@@ -306,6 +306,11 @@ local function find_item_score(item)
 end
 
 local function prepare_find_items(items)
+	local current = current_buffer_path()
+	if type(items) == "table" and items.__ucore_prepared == true and items.__ucore_prepared_for == current then
+		return items
+	end
+
 	local seen = {}
 	local result = {}
 
@@ -317,9 +322,15 @@ local function prepare_find_items(items)
 		end
 	end
 
+	for _, item in ipairs(result) do
+		item._ucore_find_sort_name = tostring(item.name or item.symbol_name or "")
+		item._ucore_find_sort_path = display_path(item.path or item.file_path or item.asset_path or "")
+		item._ucore_find_score = find_item_score(item, current)
+	end
+
 	table.sort(result, function(left, right)
-		local left_score = find_item_score(left)
-		local right_score = find_item_score(right)
+		local left_score = left._ucore_find_score or 0
+		local right_score = right._ucore_find_score or 0
 
 		if left_score ~= right_score then
 			return left_score < right_score
@@ -331,15 +342,44 @@ local function prepare_find_items(items)
 			return left_group < right_group
 		end
 
-		local left_name = tostring(left.name or left.symbol_name or "")
-		local right_name = tostring(right.name or right.symbol_name or "")
+		local left_name = left._ucore_find_sort_name or tostring(left.name or left.symbol_name or "")
+		local right_name = right._ucore_find_sort_name or tostring(right.name or right.symbol_name or "")
 		if left_name ~= right_name then
 			return left_name < right_name
 		end
 
-		return display_path(left.path or left.file_path or left.asset_path or "")
-			< display_path(right.path or right.file_path or right.asset_path or "")
+		return (left._ucore_find_sort_path or display_path(left.path or left.file_path or left.asset_path or ""))
+			< (right._ucore_find_sort_path or display_path(right.path or right.file_path or right.asset_path or ""))
 	end)
+
+	for index, item in ipairs(result) do
+		local name = tostring(item.name or item.symbol_name or "<unknown>")
+		local kind = normalize_kind(item.symbol_type or item.type)
+		local source = normalize_source(item.source)
+		local path = tostring(item.path or item.file_path or item.asset_path or "")
+		local line = tonumber(item.line or item.line_number or 1) or 1
+		local label = find_category_label(item)
+		local group = find_group(item)
+		local source_label = source ~= "" and source or "index"
+		local location = find_display_location(item, path, line)
+
+		item._ucore_find_index = index
+		item._ucore_find_path = path
+		item._ucore_find_line = line
+		item._ucore_find_text = name
+		item._ucore_find_display = string.format(
+			"%s  %s  %s  %s  %s",
+			pad_right(group, 7),
+			pad_right(label, 9),
+			pad_right(truncate_left(name, 34), 34),
+			pad_right(source_label, 7),
+			location
+		)
+		item._ucore_find_ordinal = find_search_text(item, name, kind, label, path)
+	end
+
+	result.__ucore_prepared = true
+	result.__ucore_prepared_for = current
 
 	return result
 end
@@ -405,10 +445,11 @@ local function preview_find_item(entry, bufnr)
 	local path = item.path or item.file_path
 
 	if path and path ~= vim.NIL and vim.fn.filereadable(path) == 1 then
-		local ok, lines = pcall(vim.fn.readfile, path, "", 500)
+		local ok, lines = pcall(vim.fn.readfile, path, "", FIND_PREVIEW_MAX_LINES)
 		if ok then
 			vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
 			vim.bo[bufnr].filetype = vim.filetype.match({ filename = path }) or ""
+			vim.b[bufnr].ucore_preview_path = path
 			return
 		end
 	end
@@ -437,6 +478,30 @@ local function preview_find_item(entry, bufnr)
 
 	vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
 	vim.bo[bufnr].filetype = "text"
+	vim.b[bufnr].ucore_preview_path = nil
+end
+
+local function preview_find_file(previewer, entry)
+	local path = entry.filename
+	local bufnr = previewer.state.bufnr
+
+	if not path or path == "" or vim.fn.filereadable(path) ~= 1 then
+		return false
+	end
+
+	if vim.b[bufnr].ucore_preview_path == path then
+		return true
+	end
+
+	local ok, lines = pcall(vim.fn.readfile, path, "", FIND_PREVIEW_MAX_LINES)
+	if not ok then
+		return false
+	end
+
+	vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
+	vim.bo[bufnr].filetype = vim.filetype.match({ filename = path }) or ""
+	vim.b[bufnr].ucore_preview_path = path
+	return true
 end
 
 -- Open the built-in vim.ui.select picker.
@@ -601,38 +666,28 @@ local function pick_telescope_find(items, default_text)
 			finder = finders.new_table({
 				results = items,
 				entry_maker = function(item)
-					local name = tostring(item.name or item.symbol_name or "<unknown>")
-					local kind = normalize_kind(item.symbol_type or item.type)
-					local source = normalize_source(item.source)
-					local path = tostring(item.path or item.file_path or item.asset_path or "")
-					local line = tonumber(item.line or item.line_number or 1) or 1
-					local label = find_category_label(item)
-					local group = find_group(item)
-					local source_label = source ~= "" and source or "index"
-					local location = find_display_location(item, path, line)
-
 					return {
 						value = item,
-						display = string.format(
-							"%s  %s  %s  %s  %s",
-							pad_right(group, 7),
-							pad_right(label, 9),
-							pad_right(truncate_left(name, 34), 34),
-							pad_right(source_label, 7),
-							location
-						),
-						ordinal = find_search_text(item, name, kind, label, path),
-						filename = path,
-						path = path,
-						lnum = line,
+						display = item._ucore_find_display or tostring(item.name or item.symbol_name or "<unknown>"),
+						ordinal = item._ucore_find_ordinal or tostring(item.name or item.symbol_name or "<unknown>"),
+						filename = item._ucore_find_path or tostring(item.path or item.file_path or item.asset_path or ""),
+						path = item._ucore_find_path or tostring(item.path or item.file_path or item.asset_path or ""),
+						lnum = item._ucore_find_line or tonumber(item.line or item.line_number or 1) or 1,
 						col = 1,
-						text = name,
+						text = item._ucore_find_text or tostring(item.name or item.symbol_name or "<unknown>"),
 					}
 				end,
 			}),
 			previewer = previewers.new_buffer_previewer({
+				get_buffer_by_name = function(_, entry)
+					if entry.filename and entry.filename ~= "" then
+						return entry.filename
+					end
+				end,
 				define_preview = function(self, entry)
-					preview_find_item(entry, self.state.bufnr)
+					if not preview_find_file(self, entry) then
+						preview_find_item(entry, self.state.bufnr)
+					end
 				end,
 			}),
 			sorter = conf.generic_sorter({}),

@@ -14,15 +14,54 @@ local explorer = require("ucore.explorer")
 
 local M = {}
 
-local FIND_CACHE_TTL_MS = 10000
+local FIND_CACHE_TTL_MS = 30000
 local find_cache = {
 	root = nil,
 	items = nil,
+	prepared_items = nil,
+	prepared_for_path = nil,
 	expires_at = 0,
 }
 
 local function now_ms()
 	return vim.loop.hrtime() / 1000000
+end
+
+local function clear_find_cache()
+	find_cache = {
+		root = nil,
+		items = nil,
+		prepared_items = nil,
+		prepared_for_path = nil,
+		expires_at = 0,
+	}
+end
+
+local function current_find_context_path()
+	return tostring(vim.api.nvim_buf_get_name(0) or ""):gsub("\\", "/"):lower()
+end
+
+local function cached_find_results(root)
+	if find_cache.root ~= root or not find_cache.items or find_cache.expires_at <= now_ms() then
+		return nil
+	end
+
+	local current_path = current_find_context_path()
+	if not find_cache.prepared_items or find_cache.prepared_for_path ~= current_path then
+		find_cache.prepared_items = ui.select.prepare_find_items(find_cache.items)
+		find_cache.prepared_for_path = current_path
+	end
+
+	return find_cache.prepared_items
+end
+
+local function store_find_cache(root, items)
+	find_cache.root = root
+	find_cache.items = items
+	find_cache.prepared_items = ui.select.prepare_find_items(items)
+	find_cache.prepared_for_path = current_find_context_path()
+	find_cache.expires_at = now_ms() + FIND_CACHE_TTL_MS
+	return find_cache.prepared_items
 end
 
 local function show_find_results(pattern, items)
@@ -671,6 +710,7 @@ function M.engine_refresh()
 			return notify_result("UCore engine refresh", result, refresh_err)
 		end
 
+		clear_find_cache()
 		project.write_engine_index_metadata(engine)
 		notify_result("UCore engine refresh", {
 			engine_id = engine.engine_id,
@@ -835,6 +875,9 @@ function M.setup()
 	end
 
 	client.setup(payload, function(result, setup_err)
+		if not setup_err then
+			clear_find_cache()
+		end
 		notify_result("UCore setup", result, setup_err)
 	end)
 end
@@ -851,6 +894,9 @@ function M.refresh()
 	payload.scope = "Game"
 
 	client.refresh(payload, function(result, refresh_err)
+		if not refresh_err then
+			clear_find_cache()
+		end
 		notify_result("UCore refresh", result, refresh_err)
 	end)
 end
@@ -899,8 +945,9 @@ function M.find(pattern)
 		return vim.notify("Could not find .uproject", vim.log.levels.ERROR)
 	end
 
-	if find_cache.root == root and find_cache.items and find_cache.expires_at > now_ms() then
-		return show_find_results(pattern, find_cache.items)
+	local cached_items = cached_find_results(root)
+	if cached_items then
+		return show_find_results(pattern, cached_items)
 	end
 
 	local pending = 4
@@ -923,12 +970,7 @@ function M.find(pattern)
 			return vim.notify("UCore find failed:\n" .. table.concat(errors, "\n"), vim.log.levels.ERROR)
 		end
 
-		find_cache = {
-			root = root,
-			items = items,
-			expires_at = now_ms() + FIND_CACHE_TTL_MS,
-		}
-		show_find_results(pattern, items)
+		show_find_results(pattern, store_find_cache(root, items))
 	end
 
 	remote.search_symbols(root, "", function(result, err)
