@@ -587,6 +587,7 @@ local function pick_telescope_find(items, default_text)
 	local actions = require("telescope.actions")
 	local action_state = require("telescope.actions.state")
 	local sorters = require("telescope.sorters")
+	local fzy = require("telescope.algos.fzy")
 
 	items = prepare_find_items(items)
 
@@ -625,7 +626,23 @@ local function pick_telescope_find(items, default_text)
 					preview_find_item(entry, self.state.bufnr)
 				end,
 			}),
-			sorter = sorters.get_substr_matcher(),
+			sorter = sorters.Sorter:new({
+				discard = true,
+				scoring_function = function(_, prompt, line, entry)
+					if prompt == "" then
+						return entry.index or 1
+					end
+
+					if not fzy.has_match(prompt, line) then
+						return -1
+					end
+
+					return entry.index or 1
+				end,
+				highlighter = function(_, prompt, display)
+					return fzy.positions(prompt, display)
+				end,
+			}),
 			attach_mappings = function(prompt_bufnr)
 				actions.select_default:replace(function()
 					local selection = action_state.get_selected_entry()
