@@ -120,10 +120,6 @@ local function compact_path(path, width)
 	return truncate_left(display_path(path), width)
 end
 
-local function current_buffer_path()
-	return normalize_path(vim.api.nvim_buf_get_name(0))
-end
-
 local function normalize_source(source)
 	source = tostring(source or "")
 
@@ -265,45 +261,21 @@ local function find_item_key(item)
 	return table.concat({ path, line, name, kind }, "\t")
 end
 
-local function find_item_score(item)
+local function find_source_order(item)
 	local source = normalize_source(item.source)
-	local kind = normalize_kind(item.symbol_type or item.type):lower()
-	local path = normalize_path(item.path or item.file_path or item.asset_path or "")
-	local current = current_buffer_path()
-	local score = 0
 
 	if source == "project" then
-		score = score - 300
-	elseif source == "engine" then
-		score = score + 300
+		return 1
+	end
+	if source == "engine" then
+		return 3
 	end
 
-	score = score + (find_group_order(item) * 100)
-
-	if current ~= "" and path == current then
-		score = score - 120
-	end
-
-	if kind == "class" or kind == "struct" or kind == "enum" then
-		score = score - 80
-	elseif kind == "module" then
-		score = score - 60
-	elseif kind:find("function", 1, true) or kind:find("method", 1, true) then
-		score = score - 40
-	elseif kind == "config" then
-		score = score + 40
-	elseif kind == "asset" then
-		score = score + 60
-	elseif kind:find("property", 1, true) or kind:find("member", 1, true) then
-		score = score + 20
-	end
-
-	return score
+	return 2
 end
 
 local function prepare_find_items(items)
-	local current = current_buffer_path()
-	if type(items) == "table" and items.__ucore_prepared and items.__ucore_prepared_for == current then
+	if type(items) == "table" and items.__ucore_prepared then
 		return items
 	end
 
@@ -319,17 +291,16 @@ local function prepare_find_items(items)
 	end
 
 	table.sort(result, function(left, right)
-		local left_score = find_item_score(left)
-		local right_score = find_item_score(right)
-
-		if left_score ~= right_score then
-			return left_score < right_score
-		end
-
-		local left_group = find_group(left)
-		local right_group = find_group(right)
+		local left_group = find_group_order(left)
+		local right_group = find_group_order(right)
 		if left_group ~= right_group then
 			return left_group < right_group
+		end
+
+		local left_source = find_source_order(left)
+		local right_source = find_source_order(right)
+		if left_source ~= right_source then
+			return left_source < right_source
 		end
 
 		local left_name = tostring(left.name or left.symbol_name or "")
@@ -338,7 +309,15 @@ local function prepare_find_items(items)
 			return left_name < right_name
 		end
 
-		return display_path(left.path or left.file_path or left.asset_path or "") < display_path(right.path or right.file_path or right.asset_path or "")
+		local left_path = display_path(left.path or left.file_path or left.asset_path or "")
+		local right_path = display_path(right.path or right.file_path or right.asset_path or "")
+		if left_path ~= right_path then
+			return left_path < right_path
+		end
+
+		local left_line = tonumber(left.line or left.line_number or 1) or 1
+		local right_line = tonumber(right.line or right.line_number or 1) or 1
+		return left_line < right_line
 	end)
 
 	for index, item in ipairs(result) do
@@ -367,7 +346,6 @@ local function prepare_find_items(items)
 	end
 
 	result.__ucore_prepared = true
-	result.__ucore_prepared_for = current
 
 	return result
 end
