@@ -28,12 +28,8 @@ where
         return Ok(json!(0));
     }
 
-    tracing::info!("Grepping assets for pattern: '{}'", pattern);
-
     let file_paths = collect_asset_paths(conn, true)?;
     let pattern_bytes = pattern.into_bytes();
-
-    tracing::info!("Scanning {} asset files using mmap...", file_paths.len());
 
     let matched_paths: Vec<String> = file_paths
         .par_iter()

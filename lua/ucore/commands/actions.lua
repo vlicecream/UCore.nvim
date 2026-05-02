@@ -9,6 +9,7 @@ local unreal = require("ucore.unreal")
 local bootstrap = require("ucore.bootstrap")
 local completion = require("ucore.completion")
 local dirty = require("ucore.editing.dirty")
+local lsp = require("ucore.lsp")
 local navigation = require("ucore.navigation")
 local explorer = require("ucore.explorer")
 
@@ -1079,6 +1080,40 @@ function M.editing_debug()
 	open_scratch("UCore Editing Debug", require("ucore.editing").info())
 end
 
+function M.clangd_status()
+	print(vim.inspect(lsp.clangd_status(project.find_project_root_from_context())))
+end
+
+function M.generate_compile_commands()
+	local root = project.find_project_root_from_context()
+	if not root then
+		return vim.notify("Could not find .uproject", vim.log.levels.ERROR)
+	end
+
+	vim.notify("UCore clangd: generating compile_commands.json...", vim.log.levels.INFO)
+
+	lsp.generate_compile_commands(root, {}, function(ok, result)
+		vim.schedule(function()
+			if not ok then
+				return vim.notify("UCore clangd database generation failed:\n" .. tostring(result), vim.log.levels.ERROR)
+			end
+
+			local dir = result.compile_commands_dir or "unknown"
+			vim.notify("UCore clangd: compile_commands.json ready at " .. dir, vim.log.levels.INFO)
+
+			local current = vim.api.nvim_get_current_buf()
+			local current_path = vim.api.nvim_buf_get_name(current)
+			if current_path ~= "" and project.find_project_root(current_path) == root then
+				if vim.bo[current].modified then
+					vim.notify("compile_commands.json is ready. Reopen the current file to attach clangd.", vim.log.levels.INFO)
+				else
+					vim.cmd("silent edit")
+				end
+			end
+		end)
+	end)
+end
+
 -- Print :UCore command help.
 -- 打印 :UCore 命令帮助。
 function M.help()
@@ -1120,6 +1155,8 @@ UCore debug commands:
   :UCore debug engine       Show resolved Unreal Engine root/cache
   :UCore debug engine-refresh
                             Force refresh shared Unreal Engine index
+  :UCore debug clangd       Print resolved clangd / compile_commands status
+  :UCore debug generate-db  Run UnrealBuildTool GenerateClangDatabase
   :UCore debug modules      Pick indexed modules
   :UCore debug assets       Pick indexed assets
   :UCore debug search-symbols <pattern>

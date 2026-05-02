@@ -208,6 +208,10 @@ M.values = {
 		-- 是否启用 UCore 诊断。
 		enable = true,
 
+		-- Smart quick-fix keymap. Set to false or "" to disable the default mapping.
+		-- 智能修复快捷键。设为 false 或 "" 可关闭默认映射。
+		action_keymap = "<leader>ca",
+
 		-- Show underline for diagnostics.
 		-- 是否显示红线/黄线下划线。
 		underline = true,
@@ -222,11 +226,32 @@ M.values = {
 
 		-- Update diagnostics while typing in Insert mode.
 		-- 插入模式输入时是否更新诊断。
-		update_in_insert = false,
+		update_in_insert = true,
 
 		-- Debounce delay for diagnostics refresh.
 		-- 诊断刷新的防抖延迟。
 		debounce_ms = 300,
+	},
+
+	-- Recommended LSP integration for semantic diagnostics and code actions.
+	-- 推荐的 LSP 集成，用于语义红线黄线和 code action。
+	lsp = {
+		auto_setup = true,
+		clangd = {
+			command = "clangd",
+			args = {
+				"--header-insertion=never",
+				"--completion-style=detailed",
+				"--function-arg-placeholders",
+				"--pch-storage=disk",
+				"--fallback-style=llvm",
+			},
+			prefer_blink_capabilities = true,
+			single_file_support = false,
+			compile_commands_dir = nil,
+			require_compile_commands = true,
+			auto_detect_windows = true,
+		},
 	},
 
 	-- Auto-pairs integration via nvim-autopairs.

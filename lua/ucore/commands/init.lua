@@ -34,6 +34,9 @@ local function dispatch_debug(tail)
 		projects = actions.projects,
 		modules = actions.modules,
 		assets = actions.assets,
+		clangd = actions.clangd_status,
+		["generate-db"] = actions.generate_compile_commands,
+		generatedb = actions.generate_compile_commands,
 		["search-symbols"] = function()
 			actions.search_symbols(rest)
 		end,
@@ -142,6 +145,7 @@ function M.register()
 			local diagnostics_items = {
 				"refresh",
 				"clear",
+				"action",
 				"fix",
 				"qflist",
 				"toggle",
@@ -156,6 +160,8 @@ function M.register()
 				"projects",
 				"modules",
 				"assets",
+				"clangd",
+				"generate-db",
 				"search-symbols",
 				"status",
 				"rpc-status",

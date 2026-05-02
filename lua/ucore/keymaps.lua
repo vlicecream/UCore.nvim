@@ -84,6 +84,27 @@ local function setup_global_find(args)
 	})
 end
 
+local function setup_diagnostics_action(args)
+	local diagnostics_config = config.values.diagnostics
+	if type(diagnostics_config) ~= "table" then
+		return
+	end
+
+	local lhs = normalize_lhs(diagnostics_config.action_keymap)
+	if not lhs then
+		return
+	end
+
+	local bufnr = args.buf
+	vim.keymap.set("n", lhs, function()
+		require("ucore.diagnostics").smart_action()
+	end, {
+		buffer = bufnr,
+		desc = "UCore smart action",
+		silent = true,
+	})
+end
+
 local function is_unreal_path(path)
 	if path == "" then
 		return false
@@ -107,6 +128,7 @@ function M.setup()
 			local path = vim.api.nvim_buf_get_name(args.buf)
 			if is_unreal_path(path) then
 				setup_global_find(args)
+				setup_diagnostics_action(args)
 			end
 		end,
 	})

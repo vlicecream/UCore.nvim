@@ -1,14 +1,14 @@
-# SimpleBeta u-scanner test fixtures
+# Unreal project u-scanner test fixtures
 
 This folder keeps reusable request templates for testing `u-scanner` against a
-local Unreal project named `SimpleBeta`.
+local Unreal project.
 
 Committed files live under `templates/` and use placeholders instead of local
 absolute paths. Generate runnable local files with:
 
 ```powershell
 cd ucore_test
-.\make-local.ps1 -ProjectRoot "D:\UnrealProjects\SimpleBeta"
+.\make-local.ps1 -ProjectRoot "D:\UnrealProjects\YourProject"
 ```
 
 Generated files are written to `local/` and are ignored by git.

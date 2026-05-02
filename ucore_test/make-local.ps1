@@ -31,4 +31,4 @@ Get-ChildItem -LiteralPath $templateDir -Filter "*.json" | ForEach-Object {
     Set-Content -LiteralPath $target -Value $content -Encoding $encoding -NoNewline
 }
 
-Write-Host "Generated local SimpleBeta test JSON files in: $($output.FullName)"
+Write-Host "Generated local Unreal project test JSON files in: $($output.FullName)"

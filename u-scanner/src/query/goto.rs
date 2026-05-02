@@ -1226,7 +1226,7 @@ fn goto_definition_inner(
     };
 
     let mode = if prefer_impl { "implementation" } else { "definition" };
-    tracing::info!(
+    tracing::debug!(
         "goto_{}: symbol='{}', qualifier={:?}, op={:?}, enclosing={:?}, line={}, character={}",
         mode,
         ctx.symbol,
@@ -1239,7 +1239,7 @@ fn goto_definition_inner(
 
     if let Some(local_decl) = find_local_declaration(&content, &ctx.symbol, line, character) {
         if let Some(ref path) = file_path {
-            tracing::info!(
+            tracing::debug!(
                 "goto_{}: resolved local symbol '{}' to {}:{} type={:?}",
                 mode,
                 ctx.symbol,
@@ -1265,7 +1265,7 @@ fn goto_definition_inner(
     if prefer_impl {
         if let Some(ref name) = resolve_impl_class(&ctx, &content, line) {
             if let Some(result) = find_impl_in_inheritance(conn, name, &ctx.symbol)? {
-                tracing::info!(
+                tracing::debug!(
                     "goto_{}: resolved '{}' through impl class '{}'",
                     mode,
                     ctx.symbol,
@@ -1274,7 +1274,7 @@ fn goto_definition_inner(
                 return Ok(result);
             }
             if let Some(result) = find_member_by_class_name(conn, name, &ctx.symbol, false)? {
-                tracing::info!(
+                tracing::debug!(
                     "goto_{}: fell back to class member '{}' on '{}'",
                     mode,
                     ctx.symbol,
@@ -1283,7 +1283,7 @@ fn goto_definition_inner(
                 return Ok(result);
             }
         }
-        tracing::info!("goto_{}: no result for '{}'", mode, ctx.symbol);
+        tracing::debug!("goto_{}: no result for '{}'", mode, ctx.symbol);
         return Ok(Value::Null);
     }
 
@@ -1314,7 +1314,7 @@ fn goto_definition_inner(
         if let Some(result) =
             find_symbol_in_inheritance_chain(conn, &resolved_class, &ctx.symbol)?
         {
-            tracing::info!(
+            tracing::debug!(
                 "goto_{}: resolved '{}' via qualifier class '{}'",
                 mode,
                 ctx.symbol,
@@ -1330,7 +1330,7 @@ fn goto_definition_inner(
         if let Some(result) =
             find_symbol_in_inheritance_chain(conn, enclosing_class, &ctx.symbol)?
         {
-            tracing::info!(
+            tracing::debug!(
                 "goto_{}: resolved '{}' via enclosing class '{}'",
                 mode,
                 ctx.symbol,
@@ -1343,7 +1343,7 @@ fn goto_definition_inner(
     // 3. Try type definition lookup.
     // 3. 尝试按类型定义查找。
     if let Some(result) = find_type_definition(conn, &ctx.symbol)? {
-        tracing::info!(
+        tracing::debug!(
             "goto_{}: resolved '{}' as type definition",
             mode,
             ctx.symbol
@@ -1354,7 +1354,7 @@ fn goto_definition_inner(
     // 4. Final fallback: member search across the whole project.
     // 4. 最终兜底：全工程成员名搜索。
     if let Some(result) = find_member_anywhere(conn, &ctx.symbol, false)? {
-        tracing::info!(
+        tracing::debug!(
             "goto_{}: resolved '{}' via global member fallback",
             mode,
             ctx.symbol
@@ -1362,7 +1362,7 @@ fn goto_definition_inner(
         return Ok(result);
     }
 
-    tracing::info!("goto_{}: no result for '{}'", mode, ctx.symbol);
+    tracing::debug!("goto_{}: no result for '{}'", mode, ctx.symbol);
     Ok(Value::Null)
 }
 

@@ -21,6 +21,7 @@ local in_flight_request = nil
 local queued_request = nil
 local scheduled_timer = nil
 local to_blink_item
+local prune_items
 
 local function current_prefix(ctx)
 	if type(ctx) == "table" then
@@ -116,7 +117,7 @@ local function dispatch_latest()
 	end)
 end
 
-local function prune_items(items)
+prune_items = function(items)
 	local strong = 0
 	for _, item in ipairs(items) do
 		if (tonumber(item.score_offset) or 0) >= 10 then
@@ -263,7 +264,7 @@ end
 
 -- Convert Vim complete-item shape into LSP/blink completion item shape.
 -- 把 Vim complete-item 结构转换成 LSP/blink completion item 结构。
-function to_blink_item(item)
+to_blink_item = function(item)
 	local raw = item
 	if type(item.user_data) == "string" and item.user_data ~= "" then
 		local ok, decoded = pcall(vim.json.decode, item.user_data)

@@ -122,8 +122,6 @@ local function handle_frame(frame)
 			if method == "query/partial" then
 				return
 			end
-
-			vim.notify("UCore notification: " .. tostring(method) .. "\n" .. vim.inspect(params))
 		end)
 	end
 end
