@@ -120,6 +120,15 @@ local function compact_search_text(text)
 	return tostring(text or ""):lower():gsub("[^%w]+", "")
 end
 
+local function append_find_match_fields(fields, value)
+	value = tostring(value or "")
+	if value == "" then
+		return
+	end
+
+	fields[#fields + 1] = value
+end
+
 local function normalize_source(source)
 	source = tostring(source or "")
 
@@ -247,6 +256,29 @@ local function find_search_text(item, name, kind, label, path)
 	}, " ")
 end
 
+local function find_match_fields(item, name, kind, label, path)
+	path = tostring(path or "")
+	local normalized_path = path:gsub("\\", "/")
+	local fields = {}
+
+	append_find_match_fields(fields, name)
+	append_find_match_fields(fields, kind)
+	append_find_match_fields(fields, label)
+	append_find_match_fields(fields, find_group(item))
+	append_find_match_fields(fields, tostring(item.class_name or ""))
+	append_find_match_fields(fields, tostring(item.module_name or ""))
+	append_find_match_fields(fields, tostring(item.config_section or ""))
+	append_find_match_fields(fields, tostring(item.config_value or ""))
+	append_find_match_fields(fields, tostring(item.config_file or ""))
+	append_find_match_fields(fields, tostring(item.asset_path or ""))
+	append_find_match_fields(fields, vim.fn.fnamemodify(normalized_path, ":t"))
+	append_find_match_fields(fields, display_path(normalized_path))
+	append_find_match_fields(fields, normalized_path)
+	append_find_match_fields(fields, path)
+
+	return fields
+end
+
 local function find_item_key(item)
 	local path = normalize_path(item.path or item.file_path or item.asset_path or "")
 	local line = tonumber(item.line or item.line_number or 1) or 1
@@ -269,43 +301,16 @@ local function find_source_order(item)
 	return 2
 end
 
-local function subsequence_match(needle, haystack)
-	needle = tostring(needle or "")
-	haystack = tostring(haystack or "")
-
-	if needle == "" then
-		return true
-	end
-
-	local needle_index = 1
-	local needle_len = #needle
-
-	for index = 1, #haystack do
-		if haystack:sub(index, index) == needle:sub(needle_index, needle_index) then
-			needle_index = needle_index + 1
-			if needle_index > needle_len then
-				return true
-			end
-		end
-	end
-
-	return false
-end
-
-local function find_matches_prompt(prompt, entry)
+local function find_matches_prompt(prompt, entry, fzy)
 	prompt = tostring(prompt or "")
 	if prompt == "" then
 		return true
 	end
 
-	local lower_prompt = prompt:lower()
-	local raw_text = tostring(entry._ucore_find_match_text or entry.ordinal or ""):lower()
-
-	if raw_text:find(lower_prompt, 1, true) then
-		return true
-	end
-	if subsequence_match(lower_prompt, raw_text) then
-		return true
+	for _, field in ipairs(entry._ucore_find_match_fields or {}) do
+		if fzy.has_match(prompt, field) then
+			return true
+		end
 	end
 
 	local compact_prompt = compact_search_text(prompt)
@@ -313,12 +318,13 @@ local function find_matches_prompt(prompt, entry)
 		return true
 	end
 
-	local compact_text = tostring(entry._ucore_find_compact_text or "")
-	if compact_text:find(compact_prompt, 1, true) then
-		return true
+	for _, field in ipairs(entry._ucore_find_compact_fields or {}) do
+		if field ~= "" and fzy.has_match(compact_prompt, field) then
+			return true
+		end
 	end
 
-	return subsequence_match(compact_prompt, compact_text)
+	return false
 end
 
 local function prepare_find_items(items)
@@ -376,6 +382,15 @@ local function prepare_find_items(items)
 		local source_label = source ~= "" and source or "index"
 		local location = find_display_location(item, path, line)
 		local search_text = find_search_text(item, name, kind, label, path)
+		local match_fields = find_match_fields(item, name, kind, label, path)
+		local compact_fields = {}
+
+		for _, field in ipairs(match_fields) do
+			local compact = compact_search_text(field)
+			if compact ~= "" then
+				compact_fields[#compact_fields + 1] = compact
+			end
+		end
 
 		item._ucore_find_index = index
 		item._ucore_find_path = path
@@ -389,8 +404,8 @@ local function prepare_find_items(items)
 			location
 		)
 		item._ucore_find_ordinal = search_text
-		item._ucore_find_match_text = search_text
-		item._ucore_find_compact_text = compact_search_text(search_text)
+		item._ucore_find_match_fields = match_fields
+		item._ucore_find_compact_fields = compact_fields
 	end
 
 	result.__ucore_prepared = true
@@ -636,6 +651,7 @@ local function pick_telescope_find(items, default_text)
 	local action_state = require("telescope.actions.state")
 	local conf = require("telescope.config").values
 	local sorters = require("telescope.sorters")
+	local fzy = require("telescope.algos.fzy")
 
 	items = prepare_find_items(items)
 
@@ -666,8 +682,8 @@ local function pick_telescope_find(items, default_text)
 						col = 1,
 						text = tostring(item.name or item.symbol_name or "<unknown>"),
 						index = item._ucore_find_index,
-						_ucore_find_match_text = item._ucore_find_match_text,
-						_ucore_find_compact_text = item._ucore_find_compact_text,
+						_ucore_find_match_fields = item._ucore_find_match_fields,
+						_ucore_find_compact_fields = item._ucore_find_compact_fields,
 					}
 				end,
 			}),
@@ -683,14 +699,18 @@ local function pick_telescope_find(items, default_text)
 						return entry.index or 1
 					end
 
-					if find_matches_prompt(prompt, entry) then
+					if find_matches_prompt(prompt, entry, fzy) then
 						return entry.index or 1
 					end
 
 					return -1
 				end,
-				highlighter = function()
-					return {}
+				highlighter = function(_, prompt, display)
+					if prompt == "" or not fzy.has_match(prompt, display) then
+						return {}
+					end
+
+					return fzy.positions(prompt, display)
 				end,
 			}),
 			attach_mappings = function(prompt_bufnr)
