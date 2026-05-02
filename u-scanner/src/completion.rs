@@ -385,12 +385,16 @@ fn fetch_members_with_engine(
     )?;
 
     let Some(engine_ctx) = engine_ctx else {
-        tracing::info!("COMPLETION_DEBUG: engine_ctx is None for class={class_name}");
         return Ok(items);
     };
 
     let mut roots = collect_engine_member_roots(ctx, engine_ctx, class_name)?;
-    tracing::info!("COMPLETION_DEBUG: class={class_name} roots_count={} roots={:?}", roots.len(), roots);
+    tracing::info!(
+        "COMPLETION_DEBUG: class={class_name} project_items={} roots_count={} roots={:?}",
+        items.len(),
+        roots.len(),
+        roots
+    );
 
     if assume_engine_subclass_access {
         let resolved = resolve_typedef(ctx, class_name)?;
@@ -413,7 +417,13 @@ fn fetch_members_with_engine(
             assume_subclass_access,
         )?;
 
+        tracing::info!(
+            "COMPLETION_DEBUG: engine_root={root_name} engine_items={}",
+            extra.len()
+        );
+
         merge_completion_items(&mut items, extra, MAX_COMPLETION_ITEMS);
+        tracing::info!("COMPLETION_DEBUG: after merge total_items={}", items.len());
     }
 
     Ok(items)
