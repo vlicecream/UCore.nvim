@@ -4,9 +4,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::Instant;
 use tree_sitter::{Node, Parser, Point};
-use tracing::info;
 
 use crate::server::state::CompletionCache;
 
@@ -18,34 +16,6 @@ const MIN_ENGINE_GLOBAL_PREFIX_LEN: usize = 4;
 const COMPLETION_MATCH_NONE: usize = usize::MAX;
 const STRONG_MATCH_SCORE_OFFSET: i64 = 10;
 const STRONG_MATCH_TARGET: usize = 24;
-
-fn preview_text(text: &str, limit: usize) -> String {
-    let sanitized = text.replace(['\r', '\n', '\t'], " ");
-    let mut out = String::new();
-
-    for (index, ch) in sanitized.chars().enumerate() {
-        if index >= limit {
-            out.push_str("...");
-            break;
-        }
-        out.push(ch);
-    }
-
-    out
-}
-
-fn preview_path(path: Option<&str>) -> String {
-    path.map(|value| preview_text(value, 160))
-        .unwrap_or_else(|| "-".to_string())
-}
-
-fn preview_labels(items: &[Value], limit: usize) -> Vec<String> {
-    items.iter()
-        .filter_map(|item| item.get("label").and_then(Value::as_str))
-        .take(limit)
-        .map(|label| preview_text(label, 64))
-        .collect()
-}
 
 /// Per-request cache and lookup context.
 /// 单次补全请求里的缓存和查询上下文。
@@ -244,7 +214,6 @@ pub fn process_completion_with_engine(
     cache: Option<Arc<Mutex<CompletionCache>>>,
     persistent_cache: Option<Arc<Mutex<Connection>>>,
 ) -> Result<Value> {
-    let started_at = Instant::now();
     let mut ctx = CompletionContext::new(conn, file_path.as_deref());
     let mut engine_ctx = engine_conn.map(|conn| CompletionContext::new(conn, file_path.as_deref()));
 
@@ -260,58 +229,26 @@ pub fn process_completion_with_engine(
     let cursor_node = cursor_node(root, line, character)
         .ok_or_else(|| anyhow::anyhow!("no tree-sitter node at cursor"))?;
     let buffer_inheritance = build_buffer_inheritance_map(root, content);
-    let request_prefix = completion_prefix(cursor_node, content);
 
-    info!(
-        "completion.server.start file={} line={} char={} prefix={} engine_db={} bytes={} filetype_hint={}",
-        preview_path(file_path.as_deref()),
-        line,
-        character,
-        preview_text(&request_prefix, 64),
-        engine_conn.is_some(),
-        content.len(),
-        preview_text(&clean_type(node_text(cursor_node, content)), 64),
-    );
-
-    if let Some(items) = complete_include_paths(&mut ctx, content, line, character)? {
-        info!(
-            "completion.server.finish mode=include prefix={} count={} elapsed_ms={} preview={:?}",
-            preview_text(&request_prefix, 64),
-            items.len(),
-            started_at.elapsed().as_millis(),
-            preview_labels(&items, 8),
-        );
+    if let Some(items) = complete_include_paths(&mut ctx, engine_ctx.as_mut(), content, line, character)? {
         return Ok(json!(items));
     }
 
+    if let Some(items) = complete_preprocessor_directives(content, line, character) {
+        return Ok(items);
+    }
+
     if let Some(items) = complete_macro_specifiers_at(content, line, character) {
-        let macro_items = items.as_array().cloned().unwrap_or_default();
-        info!(
-            "completion.server.finish mode=macro_at prefix={} count={} elapsed_ms={} preview={:?}",
-            preview_text(&request_prefix, 64),
-            macro_items.len(),
-            started_at.elapsed().as_millis(),
-            preview_labels(&macro_items, 8),
-        );
         return Ok(items);
     }
 
     if let Some(items) = complete_macro_specifiers(cursor_node, content) {
-        let macro_items = items.as_array().cloned().unwrap_or_default();
-        info!(
-            "completion.server.finish mode=macro prefix={} count={} elapsed_ms={} preview={:?}",
-            preview_text(&request_prefix, 64),
-            macro_items.len(),
-            started_at.elapsed().as_millis(),
-            preview_labels(&macro_items, 8),
-        );
         return Ok(items);
     }
 
     if let Some(request) = member_completion_request(cursor_node, content) {
         let receiver_text = clean_type(node_text(request.receiver, content));
         let current_class = enclosing_class(cursor_node, content);
-        let member_prefix = request.prefix.clone().unwrap_or_default();
 
         if receiver_text == "Super" {
             if let Some(current_class) = current_class.as_deref() {
@@ -326,23 +263,9 @@ pub fn process_completion_with_engine(
                 )?;
 
                 let final_items = dedupe_completion_items(members);
-                info!(
-                    "completion.server.finish mode=super current_class={} prefix={} count={} elapsed_ms={} preview={:?}",
-                    preview_text(current_class, 96),
-                    preview_text(&member_prefix, 64),
-                    final_items.len(),
-                    started_at.elapsed().as_millis(),
-                    preview_labels(&final_items, 8),
-                );
-
                 return Ok(json!(final_items));
             }
 
-            info!(
-                "completion.server.finish mode=super status=no_current_class prefix={} elapsed_ms={}",
-                preview_text(&member_prefix, 64),
-                started_at.elapsed().as_millis(),
-            );
             return Ok(json!([]));
         }
 
@@ -372,27 +295,10 @@ pub fn process_completion_with_engine(
             )?;
 
             let final_items = dedupe_completion_items(members);
-            info!(
-                "completion.server.finish mode=member receiver={} resolved_type={} current_class={} prefix={} count={} elapsed_ms={} preview={:?}",
-                preview_text(&receiver_text, 96),
-                preview_text(&ty, 96),
-                preview_text(current_class.as_deref().unwrap_or(""), 96),
-                preview_text(&member_prefix, 64),
-                final_items.len(),
-                started_at.elapsed().as_millis(),
-                preview_labels(&final_items, 8),
-            );
 
             return Ok(json!(final_items));
         }
 
-        info!(
-            "completion.server.finish mode=member status=no_resolved_type receiver={} current_class={} prefix={} elapsed_ms={}",
-            preview_text(&receiver_text, 96),
-            preview_text(current_class.as_deref().unwrap_or(""), 96),
-            preview_text(&member_prefix, 64),
-            started_at.elapsed().as_millis(),
-        );
         return Ok(json!([]));
     }
 
@@ -404,24 +310,23 @@ pub fn process_completion_with_engine(
         character as usize,
         &prefix,
     );
-    let local_count = items.len();
 
     let buffer_items = collect_buffer_symbol_items(root, content, line as usize, &prefix);
-    let buffer_count = buffer_items.len();
     merge_completion_items(&mut items, buffer_items, MAX_COMPLETION_ITEMS);
 
+    let current_class = enclosing_class(cursor_node, content);
     let mut class_member_count = 0usize;
     if !prefix.is_empty() {
-        if let Some(current_class) = enclosing_class(cursor_node, content) {
+        if let Some(current_class) = current_class.as_deref() {
             let members = fetch_members_with_engine(
                 &mut ctx,
                 engine_ctx.as_mut(),
-                &current_class,
+                current_class,
                 Some(prefix.clone()),
                 &buffer_inheritance,
                 cache.clone(),
                 persistent_cache.clone(),
-                Some(&current_class),
+                Some(current_class),
                 false,
             )?;
             class_member_count = members.len();
@@ -430,19 +335,23 @@ pub fn process_completion_with_engine(
         }
     }
 
-    let mut snippet_count = 0usize;
+    let keyword_items = cpp_keyword_items(&prefix);
+    merge_completion_items(&mut items, keyword_items, MAX_COMPLETION_ITEMS);
+
     if should_offer_ue_snippets(&prefix) {
         let snippets = ue_snippets(&prefix);
-        snippet_count = snippets.len();
         merge_completion_items(&mut items, snippets, MAX_COMPLETION_ITEMS);
     }
 
     let prefix_len = prefix.chars().count();
-    let mut project_global_count = 0usize;
-    let mut engine_global_count = 0usize;
-    if prefix_len >= MIN_GLOBAL_PREFIX_LEN && strong_item_count(&items) < STRONG_MATCH_TARGET {
+    let has_class_context = current_class.is_some();
+    let suppress_globals_for_class_context = has_class_context && class_member_count > 0;
+
+    if prefix_len >= MIN_GLOBAL_PREFIX_LEN
+        && strong_item_count(&items) < STRONG_MATCH_TARGET
+        && !suppress_globals_for_class_context
+    {
         let global_items = fetch_global_symbols(conn, &prefix)?;
-        project_global_count = global_items.len();
         merge_completion_items(&mut items, global_items, MAX_COMPLETION_ITEMS);
 
         if prefix_len >= MIN_ENGINE_GLOBAL_PREFIX_LEN
@@ -450,7 +359,6 @@ pub fn process_completion_with_engine(
         {
             if let Some(engine_ctx) = engine_ctx.as_ref() {
                 let engine_items = fetch_global_symbols(engine_ctx.conn, &prefix)?;
-                engine_global_count = engine_items.len();
                 merge_completion_items(
                     &mut items,
                     engine_items,
@@ -460,24 +368,7 @@ pub fn process_completion_with_engine(
         }
     }
 
-    let strong_count = strong_item_count(&items);
-    let merged_count = items.len();
     let final_items = dedupe_completion_items(items);
-    info!(
-        "completion.server.finish mode=global prefix={} local={} buffer={} class={} snippets={} project_global={} engine_global={} strong={} merged={} final={} elapsed_ms={} preview={:?}",
-        preview_text(&prefix, 64),
-        local_count,
-        buffer_count,
-        class_member_count,
-        snippet_count,
-        project_global_count,
-        engine_global_count,
-        strong_count,
-        merged_count,
-        final_items.len(),
-        started_at.elapsed().as_millis(),
-        preview_labels(&final_items, 8),
-    );
 
     Ok(json!(final_items))
 }
@@ -531,6 +422,7 @@ fn fetch_members_with_engine(
         persistent_cache.clone(),
         accessor_class,
         false,
+        false,
     )?;
 
     for parent_name in direct_buffer_parents(buffer_inheritance, class_name) {
@@ -542,6 +434,7 @@ fn fetch_members_with_engine(
             persistent_cache.clone(),
             accessor_class,
             true,
+            false,
         )?;
 
         merge_completion_items(&mut items, extra, MAX_COMPLETION_ITEMS);
@@ -572,6 +465,7 @@ fn fetch_members_with_engine(
             None,
             accessor_class,
             assume_subclass_access,
+            true,
         )?;
 
         merge_completion_items(&mut items, extra, MAX_COMPLETION_ITEMS);
@@ -1768,13 +1662,18 @@ fn append_buffer_function_item(
         .map(|type_node| clean_type(node_text(type_node, content)))
         .filter(|text| !text.is_empty())
         .unwrap_or_else(|| "function".to_string());
+    let params = find_descendant_by_kind(node, "parameter_list")
+        .map(|params_node| node_text(params_node, content).to_string());
+    let detail = function_completion_detail(Some(&return_type), params.as_deref(), None);
+    let insert_text = function_snippet_text(&identity.name, params.as_deref());
 
     items.push(json!({
         "label": identity.name,
         "kind": 2,
-        "detail": return_type,
+        "detail": detail,
         "filterText": identity.name,
-        "insertText": identity.name,
+        "insertText": insert_text,
+        "insertTextFormat": 2,
         "sortText": completion_sort_text(250 + match_rank, 2, &identity.name),
         "score_offset": completion_score_offset(match_rank),
     }));
@@ -2187,16 +2086,18 @@ fn fetch_members_recursive(
     persistent_cache: Option<Arc<Mutex<Connection>>>,
     accessor_class: Option<&str>,
     assume_subclass_access: bool,
+    include_impl_members: bool,
 ) -> Result<Vec<Value>> {
     let class_name = resolve_typedef(ctx, class_name)?;
     let prefix = prefix.unwrap_or_default();
     let accessor = accessor_class.unwrap_or("");
     let cache_key = format!(
-        "completion:{}:{}:{}:{}",
+        "completion:{}:{}:{}:{}:{}",
         class_name,
         prefix,
         accessor,
-        assume_subclass_access as u8
+        assume_subclass_access as u8,
+        include_impl_members as u8,
     );
 
     if let Some(items) = read_completion_cache(&cache_key, &memory_cache, &persistent_cache)? {
@@ -2238,6 +2139,7 @@ fn fetch_members_recursive(
             &prefix,
             accessor,
             assume_subclass_access,
+            include_impl_members,
             &mut seen_items,
             &mut items,
         )?;
@@ -2285,6 +2187,7 @@ fn append_members_for_class(
     prefix: &str,
     accessor_class: &str,
     assume_subclass_access: bool,
+    include_impl_members: bool,
     seen: &mut HashSet<String>,
     items: &mut Vec<Value>,
 ) -> Result<()> {
@@ -2306,13 +2209,14 @@ fn append_members_for_class(
         LEFT JOIN dir_paths dp ON f.directory_id = dp.id
         LEFT JOIN strings sn ON f.filename_id = sn.id
         WHERE m.class_id = ?
-          AND (m.access IS NULL OR m.access != 'impl')
         "#,
     );
 
-    sql.push_str(" ORDER BY smn.text LIMIT ");
+    if !include_impl_members {
+        sql.push_str(" AND (m.access IS NULL OR m.access != 'impl')");
+    }
 
-    sql.push_str(&MAX_MEMBER_ITEMS_PER_CLASS.to_string());
+    sql.push_str(" ORDER BY smn.text");
 
     let mut stmt = ctx.conn.prepare(&sql)?;
 
@@ -2344,7 +2248,11 @@ fn append_members_for_class(
             continue;
         }
 
-        let detail_text = member_detail(return_type.as_deref(), owner_class);
+        let detail_text = if member_type == "function" {
+            function_completion_detail(return_type.as_deref(), detail.as_deref(), Some(owner_class))
+        } else {
+            member_detail(return_type.as_deref(), owner_class)
+        };
         let dedupe_key = format!("{}:{}", name, detail_text);
 
         if !seen.insert(dedupe_key) {
@@ -2356,16 +2264,23 @@ fn append_members_for_class(
             .and_then(|path| line.map(|line| extract_comment_from_file(path, line, &mut ctx.file_cache)))
             .unwrap_or_default();
 
-        let documentation = merge_docs(documentation, detail);
+        let documentation = merge_docs(documentation, detail.clone());
         let kind = completion_kind(&member_type);
         let sort_text = completion_sort_text(class_rank * 1000 + match_rank, kind, &name);
+        let insert_text = if member_type == "function" {
+            function_snippet_text(&name, detail.as_deref())
+        } else {
+            name.clone()
+        };
+        let insert_text_format = if member_type == "function" { 2 } else { 1 };
 
         matched.push(json!({
             "label": name,
             "kind": kind,
             "detail": detail_text,
             "documentation": documentation,
-            "insertText": name,
+            "insertText": insert_text,
+            "insertTextFormat": insert_text_format,
             "filterText": name,
             "sortText": sort_text,
             "score_offset": completion_score_offset(match_rank),
@@ -2376,6 +2291,31 @@ fn append_members_for_class(
             "sourceClass": owner_class,
         }));
     }
+
+    matched.sort_by(|left, right| {
+        let left_sort = left
+            .get("sortText")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let right_sort = right
+            .get("sortText")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        left_sort
+            .cmp(right_sort)
+            .then_with(|| {
+                left.get("label")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .cmp(
+                        right
+                            .get("label")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                    )
+            })
+    });
 
     for item in matched.into_iter().take(MAX_MEMBER_ITEMS_PER_CLASS) {
         items.push(item);
@@ -2837,6 +2777,7 @@ fn append_global_enum_value_items(
 /// 在未完成的 #include 字符串内补全已索引头文件。
 fn complete_include_paths(
     ctx: &mut CompletionContext,
+    engine_ctx: Option<&mut CompletionContext>,
     content: &str,
     line: u32,
     character: u32,
@@ -2857,7 +2798,14 @@ fn complete_include_paths(
         return Ok(None);
     };
 
-    fetch_include_paths(ctx, &prefix).map(Some)
+    let mut items = fetch_include_paths(ctx, &prefix, line, character)?;
+
+    if let Some(engine_ctx) = engine_ctx {
+        let engine_items = fetch_include_paths(engine_ctx, &prefix, line, character)?;
+        merge_completion_items(&mut items, engine_items, MAX_COMPLETION_ITEMS);
+    }
+
+    Ok(Some(items))
 }
 
 fn include_prefix(before_cursor: &str) -> Option<String> {
@@ -2879,9 +2827,15 @@ fn include_prefix(before_cursor: &str) -> Option<String> {
     Some(prefix.trim_start().replace('\\', "/"))
 }
 
-fn fetch_include_paths(ctx: &mut CompletionContext, prefix: &str) -> Result<Vec<Value>> {
+fn fetch_include_paths(
+    ctx: &mut CompletionContext,
+    prefix: &str,
+    line: u32,
+    character: u32,
+) -> Result<Vec<Value>> {
     let pattern = format!("{}%", prefix);
     let basename_pattern = format!("%/{}%", prefix);
+    let prefix_start = character.saturating_sub(prefix.len() as u32);
     let mut stmt = ctx.conn.prepare(
         r#"
         SELECT
@@ -2889,8 +2843,7 @@ fn fetch_include_paths(ctx: &mut CompletionContext, prefix: &str) -> Result<Vec<
                 WHEN dp.full_path = '/' THEN '/' || sn.text
                 WHEN substr(dp.full_path, -1) = '/' THEN dp.full_path || sn.text
                 ELSE dp.full_path || '/' || sn.text
-            END AS path,
-            sn.text
+            END AS path
         FROM files f
         JOIN strings sn ON f.filename_id = sn.id
         JOIN dir_paths dp ON f.directory_id = dp.id
@@ -2909,22 +2862,47 @@ fn fetch_include_paths(ctx: &mut CompletionContext, prefix: &str) -> Result<Vec<
         "#,
     )?;
 
-    let rows = stmt.query_map(params![pattern, basename_pattern], |row| {
-        let path: String = row.get(0)?;
-        let filename: String = row.get(1)?;
-        let insert_text = include_insert_path(&path);
-        Ok(json!({
-            "label": insert_text,
-            "kind": 17,
-            "detail": "include",
-            "documentation": path,
-            "filterText": filename,
-            "insertText": insert_text,
-            "sortText": completion_sort_text(10, 17, &path),
-        }))
-    })?;
+    let rows = stmt.query_map(params![pattern, basename_pattern], |row| row.get::<_, String>(0))?;
 
-    Ok(rows.filter_map(|row| row.ok()).collect())
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+
+    for row in rows.flatten() {
+        let path = row;
+        let include_path = include_insert_path(&path);
+        let Some((candidate, kind, sort_bucket)) = include_candidate(&include_path, prefix) else {
+            continue;
+        };
+
+        if !seen.insert(candidate.clone()) {
+            continue;
+        }
+
+        items.push(json!({
+            "label": candidate,
+            "kind": kind,
+            "detail": if kind == 19 { "include dir" } else { "include" },
+            "documentation": path,
+            "filterText": candidate,
+            "insertText": candidate,
+            "sortText": completion_sort_text(sort_bucket, kind, &include_path),
+            "textEdit": {
+                "newText": candidate,
+                "range": {
+                    "start": {
+                        "line": line,
+                        "character": prefix_start,
+                    },
+                    "end": {
+                        "line": line,
+                        "character": character,
+                    },
+                },
+            },
+        }));
+    }
+
+    Ok(items)
 }
 
 fn include_insert_path(path: &str) -> String {
@@ -2939,6 +2917,138 @@ fn include_insert_path(path: &str) -> String {
         .and_then(|name| name.to_str())
         .unwrap_or(path)
         .to_string()
+}
+
+fn include_candidate(include_path: &str, prefix: &str) -> Option<(String, i64, usize)> {
+    let include_lower = include_path.to_ascii_lowercase();
+    let prefix_lower = prefix.to_ascii_lowercase();
+
+    if prefix.is_empty() {
+        if let Some((head, _)) = include_path.split_once('/') {
+            return Some((format!("{}/", head), 19, 5));
+        }
+
+        return Some((include_path.to_string(), 17, 10));
+    }
+
+    if include_lower.starts_with(&prefix_lower) {
+        let remainder = &include_path[prefix.len()..];
+
+        if remainder.is_empty() {
+            return Some((include_path.to_string(), 17, 10));
+        }
+
+        if let Some(rest) = remainder.strip_prefix('/') {
+            let next = rest.split('/').next().unwrap_or(rest);
+            if rest.contains('/') {
+                return Some((format!("{}/{}/", prefix, next), 19, 5));
+            }
+
+            return Some((format!("{}/{}", prefix, next), 17, 10));
+        }
+
+        let next = remainder.split('/').next().unwrap_or(remainder);
+        if remainder.contains('/') {
+            return Some((format!("{}{}/", prefix, next), 19, 5));
+        }
+
+        return Some((format!("{}{}", prefix, next), 17, 10));
+    }
+
+    if !prefix.contains('/') {
+        let filename = include_path.rsplit('/').next().unwrap_or(include_path);
+        if filename.to_ascii_lowercase().starts_with(&prefix_lower) {
+            return Some((include_path.to_string(), 17, 20));
+        }
+    }
+
+    None
+}
+
+fn complete_preprocessor_directives(content: &str, line: u32, character: u32) -> Option<Value> {
+    let offset = byte_offset_at(content, line as usize, character as usize)?;
+    let line_start = content[..offset].rfind('\n').map(|index| index + 1).unwrap_or(0);
+    let before = &content[line_start..offset];
+    let trimmed = before.trim_start();
+
+    if !trimmed.starts_with('#') {
+        return None;
+    }
+
+    if trimmed.contains('"') || trimmed.contains('<') || trimmed.contains('>') {
+        return None;
+    }
+
+    let after_hash = trimmed[1..].trim_start();
+    if after_hash.contains(' ') || after_hash.contains('\t') {
+        return None;
+    }
+
+    let prefix = after_hash;
+    let start_in_trimmed = trimmed.len().saturating_sub(prefix.len());
+    let start_in_before = before.len().saturating_sub(trimmed.len()) + start_in_trimmed;
+    let start_char = before[..start_in_before].chars().count() as u32;
+
+    let directives = preprocessor_directive_items(prefix, line, start_char, character);
+    if directives.is_empty() {
+        None
+    } else {
+        Some(json!(directives))
+    }
+}
+
+fn preprocessor_directive_items(
+    prefix: &str,
+    line: u32,
+    start_char: u32,
+    end_char: u32,
+) -> Vec<Value> {
+    let candidates = [
+        ("include", "include \"$1\"", "preprocessor include"),
+        ("pragma once", "pragma once", "header guard pragma"),
+        ("define", "define $1", "preprocessor define"),
+        ("ifdef", "ifdef $1", "preprocessor ifdef"),
+        ("ifndef", "ifndef $1", "preprocessor ifndef"),
+        ("if", "if $1", "preprocessor if"),
+        ("elif", "elif $1", "preprocessor elif"),
+        ("else", "else", "preprocessor else"),
+        ("endif", "endif", "preprocessor endif"),
+        ("undef", "undef $1", "preprocessor undef"),
+    ];
+
+    let prefix_lower = prefix.to_ascii_lowercase();
+    let mut items = Vec::new();
+
+    for (label, insert_text, detail) in candidates {
+        if !label.starts_with(&prefix_lower) {
+            continue;
+        }
+
+        items.push(json!({
+            "label": label,
+            "kind": 14,
+            "detail": detail,
+            "filterText": label,
+            "insertText": insert_text,
+            "insertTextFormat": 2,
+            "sortText": completion_sort_text(40, 14, label),
+            "textEdit": {
+                "newText": insert_text,
+                "range": {
+                    "start": {
+                        "line": line,
+                        "character": start_char,
+                    },
+                    "end": {
+                        "line": line,
+                        "character": end_char,
+                    },
+                },
+            },
+        }));
+    }
+
+    items
 }
 
 /// Complete Unreal macro specifiers.
@@ -3060,9 +3170,7 @@ fn should_offer_ue_snippets(prefix: &str) -> bool {
     }
 
     [
-        "add", "bin", "cas", "che", "cre", "dec", "def", "ens", "fin", "for", "gen", "get",
-        "imp", "inv", "isv", "loa", "loc", "mak", "mov", "new", "nsl", "sta", "sup", "tex",
-        "ver",
+        "cas", "cre", "def", "gen", "imp", "loa", "mak", "new", "nsl", "sta", "sup", "tex",
     ]
     .iter()
     .any(|known| lower.starts_with(known))
@@ -3321,6 +3429,147 @@ fn ue_snippets(prefix: &str) -> Vec<Value> {
     items
 }
 
+fn cpp_keyword_items(prefix: &str) -> Vec<Value> {
+    let prefix = prefix.trim();
+    if prefix.len() < 2 || prefix.chars().any(|ch| ch.is_ascii_uppercase()) {
+        return Vec::new();
+    }
+
+    let keywords = [
+        "auto",
+        "break",
+        "case",
+        "class",
+        "const",
+        "constexpr",
+        "continue",
+        "enum",
+        "explicit",
+        "false",
+        "final",
+        "for",
+        "if",
+        "inline",
+        "namespace",
+        "nullptr",
+        "override",
+        "private",
+        "protected",
+        "public",
+        "return",
+        "static",
+        "struct",
+        "switch",
+        "template",
+        "this",
+        "true",
+        "typename",
+        "using",
+        "virtual",
+        "void",
+        "while",
+    ];
+
+    keywords
+        .iter()
+        .filter(|keyword| keyword.starts_with(prefix))
+        .map(|keyword| keyword_item(keyword))
+        .collect()
+}
+
+fn function_completion_detail(
+    return_type: Option<&str>,
+    params: Option<&str>,
+    owner_class: Option<&str>,
+) -> String {
+    let return_type = return_type
+        .map(|text| text.trim())
+        .filter(|text| !text.is_empty())
+        .unwrap_or("function");
+    let params = params
+        .map(|text| text.trim())
+        .filter(|text| !text.is_empty())
+        .unwrap_or("()");
+
+    let mut detail = format!("{} {}", return_type, params);
+    if let Some(owner_class) = owner_class.map(|text| text.trim()).filter(|text| !text.is_empty()) {
+        detail.push_str(" - ");
+        detail.push_str(owner_class);
+    }
+
+    detail
+}
+
+fn function_snippet_text(name: &str, params: Option<&str>) -> String {
+    let placeholders = function_param_placeholders(params.unwrap_or("()"));
+    if placeholders.is_empty() {
+        return format!("{}($1)", name);
+    }
+
+    format!("{}({})", name, placeholders.join(", "))
+}
+
+fn function_param_placeholders(params: &str) -> Vec<String> {
+    let inner = params
+        .trim()
+        .strip_prefix('(')
+        .and_then(|text| text.strip_suffix(')'))
+        .unwrap_or(params)
+        .trim();
+
+    if inner.is_empty() || inner == "void" {
+        return Vec::new();
+    }
+
+    split_top_level_params(inner)
+        .into_iter()
+        .filter(|param| !param.is_empty() && param != "void")
+        .enumerate()
+        .map(|(index, param)| format!("${{{}:{}}}", index + 1, snippet_escape(&param)))
+        .collect()
+}
+
+fn split_top_level_params(text: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut angle = 0usize;
+    let mut paren = 0usize;
+    let mut bracket = 0usize;
+    let mut brace = 0usize;
+
+    for (index, ch) in text.char_indices() {
+        match ch {
+            '<' => angle += 1,
+            '>' => angle = angle.saturating_sub(1),
+            '(' => paren += 1,
+            ')' => paren = paren.saturating_sub(1),
+            '[' => bracket += 1,
+            ']' => bracket = bracket.saturating_sub(1),
+            '{' => brace += 1,
+            '}' => brace = brace.saturating_sub(1),
+            ',' if angle == 0 && paren == 0 && bracket == 0 && brace == 0 => {
+                let part = text[start..index].trim();
+                if !part.is_empty() {
+                    parts.push(part.to_string());
+                }
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+
+    let tail = text[start..].trim();
+    if !tail.is_empty() {
+        parts.push(tail.to_string());
+    }
+
+    parts
+}
+
+fn snippet_escape(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('$', "\\$").replace('}', "\\}")
+}
+
 /// Create one snippet item.
 /// 创建一个 snippet 补全项。
 fn snippet(label: &str, insert_text: &str, detail: &str) -> Value {
@@ -3332,6 +3581,18 @@ fn snippet(label: &str, insert_text: &str, detail: &str) -> Value {
         "insertTextFormat": 2,
         "filterText": label,
         "sortText": completion_sort_text(900, 15, label),
+    })
+}
+
+fn keyword_item(label: &str) -> Value {
+    json!({
+        "label": label,
+        "kind": 14,
+        "detail": "keyword",
+        "insertText": label,
+        "filterText": label,
+        "sortText": completion_sort_text(120, 14, label),
+        "score_offset": 12,
     })
 }
 
@@ -3697,6 +3958,20 @@ fn node_children(node: Node) -> Vec<Node> {
     node.children(&mut cursor).collect()
 }
 
+fn find_descendant_by_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
+    if node.kind() == kind {
+        return Some(node);
+    }
+
+    for child in node_children(node) {
+        if let Some(found) = find_descendant_by_kind(child, kind) {
+            return Some(found);
+        }
+    }
+
+    None
+}
+
 /// Completion item kind mapping.
 /// 补全 item kind 映射。
 fn completion_kind(kind: &str) -> i64 {
@@ -3844,6 +4119,11 @@ mod tests {
         labels(items).iter().any(|item| item == label)
     }
 
+    fn item_by_label<'a>(items: &'a [Value], label: &str) -> Option<&'a Value> {
+        items.iter()
+            .find(|item| item.get("label").and_then(|value| value.as_str()) == Some(label))
+    }
+
     fn test_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         crate::db::init_db(&conn).unwrap();
@@ -3976,6 +4256,58 @@ mod tests {
         .unwrap();
     }
 
+    fn insert_member_with_access(
+        conn: &Connection,
+        class_id: i64,
+        name: &str,
+        member_type: &str,
+        return_type: Option<&str>,
+        access: Option<&str>,
+        file_id: i64,
+    ) {
+        let name_id = insert_string(conn, name);
+        let type_id = insert_string(conn, member_type);
+        let return_type_id = return_type.map(|text| insert_string(conn, text));
+
+        conn.execute(
+            "INSERT INTO members
+             (class_id, name_id, type_id, access, return_type_id, line_number, file_id)
+             VALUES (?, ?, ?, ?, ?, 1, ?)",
+            rusqlite::params![class_id, name_id, type_id, access, return_type_id, file_id],
+        )
+        .unwrap();
+    }
+
+    fn insert_header_under_header_dir(
+        conn: &Connection,
+        subdir: &str,
+        filename: &str,
+        extension: &str,
+    ) -> i64 {
+        let header_dir_id: i64 = conn
+            .query_row(
+                "SELECT directory_id FROM files WHERE is_header = 1 LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let subdir_name_id = insert_string(conn, subdir);
+        conn.execute(
+            "INSERT INTO directories (parent_id, name_id) VALUES (?, ?)",
+            [header_dir_id, subdir_name_id],
+        )
+        .unwrap();
+        let subdir_id = conn.last_insert_rowid();
+
+        let filename_id = insert_string(conn, filename);
+        conn.execute(
+            "INSERT INTO files (directory_id, filename_id, extension, is_header) VALUES (?, ?, ?, 1)",
+            rusqlite::params![subdir_id, filename_id, extension],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
     fn label_index(items: &[Value], label: &str) -> Option<usize> {
         items.iter().position(|item| item.get("label").and_then(|v| v.as_str()) == Some(label))
     }
@@ -4080,6 +4412,164 @@ void Test() {
 
         assert!(has_label(&items, "MyActor.h"));
         assert!(!has_label(&items, "UPROPERTY"));
+    }
+
+    #[test]
+    fn include_context_merges_engine_header_paths() {
+        let project_conn = test_db();
+        let engine_conn = test_db();
+        insert_header_under_header_dir(&engine_conn, "GameFramework", "Actor.h", "h");
+
+        let items = completion_at_with_engine(
+            &project_conn,
+            &engine_conn,
+            r#"
+#include "GameFramework/*cursor*/"
+"#,
+        );
+
+        assert!(has_label(&items, "GameFramework/Actor.h"));
+    }
+
+    #[test]
+    fn include_context_suggests_engine_directories() {
+        let project_conn = test_db();
+        let engine_conn = test_db();
+        insert_header_under_header_dir(&engine_conn, "GameFramework", "Actor.h", "h");
+
+        let items = completion_at_with_engine(
+            &project_conn,
+            &engine_conn,
+            r#"
+#include "GameFra/*cursor*/"
+"#,
+        );
+
+        assert!(has_label(&items, "GameFramework/"));
+    }
+
+    #[test]
+    fn function_completion_inserts_signature_snippet() {
+        let conn = test_db();
+        let items = completion_at(
+            &conn,
+            r#"
+void HelperAbility(int32 Count, const FString& Name);
+
+void Test()
+{
+    Help/*cursor*/
+}
+"#,
+        );
+
+        let helper = item_by_label(&items, "HelperAbility").unwrap();
+        assert_eq!(helper.get("insertTextFormat").and_then(Value::as_i64), Some(2));
+        let insert_text = helper.get("insertText").and_then(Value::as_str).unwrap();
+        assert!(insert_text.contains("HelperAbility("));
+        assert!(insert_text.contains("Count"));
+        assert!(insert_text.contains("Name"));
+        assert!(insert_text.contains("${1:"));
+    }
+
+    #[test]
+    fn function_member_completion_inserts_signature_snippet() {
+        let conn = test_db();
+        let actor_id: i64 = conn
+            .query_row(
+                "SELECT c.id FROM classes c JOIN strings s ON c.name_id = s.id WHERE s.text = 'AMyActor' LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let file_id: i64 = conn
+            .query_row("SELECT id FROM files WHERE extension = 'cpp' LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+
+        insert_member(
+            &conn,
+            actor_id,
+            "DoAction",
+            "function",
+            Some("void"),
+            "public",
+            file_id,
+        );
+
+        let items = completion_at(
+            &conn,
+            r#"
+class AMyActor {
+public:
+    void Test() {
+        DoAct/*cursor*/
+    }
+};
+"#,
+        );
+
+        let action = item_by_label(&items, "DoAction").unwrap();
+        assert_eq!(action.get("insertTextFormat").and_then(Value::as_i64), Some(2));
+        assert!(action.get("detail").and_then(Value::as_str).unwrap_or("").contains("void"));
+        assert!(action
+            .get("insertText")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .contains("DoAction("));
+    }
+
+    #[test]
+    fn preprocessor_directive_completion_offers_include() {
+        let conn = test_db();
+        let items = completion_at(
+            &conn,
+            r#"
+#inc/*cursor*/
+"#,
+        );
+
+        assert!(has_label(&items, "include"));
+        let include = items
+            .iter()
+            .find(|item| item.get("label").and_then(|label| label.as_str()) == Some("include"))
+            .unwrap();
+        assert_eq!(
+            include
+                .get("insertTextFormat")
+                .and_then(|value| value.as_i64()),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn keyword_completion_offers_common_cpp_keywords() {
+        let conn = test_db();
+
+        let return_items = completion_at(
+            &conn,
+            r#"
+void Test() {
+    ret/*cursor*/
+}
+"#,
+        );
+        assert!(has_label(&return_items, "return"));
+
+        let virtual_items = completion_at(
+            &conn,
+            r#"
+vi/*cursor*/
+"#,
+        );
+        assert!(has_label(&virtual_items, "virtual"));
+
+        let void_items = completion_at(
+            &conn,
+            r#"
+vo/*cursor*/
+"#,
+        );
+        assert!(has_label(&void_items, "void"));
     }
 
     #[test]
@@ -4203,6 +4693,41 @@ void Test() {
 
         assert!(has_label(&items, "GetAbilitySystemComponent"));
         assert!(!has_label(&items, "AbilitySystemComponent"));
+    }
+
+    #[test]
+    fn class_scope_completion_prefers_inherited_members_without_global_noise() {
+        let conn = test_db();
+        let file_id: i64 = conn
+            .query_row("SELECT id FROM files WHERE extension = 'cpp' LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let base_id: i64 = conn
+            .query_row(
+                "SELECT c.id FROM classes c JOIN strings s ON c.name_id = s.id WHERE s.text = 'UBase' LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        insert_member(&conn, base_id, "GetAbilitySource", "function", Some("UObject"), "public", file_id);
+        insert_class(&conn, "GetActorLocation", file_id);
+        insert_class(&conn, "GetAbilitySystemComponent", file_id);
+
+        let items = completion_at(
+            &conn,
+            r#"
+class AMyActor : public UBase {
+public:
+    void Test() {
+        GetA/*cursor*/
+    }
+};
+"#,
+        );
+
+        assert!(has_label(&items, "GetAbilitySource"));
+        assert!(!has_label(&items, "GetActorLocation"));
+        assert!(!has_label(&items, "GetAbilitySystemComponent"));
     }
 
     #[test]
@@ -4428,6 +4953,50 @@ public:
         );
 
         assert!(has_label(&member_items, "CancelAllAbilities"));
+    }
+
+    #[test]
+    fn engine_impl_members_are_available_in_completion() {
+        let project_conn = test_db();
+        let engine_conn = test_db();
+
+        let file_id: i64 = project_conn
+            .query_row("SELECT id FROM files WHERE extension = 'cpp' LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let engine_file_id: i64 = engine_conn
+            .query_row("SELECT id FROM files WHERE extension = 'cpp' LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+
+        let ability_child_id = insert_class(&project_conn, "UMyAbility", file_id);
+        insert_external_inheritance(&project_conn, ability_child_id, "UGameplayAbility");
+
+        let gameplay_ability_id = insert_class(&engine_conn, "UGameplayAbility", engine_file_id);
+        insert_member_with_access(
+            &engine_conn,
+            gameplay_ability_id,
+            "GetCurrentAbilitySpec",
+            "function",
+            Some("FGameplayAbilitySpec"),
+            Some("impl"),
+            engine_file_id,
+        );
+
+        let items = completion_at_with_engine(
+            &project_conn,
+            &engine_conn,
+            r#"
+class UMyAbility : public UGameplayAbility
+{
+public:
+    void Test()
+    {
+        GetCur/*cursor*/
+    }
+};
+"#,
+        );
+
+        assert!(has_label(&items, "GetCurrentAbilitySpec"));
     }
 
     #[test]

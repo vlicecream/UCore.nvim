@@ -101,24 +101,7 @@ return {
       {
         "saghen/blink.cmp",
         opts = function(_, opts)
-          opts.sources = opts.sources or {}
-          opts.sources.default = opts.sources.default or { "lsp", "path", "snippets", "buffer" }
-
-          if not vim.tbl_contains(opts.sources.default, "ucore") then
-            table.insert(opts.sources.default, "ucore")
-          end
-
-          opts.sources.providers = opts.sources.providers or {}
-          opts.sources.providers.ucore = {
-            name = "UCore",
-            module = "ucore.completion.blink",
-            async = true,
-            timeout_ms = 2000,
-            min_keyword_length = 0,
-            score_offset = 50,
-          }
-
-          return opts
+          return require("ucore.completion.blink").extend_blink_opts(opts)
         end,
       },
 
@@ -145,6 +128,7 @@ return {
 ```
 
 `UTreeSitter.nvim` and `UVersionControlSystem.nvim` are separate top-level plugins. `UCore.nvim` no longer bundles either layer.
+`extend_blink_opts()` only prepares `blink.cmp` at config time. UCore does not patch blink at runtime.
 
 ### Quick Start
 
@@ -355,24 +339,7 @@ return {
       {
         "saghen/blink.cmp",
         opts = function(_, opts)
-          opts.sources = opts.sources or {}
-          opts.sources.default = opts.sources.default or { "lsp", "path", "snippets", "buffer" }
-
-          if not vim.tbl_contains(opts.sources.default, "ucore") then
-            table.insert(opts.sources.default, "ucore")
-          end
-
-          opts.sources.providers = opts.sources.providers or {}
-          opts.sources.providers.ucore = {
-            name = "UCore",
-            module = "ucore.completion.blink",
-            async = true,
-            timeout_ms = 2000,
-            min_keyword_length = 0,
-            score_offset = 50,
-          }
-
-          return opts
+          return require("ucore.completion.blink").extend_blink_opts(opts)
         end,
       },
 
@@ -399,6 +366,7 @@ return {
 ```
 
 `UTreeSitter.nvim` 和 `UVersionControlSystem.nvim` 现在都是独立的顶层插件，`UCore.nvim` 不再内置这两层。
+`extend_blink_opts()` 只在配置阶段补全 `blink.cmp` 选项，UCore 不会在运行时改写 blink 配置。
 
 ### 快速开始
 
