@@ -14,7 +14,7 @@ local explorer = require("ucore.explorer")
 
 local M = {}
 
-local FIND_CACHE_TTL_MS = 10000
+local FIND_CACHE_TTL_MS = 60000
 local find_cache = {
 	root = nil,
 	raw_items = nil,

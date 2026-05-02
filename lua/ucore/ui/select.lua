@@ -252,6 +252,43 @@ local function find_search_text(item, name, kind, label, path)
 	}, " ")
 end
 
+local function find_compact_search_text(item, name, path)
+	path = tostring(path or "")
+	local normalized_path = path:gsub("\\", "/")
+	local filename = vim.fn.fnamemodify(normalized_path, ":t")
+
+	return table.concat({
+		name,
+		tostring(item.class_name or ""),
+		tostring(item.module_name or ""),
+		tostring(item.config_section or ""),
+		tostring(item.asset_path or ""),
+		filename,
+	}, " ")
+end
+
+local function normalize_search_key(text)
+	return tostring(text or ""):lower():gsub("[_%-%s:/\\\\%.%[%]%(%)]+", "")
+end
+
+local function has_subsequence(needle, haystack)
+	if needle == "" then
+		return true
+	end
+
+	local index = 1
+	for pos = 1, #haystack do
+		if haystack:sub(pos, pos) == needle:sub(index, index) then
+			index = index + 1
+			if index > #needle then
+				return true
+			end
+		end
+	end
+
+	return false
+end
+
 local function find_item_key(item)
 	local path = normalize_path(item.path or item.file_path or item.asset_path or "")
 	local line = tonumber(item.line or item.line_number or 1) or 1
@@ -343,6 +380,8 @@ local function prepare_find_items(items)
 			location
 		)
 		item._ucore_find_ordinal = find_search_text(item, name, kind, label, path)
+		item._ucore_find_search = find_compact_search_text(item, name, path)
+		item._ucore_find_search_norm = normalize_search_key(item._ucore_find_search)
 	end
 
 	result.__ucore_prepared = true
@@ -443,6 +482,13 @@ local function preview_find_item(entry, bufnr)
 
 	vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
 	vim.bo[bufnr].filetype = "text"
+end
+
+local function preview_find_file(previewer, entry, conf)
+	conf.buffer_previewer_maker(entry.filename, previewer.state.bufnr, {
+		bufname = previewer.state.bufname,
+		winid = previewer.state.winid,
+	})
 end
 
 -- Open the built-in vim.ui.select picker.
@@ -586,6 +632,7 @@ local function pick_telescope_find(items, default_text)
 	local previewers = require("telescope.previewers")
 	local actions = require("telescope.actions")
 	local action_state = require("telescope.actions.state")
+	local conf = require("telescope.config").values
 	local sorters = require("telescope.sorters")
 	local fzy = require("telescope.algos.fzy")
 
@@ -622,18 +669,34 @@ local function pick_telescope_find(items, default_text)
 				end,
 			}),
 			previewer = previewers.new_buffer_previewer({
+				get_buffer_by_name = function(_, entry)
+					return entry.filename
+				end,
 				define_preview = function(self, entry)
+					local item = entry.value or {}
+					local path = item.path or item.file_path
+					if path and path ~= vim.NIL and vim.fn.filereadable(path) == 1 then
+						preview_find_file(self, entry, conf)
+						return
+					end
+
 					preview_find_item(entry, self.state.bufnr)
 				end,
 			}),
 			sorter = sorters.Sorter:new({
 				discard = true,
-				scoring_function = function(_, prompt, line, entry)
+				start = function(self, prompt)
+					self._ucore_prompt_norm = normalize_search_key(prompt)
+				end,
+				scoring_function = function(sorter, prompt, line, entry)
 					if prompt == "" then
 						return entry.index or 1
 					end
 
-					if not fzy.has_match(prompt, line) then
+					local normalized_prompt = sorter._ucore_prompt_norm or ""
+					local search_norm = entry.value and entry.value._ucore_find_search_norm or ""
+
+					if not has_subsequence(normalized_prompt, search_norm) then
 						return -1
 					end
 
