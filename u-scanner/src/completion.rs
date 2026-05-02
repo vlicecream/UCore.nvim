@@ -389,12 +389,6 @@ fn fetch_members_with_engine(
     };
 
     let mut roots = collect_engine_member_roots(ctx, engine_ctx, class_name)?;
-    tracing::info!(
-        "COMPLETION_DEBUG: class={class_name} project_items={} roots_count={} roots={:?}",
-        items.len(),
-        roots.len(),
-        roots
-    );
 
     if assume_engine_subclass_access {
         let resolved = resolve_typedef(ctx, class_name)?;
@@ -417,13 +411,7 @@ fn fetch_members_with_engine(
             assume_subclass_access,
         )?;
 
-        tracing::info!(
-            "COMPLETION_DEBUG: engine_root={root_name} engine_items={}",
-            extra.len()
-        );
-
         merge_completion_items(&mut items, extra, MAX_COMPLETION_ITEMS);
-        tracing::info!("COMPLETION_DEBUG: after merge total_items={}", items.len());
     }
 
     Ok(items)
@@ -469,10 +457,6 @@ fn collect_engine_member_roots(
 
             let parent_ids = ctx.class_ids_by_name(&parent_name)?;
             let in_engine = !engine_ctx.class_ids_by_name(&parent_name)?.is_empty();
-            tracing::info!(
-                "COMPLETION_DEBUG: parent={parent_name} project_has={} engine_has={in_engine}",
-                !parent_ids.is_empty()
-            );
 
             if in_engine {
                 roots.push((parent_name, true));
