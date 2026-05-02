@@ -302,7 +302,9 @@ pub fn process_completion_with_engine(
         return Ok(json!([]));
     }
 
-    let prefix = completion_prefix(cursor_node, content);
+    let prefix = text_prefix_at(content, line as usize, character as usize)
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| completion_prefix(cursor_node, content));
     let mut items = collect_local_completion_items(
         cursor_node,
         content,
@@ -334,6 +336,9 @@ pub fn process_completion_with_engine(
             merge_completion_items(&mut items, members, MAX_COMPLETION_ITEMS);
         }
     }
+
+    let cpp_snippet_items = cpp_snippets(&prefix);
+    merge_completion_items(&mut items, cpp_snippet_items, MAX_COMPLETION_ITEMS);
 
     let keyword_items = cpp_keyword_items(&prefix);
     merge_completion_items(&mut items, keyword_items, MAX_COMPLETION_ITEMS);
@@ -656,6 +661,35 @@ fn completion_prefix(node: Node, content: &str) -> String {
         }
         _ => String::new(),
     }
+}
+
+/// Extract a word-like prefix directly from buffer text near the cursor.
+/// 直接从光标左侧文本提取单词前缀，覆盖关键字等非 identifier 场景。
+fn text_prefix_at(content: &str, line: usize, character: usize) -> Option<String> {
+    let line_text = content.lines().nth(line)?;
+    let mut end = character.min(line_text.len());
+
+    while end > 0 && !line_text.is_char_boundary(end) {
+        end -= 1;
+    }
+
+    let before = &line_text[..end];
+    let start = before
+        .rfind(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .map(|index| index + 1)
+        .unwrap_or(0);
+
+    let prefix = before[start..].trim();
+    if prefix.is_empty() {
+        return None;
+    }
+
+    let first = prefix.chars().next()?;
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return None;
+    }
+
+    Some(prefix.to_string())
 }
 
 /// Previous non-comment sibling.
@@ -3439,10 +3473,13 @@ fn cpp_keyword_items(prefix: &str) -> Vec<Value> {
         "auto",
         "break",
         "case",
+        "catch",
         "class",
         "const",
         "constexpr",
         "continue",
+        "do",
+        "else",
         "enum",
         "explicit",
         "false",
@@ -3450,7 +3487,9 @@ fn cpp_keyword_items(prefix: &str) -> Vec<Value> {
         "for",
         "if",
         "inline",
+        "mutable",
         "namespace",
+        "noexcept",
         "nullptr",
         "override",
         "private",
@@ -3463,6 +3502,7 @@ fn cpp_keyword_items(prefix: &str) -> Vec<Value> {
         "template",
         "this",
         "true",
+        "try",
         "typename",
         "using",
         "virtual",
@@ -3474,6 +3514,97 @@ fn cpp_keyword_items(prefix: &str) -> Vec<Value> {
         .iter()
         .filter(|keyword| keyword.starts_with(prefix))
         .map(|keyword| keyword_item(keyword))
+        .collect()
+}
+
+fn cpp_snippets(prefix: &str) -> Vec<Value> {
+    let prefix = prefix.trim();
+    if prefix.len() < 2 || prefix.chars().any(|ch| ch.is_ascii_uppercase()) {
+        return Vec::new();
+    }
+
+    let snippets = [
+        (
+            "if",
+            "if (${1:condition}) {\n\t$0\n}",
+            "if block",
+        ),
+        (
+            "ifelse",
+            "if (${1:condition}) {\n\t$2\n} else {\n\t$0\n}",
+            "if / else block",
+        ),
+        (
+            "for",
+            "for (int32 ${1:Index} = 0; ${1:Index} < ${2:Count}; ++${1:Index}) {\n\t$0\n}",
+            "for loop",
+        ),
+        (
+            "forr",
+            "for (const auto& ${1:Item} : ${2:Items}) {\n\t$0\n}",
+            "range-based for loop",
+        ),
+        (
+            "while",
+            "while (${1:condition}) {\n\t$0\n}",
+            "while loop",
+        ),
+        (
+            "switch",
+            "switch (${1:value}) {\n\tcase ${2:Value}:\n\t\t$0\n\t\tbreak;\n\tdefault:\n\t\tbreak;\n}",
+            "switch block",
+        ),
+        (
+            "else",
+            "else {\n\t$0\n}",
+            "else block",
+        ),
+        (
+            "elseif",
+            "else if (${1:condition}) {\n\t$0\n}",
+            "else if block",
+        ),
+        (
+            "do",
+            "do {\n\t$0\n} while (${1:condition});",
+            "do / while loop",
+        ),
+        (
+            "try",
+            "try {\n\t$0\n} catch (const ${1:std::exception}& ${2:Exception}) {\n\t\n}",
+            "try / catch block",
+        ),
+        (
+            "return",
+            "return ${1:value};",
+            "return statement",
+        ),
+        (
+            "namespace",
+            "namespace ${1:Name}\n{\n\t$0\n}",
+            "namespace block",
+        ),
+        (
+            "class",
+            "class ${1:Name}\n{\npublic:\n\t$0\n};",
+            "class definition",
+        ),
+        (
+            "struct",
+            "struct ${1:Name}\n{\n\t$0\n};",
+            "struct definition",
+        ),
+        (
+            "lambda",
+            "[${1:&}](${2}) {\n\t$0\n}",
+            "lambda expression",
+        ),
+    ];
+
+    snippets
+        .iter()
+        .filter(|(label, _, _)| label.starts_with(prefix))
+        .map(|(label, insert_text, detail)| snippet(label, insert_text, detail))
         .collect()
 }
 
@@ -4570,6 +4701,79 @@ vo/*cursor*/
 "#,
         );
         assert!(has_label(&void_items, "void"));
+    }
+
+    #[test]
+    fn control_flow_completion_prefers_block_snippets() {
+        let conn = test_db();
+
+        let if_items = completion_at(
+            &conn,
+            r#"
+void Test() {
+    if/*cursor*/
+}
+"#,
+        );
+
+        let if_item = item_by_label(&if_items, "if").unwrap();
+        assert_eq!(if_item.get("insertTextFormat").and_then(Value::as_i64), Some(2));
+        assert_eq!(
+            if_item.get("insertText").and_then(Value::as_str),
+            Some("if (${1:condition}) {\n\t$0\n}")
+        );
+
+        let for_items = completion_at(
+            &conn,
+            r#"
+void Test() {
+    fo/*cursor*/
+}
+"#,
+        );
+
+        let for_item = item_by_label(&for_items, "for").unwrap();
+        assert_eq!(for_item.get("insertTextFormat").and_then(Value::as_i64), Some(2));
+        assert!(
+            for_item
+                .get("insertText")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .contains("for (int32 ${1:Index} = 0;")
+        );
+
+        let range_items = completion_at(
+            &conn,
+            r#"
+void Test() {
+    forr/*cursor*/
+}
+"#,
+        );
+
+        let range_item = item_by_label(&range_items, "forr").unwrap();
+        assert_eq!(range_item.get("insertTextFormat").and_then(Value::as_i64), Some(2));
+        assert_eq!(
+            range_item.get("insertText").and_then(Value::as_str),
+            Some("for (const auto& ${1:Item} : ${2:Items}) {\n\t$0\n}")
+        );
+
+        let namespace_items = completion_at(
+            &conn,
+            r#"
+name/*cursor*/
+"#,
+        );
+
+        let namespace_item = item_by_label(&namespace_items, "namespace").unwrap();
+        assert_eq!(namespace_item.get("insertTextFormat").and_then(Value::as_i64), Some(2));
+        assert!(
+            namespace_item
+                .get("insertText")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .contains("namespace ${1:Name}")
+        );
     }
 
     #[test]

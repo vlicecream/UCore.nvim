@@ -7,7 +7,6 @@ local server = require("ucore.server")
 local ui = require("ucore.ui")
 local unreal = require("ucore.unreal")
 local bootstrap = require("ucore.bootstrap")
-local completion = require("ucore.completion")
 local dirty = require("ucore.editing.dirty")
 local lsp = require("ucore.lsp")
 local navigation = require("ucore.navigation")
@@ -281,12 +280,6 @@ function M.engine()
 		cache_db_path = paths.cache_db_path,
 		needs_refresh = project.engine_needs_refresh(engine),
 	})))
-end
-
--- Trigger manual completion through Rust completion engine.
--- 通过 Rust 补全引擎触发手动补全。
-function M.complete()
-	completion.complete()
 end
 
 -- Register the current Unreal project in the global registry.
@@ -1162,7 +1155,6 @@ UCore debug commands:
   :UCore debug search-symbols <pattern>
                             Search indexed symbols
    :UCore debug goto         Go to definition at cursor
-   :UCore debug complete     Trigger manual completion in Insert mode
   :UCore debug maps         Print Lua-side component/module maps
   :UCore debug editing      Print indent/autopairs diagnostics
   :UCore debug help         Show this help

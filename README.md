@@ -85,7 +85,8 @@ return {
       auto_boot = true,
       completion = {
         enable = true,
-        keymap = "<C-l>",
+        min_chars = 2,
+        debounce_ms = 180,
       },
       ui = {
         picker = "telescope",
@@ -259,7 +260,6 @@ require("ucore").setup({
   },
   completion = {
     enable = true,
-    keymap = "<C-l>",
     min_chars = 2,
     debounce_ms = 180,
   },
@@ -411,7 +411,8 @@ return {
       auto_boot = true,
       completion = {
         enable = true,
-        keymap = "<C-l>",
+        min_chars = 2,
+        debounce_ms = 180,
       },
       ui = {
         picker = "telescope",
@@ -585,7 +586,6 @@ require("ucore").setup({
   },
   completion = {
     enable = true,
-    keymap = "<C-l>",
     min_chars = 2,
     debounce_ms = 180,
   },

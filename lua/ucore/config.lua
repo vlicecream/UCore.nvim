@@ -168,13 +168,9 @@ M.values = {
 	-- Completion integration options.
 	-- 补全集成配置。
 	completion = {
-		-- Register the default manual completion keymap.
-		-- 是否注册默认手动补全快捷键。
+		-- Enable UCore completion integration.
+		-- 是否启用 UCore 补全集成。
 		enable = true,
-
-		-- Insert-mode key used to trigger UCore completion.
-		-- 触发 UCore 补全的插入模式快捷键。
-		keymap = "<C-l>",
 
 		-- Minimum identifier prefix length before global completion starts.
 		-- 触发全局补全所需的最短标识符前缀长度。

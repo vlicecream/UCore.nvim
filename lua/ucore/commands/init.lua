@@ -1,5 +1,4 @@
 local actions = require("ucore.commands.actions")
-local config = require("ucore.config")
 
 local M = {}
 
@@ -54,7 +53,6 @@ local function dispatch_debug(tail)
 		maps = actions.maps,
 		editing = actions.editing_debug,
 		help = actions.debug_help,
-		complete = actions.complete,
 		["goto"] = actions.goto_definition,
 	}
 
@@ -111,19 +109,6 @@ function M.dispatch(args)
 end
 
 function M.register()
-	local function complete()
-		require("ucore.completion").complete()
-	end
-
-	local completion_config = config.values.completion or {}
-	local keymap = completion_config.keymap
-
-	if completion_config.enable ~= false and keymap and keymap ~= "" then
-		vim.keymap.set("i", keymap, complete, {
-			desc = "UCore complete",
-		})
-	end
-
 	vim.api.nvim_create_user_command("UCore", M.dispatch, {
 		nargs = "*",
 		complete = function(arglead, cmdline, cursorpos)
@@ -171,7 +156,6 @@ function M.register()
 				"stop",
 				"restart",
 				"maps",
-				"complete",
 				"goto",
 				"help",
 			}

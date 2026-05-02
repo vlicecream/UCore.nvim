@@ -323,7 +323,8 @@ local function report_completion_checks()
 
 	local completion = config.values.completion or {}
 	info("enabled: " .. yes_no(completion.enable ~= false))
-	info("manual keymap: " .. tostring(completion.keymap or ""))
+	info("auto trigger min chars: " .. tostring(completion.min_chars or 2))
+	info("debounce ms: " .. tostring(completion.debounce_ms or 180))
 
 	if has_module("ucore.completion.blink") then
 		ok("UCore blink provider can be required")
@@ -334,7 +335,7 @@ local function report_completion_checks()
 	if has_module("blink.cmp") then
 		ok("blink.cmp available")
 	else
-		info("blink.cmp not available; manual completion can still be used")
+		info("blink.cmp not available; built-in auto completion fallback will be used")
 	end
 end
 

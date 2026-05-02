@@ -8,6 +8,7 @@ local ns = vim.api.nvim_create_namespace("ucore_diagnostics")
 local group_name = "UCoreDiagnostics"
 local enabled = true
 local refresh_sequence = 0
+local try_include_symbol
 
 local severity_map = {
 	error = vim.diagnostic.severity.ERROR,
@@ -390,6 +391,251 @@ local function include_path_from_file(file_path)
 	return file_path:match("([^/]+)$")
 end
 
+local function is_header_file(path)
+	path = normalize(path or "")
+	local ext = path:match("%.([^.]*)$")
+	if not ext then
+		return false
+	end
+
+	ext = ext:lower()
+	return ext == "h" or ext == "hpp" or ext == "hh" or ext == "hxx"
+end
+
+local function header_to_source_candidates(path)
+	path = normalize(path or "")
+	if path == "" then
+		return {}
+	end
+
+	local ext = path:match("%.([^.]*)$")
+	if not ext then
+		return {}
+	end
+
+	local base = path:sub(1, -(#ext + 2))
+	local candidates = {
+		base .. ".cpp",
+		base .. ".cc",
+		base .. ".cxx",
+	}
+
+	local mapped = path:gsub("/Classes/", "/Private/"):gsub("/Public/", "/Private/")
+	if mapped ~= path then
+		local mapped_base = mapped:sub(1, -(#ext + 2))
+		table.insert(candidates, 1, mapped_base .. ".cpp")
+		table.insert(candidates, 2, mapped_base .. ".cc")
+		table.insert(candidates, 3, mapped_base .. ".cxx")
+	end
+
+	local seen = {}
+	local result = {}
+	for _, candidate in ipairs(candidates) do
+		if candidate ~= "" and not seen[candidate] then
+			seen[candidate] = true
+			table.insert(result, candidate)
+		end
+	end
+
+	return result
+end
+
+local function resolve_source_path(header_path)
+	local candidates = header_to_source_candidates(header_path)
+	for _, candidate in ipairs(candidates) do
+		if vim.fn.filereadable(candidate) == 1 then
+			return candidate, false
+		end
+	end
+
+	return candidates[1], true
+end
+
+local function file_lines(path)
+	if vim.fn.filereadable(path) ~= 1 then
+		return {}
+	end
+
+	local ok, lines = pcall(vim.fn.readfile, path)
+	return ok and lines or {}
+end
+
+local function ensure_parent_dir(path)
+	local parent = vim.fn.fnamemodify(path, ":p:h")
+	if parent and parent ~= "" then
+		vim.fn.mkdir(parent, "p")
+	end
+end
+
+local function normalize_space(text)
+	return tostring(text or ""):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+local function has_definition_text(lines, signature)
+	local file_text = normalize_space(table.concat(lines or {}, "\n"))
+	local normalized_signature = normalize_space(signature)
+	return normalized_signature ~= "" and file_text:find(normalized_signature, 1, true) ~= nil
+end
+
+local function append_definition(path, header_path, definition_lines, created)
+	local lines = file_lines(path)
+	local header_include = include_path_from_file(header_path)
+
+	if created or vim.tbl_isempty(lines) then
+		if header_include and header_include ~= "" then
+			lines = {
+				string.format('#include "%s"', header_include),
+				"",
+			}
+		end
+	end
+
+	if not vim.tbl_isempty(lines) and lines[#lines] ~= "" then
+		table.insert(lines, "")
+	end
+
+	local start_line = #lines + 1
+
+	for _, line in ipairs(definition_lines) do
+		table.insert(lines, line)
+	end
+
+	table.insert(lines, "")
+	ensure_parent_dir(path)
+	vim.fn.writefile(lines, path)
+
+	return start_line
+end
+
+local function definition_suffix(cursor_info)
+	local suffixes = {}
+	local full_text = tostring(cursor_info.full_text or "")
+	local params = tostring(cursor_info.parameters or "")
+	local params_end
+	if params ~= "" then
+		_, params_end = full_text:find(params, 1, true)
+	end
+	local trailing = params_end and full_text:sub(params_end + #params) or ""
+
+	if cursor_info.is_const == true then
+		table.insert(suffixes, "const")
+	end
+
+	local noexcept_text = trailing:match("(noexcept%s*%b())") or trailing:match("%f[%w](noexcept)%f[%W]")
+	if noexcept_text then
+		table.insert(suffixes, noexcept_text)
+	end
+
+	if trailing:find("&&", 1, true) then
+		table.insert(suffixes, "&&")
+	elseif trailing:find("&", 1, true) then
+		table.insert(suffixes, "&")
+	end
+
+	if vim.tbl_isempty(suffixes) then
+		return ""
+	end
+
+	return " " .. table.concat(suffixes, " ")
+end
+
+local function build_definition_lines(cursor_info)
+	local kind = tostring(cursor_info.kind or "")
+	local class_name = tostring(cursor_info.class_name or "")
+	local name = tostring(cursor_info.name or "")
+	local params = tostring(cursor_info.parameters or "()")
+	local return_type = vim.trim(tostring(cursor_info.return_type or ""))
+
+	if kind == "function_definition" then
+		return nil, "Current declaration already has a function body"
+	end
+
+	if class_name == "" or name == "" or params == "" then
+		return nil, "Current declaration is not a supported member function"
+	end
+
+	local trimmed = vim.trim(tostring(cursor_info.full_text or ""))
+	if trimmed:find("=%s*0%s*;") or trimmed:find("=%s*delete%s*;") or trimmed:find("=%s*default%s*;") then
+		return nil, "Current declaration should not generate an out-of-line definition"
+	end
+
+	local signature
+	if return_type ~= "" then
+		signature = string.format("%s %s::%s%s", return_type, class_name, name, params)
+	else
+		signature = string.format("%s::%s%s", class_name, name, params)
+	end
+
+	signature = signature .. definition_suffix(cursor_info)
+
+	return {
+		signature,
+		"{",
+		"\t",
+		"}",
+	}, nil
+end
+
+local function try_generate_definition(bufnr)
+	local header_path = normalize(vim.api.nvim_buf_get_name(bufnr))
+	if not is_header_file(header_path) then
+		return false, "not_header"
+	end
+
+	local root = project.find_project_root(header_path)
+	if not root then
+		return false, "no_project"
+	end
+
+	local target_path, should_create = resolve_source_path(header_path)
+	if not target_path or target_path == "" then
+		vim.notify("No matching source path could be resolved for this header", vim.log.levels.INFO)
+		return true, "no_source_path"
+	end
+
+	local cursor = vim.api.nvim_win_get_cursor(0)
+	remote.query(root, {
+		kind = "ParseBuffer",
+		content = current_content(bufnr),
+		file_path = header_path,
+		line = cursor[1] - 1,
+		character = cursor[2],
+	}, function(result, err)
+		if err then
+			return vim.notify("UCore parse buffer failed:\n" .. tostring(err), vim.log.levels.ERROR)
+		end
+
+		local cursor_info = type(result) == "table" and result.cursor_info or {}
+		local definition_lines, reason = build_definition_lines(cursor_info or {})
+		if not definition_lines then
+			if reason == "Current declaration is not a supported member function" then
+				return try_include_symbol(bufnr)
+			end
+
+			return vim.notify(reason or "Current declaration cannot generate a definition", vim.log.levels.INFO)
+		end
+
+		local source_lines = file_lines(target_path)
+		if has_definition_text(source_lines, definition_lines[1]) then
+			local ok = pcall(vim.cmd, "edit " .. vim.fn.fnameescape(target_path))
+			if ok then
+				vim.fn.search(cursor_info.class_name .. "::" .. cursor_info.name, "W")
+			end
+			return vim.notify("Definition already exists in source file: " .. target_path, vim.log.levels.INFO)
+		end
+
+		local start_line = append_definition(target_path, header_path, definition_lines, should_create)
+		local ok = pcall(vim.cmd, "edit " .. vim.fn.fnameescape(target_path))
+		if ok then
+			pcall(vim.api.nvim_win_set_cursor, 0, { start_line + 2, 1 })
+		else
+			vim.notify("Definition written to " .. target_path, vim.log.levels.INFO)
+		end
+	end)
+
+	return true, nil
+end
+
 local function line_contains_include(lines, include_path)
 	local quoted = string.format('"%s"', include_path)
 	local angled = string.format("<%s>", include_path)
@@ -567,7 +813,7 @@ local function choose_and_insert_include(bufnr, metadata, candidates)
 	end)
 end
 
-local function try_include_symbol(bufnr)
+try_include_symbol = function(bufnr)
 	local root = project.find_project_root(vim.api.nvim_buf_get_name(bufnr))
 	if not root then
 		return
@@ -635,6 +881,11 @@ function M.smart_action()
 			if ok then
 				return
 			end
+		end
+
+		local handled = try_generate_definition(bufnr)
+		if handled then
+			return
 		end
 
 		try_include_symbol(bufnr)
