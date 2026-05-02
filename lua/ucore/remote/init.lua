@@ -1,4 +1,5 @@
 local cli = require("ucore.client.cli")
+local log = require("ucore.log")
 local project = require("ucore.project")
 local rpc = require("ucore.client.rpc")
 
@@ -25,17 +26,56 @@ end
 function M.query(project_root, query, callback)
 	query.project_root = project_root
 	query.engine_db_path = existing_engine_db_path(project_root)
+	local trace_completion = query.kind == "GetCompletions"
+	if trace_completion then
+		log.write("completion.remote.query.start", {
+			kind = query.kind,
+			project_root = project_root,
+			engine_db_path = query.engine_db_path,
+		})
+	end
 
 	-- Prefer the persistent TCP RPC path for interactive queries.
 	-- 交互式查询优先走持久 TCP RPC，避免每次启动 CLI 进程。
 	rpc.request("query", query, function(result, err)
 		if not err then
+			local items = type(result) == "table" and (result.items or result.completions or result) or nil
+			if trace_completion then
+				log.write("completion.remote.query.finish", {
+					kind = query.kind,
+					transport = "rpc",
+					status = "ok",
+					item_count = type(items) == "table" and #items or nil,
+				})
+			end
 			return callback(result, nil)
+		end
+
+		if trace_completion then
+			log.write("completion.remote.query.finish", {
+				kind = query.kind,
+				transport = "rpc",
+				status = "error",
+				error = err,
+				fallback = "cli",
+			})
 		end
 
 		-- Fall back to the CLI bridge so early development stays forgiving.
 		-- RPC 失败时回退到 CLI 桥，方便开发阶段排查问题。
-		cli.query(query, callback)
+		cli.query(query, function(cli_result, cli_err)
+			local items = type(cli_result) == "table" and (cli_result.items or cli_result.completions or cli_result) or nil
+			if trace_completion then
+				log.write("completion.remote.query.finish", {
+					kind = query.kind,
+					transport = "cli",
+					status = cli_err and "error" or "ok",
+					error = cli_err,
+					item_count = type(items) == "table" and #items or nil,
+				})
+			end
+			callback(cli_result, cli_err)
+		end)
 	end)
 end
 

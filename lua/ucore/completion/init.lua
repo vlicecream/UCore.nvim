@@ -1,10 +1,31 @@
 local project = require("ucore.project")
 local config = require("ucore.config")
+local log = require("ucore.log")
 local remote = require("ucore.remote")
 
 local M = {}
 local auto_sequence = 0
 local request_sequence = 0
+
+local function hrtime_ms(started_at)
+	return math.floor(((vim.uv or vim.loop).hrtime() - started_at) / 1000000)
+end
+
+local function preview_labels(items, limit)
+	local labels = {}
+	for _, item in ipairs(items or {}) do
+		local label = item.abbr or item.word or item.label
+		if label and label ~= "" then
+			table.insert(labels, tostring(label))
+		end
+
+		if #labels >= limit then
+			break
+		end
+	end
+
+	return labels
+end
 
 -- Return true when the current mode can show insert completion.
 -- 判断当前模式是否适合弹出插入模式补全菜单。
@@ -107,25 +128,38 @@ end
 
 -- Return true when the current text should trigger automatic completion.
 -- 判断当前输入是否应该触发自动补全。
-local function should_auto_trigger()
+local function auto_trigger_state()
 	local completion_config = config.values.completion or {}
 	local min_chars = completion_config.min_chars or 2
 	local before = before_cursor()
 
 	if in_comment_or_string() and not in_include_context() then
-		return false
+		return false, "comment_or_string", current_prefix()
 	end
 
 	if in_include_context() or in_macro_context() then
-		return true
+		return true, in_include_context() and "include" or "macro", current_prefix()
 	end
 
 	if before:match("%-%>$") or before:match("::$") or before:match("%.$") then
-		return true
+		return true, "member_operator", ""
 	end
 
 	local prefix = current_prefix()
-	return #prefix >= min_chars and prefix:match("^[_%a][_%w]*$") ~= nil
+	if #prefix < min_chars then
+		return false, "prefix_too_short", prefix
+	end
+
+	if not prefix:match("^[_%a][_%w]*$") then
+		return false, "invalid_prefix", prefix
+	end
+
+	return true, "identifier", prefix
+end
+
+local function should_auto_trigger()
+	local ok = auto_trigger_state()
+	return ok
 end
 
 -- Convert a Rust completion item into a Vim complete-item.
@@ -189,19 +223,32 @@ end
 -- Request completions from Rust for the current cursor position.
 -- 根据当前光标位置向 Rust 请求补全。
 function M.request(callback)
-  callback = callback or function() end
+	callback = callback or function() end
 
-  if vim.b.no_cmp or vim.b.ucore_completion_disabled then
-    return callback(nil, "disabled")
-  end
+	if vim.b.no_cmp or vim.b.ucore_completion_disabled then
+		log.write("completion.lua.request.skip", {
+			reason = "disabled",
+			no_cmp = vim.b.no_cmp == true,
+			ucore_completion_disabled = vim.b.ucore_completion_disabled == true,
+		})
+		return callback(nil, "disabled")
+	end
 
-  local root = project.find_project_root()
-  if not root then
-    return callback(nil, "Could not find .uproject")
-  end
+	local root = project.find_project_root()
+	if not root then
+		log.write("completion.lua.request.skip", {
+			reason = "no_project_root",
+			filetype = vim.bo.filetype,
+		})
+		return callback(nil, "Could not find .uproject")
+	end
 
 	local file_path = vim.api.nvim_buf_get_name(0)
 	if file_path == "" then
+		log.write("completion.lua.request.skip", {
+			reason = "no_file_path",
+			root = root,
+		})
 		return callback(nil, "Current buffer has no file path")
 	end
 
@@ -212,9 +259,25 @@ function M.request(callback)
 	local changedtick = vim.api.nvim_buf_get_changedtick(bufnr)
 	request_sequence = request_sequence + 1
 	local sequence = request_sequence
+	local started_at = (vim.uv or vim.loop).hrtime()
+	local prefix = current_prefix()
+	local content = current_content()
+
+	log.write("completion.lua.request.start", {
+		sequence = sequence,
+		bufnr = bufnr,
+		file = file_path,
+		filetype = vim.bo.filetype,
+		line = line,
+		character = character,
+		prefix = prefix,
+		changedtick = changedtick,
+		content_bytes = #content,
+		mode = vim.api.nvim_get_mode().mode,
+	})
 
 	remote.get_completions(root, {
-		content = current_content(),
+		content = content,
 		line = line,
 		character = character,
 		file_path = file_path:gsub("\\", "/"),
@@ -223,14 +286,37 @@ function M.request(callback)
 			or not vim.api.nvim_buf_is_valid(bufnr)
 			or vim.api.nvim_buf_get_changedtick(bufnr) ~= changedtick
 		then
+			log.write("completion.lua.request.finish", {
+				sequence = sequence,
+				status = "stale",
+				elapsed_ms = hrtime_ms(started_at),
+				prefix = prefix,
+			})
 			return callback(nil, "stale")
 		end
 
 		if err then
+			log.write("completion.lua.request.finish", {
+				sequence = sequence,
+				status = "error",
+				error = err,
+				elapsed_ms = hrtime_ms(started_at),
+				prefix = prefix,
+			})
 			return callback(nil, err)
 		end
 
-		callback(normalize_items(result), nil)
+		local items = normalize_items(result)
+		log.write("completion.lua.request.finish", {
+			sequence = sequence,
+			status = "ok",
+			elapsed_ms = hrtime_ms(started_at),
+			prefix = prefix,
+			item_count = #items,
+			preview = preview_labels(items, 8),
+		})
+
+		callback(items, nil)
 	end)
 end
 
@@ -247,10 +333,22 @@ function M.complete(opts)
 	end
 
 	if opts.auto and not should_auto_trigger() then
+		local _, reason, prefix = auto_trigger_state()
+		log.write("completion.lua.complete.skip", {
+			auto = opts.auto == true,
+			reason = reason,
+			prefix = prefix,
+		})
 		return
 	end
 
 	local start_col = completion_start_col()
+	log.write("completion.lua.complete.start", {
+		auto = opts.auto == true,
+		silent = opts.silent == true,
+		start_col = start_col,
+		prefix = current_prefix(),
+	})
 
 	M.request(function(items, err)
 		if err then
@@ -261,6 +359,11 @@ function M.complete(opts)
 			if not opts.silent then
 				vim.notify("UCore complete failed:\n" .. tostring(err), vim.log.levels.ERROR)
 			end
+			log.write("completion.lua.complete.finish", {
+				status = "error",
+				auto = opts.auto == true,
+				error = err,
+			})
 			return
 		end
 
@@ -268,14 +371,33 @@ function M.complete(opts)
 			if not opts.silent then
 				vim.notify("UCore complete: no candidates", vim.log.levels.INFO)
 			end
+			log.write("completion.lua.complete.finish", {
+				status = "empty",
+				auto = opts.auto == true,
+				prefix = current_prefix(),
+			})
 			return
 		end
 
+		log.write("completion.lua.complete.finish", {
+			status = "ok",
+			auto = opts.auto == true,
+			item_count = #items,
+			preview = preview_labels(items, 8),
+		})
+
 		vim.schedule(function()
 			if not is_insert_mode() then
+				log.write("completion.lua.complete.schedule_skip", {
+					reason = "left_insert_mode",
+				})
 				return
 			end
 
+			log.write("completion.lua.complete.show", {
+				start_col = start_col,
+				item_count = #items,
+			})
 			vim.fn.complete(start_col, items)
 		end)
 	end)
@@ -287,19 +409,40 @@ local function schedule_auto_complete()
 	local completion_config = config.values.completion or {}
 
 	if vim.fn.pumvisible() == 1 then
+		log.write("completion.lua.auto.skip", {
+			reason = "pumvisible",
+			prefix = current_prefix(),
+		})
 		return
 	end
 
-	if not should_auto_trigger() then
+	local should_trigger, reason, prefix = auto_trigger_state()
+	log.write("completion.lua.auto.state", {
+		should_trigger = should_trigger,
+		reason = reason,
+		prefix = prefix,
+		filetype = vim.bo.filetype,
+	})
+
+	if not should_trigger then
 		return
 	end
 
 	auto_sequence = auto_sequence + 1
 	local sequence = auto_sequence
 	local delay = completion_config.debounce_ms or 180
+	log.write("completion.lua.auto.defer", {
+		sequence = sequence,
+		delay_ms = delay,
+		prefix = prefix,
+	})
 
 	vim.defer_fn(function()
 		if sequence ~= auto_sequence then
+			log.write("completion.lua.auto.cancel", {
+				sequence = sequence,
+				reason = "sequence_changed",
+			})
 			return
 		end
 

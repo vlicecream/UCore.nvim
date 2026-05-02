@@ -1,4 +1,5 @@
 local config = require("ucore.config")
+local log = require("ucore.log")
 local progress = require("ucore.progress")
 
 local uv = vim.uv or vim.loop
@@ -9,6 +10,18 @@ local connected = false
 local read_buffer = ""
 local next_msgid = 1
 local pending = {}
+
+local function now_hrtime()
+	return (vim.uv or vim.loop).hrtime()
+end
+
+local function elapsed_ms(started_at)
+	return math.floor((now_hrtime() - started_at) / 1000000)
+end
+
+local function should_trace(method, param_kind)
+	return method == "query" and param_kind == "GetCompletions"
+end
 
 -- Close the current socket without touching pending callbacks.
 -- 关闭当前 socket，但不清理等待中的回调。
@@ -85,10 +98,19 @@ local function handle_frame(frame)
 		local msgid = msg[2]
 		local err = msg[3]
 		local result = msg[4]
-		local cb = pending[msgid]
+		local pending_entry = pending[msgid]
 		pending[msgid] = nil
+		local cb = pending_entry and pending_entry.callback
 
 		if cb then
+			if pending_entry and should_trace(pending_entry.method, pending_entry.param_kind) then
+				log.write("completion.rpc.response", {
+					msgid = msgid,
+					method = pending_entry.method,
+					error = err ~= nil and err ~= vim.NIL and err or nil,
+					elapsed_ms = pending_entry.started_at and elapsed_ms(pending_entry.started_at) or nil,
+				})
+			end
 			vim.schedule(function()
 				if err ~= nil and err ~= vim.NIL then
 					cb(nil, err)
@@ -134,6 +156,9 @@ local function start_read_loop()
 		if err then
 			close_socket()
 			vim.schedule(function()
+				log.write("completion.rpc.read_error", {
+					error = err,
+				})
 				vim.notify("UCore RPC read error: " .. tostring(err), vim.log.levels.ERROR)
 			end)
 			return
@@ -162,16 +187,29 @@ function M.connect(callback)
 	callback = callback or function() end
 
 	if connected and socket then
+		log.write("completion.rpc.connect", {
+			status = "reuse",
+			port = config.values.port,
+		})
 		return callback(true, nil)
 	end
 
 	socket = uv.new_tcp()
 	read_buffer = ""
+	log.write("completion.rpc.connect", {
+		status = "start",
+		port = config.values.port,
+	})
 
 	socket:connect("127.0.0.1", config.values.port, function(err)
 		if err then
 			close_socket()
 			return vim.schedule(function()
+				log.write("completion.rpc.connect", {
+					status = "error",
+					port = config.values.port,
+					error = err,
+				})
 				callback(false, err)
 			end)
 		end
@@ -180,6 +218,10 @@ function M.connect(callback)
 		start_read_loop()
 
 		vim.schedule(function()
+			log.write("completion.rpc.connect", {
+				status = "ok",
+				port = config.values.port,
+			})
 			callback(true, nil)
 		end)
 	end)
@@ -197,7 +239,20 @@ function M.request(method, params, callback)
 
 		local msgid = next_msgid
 		next_msgid = next_msgid + 1
-		pending[msgid] = callback
+		local param_kind = type(params) == "table" and params.kind or nil
+		pending[msgid] = {
+			callback = callback,
+			method = method,
+			param_kind = param_kind,
+			started_at = now_hrtime(),
+		}
+		if should_trace(method, param_kind) then
+			log.write("completion.rpc.request", {
+				msgid = msgid,
+				method = method,
+				param_kind = param_kind,
+			})
+		end
 
 		-- Request: [0, msgid, method, params]
 		-- 请求帧：[0, msgid, method, params]
@@ -208,6 +263,11 @@ function M.request(method, params, callback)
 			if write_err then
 				pending[msgid] = nil
 				vim.schedule(function()
+					log.write("completion.rpc.write_error", {
+						msgid = msgid,
+						method = method,
+						error = write_err,
+					})
 					callback(nil, write_err)
 				end)
 			end

@@ -1,4 +1,5 @@
 local completion = require("ucore.completion")
+local log = require("ucore.log")
 local project = require("ucore.project")
 
 local M = {}
@@ -16,6 +17,22 @@ local default_opts = {
 }
 
 local policy_applied = false
+
+local function preview_labels(items, limit)
+	local labels = {}
+	for _, item in ipairs(items or {}) do
+		local label = item.label or item.word or item.abbr
+		if label and label ~= "" then
+			table.insert(labels, tostring(label))
+		end
+
+		if #labels >= limit then
+			break
+		end
+	end
+
+	return labels
+end
 
 local function call_or_value(value, ...)
 	if type(value) == "function" then
@@ -108,6 +125,11 @@ function M.apply_recommended_blink_policy()
 	end
 
 	policy_applied = true
+	log.write("completion.blink.policy", {
+		filetype = "unreal_cpp",
+		buffer_disabled = type(providers.buffer) == "table",
+		path_filtered = type(providers.path) == "table",
+	})
 
 	local ok_blink, blink = pcall(require, "blink.cmp")
 	if ok_blink and blink and blink.reload then
@@ -208,27 +230,47 @@ end
 -- Request completion candidates from the Rust backend.
 -- 从 Rust 后端请求补全候选。
 function M:get_completions(_, callback)
-  if vim.b.no_cmp or vim.b.ucore_completion_disabled or vim.b.blink_cmp_disabled then
-    callback({
-      is_incomplete_forward = false,
-      is_incomplete_backward = false,
-      items = {},
-    })
-    return
-  end
+	if vim.b.no_cmp or vim.b.ucore_completion_disabled or vim.b.blink_cmp_disabled then
+		log.write("completion.blink.skip", {
+			reason = "disabled",
+			no_cmp = vim.b.no_cmp == true,
+			ucore_completion_disabled = vim.b.ucore_completion_disabled == true,
+			blink_cmp_disabled = vim.b.blink_cmp_disabled == true,
+		})
+		callback({
+			is_incomplete_forward = false,
+			is_incomplete_backward = false,
+			items = {},
+		})
+		return
+	end
 
-  local cancelled = false
+	local cancelled = false
+	log.write("completion.blink.start", {
+		filetype = vim.bo.filetype,
+		prefix = vim.fn.expand("<cword>"),
+	})
 
-  completion.request(function(items, err)
+	completion.request(function(items, err)
 		if cancelled then
+			log.write("completion.blink.cancelled", {
+				reason = "callback_after_cancel",
+			})
 			return
 		end
 
 		if err == "stale" then
+			log.write("completion.blink.finish", {
+				status = "stale",
+			})
 			return
 		end
 
 		if err or not items then
+			log.write("completion.blink.finish", {
+				status = "error",
+				error = err,
+			})
 			callback({
 				is_incomplete_forward = false,
 				is_incomplete_backward = false,
@@ -245,7 +287,15 @@ function M:get_completions(_, callback)
 			end
 		end
 
+		local converted_count = #blink_items
 		blink_items = prune_items(blink_items)
+		log.write("completion.blink.finish", {
+			status = "ok",
+			raw_count = #(items or {}),
+			converted_count = converted_count,
+			pruned_count = #blink_items,
+			preview = preview_labels(blink_items, 8),
+		})
 
 		callback({
 			is_incomplete_forward = false,
@@ -256,6 +306,9 @@ function M:get_completions(_, callback)
 
 	return function()
 		cancelled = true
+		log.write("completion.blink.cancel", {
+			reason = "provider_cancel",
+		})
 	end
 end
 

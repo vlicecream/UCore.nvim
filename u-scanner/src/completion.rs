@@ -4,7 +4,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::time::Instant;
 use tree_sitter::{Node, Parser, Point};
+use tracing::info;
 
 use crate::server::state::CompletionCache;
 
@@ -16,6 +18,34 @@ const MIN_ENGINE_GLOBAL_PREFIX_LEN: usize = 4;
 const COMPLETION_MATCH_NONE: usize = usize::MAX;
 const STRONG_MATCH_SCORE_OFFSET: i64 = 10;
 const STRONG_MATCH_TARGET: usize = 24;
+
+fn preview_text(text: &str, limit: usize) -> String {
+    let sanitized = text.replace(['\r', '\n', '\t'], " ");
+    let mut out = String::new();
+
+    for (index, ch) in sanitized.chars().enumerate() {
+        if index >= limit {
+            out.push_str("...");
+            break;
+        }
+        out.push(ch);
+    }
+
+    out
+}
+
+fn preview_path(path: Option<&str>) -> String {
+    path.map(|value| preview_text(value, 160))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn preview_labels(items: &[Value], limit: usize) -> Vec<String> {
+    items.iter()
+        .filter_map(|item| item.get("label").and_then(Value::as_str))
+        .take(limit)
+        .map(|label| preview_text(label, 64))
+        .collect()
+}
 
 /// Per-request cache and lookup context.
 /// 单次补全请求里的缓存和查询上下文。
@@ -214,6 +244,7 @@ pub fn process_completion_with_engine(
     cache: Option<Arc<Mutex<CompletionCache>>>,
     persistent_cache: Option<Arc<Mutex<Connection>>>,
 ) -> Result<Value> {
+    let started_at = Instant::now();
     let mut ctx = CompletionContext::new(conn, file_path.as_deref());
     let mut engine_ctx = engine_conn.map(|conn| CompletionContext::new(conn, file_path.as_deref()));
 
@@ -229,22 +260,58 @@ pub fn process_completion_with_engine(
     let cursor_node = cursor_node(root, line, character)
         .ok_or_else(|| anyhow::anyhow!("no tree-sitter node at cursor"))?;
     let buffer_inheritance = build_buffer_inheritance_map(root, content);
+    let request_prefix = completion_prefix(cursor_node, content);
+
+    info!(
+        "completion.server.start file={} line={} char={} prefix={} engine_db={} bytes={} filetype_hint={}",
+        preview_path(file_path.as_deref()),
+        line,
+        character,
+        preview_text(&request_prefix, 64),
+        engine_conn.is_some(),
+        content.len(),
+        preview_text(&clean_type(node_text(cursor_node, content)), 64),
+    );
 
     if let Some(items) = complete_include_paths(&mut ctx, content, line, character)? {
+        info!(
+            "completion.server.finish mode=include prefix={} count={} elapsed_ms={} preview={:?}",
+            preview_text(&request_prefix, 64),
+            items.len(),
+            started_at.elapsed().as_millis(),
+            preview_labels(&items, 8),
+        );
         return Ok(json!(items));
     }
 
     if let Some(items) = complete_macro_specifiers_at(content, line, character) {
+        let macro_items = items.as_array().cloned().unwrap_or_default();
+        info!(
+            "completion.server.finish mode=macro_at prefix={} count={} elapsed_ms={} preview={:?}",
+            preview_text(&request_prefix, 64),
+            macro_items.len(),
+            started_at.elapsed().as_millis(),
+            preview_labels(&macro_items, 8),
+        );
         return Ok(items);
     }
 
     if let Some(items) = complete_macro_specifiers(cursor_node, content) {
+        let macro_items = items.as_array().cloned().unwrap_or_default();
+        info!(
+            "completion.server.finish mode=macro prefix={} count={} elapsed_ms={} preview={:?}",
+            preview_text(&request_prefix, 64),
+            macro_items.len(),
+            started_at.elapsed().as_millis(),
+            preview_labels(&macro_items, 8),
+        );
         return Ok(items);
     }
 
     if let Some(request) = member_completion_request(cursor_node, content) {
         let receiver_text = clean_type(node_text(request.receiver, content));
         let current_class = enclosing_class(cursor_node, content);
+        let member_prefix = request.prefix.clone().unwrap_or_default();
 
         if receiver_text == "Super" {
             if let Some(current_class) = current_class.as_deref() {
@@ -252,15 +319,30 @@ pub fn process_completion_with_engine(
                     &mut ctx,
                     engine_ctx.as_mut(),
                     current_class,
-                    request.prefix,
+                    request.prefix.clone(),
                     &buffer_inheritance,
                     cache,
                     persistent_cache,
                 )?;
 
-                return Ok(json!(dedupe_completion_items(members)));
+                let final_items = dedupe_completion_items(members);
+                info!(
+                    "completion.server.finish mode=super current_class={} prefix={} count={} elapsed_ms={} preview={:?}",
+                    preview_text(current_class, 96),
+                    preview_text(&member_prefix, 64),
+                    final_items.len(),
+                    started_at.elapsed().as_millis(),
+                    preview_labels(&final_items, 8),
+                );
+
+                return Ok(json!(final_items));
             }
 
+            info!(
+                "completion.server.finish mode=super status=no_current_class prefix={} elapsed_ms={}",
+                preview_text(&member_prefix, 64),
+                started_at.elapsed().as_millis(),
+            );
             return Ok(json!([]));
         }
 
@@ -281,7 +363,7 @@ pub fn process_completion_with_engine(
                 &mut ctx,
                 engine_ctx.as_mut(),
                 &ty,
-                request.prefix,
+                request.prefix.clone(),
                 &buffer_inheritance,
                 cache,
                 persistent_cache,
@@ -289,9 +371,28 @@ pub fn process_completion_with_engine(
                 false,
             )?;
 
-            return Ok(json!(dedupe_completion_items(members)));
+            let final_items = dedupe_completion_items(members);
+            info!(
+                "completion.server.finish mode=member receiver={} resolved_type={} current_class={} prefix={} count={} elapsed_ms={} preview={:?}",
+                preview_text(&receiver_text, 96),
+                preview_text(&ty, 96),
+                preview_text(current_class.as_deref().unwrap_or(""), 96),
+                preview_text(&member_prefix, 64),
+                final_items.len(),
+                started_at.elapsed().as_millis(),
+                preview_labels(&final_items, 8),
+            );
+
+            return Ok(json!(final_items));
         }
 
+        info!(
+            "completion.server.finish mode=member status=no_resolved_type receiver={} current_class={} prefix={} elapsed_ms={}",
+            preview_text(&receiver_text, 96),
+            preview_text(current_class.as_deref().unwrap_or(""), 96),
+            preview_text(&member_prefix, 64),
+            started_at.elapsed().as_millis(),
+        );
         return Ok(json!([]));
     }
 
@@ -303,10 +404,13 @@ pub fn process_completion_with_engine(
         character as usize,
         &prefix,
     );
+    let local_count = items.len();
 
     let buffer_items = collect_buffer_symbol_items(root, content, line as usize, &prefix);
+    let buffer_count = buffer_items.len();
     merge_completion_items(&mut items, buffer_items, MAX_COMPLETION_ITEMS);
 
+    let mut class_member_count = 0usize;
     if !prefix.is_empty() {
         if let Some(current_class) = enclosing_class(cursor_node, content) {
             let members = fetch_members_with_engine(
@@ -320,33 +424,62 @@ pub fn process_completion_with_engine(
                 Some(&current_class),
                 false,
             )?;
+            class_member_count = members.len();
 
             merge_completion_items(&mut items, members, MAX_COMPLETION_ITEMS);
         }
     }
 
+    let mut snippet_count = 0usize;
     if should_offer_ue_snippets(&prefix) {
-        merge_completion_items(&mut items, ue_snippets(&prefix), MAX_COMPLETION_ITEMS);
+        let snippets = ue_snippets(&prefix);
+        snippet_count = snippets.len();
+        merge_completion_items(&mut items, snippets, MAX_COMPLETION_ITEMS);
     }
 
     let prefix_len = prefix.chars().count();
+    let mut project_global_count = 0usize;
+    let mut engine_global_count = 0usize;
     if prefix_len >= MIN_GLOBAL_PREFIX_LEN && strong_item_count(&items) < STRONG_MATCH_TARGET {
-        merge_completion_items(&mut items, fetch_global_symbols(conn, &prefix)?, MAX_COMPLETION_ITEMS);
+        let global_items = fetch_global_symbols(conn, &prefix)?;
+        project_global_count = global_items.len();
+        merge_completion_items(&mut items, global_items, MAX_COMPLETION_ITEMS);
 
         if prefix_len >= MIN_ENGINE_GLOBAL_PREFIX_LEN
             && strong_item_count(&items) < STRONG_MATCH_TARGET
         {
             if let Some(engine_ctx) = engine_ctx.as_ref() {
-            merge_completion_items(
-                &mut items,
-                fetch_global_symbols(engine_ctx.conn, &prefix)?,
-                MAX_COMPLETION_ITEMS,
-            );
+                let engine_items = fetch_global_symbols(engine_ctx.conn, &prefix)?;
+                engine_global_count = engine_items.len();
+                merge_completion_items(
+                    &mut items,
+                    engine_items,
+                    MAX_COMPLETION_ITEMS,
+                );
             }
         }
     }
 
-    Ok(json!(dedupe_completion_items(items)))
+    let strong_count = strong_item_count(&items);
+    let merged_count = items.len();
+    let final_items = dedupe_completion_items(items);
+    info!(
+        "completion.server.finish mode=global prefix={} local={} buffer={} class={} snippets={} project_global={} engine_global={} strong={} merged={} final={} elapsed_ms={} preview={:?}",
+        preview_text(&prefix, 64),
+        local_count,
+        buffer_count,
+        class_member_count,
+        snippet_count,
+        project_global_count,
+        engine_global_count,
+        strong_count,
+        merged_count,
+        final_items.len(),
+        started_at.elapsed().as_millis(),
+        preview_labels(&final_items, 8),
+    );
+
+    Ok(json!(final_items))
 }
 
 /// Complete members for the direct parent of the current class with Engine fallback.
