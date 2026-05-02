@@ -22,10 +22,10 @@ local function refresh_progress_title(payload, opts)
 	end
 
 	if payload and payload.engine_root == nil then
-		return "UCore engine index"
+		return "UCore Engine Index"
 	end
 
-	return "UCore project index"
+	return "UCore Project Index"
 end
 
 function M.refresh(payload, callback, opts)
@@ -43,7 +43,7 @@ function M.refresh(payload, callback, opts)
 			return cli.refresh(payload, callback)
 		end
 
-		progress.fail("UCore index failed: " .. text)
+		progress.fail("UCore Index Failed: " .. text)
 		callback(nil, err)
 	end)
 end

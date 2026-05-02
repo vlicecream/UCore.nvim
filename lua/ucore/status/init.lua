@@ -5,15 +5,83 @@ local boot_active = false
 local state = "running"
 local notify_handle = nil
 local notify_id = "ucore.status"
+local pending_finish_message = nil
+local spinner_frames = { "", "", "", "", "", "", "", "", "", "", "", "" }
+local spinner_index = 1
+local spinner_active_keys = {}
+local spinner_scheduled = false
+local render
 
 local ordered_keys = {
 	"boot",
-	"progress:UCore other initialization",
-	"progress:UCore clangd database",
-	"progress:UCore syntax highlight",
-	"progress:UCore project index",
-	"progress:UCore engine index",
+	"progress:UCore Other Initialization",
+	"progress:UCore Clangd Database",
+	"progress:UCore Syntax Highlight",
+	"progress:UCore Project Index",
+	"progress:UCore Engine Index",
+	"progress:UCore Clangd Index",
 }
+
+local function has_spinner_items()
+	for key, active in pairs(spinner_active_keys) do
+		if active and items[key] then
+			return true
+		end
+	end
+
+	return false
+end
+
+local function spinner_frame()
+	return spinner_frames[spinner_index] or spinner_frames[1]
+end
+
+local function render_line(key, message)
+	if spinner_active_keys[key] and message and message ~= "" then
+		return string.format("%s %s", message, spinner_frame())
+	end
+
+	return message
+end
+
+local function clear_progress_items()
+	for key, _ in pairs(items) do
+		if key:match("^progress:") then
+			items[key] = nil
+			spinner_active_keys[key] = nil
+		end
+	end
+end
+
+local function maybe_clear_completed_panel()
+	if state ~= "complete" or boot_active or has_spinner_items() then
+		return
+	end
+
+	local boot_text = items.boot
+	if not boot_text then
+		return
+	end
+
+	vim.defer_fn(function()
+		if state == "complete" and not boot_active and not has_spinner_items() and items.boot == boot_text then
+			M.clear_all()
+		end
+	end, 5000)
+end
+
+local function maybe_apply_pending_finish()
+	if not pending_finish_message or boot_active or has_spinner_items() then
+		return
+	end
+
+	state = "complete"
+	clear_progress_items()
+	items.boot = pending_finish_message
+	pending_finish_message = nil
+	render()
+	maybe_clear_completed_panel()
+end
 
 -- Collect visible status lines in stable user-facing order.
 -- 按稳定的用户可见顺序收集状态行。
@@ -23,14 +91,14 @@ local function collect_lines()
 
 	for _, key in ipairs(ordered_keys) do
 		if items[key] then
-			table.insert(lines, items[key])
+			table.insert(lines, render_line(key, items[key]))
 			seen[key] = true
 		end
 	end
 
 	for key, line in pairs(items) do
 		if not seen[key] then
-			table.insert(lines, line)
+			table.insert(lines, render_line(key, line))
 		end
 	end
 
@@ -59,7 +127,7 @@ end
 
 -- Render the current status lines as one replaceable notification.
 -- 将当前状态渲染成一条可替换的通知，交给 noice/notify 管理位置。
-local function render()
+function render()
 	local lines = collect_lines()
 
 	if #lines == 0 then
@@ -87,10 +155,30 @@ local function render()
 	end
 end
 
+local function schedule_spinner()
+	if spinner_scheduled or not has_spinner_items() then
+		return
+	end
+
+	spinner_scheduled = true
+	vim.defer_fn(function()
+		spinner_scheduled = false
+		if not has_spinner_items() then
+			return
+		end
+
+		spinner_index = (spinner_index % #spinner_frames) + 1
+		render()
+		schedule_spinner()
+	end, 120)
+end
+
 local function reset_notification()
 	items = {}
 	boot_active = false
 	state = "running"
+	pending_finish_message = nil
+	spinner_active_keys = {}
 	render()
 end
 
@@ -99,13 +187,17 @@ end
 function M.set(key, message)
 	items[key] = message
 	render()
+	schedule_spinner()
 end
 
 -- Clear one status line.
 -- 清理一条状态行。
 function M.clear(key)
+	spinner_active_keys[key] = nil
 	items[key] = nil
 	render()
+	maybe_apply_pending_finish()
+	maybe_clear_completed_panel()
 end
 
 -- Clear the whole status panel.
@@ -120,21 +212,17 @@ function M.start(message)
 	reset_notification()
 	boot_active = true
 	state = "running"
-	M.set("boot", message or "UCore initializing...")
+	spinner_active_keys.boot = true
+	M.set("boot", message or "UCore Initializing...")
 end
 
 -- Mark initialization as complete and hide the whole panel shortly after.
 -- 标记初始化完成，并在短暂显示后隐藏整个面板。
 function M.finish(message)
-	state = "complete"
-	local text = message or "UCore READY - initialization complete"
-	M.set("boot", text)
-
-	vim.defer_fn(function()
-		if items.boot == text then
-			M.clear_all()
-		end
-	end, 5000)
+	boot_active = false
+	spinner_active_keys.boot = nil
+	pending_finish_message = message or "UCore Ready - Initialization Complete"
+	maybe_apply_pending_finish()
 end
 
 -- Mark initialization as failed and keep the error visible.
@@ -142,7 +230,9 @@ end
 function M.fail(message, detail)
 	boot_active = false
 	state = "failed"
-	local text = message or "UCore initialization failed"
+	pending_finish_message = nil
+	spinner_active_keys.boot = nil
+	local text = message or "UCore Initialization Failed"
 	if detail and detail ~= "" then
 		text = text .. " | " .. tostring(detail)
 	end
@@ -153,31 +243,31 @@ end
 -- Update a progress line.
 -- 更新一条进度状态。
 function M.progress(title, message)
-	M.set("progress:" .. title, message)
+	local key = "progress:" .. title
+	spinner_active_keys[key] = true
+	M.set(key, message)
 end
 
 -- Complete a progress line and hide it shortly after.
 -- 完成一条进度状态，并在短暂显示后隐藏。
 function M.progress_finish(title, message)
 	local key = "progress:" .. title
-	local text = message or string.format("%s complete", title)
-	M.set(key, text)
-
+	spinner_active_keys[key] = nil
+	local text = message or string.format("%s Complete", title)
 	if boot_active then
+		M.set(key, text)
 		return
 	end
 
-	vim.defer_fn(function()
-		if items[key] == text then
-			M.clear(key)
-		end
-	end, 5000)
+	M.clear(key)
 end
 
 -- Mark a progress line as failed and keep it visible.
 -- 标记一条进度失败，并保留方便排查。
 function M.progress_fail(title, message)
-	M.set("progress:" .. title, message)
+	local key = "progress:" .. title
+	spinner_active_keys[key] = nil
+	M.set(key, message)
 end
 
 return M

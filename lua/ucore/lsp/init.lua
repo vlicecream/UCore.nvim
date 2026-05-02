@@ -1,5 +1,6 @@
 local config = require("ucore.config")
 local project = require("ucore.project")
+local status = require("ucore.status")
 
 local M = {}
 local uv = vim.uv or vim.loop
@@ -516,6 +517,182 @@ local function filtered_publish_diagnostics_handler(user_handler)
 	end
 end
 
+local function normalize_clangd_file_status(result)
+	if type(result) ~= "table" then
+		return nil
+	end
+
+	local state = result.state or result.status or result.message
+	if type(state) ~= "string" then
+		return nil
+	end
+
+	state = vim.trim(state)
+	if state == "" then
+		return nil
+	end
+
+	return state
+end
+
+local clangd_progress_state = {}
+
+local function progress_message_title(value)
+	local parts = {}
+	local title = type(value.title) == "string" and vim.trim(value.title) or ""
+	local message = type(value.message) == "string" and vim.trim(value.message) or ""
+
+	if title ~= "" then
+		table.insert(parts, title)
+	end
+
+	if message ~= "" and message ~= title then
+		table.insert(parts, message)
+	end
+
+	return table.concat(parts, " - ")
+end
+
+local function render_clangd_progress(client_id)
+	local state = clangd_progress_state[client_id]
+	local title = "UCore Clangd Index"
+
+	if not state then
+		status.clear("progress:" .. title)
+		return
+	end
+
+	local chosen = nil
+	for _, item in pairs(state.tokens or {}) do
+		if not chosen then
+			chosen = item
+		end
+
+		local text = ((item.title or "") .. " " .. (item.message or "")):lower()
+		if text:find("index", 1, true) then
+			chosen = item
+			break
+		end
+	end
+
+	if chosen then
+		local detail = progress_message_title(chosen)
+		local percent = tonumber(chosen.percentage)
+		if percent then
+			percent = math.max(0, math.min(100, math.floor(percent)))
+		end
+
+		if detail ~= "" and percent ~= nil then
+			status.progress(title, string.format("UCore Clangd Index %d%% - %s", percent, detail))
+			return
+		end
+
+		if percent ~= nil then
+			status.progress(title, string.format("UCore Clangd Index %d%%", percent))
+			return
+		end
+
+		if detail ~= "" then
+			status.progress(title, "UCore Clangd Index - " .. detail)
+			return
+		end
+
+		status.progress(title, "UCore Clangd Index")
+		return
+	end
+
+	local file_status = state.file_status
+	if file_status and file_status ~= "" then
+		local lowered = file_status:lower()
+		if lowered:find("idle", 1, true) or lowered:find("ready", 1, true) then
+			status.progress_finish(title, "UCore Clangd Index 100%")
+		else
+			status.progress(title, "UCore Clangd Index - " .. file_status)
+		end
+		return
+	end
+
+	status.clear("progress:" .. title)
+end
+
+local function normalize_progress_value(result)
+	if type(result) ~= "table" then
+		return nil
+	end
+
+	local value = result.value
+	if type(value) ~= "table" then
+		return nil
+	end
+
+	return {
+		token = result.token,
+		kind = value.kind,
+		title = value.title,
+		message = value.message,
+		percentage = value.percentage,
+	}
+end
+
+local function clangd_progress_handler(user_handler)
+	return function(err, result, ctx, cfg)
+		local client = ctx and ctx.client_id and vim.lsp.get_client_by_id(ctx.client_id) or nil
+		if client and client.name == "clangd" then
+			local value = normalize_progress_value(result)
+			local state = clangd_progress_state[client.id] or {
+				tokens = {},
+				file_status = nil,
+			}
+			clangd_progress_state[client.id] = state
+
+			if value and value.token ~= nil then
+				local token_key = tostring(value.token)
+				if value.kind == "end" then
+					state.tokens[token_key] = nil
+				else
+					local current = state.tokens[token_key] or {}
+					current.kind = value.kind
+					current.title = type(value.title) == "string" and value.title or current.title
+					current.message = type(value.message) == "string" and value.message or current.message
+					current.percentage = tonumber(value.percentage) or current.percentage
+					state.tokens[token_key] = current
+				end
+			end
+
+			render_clangd_progress(client.id)
+			return
+		end
+
+		if type(user_handler) == "function" then
+			return user_handler(err, result, ctx, cfg)
+		end
+
+		return vim.lsp.handlers["$/progress"](err, result, ctx, cfg)
+	end
+end
+
+local function clangd_file_status_handler(user_handler)
+	return function(err, result, ctx, cfg)
+		local client = ctx and ctx.client_id and vim.lsp.get_client_by_id(ctx.client_id) or nil
+		local state = normalize_clangd_file_status(result)
+
+		if client and client.name == "clangd" then
+			local progress_state = clangd_progress_state[client.id] or {
+				tokens = {},
+				file_status = nil,
+			}
+			progress_state.file_status = state
+			clangd_progress_state[client.id] = progress_state
+			render_clangd_progress(client.id)
+			return
+		end
+
+		if type(user_handler) == "function" then
+			return user_handler(err, result, ctx, cfg)
+		end
+	end
+end
+
 function M.find_root(fname)
 	if type(fname) == "number" then
 		fname = vim.api.nvim_buf_get_name(fname)
@@ -878,6 +1055,10 @@ function M.clangd_config(opts)
 	local user_handlers = deep_copy(opts.handlers or clangd.handlers or {})
 	user_handlers["textDocument/publishDiagnostics"] = filtered_publish_diagnostics_handler(
 		user_handlers["textDocument/publishDiagnostics"]
+	)
+	user_handlers["$/progress"] = clangd_progress_handler(user_handlers["$/progress"])
+	user_handlers["textDocument/clangd.fileStatus"] = clangd_file_status_handler(
+		user_handlers["textDocument/clangd.fileStatus"]
 	)
 
 	local merged = vim.tbl_deep_extend("force", {

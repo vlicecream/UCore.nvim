@@ -9,36 +9,42 @@ local M = {}
 
 local booting = false
 local engine_refreshing = {}
+local clangd_prewarmed = {}
+local clangd_prewarming = {}
 
 -- Report boot failures through the persistent initialization status.
 -- 通过持久初始化状态报告 boot 错误。
 local function fail(message, detail)
-	status.fail("UCore initialization failed", detail or message)
+	status.fail("UCore Initialization Failed", detail or message)
 end
 
 -- Update the non-indexing part of boot progress.
 -- 更新非索引部分的初始化进度。
 local function other_progress(percent)
-	status.progress(
-		"UCore other initialization",
-		string.format("UCore other initialization %d%%", percent)
-	)
+	local title = "UCore Other Initialization"
+	local message = string.format("UCore Other Initialization %d%%", percent)
+	if percent >= 100 then
+		status.progress_finish(title, message)
+		return
+	end
+
+	status.progress(title, message)
 end
 
 local function clangd_progress(percent)
 	status.progress(
-		"UCore clangd database",
-		string.format("UCore clangd database %d%%", percent)
+		"UCore Clangd Database",
+		string.format("UCore Clangd Database %d%%", percent)
 	)
 end
 
 local function clangd_progress_done(result)
 	if type(result) == "table" and result.generated == false then
-		status.progress_finish("UCore clangd database", "UCore clangd database 100% (cached)")
+		status.progress_finish("UCore Clangd Database", "UCore Clangd Database 100% (Cached)")
 		return
 	end
 
-	status.progress_finish("UCore clangd database", "UCore clangd database 100%")
+	status.progress_finish("UCore Clangd Database", "UCore Clangd Database 100%")
 end
 
 -- Build a setup/refresh/watch payload for the current Unreal project.
@@ -118,17 +124,17 @@ local function run_engine_refresh_if_needed(payload, callback)
 	local engine_paths = payload._engine_paths
 
 	if not engine or not engine_paths then
-		status.progress_finish("UCore engine index", "UCore engine index 100%")
+		status.progress_finish("UCore Engine Index", "UCore Engine Index 100%")
 		return callback(true)
 	end
 
 	if not project.engine_needs_refresh(engine) then
-		status.progress_finish("UCore engine index", "UCore engine index 100%")
+		status.progress_finish("UCore Engine Index", "UCore Engine Index 100%")
 		return callback(true)
 	end
 
 	if engine_refreshing[engine.engine_id] then
-		status.progress_finish("UCore engine index", "UCore engine index 100%")
+		status.progress_finish("UCore Engine Index", "UCore Engine Index 100%")
 		return callback(true)
 	end
 
@@ -159,11 +165,11 @@ end
 local function run_engine_refresh_in_background(payload)
 	run_engine_refresh_if_needed(payload, function(ok, err)
 		if ok then
-			status.finish("UCore READY - initialization complete")
+			status.finish("UCore Ready - Initialization Complete")
 			return
 		end
 
-		status.fail("UCore engine index failed", tostring(err))
+		status.fail("UCore Engine Index Failed", tostring(err))
 	end)
 end
 
@@ -171,7 +177,7 @@ end
 -- 当 setup 判断数据库缺失或过期时执行 refresh。
 local function run_refresh_if_needed(payload, setup_result, callback)
 	if not setup_result.needs_full_refresh then
-		status.progress_finish("UCore project index", "UCore project index 100%")
+		status.progress_finish("UCore Project Index", "UCore Project Index 100%")
 		return callback(true)
 	end
 
@@ -208,9 +214,40 @@ end
 -- 在 boot 期间准备 clangd 的 compile_commands.json，避免再手动跑命令。
 local function run_clangd_prepare(payload, callback)
 	local clangd = (config.values.lsp and config.values.lsp.clangd) or {}
+	local project_root = payload.project_root
+	if project_root and clangd_prewarmed[project_root] then
+		status.progress_finish("UCore Clangd Database", "UCore Clangd Database 100% (Cached)")
+		return callback(true, {
+			compile_commands_dir = lsp.find_compilation_database(project_root),
+			generated = false,
+			staged = true,
+		})
+	end
+
+	if project_root and clangd_prewarming[project_root] then
+		table.insert(clangd_prewarming[project_root], callback)
+		return
+	end
+
 	if clangd.auto_generate_compile_commands == false then
-		status.progress_finish("UCore clangd database", "UCore clangd database skipped")
+		status.progress_finish("UCore Clangd Database", "UCore Clangd Database Skipped")
 		return callback(true)
+	end
+
+	if project_root then
+		clangd_prewarming[project_root] = { callback }
+	end
+
+	local function finish_callbacks(ok, result)
+		if not project_root then
+			return callback(ok, result)
+		end
+
+		local pending = clangd_prewarming[project_root] or {}
+		clangd_prewarming[project_root] = nil
+		for _, cb in ipairs(pending) do
+			cb(ok, result)
+		end
 	end
 
 	clangd_progress(0)
@@ -220,19 +257,33 @@ local function run_clangd_prepare(payload, callback)
 		remove_source = true,
 	}, function(ok, result)
 		if ok then
+			if project_root then
+				clangd_prewarmed[project_root] = true
+			end
 			clangd_progress_done(result)
-			return callback(true, result)
+			return finish_callbacks(true, result)
 		end
 
-		status.progress_fail("UCore clangd database", "UCore clangd database failed")
+		status.progress_fail("UCore Clangd Database", "UCore Clangd Database Failed")
 		vim.schedule(function()
 			vim.notify(
-				"UCore clangd database generation failed:\n" .. tostring(result),
+				"UCore Clangd Database Generation Failed:\n" .. tostring(result),
 				vim.log.levels.WARN
 			)
 		end)
-		callback(true)
+		finish_callbacks(true)
 	end)
+end
+
+-- Warm clangd compile_commands once for the current project during setup.
+-- 在 setup 期间为当前工程预热一次 clangd 的 compile_commands。
+function M.prewarm_clangd(project_root)
+	local payload, err = current_project_payload(project_root)
+	if not payload or err then
+		return
+	end
+
+	run_clangd_prepare(payload, function() end)
 end
 
 -- Boot the whole UCore stack for the current Unreal project.
@@ -242,7 +293,7 @@ function M.boot(callback, opts)
 	opts = opts or {}
 
 	if booting then
-		status.start("UCore initializing...")
+		status.start("UCore Initializing...")
 		return callback(false, "already booting")
 	end
 
@@ -258,7 +309,7 @@ function M.boot(callback, opts)
 	end
 
 	booting = true
-	status.start("UCore initializing...")
+	status.start("UCore Initializing...")
 	other_progress(0)
 
 	server.start(function(ok, start_message)
