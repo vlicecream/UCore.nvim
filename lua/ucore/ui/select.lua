@@ -659,6 +659,7 @@ local function pick_telescope_find(items, default_text)
 		backend = "telescope",
 		default_text = default_text or "",
 		item_count = #items,
+		sorting_strategy = "ascending",
 	})
 
 	if vim.tbl_isempty(items) then
@@ -673,6 +674,7 @@ local function pick_telescope_find(items, default_text)
 		.new({}, {
 			prompt_title = "UCore find",
 			default_text = default_text,
+			sorting_strategy = "ascending",
 			-- Telescope's default reset strategy can try to restore row 1 while
 			-- the filtered results buffer is temporarily empty, which trips
 			-- `Invalid cursor line: out of range` on first prompt edits.
