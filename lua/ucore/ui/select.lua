@@ -252,43 +252,6 @@ local function find_search_text(item, name, kind, label, path)
 	}, " ")
 end
 
-local function find_compact_search_text(item, name, path)
-	path = tostring(path or "")
-	local normalized_path = path:gsub("\\", "/")
-	local filename = vim.fn.fnamemodify(normalized_path, ":t")
-
-	return table.concat({
-		name,
-		tostring(item.class_name or ""),
-		tostring(item.module_name or ""),
-		tostring(item.config_section or ""),
-		tostring(item.asset_path or ""),
-		filename,
-	}, " ")
-end
-
-local function normalize_search_key(text)
-	return tostring(text or ""):lower():gsub("[_%-%s:/\\\\%.%[%]%(%)]+", "")
-end
-
-local function has_subsequence(needle, haystack)
-	if needle == "" then
-		return true
-	end
-
-	local index = 1
-	for pos = 1, #haystack do
-		if haystack:sub(pos, pos) == needle:sub(index, index) then
-			index = index + 1
-			if index > #needle then
-				return true
-			end
-		end
-	end
-
-	return false
-end
-
 local function find_item_key(item)
 	local path = normalize_path(item.path or item.file_path or item.asset_path or "")
 	local line = tonumber(item.line or item.line_number or 1) or 1
@@ -380,8 +343,6 @@ local function prepare_find_items(items)
 			location
 		)
 		item._ucore_find_ordinal = find_search_text(item, name, kind, label, path)
-		item._ucore_find_search = find_compact_search_text(item, name, path)
-		item._ucore_find_search_norm = normalize_search_key(item._ucore_find_search)
 	end
 
 	result.__ucore_prepared = true
@@ -685,18 +646,12 @@ local function pick_telescope_find(items, default_text)
 			}),
 			sorter = sorters.Sorter:new({
 				discard = true,
-				start = function(self, prompt)
-					self._ucore_prompt_norm = normalize_search_key(prompt)
-				end,
 				scoring_function = function(sorter, prompt, line, entry)
 					if prompt == "" then
 						return entry.index or 1
 					end
 
-					local normalized_prompt = sorter._ucore_prompt_norm or ""
-					local search_norm = entry.value and entry.value._ucore_find_search_norm or ""
-
-					if not has_subsequence(normalized_prompt, search_norm) then
+					if not fzy.has_match(prompt, line) then
 						return -1
 					end
 
