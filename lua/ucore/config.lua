@@ -94,6 +94,10 @@ M.values = {
 		"DirChanged",
 	},
 
+	-- Auto-save interval in seconds. `0` disables auto-save.
+	-- 自动保存间隔，单位秒。`0` 表示关闭。
+	autosave = 0,
+
 	-- Refresh progress notification options.
 	-- refresh 进度通知配置。
 	progress = {
@@ -168,10 +172,6 @@ M.values = {
 	-- Completion integration options.
 	-- 补全集成配置。
 	completion = {
-		-- Enable UCore completion integration.
-		-- 是否启用 UCore 补全集成。
-		enable = true,
-
 		-- Minimum identifier prefix length before global completion starts.
 		-- 触发全局补全所需的最短标识符前缀长度。
 		min_chars = 2,

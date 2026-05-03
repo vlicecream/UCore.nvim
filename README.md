@@ -84,7 +84,6 @@ return {
     opts = {
       auto_boot = true,
       completion = {
-        enable = true,
         min_chars = 2,
         debounce_ms = 180,
       },
@@ -135,11 +134,7 @@ Recommended setup:
 
 For a normal Windows Unreal setup, you usually do not need to hardcode a `clangd.exe` path or manage `compile_commands.json` manually. UCore tries to resolve both automatically.
 
-You can also generate the Unreal compilation database directly from UCore:
-
-```vim
-:UCore debug generate-db
-```
+During normal `:UCore` boot, UCore can generate and stage the Unreal compilation database automatically when UnrealBuildTool is available.
 
 If your compilation database lives outside the project root:
 
@@ -229,11 +224,10 @@ With `auto_boot = true`, UCore boots automatically when you enter the project.
 :UCore build-cancel
 :UCore editor
 :UCore explorer
-:UCore globalfind [pattern]
+:UCore find [pattern]
+:UCore diagnostics [refresh|clear|action|fix|qflist|toggle]
 :UCore goto <definition|declaration|implementation|references|source>
-:UCore debug status
-:UCore debug logs
-:UCore debug rpc-status
+:UCore help
 :checkhealth ucore
 ```
 
@@ -259,7 +253,6 @@ require("ucore").setup({
     picker = "telescope",
   },
   completion = {
-    enable = true,
     min_chars = 2,
     debounce_ms = 180,
   },
@@ -305,15 +298,14 @@ The backend prefers release binaries under `u-scanner/target/release/` and falls
 
 ```vim
 :checkhealth ucore
-:UCore debug status
-:UCore debug logs
+:UCore
 ```
 
 Common cases:
 
 - Rust missing: install from `https://rustup.rs/`
 - project not indexed yet: run `:UCore` and wait for boot/indexing
-- server not ready: check `:UCore debug logs`
+- server not ready: run `:UCore`, wait for boot, then re-run `:checkhealth ucore`
 - no syntax highlight: install `UTreeSitter.nvim`, then run `:checkhealth utreesitter`
 
 ### Related Repositories
@@ -410,7 +402,6 @@ return {
     opts = {
       auto_boot = true,
       completion = {
-        enable = true,
         min_chars = 2,
         debounce_ms = 180,
       },
@@ -461,11 +452,7 @@ UCore 自己主要负责：
 
 对大多数 Windows Unreal 环境来说，通常不需要手写 `clangd.exe` 路径，也不需要自己管理 `compile_commands.json` 放哪里，UCore 会优先自动处理。
 
-也可以直接让 UCore 帮你跑 UnrealBuildTool 生成编译数据库：
-
-```vim
-:UCore debug generate-db
-```
+正常执行 `:UCore` boot 时，只要 UnrealBuildTool 可用，UCore 就会自动生成并缓存 Unreal 的 compilation database。
 
 如果你的编译数据库不在项目根目录下：
 
@@ -555,11 +542,10 @@ require("ucore").setup({
 :UCore build-cancel
 :UCore editor
 :UCore explorer
-:UCore globalfind [pattern]
+:UCore find [pattern]
+:UCore diagnostics [refresh|clear|action|fix|qflist|toggle]
 :UCore goto <definition|declaration|implementation|references|source>
-:UCore debug status
-:UCore debug logs
-:UCore debug rpc-status
+:UCore help
 :checkhealth ucore
 ```
 
@@ -585,7 +571,6 @@ require("ucore").setup({
     picker = "telescope",
   },
   completion = {
-    enable = true,
     min_chars = 2,
     debounce_ms = 180,
   },
@@ -630,15 +615,14 @@ Neovim (Lua)
 
 ```vim
 :checkhealth ucore
-:UCore debug status
-:UCore debug logs
+:UCore
 ```
 
 常见情况：
 
 - 没装 Rust：从 `https://rustup.rs/` 安装
 - 项目还没建索引：运行 `:UCore` 并等待 boot/index 完成
-- 服务没有起来：查看 `:UCore debug logs`
+- 服务没有起来：先执行 `:UCore`，等待 boot 完成后再运行 `:checkhealth ucore`
 - 没有语法高亮：安装 `UTreeSitter.nvim`，然后运行 `:checkhealth utreesitter`
 
 ### 相关仓库

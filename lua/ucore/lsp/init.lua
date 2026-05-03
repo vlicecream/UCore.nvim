@@ -393,6 +393,58 @@ local function should_filter_clangd_diagnostic(diagnostic, clangd)
 	return false
 end
 
+local foundational_unreal_includes = {
+	["coreminimal.h"] = true,
+	["engineminimal.h"] = true,
+	["uobject/objectmacros.h"] = true,
+	["uobject/scriptmacros.h"] = true,
+}
+
+local function diagnostic_start_line(diagnostic)
+	local range = diagnostic and diagnostic.range or nil
+	local start_range = range and range.start or nil
+	return start_range and tonumber(start_range.line) or nil
+end
+
+local function line_text(bufnr, row)
+	if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then
+		return ""
+	end
+
+	local lines = vim.api.nvim_buf_get_lines(bufnr, row, row + 1, false)
+	return lines[1] or ""
+end
+
+local function normalize_include_target(include_line)
+	local target = tostring(include_line or ""):match('^%s*#%s*include%s*[<"]([^>"]+)[>"]')
+	if not target then
+		return nil
+	end
+
+	target = target:gsub("\\", "/"):lower()
+	return target
+end
+
+local function should_filter_foundational_unreal_include_warning(bufnr, diagnostic)
+	if not should_filter_clangd_diagnostic(diagnostic, {
+		suppress_unused_include_warnings = true,
+	}) then
+		return false
+	end
+
+	local row = diagnostic_start_line(diagnostic)
+	if row == nil then
+		return false
+	end
+
+	local include_target = normalize_include_target(line_text(bufnr, row))
+	if not include_target then
+		return false
+	end
+
+	return foundational_unreal_includes[include_target] == true
+end
+
 local function clangd_diagnostic_code(diagnostic)
 	local code = diagnostic and diagnostic.code
 	if type(code) == "table" then
@@ -501,7 +553,12 @@ local function filtered_publish_diagnostics_handler(user_handler)
 
 			local filtered = {}
 			for _, diagnostic in ipairs(result.diagnostics) do
-				if not should_filter_clangd_diagnostic(diagnostic, clangd) then
+				local suppress = should_filter_clangd_diagnostic(diagnostic, clangd)
+				if not suppress and bufnr and vim.api.nvim_buf_is_valid(bufnr) then
+					suppress = should_filter_foundational_unreal_include_warning(bufnr, diagnostic)
+				end
+
+				if not suppress then
 					table.insert(
 						filtered,
 						bufnr and vim.api.nvim_buf_is_valid(bufnr)
@@ -562,6 +619,9 @@ local function render_clangd_progress(client_id)
 		return
 	end
 
+	local has_active_tokens = next(state.tokens or {}) ~= nil
+	local is_completed = state.completed == true
+
 	local chosen = nil
 	for _, item in pairs(state.tokens or {}) do
 		if not chosen then
@@ -580,6 +640,14 @@ local function render_clangd_progress(client_id)
 		local percent = tonumber(chosen.percentage)
 		if percent then
 			percent = math.max(0, math.min(100, math.floor(percent)))
+		end
+
+		if percent ~= nil and percent < 100 then
+			state.completed = false
+		end
+
+		if is_completed and not has_active_tokens and percent == 100 then
+			return
 		end
 
 		if detail ~= "" and percent ~= nil then
@@ -605,10 +673,19 @@ local function render_clangd_progress(client_id)
 	if file_status and file_status ~= "" then
 		local lowered = file_status:lower()
 		if lowered:find("idle", 1, true) or lowered:find("ready", 1, true) then
+			if is_completed and not has_active_tokens then
+				return
+			end
+			state.completed = true
 			status.progress_finish(title, "UCore Clangd Index 100%")
 		else
+			state.completed = false
 			status.progress(title, "UCore Clangd Index - " .. file_status)
 		end
+		return
+	end
+
+	if is_completed and not has_active_tokens then
 		return
 	end
 
@@ -642,6 +719,7 @@ local function clangd_progress_handler(user_handler)
 			local state = clangd_progress_state[client.id] or {
 				tokens = {},
 				file_status = nil,
+				completed = false,
 			}
 			clangd_progress_state[client.id] = state
 
@@ -656,6 +734,9 @@ local function clangd_progress_handler(user_handler)
 					current.message = type(value.message) == "string" and value.message or current.message
 					current.percentage = tonumber(value.percentage) or current.percentage
 					state.tokens[token_key] = current
+					if current.percentage ~= nil and current.percentage < 100 then
+						state.completed = false
+					end
 				end
 			end
 
@@ -680,8 +761,15 @@ local function clangd_file_status_handler(user_handler)
 			local progress_state = clangd_progress_state[client.id] or {
 				tokens = {},
 				file_status = nil,
+				completed = false,
 			}
 			progress_state.file_status = state
+			if state and state ~= "" then
+				local lowered = state:lower()
+				if not (lowered:find("ready", 1, true) or lowered:find("idle", 1, true)) then
+					progress_state.completed = false
+				end
+			end
 			clangd_progress_state[client.id] = progress_state
 			render_clangd_progress(client.id)
 			return

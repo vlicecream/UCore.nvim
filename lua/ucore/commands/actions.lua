@@ -1,6 +1,3 @@
-local client = require("ucore.client")
-local config = require("ucore.config")
-local maps = require("ucore.maps")
 local project = require("ucore.project")
 local remote = require("ucore.remote")
 local server = require("ucore.server")
@@ -8,7 +5,6 @@ local ui = require("ucore.ui")
 local unreal = require("ucore.unreal")
 local bootstrap = require("ucore.bootstrap")
 local dirty = require("ucore.editing.dirty")
-local lsp = require("ucore.lsp")
 local navigation = require("ucore.navigation")
 local explorer = require("ucore.explorer")
 
@@ -80,10 +76,6 @@ local function current_project_label()
 	return string.format("%s - %s", name, root)
 end
 
-local function yes_no(value)
-	return value and "yes" or "no"
-end
-
 local function file_state(path)
 	if not path or path == "" then
 		return "missing"
@@ -94,78 +86,6 @@ local function file_state(path)
 	end
 
 	return "missing"
-end
-
-local function dir_state(path)
-	if not path or path == "" then
-		return "missing"
-	end
-
-	if vim.fn.isdirectory(path) == 1 then
-		return "ok"
-	end
-
-	return "missing"
-end
-
-local function format_cmd(cmd)
-	if type(cmd) ~= "table" then
-		return tostring(cmd or "")
-	end
-
-	return table.concat(vim.tbl_map(tostring, cmd), " ")
-end
-
-local function open_scratch(title, lines)
-	vim.cmd("botright new")
-	local buf = vim.api.nvim_get_current_buf()
-	vim.bo[buf].buftype = "nofile"
-	vim.bo[buf].bufhidden = "wipe"
-	vim.bo[buf].swapfile = false
-	vim.bo[buf].filetype = "ucore-status"
-	pcall(vim.api.nvim_buf_set_name, buf, "ucore://" .. title:gsub("%s+", "-"):lower() .. "/" .. tostring(buf))
-	vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-	vim.bo[buf].modified = false
-	return buf
-end
-
-local function latest_server_log()
-	local candidates = {}
-	local session_log = server.log_path()
-	local fallback
-
-	if session_log and session_log ~= "" then
-		table.insert(candidates, session_log)
-		fallback = session_log
-	end
-
-	local root = project.find_project_root()
-	if root then
-		local path = project.build_paths(root).log_path
-		table.insert(candidates, path)
-		fallback = fallback or path
-	end
-
-	for _, path in ipairs(vim.fn.glob(config.values.cache_dir .. "/**/u_core_server.log", false, true)) do
-		table.insert(candidates, path)
-	end
-
-	local best
-	local best_time = -1
-	local seen = {}
-	for _, path in ipairs(candidates) do
-		path = tostring(path or "")
-		if path ~= "" and not seen[path] and vim.fn.filereadable(path) == 1 then
-			seen[path] = true
-			local modified = vim.fn.getftime(path)
-			if modified > best_time then
-				best = path
-				best_time = modified
-			end
-		end
-	end
-
-	return best or fallback
 end
 
 -- Open the left-side UCore Explorer tree.
@@ -261,39 +181,6 @@ function M.editor(args)
 	end)
 end
 
--- Print the resolved Unreal Engine root for the current project.
--- 打印当前项目解析到的 Unreal Engine 根目录。
-function M.engine()
-	local root = project.find_project_root()
-	if not root then
-		return vim.notify("Could not find .uproject", vim.log.levels.ERROR)
-	end
-
-	local engine, err = project.engine_metadata(root)
-	if not engine then
-		return vim.notify(tostring(err), vim.log.levels.ERROR)
-	end
-
-	local paths = project.build_engine_paths(engine)
-	print(vim.inspect(vim.tbl_extend("force", engine, {
-		db_path = paths.db_path,
-		cache_db_path = paths.cache_db_path,
-		needs_refresh = project.engine_needs_refresh(engine),
-	})))
-end
-
--- Register the current Unreal project in the global registry.
--- 将当前 Unreal 项目注册到全局注册表。
-function M.register_project()
-	local root = project.find_project_root()
-	if not root then
-		return vim.notify("Could not find .uproject", vim.log.levels.ERROR)
-	end
-
-	local metadata = project.register_project(root)
-	vim.notify("UCore registered project: " .. metadata.name, vim.log.levels.INFO)
-end
-
 -- Pick and open a registered Unreal project.
 -- 选择并打开一个已注册 Unreal 项目。
 function M.open_project()
@@ -301,7 +188,7 @@ function M.open_project()
 
 	if vim.tbl_isempty(items) then
 		return vim.notify(
-			"No registered UCore projects. Open a project and run :UCore register first.",
+			"No registered UCore projects. Open a project once and let UCore register it automatically.",
 			vim.log.levels.WARN
 		)
 	end
@@ -314,12 +201,6 @@ function M.open_project()
 		project.open_project(item.root)
 		M.boot()
 	end)
-end
-
--- Print registered projects.
--- 打印已注册项目。
-function M.projects()
-	print(vim.inspect(project.list_registered_projects()))
 end
 
 -- Collect current UCore state for dashboard display.
@@ -341,7 +222,6 @@ function M.collect_dashboard_state()
 		cache_db_state = nil,
 		engine_root = nil,
 		engine_db_state = nil,
-		log_exists = nil,
 	}
 
 	if root then
@@ -352,7 +232,6 @@ function M.collect_dashboard_state()
 		local paths = project.build_paths(root)
 		state.project_db_state = file_state(paths.db_path)
 		state.cache_db_state = file_state(paths.cache_db_path)
-		state.log_exists = file_state(paths.log_path)
 
 		local engine, _ = project.engine_metadata(root)
 		if engine then
@@ -412,10 +291,6 @@ local function editor_label(state)
 		return "[no project]"
 	end
 	return "[build first]"
-end
-
-local function log_label(state)
-	return (state.log_exists == "ok") and "[available]" or "[missing]"
 end
 
 local function registered_label(state)
@@ -535,7 +410,7 @@ function M.dashboard()
 			badge = index_label(s),
 			description = "Search symbols, modules, assets, config",
 			run = index_guard(function()
-				M.global_find("")
+				M.find("")
 			end),
 		},
 		{
@@ -624,308 +499,6 @@ function M.boot()
 		end, {
 			project_root = item.root,
 		})
-	end)
-end
-
--- :UCore start
--- 启动 Rust server。
-function M.start()
-	server.start(function(ok, message)
-		if ok then
-			vim.notify(message, vim.log.levels.INFO)
-		else
-			vim.notify(message, vim.log.levels.ERROR)
-		end
-	end)
-end
-
--- :UCore stop
--- 停止当前 nvim 管理的 Rust server。
-function M.stop()
-	server.stop(function(ok, message)
-		if ok then
-			vim.notify(message, vim.log.levels.INFO)
-		else
-			vim.notify(message, vim.log.levels.ERROR)
-		end
-	end)
-end
-
--- :UCore restart
--- 重启 Rust server。
-function M.restart()
-	server.restart(function(ok, message)
-		if ok then
-			vim.notify(message, vim.log.levels.INFO)
-		else
-			vim.notify(message, vim.log.levels.ERROR)
-		end
-	end)
-end
-
--- Print command result or show an error notification.
--- 打印命令结果，或者显示错误通知。
-local function notify_result(title, result, err)
-	if err then
-		vim.notify(title .. " failed:\n" .. tostring(err), vim.log.levels.ERROR)
-		return
-	end
-
-	print(vim.inspect(result))
-end
-
--- Force-refresh the shared Unreal Engine index for the current project.
--- 强制刷新当前项目对应的共享 Unreal Engine 索引。
-function M.engine_refresh()
-	local root = project.find_project_root()
-	if not root then
-		return vim.notify("Could not find .uproject", vim.log.levels.ERROR)
-	end
-
-	local engine, err = project.engine_metadata(root)
-	if not engine then
-		return vim.notify(tostring(err), vim.log.levels.ERROR)
-	end
-
-	local paths = project.build_engine_paths(engine)
-	vim.notify("UCore engine refresh: " .. engine.engine_root, vim.log.levels.INFO)
-
-	client.refresh({
-		type = "refresh",
-		project_root = engine.engine_root,
-		engine_root = nil,
-		db_path = paths.db_path,
-		cache_db_path = paths.cache_db_path,
-		config = project.default_config(),
-		scope = "Game",
-		vcs_hash = nil,
-	}, function(result, refresh_err)
-		if refresh_err then
-			return notify_result("UCore engine refresh", result, refresh_err)
-		end
-
-		clear_find_cache()
-		project.write_engine_index_metadata(engine)
-		notify_result("UCore engine refresh", {
-			engine_id = engine.engine_id,
-			engine_root = engine.engine_root,
-			db_path = paths.db_path,
-			status = "ok",
-		}, nil)
-	end)
-end
-
--- Build a setup/refresh payload for the current Unreal project.
--- 为当前 Unreal 工程构造 setup/refresh 请求体。
-local function current_project_payload()
-	local root = project.find_project_root()
-	if not root then
-		return nil, "Could not find .uproject"
-	end
-
-	local engine, engine_err = project.engine_metadata(root)
-	if not engine then
-		return nil, engine_err
-	end
-
-	local paths = project.build_paths(root)
-
-	return {
-		project_root = paths.project_root,
-		db_path = paths.db_path,
-		cache_db_path = paths.cache_db_path,
-		config = project.default_config(),
-		engine_root = engine.engine_root,
-		vcs_hash = nil,
-	}
-end
-
--- Check server status through the CLI bridge.
--- 打开用户可读的 UCore 状态面板。
-function M.status()
-	local root = project.find_project_root()
-	local registry = project.read_registry()
-	local lines = {
-		"UCore Status",
-		"",
-		"Server",
-		"  managed by this nvim: " .. yes_no(server.is_running()),
-		"  port: " .. tostring(config.values.port),
-		"  backend mode: " .. tostring(config.values.backend_mode),
-		"  scanner command: " .. format_cmd(config.values.scanner_cmd),
-		"  server command: " .. format_cmd(config.values.server_cmd),
-		"",
-		"Cache",
-		"  cache dir: " .. tostring(config.values.cache_dir),
-		"  cache dir state: " .. dir_state(config.values.cache_dir),
-		"  registry: " .. project.global_registry_path(),
-		"  server registry: " .. project.server_registry_path(),
-		"  registered projects: " .. tostring(vim.tbl_count(registry.projects or {})),
-		"  registered engines: " .. tostring(vim.tbl_count(registry.engines or {})),
-	}
-
-	if root then
-		local paths = project.build_paths(root)
-		local metadata = registry.projects and registry.projects[root]
-		local engine, engine_err = project.engine_metadata(root)
-
-		vim.list_extend(lines, {
-			"",
-			"Current Project",
-			"  root: " .. root,
-			"  registered: " .. yes_no(type(metadata) == "table"),
-			"  db: " .. paths.db_path .. " [" .. file_state(paths.db_path) .. "]",
-			"  cache db: " .. paths.cache_db_path .. " [" .. file_state(paths.cache_db_path) .. "]",
-			"  server log: " .. paths.log_path .. " [" .. file_state(paths.log_path) .. "]",
-		})
-
-		if engine then
-			local engine_paths = project.build_engine_paths(engine)
-			vim.list_extend(lines, {
-				"",
-				"Unreal Engine",
-				"  association: " .. tostring(engine.engine_association or ""),
-				"  root: " .. tostring(engine.engine_root or ""),
-				"  id: " .. tostring(engine.engine_id or ""),
-				"  needs refresh: " .. yes_no(project.engine_needs_refresh(engine)),
-				"  db: " .. engine_paths.db_path .. " [" .. file_state(engine_paths.db_path) .. "]",
-				"  cache db: " .. engine_paths.cache_db_path .. " [" .. file_state(engine_paths.cache_db_path) .. "]",
-			})
-		else
-			vim.list_extend(lines, {
-				"",
-				"Unreal Engine",
-				"  error: " .. tostring(engine_err),
-			})
-		end
-	else
-		vim.list_extend(lines, {
-			"",
-			"Current Project",
-			"  root: not inside an Unreal project",
-			"  tip: run :UCore to choose a registered project",
-		})
-	end
-
-	local buf = open_scratch("UCore Status", lines)
-
-	client.rpc.request("status", {}, function(result, err)
-		if not vim.api.nvim_buf_is_valid(buf) then
-			return
-		end
-
-		local rpc_lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-		vim.list_extend(rpc_lines, {
-			"",
-			"RPC",
-			err and ("  status: offline [" .. tostring(err) .. "]") or "  status: online",
-		})
-
-		if not err then
-			vim.list_extend(rpc_lines, vim.split(vim.inspect(result), "\n", { plain = true }))
-		end
-
-		vim.api.nvim_buf_set_lines(buf, 0, -1, false, rpc_lines)
-		vim.bo[buf].modified = false
-	end)
-end
-
--- Open the latest known UCore server log.
--- 打开最近的 UCore server 日志。
-function M.logs()
-	local path = latest_server_log()
-
-	if not path then
-		return vim.notify("UCore logs: no server log found yet", vim.log.levels.WARN)
-	end
-
-	if vim.fn.filereadable(path) ~= 1 then
-		vim.fn.mkdir(vim.fn.fnamemodify(path, ":p:h"), "p")
-		vim.fn.writefile({
-			"UCore server log",
-			"Log file created by :UCore logs.",
-			"Start UCore with :UCore to collect server output here.",
-			"",
-		}, path)
-	end
-
-	vim.cmd.edit(vim.fn.fnameescape(path))
-end
-
--- Check server status through the direct TCP RPC client.
--- 通过 TCP RPC 直连查询 server 状态。
-function M.rpc_status()
-	client.rpc.request("status", {}, function(result, err)
-		notify_result("UCore rpc-status", result, err)
-	end)
-end
-
--- Register the current Unreal project.
--- 注册当前 Unreal 工程。
-function M.setup()
-	local payload, err = current_project_payload()
-	if err then
-		return vim.notify(err, vim.log.levels.ERROR)
-	end
-
-	client.setup(payload, function(result, setup_err)
-		if not setup_err then
-			clear_find_cache()
-		end
-		notify_result("UCore setup", result, setup_err)
-	end)
-end
-
--- Refresh the current Unreal project index.
--- 刷新当前 Unreal 工程索引。
-function M.refresh()
-	local payload, err = current_project_payload()
-	if err then
-		return vim.notify(err, vim.log.levels.ERROR)
-	end
-
-	payload.type = "refresh"
-	payload.scope = "Game"
-
-	client.refresh(payload, function(result, refresh_err)
-		if not refresh_err then
-			clear_find_cache()
-		end
-		notify_result("UCore refresh", result, refresh_err)
-	end)
-end
-
--- Pick indexed modules for the current Unreal project.
--- 选择当前 Unreal 工程的模块索引。
-function M.modules()
-	local root = project.find_project_root()
-	if not root then
-		return vim.notify("Could not find .uproject", vim.log.levels.ERROR)
-	end
-
-	remote.get_modules(root, function(result, err)
-		if err then
-			return vim.notify("UCore modules failed:\n" .. tostring(err), vim.log.levels.ERROR)
-		end
-
-		ui.select.modules(result or {})
-	end)
-end
-
--- Pick indexed assets for the current Unreal project.
--- 选择当前 Unreal 工程的资产索引。
-function M.assets()
-	local root = project.find_project_root()
-	if not root then
-		return vim.notify("Could not find .uproject", vim.log.levels.ERROR)
-	end
-
-	remote.get_assets(root, function(result, err)
-		if err then
-			return vim.notify("UCore assets failed:\n" .. tostring(err), vim.log.levels.ERROR)
-		end
-
-		ui.select.assets(result or {})
 	end)
 end
 
@@ -1044,69 +617,6 @@ function M.find(pattern)
 	end)
 end
 
--- :UCore globalfind [pattern]
--- Global find: fuzzy search indexed symbols, modules, assets, config.
--- 全局搜索：模糊查找已索引的符号、模块、资产、配置。
-function M.global_find(pattern)
-	M.find(pattern)
-end
-
--- Backward-compatible debug alias for the old command name.
--- 旧命令名保留为 debug 兼容入口。
-function M.search_symbols(pattern)
-	M.find(pattern)
-end
-
--- Print Lua-side component/module lookup maps.
--- 打印 Lua 侧整理后的 component/module 映射。
-function M.maps()
-	maps.get_maps(vim.api.nvim_buf_get_name(0), function(ok, result)
-		if not ok then
-			return vim.notify(tostring(result), vim.log.levels.ERROR)
-		end
-
-		print(vim.inspect(result))
-	end)
-end
-
-function M.editing_debug()
-	open_scratch("UCore Editing Debug", require("ucore.editing").info())
-end
-
-function M.clangd_status()
-	print(vim.inspect(lsp.clangd_status(project.find_project_root_from_context())))
-end
-
-function M.generate_compile_commands()
-	local root = project.find_project_root_from_context()
-	if not root then
-		return vim.notify("Could not find .uproject", vim.log.levels.ERROR)
-	end
-
-	vim.notify("UCore clangd: generating compile_commands.json...", vim.log.levels.INFO)
-
-	lsp.generate_compile_commands(root, {}, function(ok, result)
-		vim.schedule(function()
-			if not ok then
-				return vim.notify("UCore clangd database generation failed:\n" .. tostring(result), vim.log.levels.ERROR)
-			end
-
-			local dir = result.compile_commands_dir or "unknown"
-			vim.notify("UCore clangd: compile_commands.json ready at " .. dir, vim.log.levels.INFO)
-
-			local current = vim.api.nvim_get_current_buf()
-			local current_path = vim.api.nvim_buf_get_name(current)
-			if current_path ~= "" and project.find_project_root(current_path) == root then
-				if vim.bo[current].modified then
-					vim.notify("compile_commands.json is ready. Reopen the current file to attach clangd.", vim.log.levels.INFO)
-				else
-					vim.cmd("silent edit")
-				end
-			end
-		end)
-	end)
-end
-
 -- Print :UCore command help.
 -- 打印 :UCore 命令帮助。
 function M.help()
@@ -1119,45 +629,10 @@ UCore commands:
   :UCore build-cancel Cancel the currently running Unreal build
   :UCore editor       Open current project in Unreal Editor
   :UCore explorer     Open the left-side Project/Source/Config tree
-  :UCore tree         Open the left-side Project/Source/Config tree
-  :UCore files        Open the left-side Project/Source/Config tree
-   :UCore globalfind   Find indexed symbols, modules, assets, config
-   :UCore goto         Navigation subcommands (see :UCore goto help)
-  :UCore debug        Debug and lifecycle subcommands
+  :UCore find         Find indexed symbols, modules, assets, config
+  :UCore diagnostics  UCore diagnostics actions and toggles
+  :UCore goto         Navigation subcommands (see :UCore goto help)
   :UCore help         Show this help
-]])
-end
-
--- Print :UCore debug command help.
--- 打印 :UCore debug 调试命令帮助。
-function M.debug_help()
-	print([[
-UCore debug commands:
-
-  :UCore debug logs         Open the latest UCore server log
-  :UCore debug status       Check server status through CLI bridge
-  :UCore debug rpc-status   Check server status through direct TCP RPC
-  :UCore debug start        Start Rust server
-  :UCore debug stop         Stop server started by this nvim session
-  :UCore debug restart      Restart Rust server
-  :UCore debug setup        Register current Unreal project
-  :UCore debug refresh      Refresh current Unreal project index
-  :UCore debug register     Register current project in global registry
-  :UCore debug open         Pick and open a registered project
-  :UCore debug projects     Print registered projects
-  :UCore debug engine       Show resolved Unreal Engine root/cache
-  :UCore debug engine-refresh
-                            Force refresh shared Unreal Engine index
-  :UCore debug clangd       Print resolved clangd / compile_commands status
-  :UCore debug generate-db  Run UnrealBuildTool GenerateClangDatabase
-  :UCore debug modules      Pick indexed modules
-  :UCore debug assets       Pick indexed assets
-  :UCore debug search-symbols <pattern>
-                            Search indexed symbols
-   :UCore debug goto         Go to definition at cursor
-  :UCore debug maps         Print Lua-side component/module maps
-  :UCore debug editing      Print indent/autopairs diagnostics
-  :UCore debug help         Show this help
 ]])
 end
 

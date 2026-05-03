@@ -292,15 +292,12 @@ function M.request(callback)
 	end)
 end
 
--- Show native Vim insert completion menu.
--- 显示 Vim 原生插入模式补全菜单。
-function M.complete(opts)
+-- Drive native Vim insert completion for the automatic fallback path.
+-- 为自动补全回退路径驱动 Vim 原生插入补全。
+local function complete_auto(opts)
 	opts = opts or {}
 
 	if not is_insert_mode() then
-		if not opts.silent then
-			vim.notify("UCore complete must be triggered in Insert mode", vim.log.levels.WARN)
-		end
 		return
 	end
 
@@ -316,16 +313,10 @@ function M.complete(opts)
 				return
 			end
 
-			if not opts.silent then
-				vim.notify("UCore complete failed:\n" .. tostring(err), vim.log.levels.ERROR)
-			end
 			return
 		end
 
 		if not items or vim.tbl_isempty(items) then
-			if not opts.silent then
-				vim.notify("UCore complete: no candidates", vim.log.levels.INFO)
-			end
 			return
 		end
 
@@ -362,9 +353,8 @@ local function schedule_auto_complete()
 			return
 		end
 
-		M.complete({
+		complete_auto({
 			auto = true,
-			silent = true,
 		})
 	end, delay)
 end

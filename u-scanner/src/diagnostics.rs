@@ -303,6 +303,7 @@ fn member_function_declaration(
     let text = node_text(node, content).trim().to_string();
     if text.is_empty()
         || text.contains('{')
+        || !text.contains(';')
         || contains_token(&text, "inline")
         || contains_token(&text, "FORCEINLINE")
         || contains_token(&text, "friend")
@@ -1039,6 +1040,29 @@ mod tests {
 
         let items = value["items"].as_array().unwrap();
         assert!(items.iter().any(|item| item["code"] == "UECPP001"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn incomplete_member_declaration_does_not_warn_about_missing_cpp() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let root = temp_project_path("incomplete_decl");
+        let header = root.join("Source/Game/Public/MyActor.h");
+        std::fs::create_dir_all(header.parent().unwrap()).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "class UMyActor\n{\npublic:\n    void DoThing()\n};\n",
+            Some(header.to_string_lossy().replace('\\', "/")),
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP001"));
 
         let _ = std::fs::remove_dir_all(root);
     }

@@ -286,7 +286,7 @@ local function report_server_checks()
 	else
 		warn("server is not reachable: " .. tostring(err), {
 			"Run :UCore to boot the server.",
-			"For debugging, run :UCore debug start and :UCore debug rpc-status.",
+			"Then re-run :checkhealth ucore after boot finishes.",
 		})
 	end
 end
@@ -322,7 +322,6 @@ local function report_completion_checks()
 	start("UCore completion")
 
 	local completion = config.values.completion or {}
-	info("enabled: " .. yes_no(completion.enable ~= false))
 	info("auto trigger min chars: " .. tostring(completion.min_chars or 2))
 	info("debounce ms: " .. tostring(completion.debounce_ms or 180))
 
@@ -375,7 +374,6 @@ local function report_lsp_checks()
 			warn("compile_commands.json not found for current project", {
 				"With the default UCore clangd policy, clangd will not attach until a compilation database is available.",
 				"During normal :UCore boot, UCore can try to generate and cache the database automatically when UnrealBuildTool is available.",
-				"Run :UCore debug generate-db to let UnrealBuildTool generate it for the current project.",
 				"Set require('ucore').setup({ lsp = { clangd = { compile_commands_dir = '...' } } }) if your database lives outside the project root.",
 				"Or set require('ucore').setup({ lsp = { clangd = { require_compile_commands = false } } }) if you want clangd to attach anyway.",
 			})

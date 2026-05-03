@@ -39,11 +39,6 @@ local function clangd_progress(percent)
 end
 
 local function clangd_progress_done(result)
-	if type(result) == "table" and result.generated == false then
-		status.progress_finish("UCore Clangd Database", "UCore Clangd Database 100% (Cached)")
-		return
-	end
-
 	status.progress_finish("UCore Clangd Database", "UCore Clangd Database 100%")
 end
 
@@ -216,7 +211,7 @@ local function run_clangd_prepare(payload, callback)
 	local clangd = (config.values.lsp and config.values.lsp.clangd) or {}
 	local project_root = payload.project_root
 	if project_root and clangd_prewarmed[project_root] then
-		status.progress_finish("UCore Clangd Database", "UCore Clangd Database 100% (Cached)")
+		status.progress_finish("UCore Clangd Database", "UCore Clangd Database 100%")
 		return callback(true, {
 			compile_commands_dir = lsp.find_compilation_database(project_root),
 			generated = false,
