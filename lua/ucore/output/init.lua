@@ -143,8 +143,6 @@ local function render_tabbar()
 				local prefix = " "
 				if tab.status == "failed" then
 					prefix = "!"
-				elseif tab.status == "success" then
-					prefix = "+"
 				elseif tab.unread and key ~= state.active then
 					prefix = "*"
 				end
@@ -162,8 +160,6 @@ local function render_tabbar()
 					group = "UCoreOutputTabFailed"
 				elseif tab.unread then
 					group = "UCoreOutputTabUnread"
-				elseif tab.status == "success" then
-					group = "UCoreOutputTabSuccess"
 				end
 				spans[#spans + 1] = {
 					group = group,
@@ -386,14 +382,35 @@ local function set_modifiable(buf, value)
 	vim.bo[buf].readonly = not value
 end
 
-local function move_key_to_front(key)
+local function tab_order_rank(key)
+	if key == "workspace:unreal" then
+		return 1
+	end
+	if key == "workspace:build" then
+		return 2
+	end
+	if key == "workspace:debug" then
+		return 3
+	end
+	return 100
+end
+
+local function insert_key_ordered(key)
 	for index, value in ipairs(state.order) do
 		if value == key then
-			table.remove(state.order, index)
-			break
+			return
 		end
 	end
-	table.insert(state.order, 1, key)
+
+	local rank = tab_order_rank(key)
+	for index, value in ipairs(state.order) do
+		if rank < tab_order_rank(value) then
+			table.insert(state.order, index, key)
+			return
+		end
+	end
+
+	table.insert(state.order, key)
 end
 
 local function trim_old_tabs()
@@ -525,7 +542,7 @@ local function get_or_create_tab(opts)
 		updated_at = vim.loop.hrtime(),
 	}
 	state.tabs[key] = tab
-	move_key_to_front(key)
+	insert_key_ordered(key)
 	state.active = key
 	ensure_tab_buffer(tab)
 	trim_old_tabs()
@@ -537,7 +554,6 @@ local function touch_tab(tab, opts)
 	if opts and opts.focus then
 		state.active = tab.key
 		tab.unread = false
-		move_key_to_front(tab.key)
 	elseif tab.key ~= state.active then
 		tab.unread = true
 	end
@@ -717,7 +733,6 @@ function M.select(key)
 
 	state.active = key
 	tab.unread = false
-	move_key_to_front(key)
 	ensure_workspace()
 	render_tabbar()
 	sync_content_buffer()
