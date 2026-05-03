@@ -328,6 +328,14 @@ M.values = {
 		adapter = {
 			command = nil,
 			args = {},
+
+			-- Auto-install the debug adapter via mason.nvim when possible.
+			-- 缺少调试适配器时，尽量通过 mason.nvim 自动安装。
+			auto_install = true,
+
+			-- Mason package name to install for cppvsdbg support.
+			-- 用于提供 cppvsdbg 支持的 Mason 包名。
+			package = "cpptools",
 		},
 
 		ui = {

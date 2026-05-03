@@ -401,6 +401,12 @@ local function report_debug_checks()
 
 	info("enabled: " .. yes_no(debug_config.enable ~= false))
 	info("platform: " .. (status.windows and "windows" or "non-windows"))
+	info("adapter auto install: " .. yes_no(status.adapter_auto_install))
+	info("mason available: " .. yes_no(status.mason_available))
+	info("adapter package: " .. tostring(status.adapter_package or "cpptools"))
+	if status.adapter_installing then
+		info("adapter install: in progress")
+	end
 
 	if status.dap_available then
 		ok("nvim-dap available")
@@ -420,7 +426,8 @@ local function report_debug_checks()
 		ok("cppvsdbg adapter available: " .. tostring(status.adapter_command))
 	else
 		warn("cppvsdbg adapter not found", {
-			"Install cpptools via Mason or VS Code, or set require('ucore').setup({ debug = { adapter = { command = '.../OpenDebugAD7.exe' } } })",
+			"With the default UCore policy, debug commands will try to install Mason package '" .. tostring(status.adapter_package or "cpptools") .. "' automatically when mason.nvim is available.",
+			"Or install cpptools via Mason / VS Code yourself, or set require('ucore').setup({ debug = { adapter = { command = '.../OpenDebugAD7.exe' } } })",
 		})
 	end
 

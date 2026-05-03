@@ -2,16 +2,20 @@ local config = require("ucore.config")
 local dirty = require("ucore.editing.dirty")
 local project = require("ucore.project")
 local remote = require("ucore.remote")
+local status = require("ucore.status")
 local ui = require("ucore.ui.select")
 local unreal = require("ucore.unreal")
 
 local M = {}
+local ADAPTER_PROGRESS_TITLE = "UCore Debug Adapter Init"
 
 local redirect_group = "ucore_debug_redirect"
 local track_ns = vim.api.nvim_create_namespace("ucore_debug_track")
 
 local state = {
 	adapter_registered = false,
+	adapter_installing = false,
+	adapter_waiters = {},
 	loaded_roots = {},
 	redirected = {},
 }
@@ -49,6 +53,118 @@ end
 
 local function has_module(name)
 	return pcall(require, name)
+end
+
+local function adapter_config()
+	return (config.values.debug or {}).adapter or {}
+end
+
+local function adapter_package_name()
+	return tostring(adapter_config().package or "cpptools")
+end
+
+local function adapter_auto_install_enabled()
+	return adapter_config().auto_install ~= false
+end
+
+local function mason_registry()
+	local ok, registry = pcall(require, "mason-registry")
+	if ok and registry then
+		return registry
+	end
+	return nil
+end
+
+local function mason_available()
+	return has_module("mason") and mason_registry() ~= nil
+end
+
+local function adapter_progress_message(percent, detail)
+	percent = math.max(0, math.min(100, math.floor(tonumber(percent) or 0)))
+	detail = vim.trim(tostring(detail or ""))
+	if detail ~= "" then
+		return string.format("%s %d%% - %s", ADAPTER_PROGRESS_TITLE, percent, detail)
+	end
+	return string.format("%s %d%%", ADAPTER_PROGRESS_TITLE, percent)
+end
+
+local function adapter_progress(percent, detail)
+	status.progress(ADAPTER_PROGRESS_TITLE, adapter_progress_message(percent, detail))
+end
+
+local function adapter_progress_finish(detail)
+	status.progress_finish(ADAPTER_PROGRESS_TITLE, adapter_progress_message(100, detail or "Ready"))
+end
+
+local function adapter_progress_fail(detail)
+	status.progress_fail(
+		ADAPTER_PROGRESS_TITLE,
+		detail and detail ~= "" and (ADAPTER_PROGRESS_TITLE .. " Failed - " .. tostring(detail))
+			or (ADAPTER_PROGRESS_TITLE .. " Failed")
+	)
+end
+
+local function parse_progress_percent(text)
+	local best = nil
+	for token in tostring(text or ""):gmatch("(%d?%d?%d)%%") do
+		local value = tonumber(token)
+		if value and value >= 0 and value <= 100 then
+			best = best and math.max(best, value) or value
+		end
+	end
+	return best
+end
+
+local function normalize_progress_detail(text)
+	text = tostring(text or ""):gsub("\r\n", "\n"):gsub("\r", "\n")
+	local lines = vim.split(text, "\n", { plain = true })
+	for i = #lines, 1, -1 do
+		local line = vim.trim(lines[i])
+		if line ~= "" then
+			if #line > 90 then
+				line = line:sub(1, 87) .. "..."
+			end
+			return line
+		end
+	end
+	return ""
+end
+
+local function format_megabytes(bytes)
+	bytes = tonumber(bytes) or 0
+	return string.format("%.1f MB", bytes / (1024 * 1024))
+end
+
+local function mason_install_root()
+	local ok, settings = pcall(require, "mason.settings")
+	if ok and settings and settings.current and settings.current.install_root_dir then
+		return normalize(settings.current.install_root_dir)
+	end
+	return normalize(vim.fn.stdpath("data") .. "/mason")
+end
+
+local function adapter_staging_dir()
+	return path_join(mason_install_root(), "staging", adapter_package_name())
+end
+
+local function latest_file_in_dir(dir)
+	if not dir or vim.fn.isdirectory(dir) ~= 1 then
+		return nil, nil
+	end
+
+	local best_path, best_stat
+	for _, name in ipairs(vim.fn.readdir(dir) or {}) do
+		local path = path_join(dir, name)
+		local stat = vim.loop.fs_stat(path)
+		if stat and stat.type == "file" then
+			if not best_stat or (stat.mtime.sec or 0) > (best_stat.mtime.sec or 0) then
+				best_path = path
+				best_stat = stat
+			end
+		end
+	end
+
+	return best_path, best_stat
 end
 
 local function dap_available()
@@ -349,6 +465,26 @@ local function default_adapter_path_candidates()
 
 	add(path_join(data_dir, "mason/packages/cpptools/extension/debugAdapters/bin/OpenDebugAD7.exe"))
 	add(path_join(data_dir, "mason/packages/cpptools/debugAdapters/bin/OpenDebugAD7.exe"))
+	add(path_join(data_dir, "mason/packages/cpptools-win32-x64/extension/debugAdapters/bin/OpenDebugAD7.exe"))
+	add(path_join(data_dir, "mason/packages/cpptools-win32-x64/debugAdapters/bin/OpenDebugAD7.exe"))
+
+	local extension_roots = {}
+	local seen_roots = {}
+	local function add_root(path)
+		path = normalize(path)
+		if not path or path == "" or seen_roots[path] then
+			return
+		end
+		seen_roots[path] = true
+		table.insert(extension_roots, path)
+	end
+	local function env_join(name, suffix)
+		local base = vim.env[name]
+		if not base or base == "" then
+			return nil
+		end
+		return path_join(base, suffix)
+	end
 
 	if home and home ~= "" then
 		for _, base in ipairs({
@@ -356,8 +492,46 @@ local function default_adapter_path_candidates()
 			".cursor/extensions",
 			".vscode-insiders/extensions",
 			".vscodium/extensions",
+			"scoop/persist/vscode/data/extensions",
+			"scoop/persist/vscodium/data/extensions",
+			"scoop/persist/cursor/data/extensions",
+			"scoop/persist/windsurf/data/extensions",
 		}) do
-			for _, match in ipairs(vim.fn.glob(path_join(home, base, "ms-vscode.cpptools-*", "debugAdapters/bin/OpenDebugAD7.exe"), false, true)) do
+			add_root(path_join(home, base))
+		end
+	end
+
+	for _, path in ipairs({
+		vim.env.VSCODE_EXTENSIONS,
+		vim.env.CURSOR_EXTENSIONS_DIR,
+		vim.env.VSCODIUM_EXTENSIONS_DIR,
+		vim.env.WINDSURF_EXTENSIONS_DIR,
+		env_join("USERPROFILE", ".vscode/extensions"),
+		env_join("USERPROFILE", ".cursor/extensions"),
+		env_join("USERPROFILE", ".vscode-insiders/extensions"),
+		env_join("USERPROFILE", ".vscodium/extensions"),
+		env_join("USERPROFILE", "scoop/persist/vscode/data/extensions"),
+		env_join("USERPROFILE", "scoop/persist/vscodium/data/extensions"),
+		env_join("USERPROFILE", "scoop/persist/cursor/data/extensions"),
+		env_join("USERPROFILE", "scoop/persist/windsurf/data/extensions"),
+		env_join("SCOOP", "persist/vscode/data/extensions"),
+		env_join("SCOOP", "persist/vscodium/data/extensions"),
+		env_join("SCOOP", "persist/cursor/data/extensions"),
+		env_join("SCOOP", "persist/windsurf/data/extensions"),
+	}) do
+		add_root(path)
+	end
+
+	for _, root in ipairs(extension_roots) do
+		for _, pattern in ipairs({
+			path_join(root, "ms-vscode.cpptools-*", "debugAdapters/bin/OpenDebugAD7.exe"),
+			path_join(root, "ms-vscode.cpptools-*", "extension/debugAdapters/bin/OpenDebugAD7.exe"),
+			path_join(root, "*cpptools*", "debugAdapters/bin/OpenDebugAD7.exe"),
+			path_join(root, "*cpptools*", "extension/debugAdapters/bin/OpenDebugAD7.exe"),
+			path_join(root, "*", "debugAdapters/bin/OpenDebugAD7.exe"),
+			path_join(root, "*", "extension/debugAdapters/bin/OpenDebugAD7.exe"),
+		}) do
+			for _, match in ipairs(vim.fn.glob(pattern, false, true)) do
 				add(match)
 			end
 		end
@@ -367,11 +541,28 @@ local function default_adapter_path_candidates()
 end
 
 local function adapter_command()
-	local debug_config = config.values.debug or {}
-	local adapter = debug_config.adapter or {}
+	local adapter = adapter_config()
 
 	if adapter.command and file_readable(adapter.command) then
 		return normalize(adapter.command)
+	end
+
+	if vim.fn.executable("OpenDebugAD7.exe") == 1 then
+		return "OpenDebugAD7.exe"
+	end
+
+	if is_windows() and vim.fn.executable("where") == 1 then
+		local ok, result = pcall(function()
+			return vim.system({ "where", "OpenDebugAD7.exe" }, { text = true }):wait()
+		end)
+		if ok and result and result.code == 0 then
+			for _, line in ipairs(vim.split(result.stdout or "", "\n", { plain = true })) do
+				line = normalize(vim.trim(line))
+				if file_readable(line) then
+					return line
+				end
+			end
+		end
 	end
 
 	for _, candidate in ipairs(default_adapter_path_candidates()) do
@@ -384,13 +575,26 @@ local function adapter_command()
 end
 
 local function adapter_args()
-	local adapter = (config.values.debug or {}).adapter or {}
+	local adapter = adapter_config()
 	return type(adapter.args) == "table" and adapter.args or {}
+end
+
+local function register_dap_adapter(command)
+	local dap = require("dap")
+	dap.adapters.cppvsdbg = {
+		id = "cppvsdbg",
+		type = "executable",
+		command = command,
+		args = adapter_args(),
+	}
+
+	state.adapter_registered = true
+	return true, command
 end
 
 local function ensure_dap_adapter()
 	if state.adapter_registered then
-		return true, nil
+		return true, adapter_command()
 	end
 
 	if not dap_available() then
@@ -406,16 +610,277 @@ local function ensure_dap_adapter()
 		return false, "OpenDebugAD7.exe was not found"
 	end
 
-	local dap = require("dap")
-	dap.adapters.cppvsdbg = {
-		id = "cppvsdbg",
-		type = "executable",
-		command = command,
-		args = adapter_args(),
+	return register_dap_adapter(command)
+end
+
+local function finish_adapter_waiters(ok, payload)
+	state.adapter_installing = false
+	local waiters = state.adapter_waiters
+	state.adapter_waiters = {}
+	for _, waiter in ipairs(waiters) do
+		pcall(waiter, ok, payload)
+	end
+end
+
+local function queue_adapter_waiter(callback)
+	if callback then
+		table.insert(state.adapter_waiters, callback)
+	end
+end
+
+local function ensure_dap_adapter_async(callback)
+	local ok, payload = ensure_dap_adapter()
+	if ok then
+		if callback then
+			callback(true, payload)
+		end
+		return
+	end
+
+	if not adapter_auto_install_enabled() or not is_windows() then
+		if callback then
+			callback(false, payload)
+		end
+		return
+	end
+
+	local registry = mason_registry()
+	if not registry then
+		if callback then
+			callback(false, payload .. ". mason.nvim is not available")
+		end
+		return
+	end
+
+	queue_adapter_waiter(callback)
+
+	if state.adapter_installing then
+		return
+	end
+
+	state.adapter_installing = true
+	local package_name = adapter_package_name()
+	local reported_percent = 0
+	local download_watch = {
+		timer = nil,
+		url = nil,
+		total_bytes = nil,
+		last_size = 0,
+		last_change = vim.loop.hrtime(),
 	}
 
-	state.adapter_registered = true
-	return true, command
+	local function fail(message)
+		if download_watch.timer then
+			download_watch.timer:stop()
+			download_watch.timer:close()
+			download_watch.timer = nil
+		end
+		adapter_progress_fail(message)
+		finish_adapter_waiters(false, message)
+	end
+
+	local function report_progress(percent, detail)
+		percent = math.max(reported_percent, math.floor(tonumber(percent) or 0))
+		reported_percent = math.min(percent, 100)
+		adapter_progress(reported_percent, detail)
+	end
+
+	local function stop_download_watch()
+		if download_watch.timer then
+			download_watch.timer:stop()
+			download_watch.timer:close()
+			download_watch.timer = nil
+		end
+	end
+
+	local function update_download_watch()
+		local path, stat = latest_file_in_dir(adapter_staging_dir())
+		if not path or not stat then
+			return
+		end
+
+		local size = tonumber(stat.size) or 0
+		if size > (download_watch.last_size or 0) then
+			download_watch.last_size = size
+			download_watch.last_change = vim.loop.hrtime()
+		end
+
+		local now = vim.loop.hrtime()
+		local stalled = ((now - (download_watch.last_change or now)) / 1e9) >= 8
+		local detail
+		local percent
+
+		if download_watch.total_bytes and download_watch.total_bytes > 0 then
+			local ratio = math.max(0, math.min(1, size / download_watch.total_bytes))
+			percent = 55 + math.floor(ratio * 35)
+			detail = string.format(
+				"%s %s / %s",
+				stalled and "Download Stalled" or "Downloading",
+				format_megabytes(size),
+				format_megabytes(download_watch.total_bytes)
+			)
+		else
+			local size_mb = size / (1024 * 1024)
+			percent = math.min(90, math.max(reported_percent, 60 + math.floor(size_mb / 8)))
+			detail = string.format(
+				"%s %s / ?",
+				stalled and "Download Stalled" or "Downloading",
+				format_megabytes(size)
+			)
+		end
+
+		report_progress(percent, detail)
+	end
+
+	local function maybe_fetch_download_size(url)
+		if not url or url == "" or download_watch.total_bytes then
+			return
+		end
+		download_watch.url = url
+
+		local curl_cmd = nil
+		if vim.fn.executable("curl.exe") == 1 then
+			curl_cmd = "curl.exe"
+		elseif vim.fn.executable("curl") == 1 then
+			curl_cmd = "curl"
+		end
+
+		if not curl_cmd then
+			return
+		end
+
+		vim.system({ curl_cmd, "-I", "-L", "-s", url }, { text = true }, function(result)
+			if result.code ~= 0 then
+				return
+			end
+
+			local header_text = table.concat({
+				tostring(result.stdout or ""),
+				tostring(result.stderr or ""),
+			}, "\n")
+			local best_value = nil
+			for _, line in ipairs(vim.split(header_text, "\n", { plain = true })) do
+				local value = line:match("^[Cc]ontent%-[Ll]ength:%s*(%d+)")
+				if value then
+					local bytes = tonumber(value)
+					if bytes and bytes > 0 then
+						best_value = bytes
+					end
+				end
+			end
+
+			if best_value and best_value > 0 then
+				download_watch.total_bytes = best_value
+				vim.schedule(update_download_watch)
+			end
+		end)
+	end
+
+	local function maybe_start_download_watch(url)
+		maybe_fetch_download_size(url)
+		if download_watch.timer then
+			return
+		end
+
+		download_watch.timer = vim.loop.new_timer()
+		download_watch.timer:start(0, 1000, vim.schedule_wrap(function()
+			update_download_watch()
+		end))
+	end
+
+	local function attach_handle_progress(handle)
+		if not handle then
+			return
+		end
+
+		handle:on("state:change", vim.schedule_wrap(function(new_state)
+			if new_state == "QUEUED" then
+				report_progress(45, "Queued")
+			elseif new_state == "ACTIVE" then
+				report_progress(55, "Installing")
+			end
+		end))
+
+		local function on_chunk(chunk)
+			local detail = normalize_progress_detail(chunk)
+			local percent = parse_progress_percent(chunk)
+			local url = tostring(chunk or ""):match('"([^"]+)"') or tostring(chunk or ""):match("(https?://%S+)")
+			if url and url:find("github.com", 1, true) then
+				maybe_start_download_watch(url)
+			end
+			if percent then
+				report_progress(math.max(55, percent), detail ~= "" and detail or "Installing")
+			elseif detail ~= "" then
+				report_progress(math.max(reported_percent, 60), detail)
+			end
+		end
+
+		handle:on("stdout", vim.schedule_wrap(on_chunk))
+		handle:on("stderr", vim.schedule_wrap(on_chunk))
+	end
+
+	local function complete()
+		stop_download_watch()
+		state.adapter_registered = false
+		local ready, result = ensure_dap_adapter()
+		if ready then
+			adapter_progress_finish("Ready")
+			vim.notify("UCore debug: cppvsdbg adapter is ready", vim.log.levels.INFO)
+			finish_adapter_waiters(true, result)
+		else
+			fail("UCore debug: adapter install finished but OpenDebugAD7.exe is still unavailable")
+		end
+	end
+
+	local function watch_package(pkg)
+		if pkg:is_installed() then
+			report_progress(95, "Finalizing")
+			return complete()
+		end
+
+		pkg:once("install:handle", vim.schedule_wrap(function(handle)
+			report_progress(50, "Starting Installer")
+			attach_handle_progress(handle)
+		end))
+
+		pkg:once("install:success", vim.schedule_wrap(function()
+			report_progress(95, "Finalizing")
+			complete()
+		end))
+
+		pkg:once("install:failed", vim.schedule_wrap(function(result)
+			fail("UCore debug: failed to install " .. package_name .. ": " .. tostring(result))
+		end))
+
+		if pkg:is_installing() then
+			report_progress(60, "Installing")
+			return
+		end
+
+		local ok_install, install_err = pcall(function()
+			pkg:install()
+		end)
+		if not ok_install then
+			fail("UCore debug: failed to start Mason install for " .. package_name .. ": " .. tostring(install_err))
+		end
+	end
+
+	vim.notify("UCore debug: installing cppvsdbg adapter via Mason (" .. package_name .. ")", vim.log.levels.INFO)
+	report_progress(5, "Preparing")
+	registry.refresh(vim.schedule_wrap(function(success)
+		if not success then
+			return fail("UCore debug: failed to refresh Mason registry")
+		end
+		report_progress(20, "Registry Ready")
+
+		local ok_pkg, pkg = pcall(registry.get_package, package_name)
+		if not ok_pkg or not pkg then
+			return fail("UCore debug: Mason package not found: " .. package_name)
+		end
+		report_progress(35, "Package Resolved")
+
+		watch_package(pkg)
+	end))
 end
 
 local function project_context(root)
@@ -800,6 +1265,10 @@ local function dap_status(root)
 		windows = is_windows(),
 		adapter_ready = ok,
 		adapter_command = command,
+		adapter_auto_install = adapter_auto_install_enabled(),
+		adapter_package = adapter_package_name(),
+		mason_available = mason_available(),
+		adapter_installing = state.adapter_installing,
 		breakpoint_store = root and breakpoint_store_path(root) or nil,
 	}
 end
@@ -890,19 +1359,115 @@ local function enumerate_processes(ctx, callback)
 	end)
 end
 
-local function attach_with_process(process)
-	local ok, err = ensure_dap_adapter()
-	if not ok then
-		return vim.notify("UCore debug: " .. tostring(err), vim.log.levels.ERROR)
+local function process_id_set(items)
+	local set = {}
+	for _, item in ipairs(items or {}) do
+		local pid = tonumber(type(item) == "table" and item.pid or nil)
+		if pid and pid > 0 then
+			set[pid] = true
+		end
+	end
+	return set
+end
+
+local function launch_editor_args(ctx)
+	return {
+		ctx.uproject,
+		"-WaitForDebuggerNoBreak",
+	}
+end
+
+local function spawn_editor_process(ctx, callback)
+	local handle
+	local pid
+	local args = launch_editor_args(ctx)
+	handle, pid = vim.loop.spawn(ctx.editor_exe, {
+		args = args,
+		cwd = ctx.root,
+		detached = true,
+		hide = false,
+	}, function()
+		if handle and not handle:is_closing() then
+			handle:close()
+		end
+	end)
+
+	if not handle then
+		return callback(nil, "failed to launch UnrealEditor.exe")
 	end
 
-	local dap = require("dap")
-	dap.run({
-		type = "cppvsdbg",
-		request = "attach",
-		name = "UCore Attach " .. tostring(process.name or process.pid),
-		processId = tostring(process.pid),
-	})
+	handle:unref()
+	callback(pid, nil)
+end
+
+local function wait_for_editor_attach_target(ctx, before_pids, preferred_pid, callback)
+	local deadline = vim.loop.hrtime() + (30 * 1e9)
+	local timer = vim.loop.new_timer()
+
+	local function finish(item, err)
+		if timer then
+			timer:stop()
+			timer:close()
+			timer = nil
+		end
+		callback(item, err)
+	end
+
+	local function choose_process(items)
+		if preferred_pid then
+			for _, item in ipairs(items or {}) do
+				if tonumber(item.pid) == tonumber(preferred_pid) then
+					return item
+				end
+			end
+		end
+
+		for _, item in ipairs(items or {}) do
+			local pid = tonumber(item.pid)
+			local name = lower(item.name or "")
+			if pid and pid > 0 and not before_pids[pid] and (name == "unrealeditor.exe" or name == "ue4editor.exe") then
+				return item
+			end
+		end
+
+		return nil
+	end
+
+	timer:start(0, 500, vim.schedule_wrap(function()
+		if vim.loop.hrtime() >= deadline then
+			return finish(
+				nil,
+				"timed out waiting for the launched Unreal Editor process. The editor may still be waiting for debugger attach."
+			)
+		end
+
+		enumerate_processes(ctx, function(items, err)
+			if err then
+				return finish(nil, err)
+			end
+
+			local item = choose_process(items)
+			if item then
+				finish(item, nil)
+			end
+		end)
+	end))
+end
+
+local function attach_with_process(process)
+	ensure_dap_adapter_async(function(ok, err)
+		if not ok then
+			return vim.notify("UCore debug: " .. tostring(err), vim.log.levels.ERROR)
+		end
+
+		local dap = require("dap")
+		dap.run({
+			type = "cppvsdbg",
+			request = "attach",
+			name = "UCore Attach " .. tostring(process.name or process.pid),
+			processId = tostring(process.pid),
+		})
+	end)
 end
 
 function M.attach()
@@ -978,11 +1543,6 @@ function M.launch_editor()
 		return vim.notify("UCore debug: UnrealEditor.exe was not found", vim.log.levels.ERROR)
 	end
 
-	local ok, adapter_err = ensure_dap_adapter()
-	if not ok then
-		return vim.notify("UCore debug: " .. tostring(adapter_err), vim.log.levels.ERROR)
-	end
-
 	restore_project_breakpoints(ctx.root)
 
 	ensure_launch_ready(ctx.root, function(ready)
@@ -990,16 +1550,27 @@ function M.launch_editor()
 			return
 		end
 
-		require("dap").run({
-			type = "cppvsdbg",
-			request = "launch",
-			name = "UCore Launch Unreal Editor",
-			program = ctx.editor_exe,
-			args = { ctx.uproject },
-			cwd = ctx.root,
-			stopAtEntry = false,
-			console = "integratedTerminal",
-		})
+		enumerate_processes(ctx, function(existing_items, process_err)
+			if process_err then
+				return vim.notify("UCore debug: " .. tostring(process_err), vim.log.levels.ERROR)
+			end
+
+			local before_pids = process_id_set(existing_items)
+			spawn_editor_process(ctx, function(launch_pid, launch_err)
+				if launch_err then
+					return vim.notify("UCore debug: " .. tostring(launch_err), vim.log.levels.ERROR)
+				end
+
+				vim.notify("UCore debug: launching Unreal Editor and waiting to attach", vim.log.levels.INFO)
+				wait_for_editor_attach_target(ctx, before_pids, launch_pid, function(process, wait_err)
+					if not process then
+						return vim.notify("UCore debug: " .. tostring(wait_err), vim.log.levels.WARN)
+					end
+
+					attach_with_process(process)
+				end)
+			end)
+		end)
 	end)
 end
 

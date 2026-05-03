@@ -32,6 +32,9 @@ local panels = {
 		"progress:UCore Clangd Database",
 		"progress:UCore Clangd Index",
 	}),
+	debug = make_panel("UCore Debug Adapter Init", "ucore.status.debug", {
+		"progress:UCore Debug Adapter Init",
+	}),
 }
 
 local function panel_for_key(key)
@@ -42,6 +45,9 @@ local function panel_for_key(key)
 	local lower = tostring(key or ""):lower()
 	if lower:find("clangd", 1, true) then
 		return panels.clang
+	end
+	if lower:find("debug adapter", 1, true) or lower:find("cppvsdbg", 1, true) then
+		return panels.debug
 	end
 
 	return panels.init
@@ -58,7 +64,9 @@ local function panel_has_spinner_items(panel)
 end
 
 local function any_spinner_items()
-	return panel_has_spinner_items(panels.init) or panel_has_spinner_items(panels.clang)
+	return panel_has_spinner_items(panels.init)
+		or panel_has_spinner_items(panels.clang)
+		or panel_has_spinner_items(panels.debug)
 end
 
 local function spinner_frame()
@@ -119,6 +127,7 @@ end
 local function render()
 	render_panel(panels.init)
 	render_panel(panels.clang)
+	render_panel(panels.debug)
 end
 
 local function dismiss_panel(panel)
@@ -220,6 +229,11 @@ local function schedule_panel_dismiss(panel, delay_ms)
 			clear_panel_contents(panel)
 			dismiss_panel(panel)
 		end
+		if panel == panels.debug and clang_panel_ready(panel) then
+			suppress_panel_keys(panel)
+			clear_panel_contents(panel)
+			dismiss_panel(panel)
+		end
 	end, delay_ms or 5000)
 end
 
@@ -252,6 +266,7 @@ end
 local function reset_all()
 	reset_panel(panels.init)
 	reset_panel(panels.clang)
+	reset_panel(panels.debug)
 	render()
 end
 
@@ -334,7 +349,7 @@ function M.progress_finish(title, message)
 	render()
 	if panel == panels.init then
 		apply_pending_init_finish()
-	elseif panel == panels.clang and clang_panel_ready(panel) then
+	elseif (panel == panels.clang or panel == panels.debug) and clang_panel_ready(panel) then
 		panel.state = "complete"
 		schedule_panel_dismiss(panel, 5000)
 	end

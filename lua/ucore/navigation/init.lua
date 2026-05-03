@@ -35,6 +35,24 @@ local function normalize_space(text)
 	return tostring(text or ""):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
 end
 
+local function refresh_opened_buffer_filetype(path, bufnr)
+	bufnr = bufnr or vim.api.nvim_get_current_buf()
+	if not vim.api.nvim_buf_is_valid(bufnr) then
+		return
+	end
+
+	local ok_utreesitter, utreesitter_filetype = pcall(require, "utreesitter.filetype")
+	if ok_utreesitter and utreesitter_filetype and type(utreesitter_filetype.apply_to_buffer) == "function" then
+		pcall(utreesitter_filetype.apply_to_buffer, bufnr)
+		return
+	end
+
+	local detected = vim.filetype.match({ buf = bufnr, filename = path }) or vim.filetype.match({ filename = path })
+	if detected and detected ~= "" and vim.bo[bufnr].filetype ~= detected then
+		vim.bo[bufnr].filetype = detected
+	end
+end
+
 local function find_buffer_for_path(path)
 	path = normalize_path(path)
 	if path == "" then
@@ -402,6 +420,7 @@ open_result = function(result, opts)
 	end
 
 	vim.cmd.edit(vim.fn.fnameescape(path))
+	refresh_opened_buffer_filetype(path)
 
 	local last_line = math.max(1, vim.api.nvim_buf_line_count(0))
 	line = line or 1
@@ -545,6 +564,7 @@ function M.toggle_source()
 	local alt = find_alternate_source(path)
 	if alt and vim.fn.filereadable(alt) == 1 then
 		vim.cmd.edit(vim.fn.fnameescape(alt))
+		refresh_opened_buffer_filetype(alt)
 	else
 		vim.notify("UCore: no matching source/header file found", vim.log.levels.INFO)
 	end
@@ -625,12 +645,7 @@ end
 -- Global find: fuzzy search indexed items.
 -- 全局搜索：模糊查找已索引内容。
 function M.global_find()
-	local root = project.find_project_root()
-	if not root then
-		return vim.notify("Could not find .uproject", vim.log.levels.ERROR)
-	end
-
-	require("ucore.commands.actions").global_find("")
+	require("ucore.commands.actions").find("")
 end
 
 return M
