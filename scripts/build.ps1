@@ -215,15 +215,4 @@ if ($exitCode -ne 0) {
 
 Remove-Item -LiteralPath $logPath -ErrorAction SilentlyContinue
 
-if ($exitCode -eq 0) {
-  $serverExe = Join-Path $backendSource.Path "target\release\u_core_server.exe"
-  $registry = Join-Path $managedPaths.DataDir "ucore\server-registry.json"
-
-  if ((Test-Path -LiteralPath $serverExe) -and (Test-Path -LiteralPath $registry)) {
-    Write-Host "UCore build: restarting server..."
-    Start-Process -WindowStyle Hidden -FilePath $serverExe -ArgumentList "30110", $registry
-    Start-Sleep -Milliseconds 500
-  }
-}
-
 exit $exitCode
