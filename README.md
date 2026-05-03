@@ -16,6 +16,7 @@ It focuses on:
 - Rust-backed indexing for symbols, modules, assets, and config
 - definition / declaration / implementation / references navigation
 - project explorer, global search, completion, diagnostics, semantic overlay
+- shared bottom output tabs for build / debug / Unreal runtime streams
 
 It does **not** own syntax highlighting or VCS anymore:
 
@@ -227,6 +228,17 @@ Open any file inside an Unreal project and run:
 
 With `auto_boot = true`, UCore boots automatically when you enter the project.
 
+### Output Workspace
+
+When companion plugins emit runtime output into UCore, a bottom tabbed workspace opens automatically.
+
+- newest tabs are inserted at the front and shown immediately
+- build logs, debug session updates, adapter install progress, and Unreal launch messages can share the same area
+- inside the workspace:
+  - `<Tab>` / `<S-Tab>` or `H` / `L` switch tabs
+  - `q` closes the current tab
+  - `x` closes the workspace
+
 ### Commands
 
 ```vim
@@ -262,6 +274,12 @@ require("ucore").setup({
   use_release_binary = true,
   ui = {
     picker = "telescope",
+    output = {
+      enable = true,
+      auto_open = true,
+      height = 12,
+      max_tabs = 8,
+    },
   },
   completion = {
     min_chars = 2,

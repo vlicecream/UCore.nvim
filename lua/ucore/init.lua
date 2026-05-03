@@ -36,6 +36,9 @@ function M.reset()
 	pcall(function()
 		require("ucore.autosave").reset()
 	end)
+	pcall(function()
+		require("ucore.output").reset()
+	end)
 
 	clear_augroup("UCoreAutopairs")
 	clear_augroup("UCoreEditing")
@@ -52,6 +55,7 @@ function M.setup(opts)
 	end
 
 	require("ucore.config").setup(opts)
+	require("ucore.output").setup()
 	require("ucore.commands").register()
 	require("ucore.completion").setup()
 	pcall(function()

@@ -183,6 +183,12 @@ local function default_values()
 		-- UI 集成配置。
 		ui = {
 			picker = "auto",
+			output = {
+				enable = true,
+				auto_open = true,
+				height = 12,
+				max_tabs = 8,
+			},
 		},
 
 		-- Navigation keymaps.
