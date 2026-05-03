@@ -6,6 +6,15 @@ local M = {}
 -- 根据类似 RPC 的 method 和 payload 构造 u_scanner CLI 命令。
 local function build_cmd(method, payload)
 	local cmd = vim.deepcopy(config.values.scanner_cmd)
+	if #cmd == 0 then
+		config.refresh_backend_commands()
+		cmd = vim.deepcopy(config.values.scanner_cmd)
+	end
+
+	if #cmd == 0 then
+		return nil, "UScanner command is not available"
+	end
+
 	table.insert(cmd, method)
 
 	if payload ~= nil then
@@ -39,11 +48,17 @@ end
 function M.request(method, payload, callback)
 	callback = callback or function() end
 
+	config.refresh_backend_commands()
+	local cmd, build_err = build_cmd(method, payload)
+	if not cmd then
+		return callback(nil, build_err)
+	end
+
 	local env = vim.tbl_extend("force", vim.fn.environ(), {
 		UNL_SERVER_PORT = tostring(config.values.port),
 	})
 
-	vim.system(build_cmd(method, payload), {
+	vim.system(cmd, {
 		cwd = config.values.backend_cwd,
 		text = true,
 		env = env,

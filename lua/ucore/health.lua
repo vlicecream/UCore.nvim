@@ -122,6 +122,10 @@ local function report_static_checks()
 		info("managed backend source dir: " .. tostring(backend.managed_source_dir))
 	end
 
+	if backend.managed_env_source_dir and backend.managed_env_source_dir ~= backend.managed_source_dir then
+		info("managed backend source dir (env): " .. tostring(backend.managed_env_source_dir))
+	end
+
 	if preferred_bin_dir then
 		info("resolved backend bin dir: " .. tostring(preferred_bin_dir))
 	end

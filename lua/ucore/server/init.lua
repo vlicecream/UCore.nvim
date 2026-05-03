@@ -39,6 +39,15 @@ end
 -- 构造 server 启动命令。
 local function build_cmd(port, registry)
 	local cmd = vim.deepcopy(config.values.server_cmd)
+	if #cmd == 0 then
+		config.refresh_backend_commands()
+		cmd = vim.deepcopy(config.values.server_cmd)
+	end
+
+	if #cmd == 0 then
+		return nil, "UScanner server command is not available"
+	end
+
 	table.insert(cmd, tostring(port))
 	table.insert(cmd, registry)
 	return cmd
@@ -68,6 +77,8 @@ function M.start(callback, opts)
 		return callback(true, "Server already running")
 	end
 
+	config.refresh_backend_commands()
+
 	local root = opts.project_root or project.find_project_root_from_context({
 		registered_fallback = false,
 	})
@@ -76,7 +87,10 @@ function M.start(callback, opts)
 	end
 
 	local paths = project.build_paths(root)
-	local cmd = build_cmd(config.values.port, paths.registry_path)
+	local cmd, build_err = build_cmd(config.values.port, paths.registry_path)
+	if not cmd then
+		return callback(false, build_err)
+	end
 
 	log_file = paths.log_path
 	vim.fn.writefile({

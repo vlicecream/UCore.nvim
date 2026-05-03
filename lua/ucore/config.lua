@@ -102,6 +102,9 @@ local function default_values()
 	local cache_dir = vim.fn.stdpath("data") .. "/ucore"
 	local managed_root = normalize(cache_dir .. "/backend")
 	local managed_source_dir = normalize(managed_root .. "/UScanner")
+	local xdg_data_home = normalize(vim.env.XDG_DATA_HOME)
+	local managed_env_root = xdg_data_home and normalize(xdg_data_home .. "/ucore/backend") or nil
+	local managed_env_source_dir = managed_env_root and normalize(managed_env_root .. "/UScanner") or nil
 
 	return {
 		port = 30110,
@@ -123,6 +126,8 @@ local function default_values()
 			bin_dir = nil,
 			managed_root = managed_root,
 			managed_source_dir = managed_source_dir,
+			managed_env_root = managed_env_root,
+			managed_env_source_dir = managed_env_source_dir,
 		},
 
 		-- Current backend mode: "missing", "cargo", or "release".
@@ -302,6 +307,7 @@ function M.backend_source_candidates(values)
 	local dirs = {}
 	push_unique(dirs, backend.source_dir)
 	push_unique(dirs, backend.managed_source_dir)
+	push_unique(dirs, backend.managed_env_source_dir)
 	return dirs
 end
 
