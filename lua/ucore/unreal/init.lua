@@ -288,10 +288,11 @@ local function color_build_line(buf, line_num, text)
 	end
 
 	if group then
+		local end_col = math.max(0, vim.fn.strchars(text))
 		vim.api.nvim_buf_set_extmark(buf, build_ns, line_num, 0, {
 			hl_group = group,
 			end_row = line_num,
-			end_col = -1,
+			end_col = end_col,
 		})
 	end
 end
@@ -488,6 +489,10 @@ end
 
 function M.build(args)
 	start_build(args)
+end
+
+function M.build_async(args, callback)
+	start_build(args, callback)
 end
 
 function M.cancel_build()

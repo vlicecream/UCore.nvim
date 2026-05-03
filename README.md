@@ -290,7 +290,8 @@ require("ucore").setup({
     autosave_before_launch = true,
     redirect_header_breakpoints = true,
     adapter = {
-      command = nil, -- auto-detect OpenDebugAD7.exe when possible
+      command = nil, -- auto-detect vsdbg.exe when possible
+      signer = nil,  -- auto-detect VS Code's vsda.node when possible
     },
     ui = {
       auto_open = true,  -- auto-open the minimal UCore debug UI
@@ -322,7 +323,7 @@ The backend prefers release binaries under `u-scanner/target/release/` and falls
 
 ### Unreal Debugging
 
-UCore's Unreal debugging layer is built on top of `nvim-dap`. On Windows, it targets `cppvsdbg` and auto-detects `OpenDebugAD7.exe` from common Mason / VS Code locations when possible.
+UCore's Unreal debugging layer is built on top of `nvim-dap`. On Windows, it targets `cppvsdbg`, auto-detects `vsdbg.exe` from common Mason / VS Code locations, and provisions the required `vsda.node` handshake signer into the UCore cache when needed.
 
 - install `mfussenegger/nvim-dap`
 - use `:checkhealth ucore` to verify the adapter path
@@ -342,7 +343,7 @@ Common cases:
 - Rust missing: install from `https://rustup.rs/`
 - project not indexed yet: run `:UCore` and wait for boot/indexing
 - server not ready: run `:UCore`, wait for boot, then re-run `:checkhealth ucore`
-- debug adapter missing: install `nvim-dap`, then point `debug.adapter.command` at `OpenDebugAD7.exe` if auto-detection does not find it
+- debug adapter or signer missing: install `nvim-dap`, let UCore provision the signer automatically, or point `debug.adapter.command` at `vsdbg.exe` and `debug.adapter.signer` at `vsda.node` yourself
 - no syntax highlight: install `UTreeSitter.nvim`, then run `:checkhealth utreesitter`
 
 ### Related Repositories
@@ -644,7 +645,8 @@ require("ucore").setup({
     autosave_before_launch = true,
     redirect_header_breakpoints = true,
     adapter = {
-      command = nil, -- 尽量自动查找 OpenDebugAD7.exe
+      command = nil, -- 尽量自动查找 vsdbg.exe
+      signer = nil,  -- 尽量自动查找 VS Code 的 vsda.node
     },
     ui = {
       auto_open = true,  -- 自动打开 UCore 自带的最轻调试 UI
@@ -676,7 +678,7 @@ Neovim (Lua)
 
 ### Unreal 调试
 
-UCore 的 Unreal 调试层建立在 `nvim-dap` 之上。Windows 下默认走 `cppvsdbg`，并尽量从常见的 Mason / VS Code 路径自动找到 `OpenDebugAD7.exe`。
+UCore 的 Unreal 调试层建立在 `nvim-dap` 之上。Windows 下默认走 `cppvsdbg`，并尽量从常见的 Mason / VS Code 路径自动找到 `vsdbg.exe`；如果缺少必须的 `vsda.node`，UCore 会自动把 signer 下到自己的缓存里。
 
 - 安装 `mfussenegger/nvim-dap`
 - 用 `:checkhealth ucore` 检查 adapter 路径
@@ -696,7 +698,7 @@ UCore 的 Unreal 调试层建立在 `nvim-dap` 之上。Windows 下默认走 `cp
 - 没装 Rust：从 `https://rustup.rs/` 安装
 - 项目还没建索引：运行 `:UCore` 并等待 boot/index 完成
 - 服务没有起来：先执行 `:UCore`，等待 boot 完成后再运行 `:checkhealth ucore`
-- 调试 adapter 没找到：先安装 `nvim-dap`，如果自动检测不到，再手动配置 `debug.adapter.command = '.../OpenDebugAD7.exe'`
+- 调试 adapter 或 signer 没找到：先安装 `nvim-dap`，让 UCore 自动补 signer；如果还不行，再手动配置 `debug.adapter.command = '.../vsdbg.exe'` 与 `debug.adapter.signer = '.../vsda.node'`
 - 没有语法高亮：安装 `UTreeSitter.nvim`，然后运行 `:checkhealth utreesitter`
 
 ### 相关仓库

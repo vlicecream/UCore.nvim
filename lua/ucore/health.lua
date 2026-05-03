@@ -424,10 +424,23 @@ local function report_debug_checks()
 		info("cppvsdbg adapter check skipped until nvim-dap is available")
 	elseif status.adapter_ready then
 		ok("cppvsdbg adapter available: " .. tostring(status.adapter_command))
+		ok("cppvsdbg handshake signer available: " .. tostring(status.adapter_signer))
+		ok("cppvsdbg signer runtime available: " .. tostring(status.adapter_node_command))
 	else
-		warn("cppvsdbg adapter not found", {
+		local missing = {}
+		if not status.adapter_command then
+			table.insert(missing, "vsdbg.exe")
+		end
+		if not status.adapter_signer then
+			table.insert(missing, "vsda.node")
+		end
+		if not status.adapter_node_command then
+			table.insert(missing, "node")
+		end
+		warn("cppvsdbg prerequisites missing: " .. table.concat(missing, ", "), {
 			"With the default UCore policy, debug commands will try to install Mason package '" .. tostring(status.adapter_package or "cpptools") .. "' automatically when mason.nvim is available.",
-			"Or install cpptools via Mason / VS Code yourself, or set require('ucore').setup({ debug = { adapter = { command = '.../OpenDebugAD7.exe' } } })",
+			"UCore will also provision the cppvsdbg handshake signer into its cache when needed.",
+			"Or set require('ucore').setup({ debug = { adapter = { command = '.../vsdbg.exe', signer = '.../vsda.node' } } }) to use explicit paths.",
 		})
 	end
 

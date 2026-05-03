@@ -323,11 +323,21 @@ M.values = {
 		-- 尽量把头文件声明上的断点重定向到对应 .cpp 定义。
 		redirect_header_breakpoints = true,
 
-		-- Adapter resolution. `command = nil` means auto-detect OpenDebugAD7.exe.
-		-- 调试适配器解析。`command = nil` 表示自动查找 OpenDebugAD7.exe。
+		-- Adapter resolution. `command = nil` means auto-detect vsdbg.exe.
+		-- 调试适配器解析。`command = nil` 表示自动查找 vsdbg.exe。
 		adapter = {
 			command = nil,
 			args = {},
+
+			-- Optional explicit path to VS Code's vsda.node signer module.
+			-- Leave nil to auto-detect from common VS Code install locations.
+			-- 可选：显式指定 VS Code 的 vsda.node 签名模块路径。
+			-- 置为 nil 时会自动从常见 VS Code 安装路径查找。
+			signer = nil,
+
+			-- Node.js command used to execute the signer bridge.
+			-- 用于执行 signer bridge 的 Node.js 命令。
+			node_command = "node",
 
 			-- Auto-install the debug adapter via mason.nvim when possible.
 			-- 缺少调试适配器时，尽量通过 mason.nvim 自动安装。

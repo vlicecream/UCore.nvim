@@ -16,6 +16,9 @@ local state = {
 	adapter_registered = false,
 	adapter_installing = false,
 	adapter_waiters = {},
+	attach_in_progress = false,
+	attach_target_pid = nil,
+	launch_in_progress = false,
 	loaded_roots = {},
 	redirected = {},
 }
@@ -55,6 +58,10 @@ local function has_module(name)
 	return pcall(require, name)
 end
 
+local function ps_quote(text)
+	return "'" .. tostring(text or ""):gsub("'", "''") .. "'"
+end
+
 local function adapter_config()
 	return (config.values.debug or {}).adapter or {}
 end
@@ -65,6 +72,14 @@ end
 
 local function adapter_auto_install_enabled()
 	return adapter_config().auto_install ~= false
+end
+
+local function adapter_node_command()
+	local command = tostring(adapter_config().node_command or "node")
+	if command ~= "" and vim.fn.executable(command) == 1 then
+		return command
+	end
+	return nil
 end
 
 local function mason_registry()
@@ -143,8 +158,40 @@ local function mason_install_root()
 	return normalize(vim.fn.stdpath("data") .. "/mason")
 end
 
+local function ucore_cache_dir()
+	return normalize((config.values or {}).cache_dir or (vim.fn.stdpath("data") .. "/ucore"))
+end
+
 local function adapter_staging_dir()
 	return path_join(mason_install_root(), "staging", adapter_package_name())
+end
+
+local function signer_install_root()
+	return path_join(ucore_cache_dir(), "tools", "vscode-signer")
+end
+
+local function signer_installed_path()
+	return path_join(signer_install_root(), "vsda.node")
+end
+
+local function signer_archive_path()
+	return path_join(signer_install_root(), "vscode-signer.zip")
+end
+
+local function signer_extract_marker_path()
+	return path_join(signer_install_root(), "source.txt")
+end
+
+local function vscode_archive_target()
+	local machine = lower(((vim.loop.os_uname() or {}).machine) or "")
+	if machine:find("arm64", 1, true) then
+		return "win32-arm64-archive"
+	end
+	return "win32-x64-archive"
+end
+
+local function vscode_signer_download_url()
+	return "https://update.code.visualstudio.com/latest/" .. vscode_archive_target() .. "/stable"
 end
 
 local function latest_file_in_dir(dir)
@@ -463,10 +510,10 @@ local function default_adapter_path_candidates()
 		end
 	end
 
-	add(path_join(data_dir, "mason/packages/cpptools/extension/debugAdapters/bin/OpenDebugAD7.exe"))
-	add(path_join(data_dir, "mason/packages/cpptools/debugAdapters/bin/OpenDebugAD7.exe"))
-	add(path_join(data_dir, "mason/packages/cpptools-win32-x64/extension/debugAdapters/bin/OpenDebugAD7.exe"))
-	add(path_join(data_dir, "mason/packages/cpptools-win32-x64/debugAdapters/bin/OpenDebugAD7.exe"))
+	add(path_join(data_dir, "mason/packages/cpptools/extension/debugAdapters/vsdbg/bin/vsdbg.exe"))
+	add(path_join(data_dir, "mason/packages/cpptools/debugAdapters/vsdbg/bin/vsdbg.exe"))
+	add(path_join(data_dir, "mason/packages/cpptools-win32-x64/extension/debugAdapters/vsdbg/bin/vsdbg.exe"))
+	add(path_join(data_dir, "mason/packages/cpptools-win32-x64/debugAdapters/vsdbg/bin/vsdbg.exe"))
 
 	local extension_roots = {}
 	local seen_roots = {}
@@ -524,12 +571,12 @@ local function default_adapter_path_candidates()
 
 	for _, root in ipairs(extension_roots) do
 		for _, pattern in ipairs({
-			path_join(root, "ms-vscode.cpptools-*", "debugAdapters/bin/OpenDebugAD7.exe"),
-			path_join(root, "ms-vscode.cpptools-*", "extension/debugAdapters/bin/OpenDebugAD7.exe"),
-			path_join(root, "*cpptools*", "debugAdapters/bin/OpenDebugAD7.exe"),
-			path_join(root, "*cpptools*", "extension/debugAdapters/bin/OpenDebugAD7.exe"),
-			path_join(root, "*", "debugAdapters/bin/OpenDebugAD7.exe"),
-			path_join(root, "*", "extension/debugAdapters/bin/OpenDebugAD7.exe"),
+			path_join(root, "ms-vscode.cpptools-*", "debugAdapters/vsdbg/bin/vsdbg.exe"),
+			path_join(root, "ms-vscode.cpptools-*", "extension/debugAdapters/vsdbg/bin/vsdbg.exe"),
+			path_join(root, "*cpptools*", "debugAdapters/vsdbg/bin/vsdbg.exe"),
+			path_join(root, "*cpptools*", "extension/debugAdapters/vsdbg/bin/vsdbg.exe"),
+			path_join(root, "*", "debugAdapters/vsdbg/bin/vsdbg.exe"),
+			path_join(root, "*", "extension/debugAdapters/vsdbg/bin/vsdbg.exe"),
 		}) do
 			for _, match in ipairs(vim.fn.glob(pattern, false, true)) do
 				add(match)
@@ -540,29 +587,11 @@ local function default_adapter_path_candidates()
 	return candidates
 end
 
-local function adapter_command()
+local function adapter_source_command()
 	local adapter = adapter_config()
 
 	if adapter.command and file_readable(adapter.command) then
 		return normalize(adapter.command)
-	end
-
-	if vim.fn.executable("OpenDebugAD7.exe") == 1 then
-		return "OpenDebugAD7.exe"
-	end
-
-	if is_windows() and vim.fn.executable("where") == 1 then
-		local ok, result = pcall(function()
-			return vim.system({ "where", "OpenDebugAD7.exe" }, { text = true }):wait()
-		end)
-		if ok and result and result.code == 0 then
-			for _, line in ipairs(vim.split(result.stdout or "", "\n", { plain = true })) do
-				line = normalize(vim.trim(line))
-				if file_readable(line) then
-					return line
-				end
-			end
-		end
 	end
 
 	for _, candidate in ipairs(default_adapter_path_candidates()) do
@@ -574,9 +603,198 @@ local function adapter_command()
 	return nil
 end
 
+local function adapter_command()
+	return adapter_source_command()
+end
+
+local function default_signer_path_candidates()
+	local candidates = {}
+
+	local function add(path)
+		if path and path ~= "" then
+			table.insert(candidates, normalize(path))
+		end
+	end
+
+	add(signer_installed_path())
+
+	local roots = {
+		vim.env.LOCALAPPDATA and path_join(vim.env.LOCALAPPDATA, "Programs/Microsoft VS Code"),
+		vim.env.LOCALAPPDATA and path_join(vim.env.LOCALAPPDATA, "Programs/VSCode"),
+		vim.env.LOCALAPPDATA and path_join(vim.env.LOCALAPPDATA, "Programs/Microsoft VS Code Insiders"),
+		vim.env.ProgramFiles and path_join(vim.env.ProgramFiles, "Microsoft VS Code"),
+		vim.env.ProgramFiles and path_join(vim.env.ProgramFiles, "Microsoft VS Code Insiders"),
+		vim.env["ProgramFiles(x86)"] and path_join(vim.env["ProgramFiles(x86)"], "Microsoft VS Code"),
+		vim.env["ProgramFiles(x86)"] and path_join(vim.env["ProgramFiles(x86)"], "Microsoft VS Code Insiders"),
+		vim.env.USERPROFILE and path_join(vim.env.USERPROFILE, "scoop/apps/vscode/current"),
+		vim.env.USERPROFILE and path_join(vim.env.USERPROFILE, "scoop/apps/vscode-insiders/current"),
+		vim.env.SCOOP and path_join(vim.env.SCOOP, "apps/vscode/current"),
+		vim.env.SCOOP and path_join(vim.env.SCOOP, "apps/vscode-insiders/current"),
+	}
+
+	for _, root in ipairs(roots) do
+		if root and root ~= "" then
+			add(path_join(root, "resources/app/node_modules.asar.unpacked/vsda/build/Release/vsda.node"))
+		end
+	end
+
+	return candidates
+end
+
+local function adapter_signer_path()
+	local adapter = adapter_config()
+	if adapter.signer and file_readable(adapter.signer) then
+		return normalize(adapter.signer)
+	end
+
+	for _, candidate in ipairs(default_signer_path_candidates()) do
+		if file_readable(candidate) then
+			return candidate
+		end
+	end
+
+	return nil
+end
+
+local function sign_handshake_value(value, callback)
+	local node = adapter_node_command()
+	if not node then
+		return callback(false, "Node.js was not found for cppvsdbg handshake signing")
+	end
+
+	local signer = adapter_signer_path()
+	if not signer then
+		return callback(false, "VS Code handshake signer (vsda.node) was not found")
+	end
+
+	local script = table.concat({
+		"const signerPath = process.argv[1];",
+		"const challenge = process.argv[2] || '';",
+		"const vsda = require(signerPath);",
+		"const signer = new vsda.signer();",
+		"process.stdout.write(String(signer.sign(challenge)));",
+	}, " ")
+
+	vim.system({ node, "-e", script, signer, tostring(value or "") }, { text = true }, function(result)
+		vim.schedule(function()
+			if result.code ~= 0 then
+				local err = vim.trim(result.stderr ~= "" and result.stderr or result.stdout or "")
+				if err == "" then
+					err = "cppvsdbg handshake signing failed"
+				end
+				return callback(false, err)
+			end
+
+			local signature = vim.trim(result.stdout or "")
+			if signature == "" then
+				return callback(false, "cppvsdbg handshake signer returned an empty signature")
+			end
+
+			callback(true, signature)
+		end)
+	end)
+end
+
+local function install_signer_async(callback)
+	local root = signer_install_root()
+	local archive = signer_archive_path()
+	local target = signer_installed_path()
+	local marker = signer_extract_marker_path()
+	local url = vscode_signer_download_url()
+
+	vim.fn.mkdir(root, "p")
+	adapter_progress(10, "Preparing Signer")
+
+	local script = table.concat({
+		"$ErrorActionPreference = 'Stop'",
+		"$root = " .. ps_quote(root),
+		"$archive = " .. ps_quote(archive),
+		"$target = " .. ps_quote(target),
+		"$marker = " .. ps_quote(marker),
+		"$url = " .. ps_quote(url),
+		"New-Item -ItemType Directory -Force -Path $root | Out-Null",
+		"Invoke-WebRequest -Uri $url -OutFile $archive",
+		"Add-Type -AssemblyName System.IO.Compression.FileSystem",
+		"$zip = [System.IO.Compression.ZipFile]::OpenRead($archive)",
+		"try {",
+		"  $entry = $zip.Entries | Where-Object { $_.FullName -like '*/resources/app/node_modules.asar.unpacked/vsda/build/Release/vsda.node' } | Select-Object -First 1",
+		"  if (-not $entry) { throw 'vsda.node was not found in the VS Code archive' }",
+		"  if (Test-Path $target) { Remove-Item -LiteralPath $target -Force }",
+		"  [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $target, $true)",
+		"} finally {",
+		"  $zip.Dispose()",
+		"}",
+		"Set-Content -LiteralPath $marker -Value $url -NoNewline",
+		"Write-Output $target",
+	}, "; ")
+
+	local ps = vim.fn.executable("pwsh") == 1 and "pwsh" or "powershell"
+	vim.system({
+		ps,
+		"-NoProfile",
+		"-ExecutionPolicy",
+		"Bypass",
+		"-Command",
+		script,
+	}, { text = true }, function(result)
+		vim.schedule(function()
+			if result.code ~= 0 then
+				local err = vim.trim(result.stderr ~= "" and result.stderr or result.stdout or "")
+				if err == "" then
+					err = "failed to provision VS Code handshake signer"
+				end
+				return callback(false, err)
+			end
+
+			if not file_readable(target) then
+				return callback(false, "vsda.node provisioning finished but target file is missing")
+			end
+
+			callback(true, normalize(vim.trim(result.stdout or target)))
+		end)
+	end)
+end
+
+local function handle_reverse_handshake(session, request)
+	local value = (((request or {}).arguments or {}).value)
+	if not value or tostring(value) == "" then
+		return session:response(request, {
+			success = false,
+			message = "Missing cppvsdbg handshake value",
+		})
+	end
+
+	sign_handshake_value(value, function(ok, payload)
+		if ok then
+			session:response(request, {
+				success = true,
+				body = {
+					signature = payload,
+				},
+			})
+			return
+		end
+
+		vim.notify("UCore debug: " .. tostring(payload), vim.log.levels.ERROR)
+		session:response(request, {
+			success = false,
+			message = tostring(payload),
+		})
+	end)
+end
+
 local function adapter_args()
 	local adapter = adapter_config()
-	return type(adapter.args) == "table" and adapter.args or {}
+	local args = { "--interpreter=vscode" }
+	if vim.env.USERPROFILE and vim.env.USERPROFILE ~= "" then
+		table.insert(args, "--extConfigDir=" .. normalize(vim.env.USERPROFILE .. "/.cppvsdbg/extensions"))
+	end
+	if type(adapter.args) == "table" then
+		for _, arg in ipairs(adapter.args) do
+			table.insert(args, arg)
+		end
+	end
+	return args
 end
 
 local function register_dap_adapter(command)
@@ -586,6 +804,9 @@ local function register_dap_adapter(command)
 		type = "executable",
 		command = command,
 		args = adapter_args(),
+		reverse_request_handlers = {
+			handshake = handle_reverse_handshake,
+		},
 	}
 
 	state.adapter_registered = true
@@ -605,9 +826,19 @@ local function ensure_dap_adapter()
 		return false, "UCore debug currently supports Windows Unreal workflows only"
 	end
 
-	local command = adapter_command()
+	local command = adapter_source_command()
 	if not command then
-		return false, "OpenDebugAD7.exe was not found"
+		return false, "vsdbg.exe was not found"
+	end
+
+	local node = adapter_node_command()
+	if not node then
+		return false, "Node.js was not found for cppvsdbg handshake signing"
+	end
+
+	local signer = adapter_signer_path()
+	if not signer then
+		return false, "VS Code handshake signer (vsda.node) was not found"
 	end
 
 	return register_dap_adapter(command)
@@ -640,14 +871,6 @@ local function ensure_dap_adapter_async(callback)
 	if not adapter_auto_install_enabled() or not is_windows() then
 		if callback then
 			callback(false, payload)
-		end
-		return
-	end
-
-	local registry = mason_registry()
-	if not registry then
-		if callback then
-			callback(false, payload .. ". mason.nvim is not available")
 		end
 		return
 	end
@@ -828,7 +1051,7 @@ local function ensure_dap_adapter_async(callback)
 			vim.notify("UCore debug: cppvsdbg adapter is ready", vim.log.levels.INFO)
 			finish_adapter_waiters(true, result)
 		else
-			fail("UCore debug: adapter install finished but OpenDebugAD7.exe is still unavailable")
+			fail("UCore debug: debug prerequisites installation finished but adapter is still unavailable")
 		end
 	end
 
@@ -865,22 +1088,60 @@ local function ensure_dap_adapter_async(callback)
 		end
 	end
 
-	vim.notify("UCore debug: installing cppvsdbg adapter via Mason (" .. package_name .. ")", vim.log.levels.INFO)
+	local function install_adapter_with_mason()
+		local registry = mason_registry()
+		if not registry then
+			return fail("UCore debug: Mason is not available to install cppvsdbg")
+		end
+
+		vim.notify("UCore debug: installing cppvsdbg adapter via Mason (" .. package_name .. ")", vim.log.levels.INFO)
+		report_progress(45, "Preparing Adapter")
+		registry.refresh(vim.schedule_wrap(function(success)
+			if not success then
+				return fail("UCore debug: failed to refresh Mason registry")
+			end
+			report_progress(55, "Registry Ready")
+
+			local ok_pkg, pkg = pcall(registry.get_package, package_name)
+			if not ok_pkg or not pkg then
+				return fail("UCore debug: Mason package not found: " .. package_name)
+			end
+			report_progress(65, "Package Resolved")
+
+			watch_package(pkg)
+		end))
+	end
+
+	local function continue_after_signer()
+		local ready, result = ensure_dap_adapter()
+		if ready then
+			adapter_progress_finish("Ready")
+			vim.notify("UCore debug: cppvsdbg adapter is ready", vim.log.levels.INFO)
+			return finish_adapter_waiters(true, result)
+		end
+
+		if adapter_source_command() then
+			return fail("UCore debug: " .. tostring(result))
+		end
+
+		install_adapter_with_mason()
+	end
+
 	report_progress(5, "Preparing")
-	registry.refresh(vim.schedule_wrap(function(success)
-		if not success then
-			return fail("UCore debug: failed to refresh Mason registry")
-		end
-		report_progress(20, "Registry Ready")
+	if adapter_signer_path() then
+		report_progress(35, "Signer Ready")
+		return continue_after_signer()
+	end
 
-		local ok_pkg, pkg = pcall(registry.get_package, package_name)
-		if not ok_pkg or not pkg then
-			return fail("UCore debug: Mason package not found: " .. package_name)
+	vim.notify("UCore debug: provisioning cppvsdbg handshake signer from official VS Code archive", vim.log.levels.INFO)
+	report_progress(15, "Downloading Signer")
+	install_signer_async(function(installed, result)
+		if not installed then
+			return fail("UCore debug: " .. tostring(result))
 		end
-		report_progress(35, "Package Resolved")
-
-		watch_package(pkg)
-	end))
+		report_progress(35, "Signer Ready")
+		continue_after_signer()
+	end)
 end
 
 local function project_context(root)
@@ -1254,17 +1515,18 @@ end
 
 local function dap_status(root)
 	root = root or active_root()
-	local ok = false
 	local command = adapter_command()
-	if dap_available() and is_windows() then
-		ok = command ~= nil
-	end
+	local signer = adapter_signer_path()
+	local node = adapter_node_command()
+	local ok = dap_available() and is_windows() and command ~= nil and signer ~= nil and node ~= nil
 	return {
 		enabled = (config.values.debug or {}).enable ~= false,
 		dap_available = dap_available(),
 		windows = is_windows(),
 		adapter_ready = ok,
 		adapter_command = command,
+		adapter_node_command = node,
+		adapter_signer = signer,
 		adapter_auto_install = adapter_auto_install_enabled(),
 		adapter_package = adapter_package_name(),
 		mason_available = mason_available(),
@@ -1359,78 +1621,74 @@ local function enumerate_processes(ctx, callback)
 	end)
 end
 
-local function process_id_set(items)
-	local set = {}
-	for _, item in ipairs(items or {}) do
-		local pid = tonumber(type(item) == "table" and item.pid or nil)
-		if pid and pid > 0 then
-			set[pid] = true
-		end
-	end
-	return set
-end
-
 local function launch_editor_args(ctx)
 	return {
 		ctx.uproject,
-		"-WaitForDebuggerNoBreak",
 	}
 end
 
 local function spawn_editor_process(ctx, callback)
-	local handle
-	local pid
+	local ps = vim.fn.executable("pwsh") == 1 and "pwsh" or "powershell"
 	local args = launch_editor_args(ctx)
-	handle, pid = vim.loop.spawn(ctx.editor_exe, {
-		args = args,
-		cwd = ctx.root,
-		detached = true,
-		hide = false,
-	}, function()
-		if handle and not handle:is_closing() then
-			handle:close()
-		end
-	end)
-
-	if not handle then
-		return callback(nil, "failed to launch UnrealEditor.exe")
+	local quoted_args = {}
+	for _, arg in ipairs(args) do
+		table.insert(quoted_args, "'" .. tostring(arg):gsub("'", "''") .. "'")
 	end
 
-	handle:unref()
-	callback(pid, nil)
+	local script = table.concat({
+		"$proc = Start-Process -FilePath '"
+			.. tostring(ctx.editor_exe):gsub("'", "''")
+			.. "' -ArgumentList @("
+			.. table.concat(quoted_args, ",")
+			.. ") -WorkingDirectory '"
+			.. tostring(ctx.root):gsub("'", "''")
+			.. "' -PassThru",
+		"$proc.Id",
+	}, "; ")
+
+	vim.system({
+		ps,
+		"-NoProfile",
+		"-ExecutionPolicy",
+		"Bypass",
+		"-Command",
+		script,
+	}, { text = true }, function(result)
+		vim.schedule(function()
+			if result.code ~= 0 then
+				local err = vim.trim(result.stderr ~= "" and result.stderr or result.stdout or "")
+				if err == "" then
+					err = "failed to launch UnrealEditor.exe"
+				end
+				return callback(nil, err)
+			end
+
+			local pid = tonumber(vim.trim(result.stdout or ""))
+			if not pid or pid <= 0 then
+				return callback(nil, "failed to resolve Unreal Editor process id")
+			end
+
+			callback(pid, nil)
+		end)
+	end)
 end
 
-local function wait_for_editor_attach_target(ctx, before_pids, preferred_pid, callback)
+local function wait_for_editor_attach_target(ctx, preferred_pid, callback)
 	local deadline = vim.loop.hrtime() + (30 * 1e9)
 	local timer = vim.loop.new_timer()
+	local done = false
 
 	local function finish(item, err)
+		if done then
+			return
+		end
+		done = true
 		if timer then
 			timer:stop()
 			timer:close()
 			timer = nil
 		end
 		callback(item, err)
-	end
-
-	local function choose_process(items)
-		if preferred_pid then
-			for _, item in ipairs(items or {}) do
-				if tonumber(item.pid) == tonumber(preferred_pid) then
-					return item
-				end
-			end
-		end
-
-		for _, item in ipairs(items or {}) do
-			local pid = tonumber(item.pid)
-			local name = lower(item.name or "")
-			if pid and pid > 0 and not before_pids[pid] and (name == "unrealeditor.exe" or name == "ue4editor.exe") then
-				return item
-			end
-		end
-
-		return nil
 	end
 
 	timer:start(0, 500, vim.schedule_wrap(function()
@@ -1446,26 +1704,56 @@ local function wait_for_editor_attach_target(ctx, before_pids, preferred_pid, ca
 				return finish(nil, err)
 			end
 
-			local item = choose_process(items)
-			if item then
-				finish(item, nil)
+			for _, item in ipairs(items or {}) do
+				if tonumber(item.pid) == tonumber(preferred_pid) then
+					return finish(item, nil)
+				end
 			end
 		end)
 	end))
 end
 
-local function attach_with_process(process)
+local function attach_with_process(process, ctx)
+	local pid = tonumber(process and process.pid or nil)
+	if not pid or pid <= 0 then
+		return vim.notify("UCore debug: invalid target process id", vim.log.levels.ERROR)
+	end
+
+	local program = normalize(process and process.exe or nil)
+	if not program or program == "" then
+		program = normalize(ctx and ctx.editor_exe or nil)
+	end
+	if not program or program == "" then
+		return vim.notify("UCore debug: missing program path for attach", vim.log.levels.ERROR)
+	end
+
+	local cwd = normalize(ctx and ctx.root or nil)
+
+	if state.attach_in_progress and state.attach_target_pid == pid then
+		return
+	end
+
+	state.attach_in_progress = true
+	state.attach_target_pid = pid
 	ensure_dap_adapter_async(function(ok, err)
 		if not ok then
+			state.attach_in_progress = false
+			state.attach_target_pid = nil
 			return vim.notify("UCore debug: " .. tostring(err), vim.log.levels.ERROR)
 		end
 
 		local dap = require("dap")
+		vim.notify(
+			"UCore debug: attaching to " .. tostring(process.name or "UnrealEditor.exe") .. " (" .. tostring(pid) .. ")",
+			vim.log.levels.INFO
+		)
 		dap.run({
 			type = "cppvsdbg",
 			request = "attach",
 			name = "UCore Attach " .. tostring(process.name or process.pid),
-			processId = tostring(process.pid),
+			processId = pid,
+			program = program,
+			cwd = cwd,
 		})
 	end)
 end
@@ -1492,7 +1780,7 @@ function M.attach()
 		end
 
 		local best = items[1]
-		attach_with_process(best)
+		attach_with_process(best, ctx)
 	end)
 end
 
@@ -1523,7 +1811,7 @@ function M.pick_process()
 				return string.format("[%s] %s (%s)%s", tostring(item.kind or "proc"), tostring(item.name or "?"), tostring(item.pid or "?"), suffix)
 			end,
 			on_choice = function(choice)
-				attach_with_process(choice)
+				attach_with_process(choice, ctx)
 			end,
 		})
 	end)
@@ -1532,6 +1820,10 @@ end
 function M.launch_editor()
 	if not dap_available() then
 		return notify_missing_dap()
+	end
+
+	if state.launch_in_progress then
+		return vim.notify("UCore debug: Unreal Editor launch already in progress", vim.log.levels.INFO)
 	end
 
 	local ctx, err = project_context()
@@ -1550,24 +1842,41 @@ function M.launch_editor()
 			return
 		end
 
-		enumerate_processes(ctx, function(existing_items, process_err)
-			if process_err then
-				return vim.notify("UCore debug: " .. tostring(process_err), vim.log.levels.ERROR)
+		state.launch_in_progress = true
+		vim.notify("UCore debug: building Unreal Editor target before launch", vim.log.levels.INFO)
+		unreal.build_async("", function(ok, result, build_ctx)
+			if not ok then
+				state.launch_in_progress = false
+				if result ~= "cancelled" then
+					vim.notify("UCore debug: build failed, not launching Unreal Editor", vim.log.levels.ERROR)
+				end
+				return
 			end
 
-			local before_pids = process_id_set(existing_items)
-			spawn_editor_process(ctx, function(launch_pid, launch_err)
+			local refreshed_ctx = build_ctx and project_context(build_ctx.root) or project_context(ctx.root)
+			local launch_ctx = refreshed_ctx or ctx
+			if not launch_ctx.editor_exe or vim.fn.filereadable(launch_ctx.editor_exe) ~= 1 then
+				state.launch_in_progress = false
+				return vim.notify("UCore debug: UnrealEditor.exe was not found after build", vim.log.levels.ERROR)
+			end
+
+			spawn_editor_process(launch_ctx, function(launch_pid, launch_err)
 				if launch_err then
+					state.launch_in_progress = false
 					return vim.notify("UCore debug: " .. tostring(launch_err), vim.log.levels.ERROR)
 				end
 
-				vim.notify("UCore debug: launching Unreal Editor and waiting to attach", vim.log.levels.INFO)
-				wait_for_editor_attach_target(ctx, before_pids, launch_pid, function(process, wait_err)
+				vim.notify(
+					"UCore debug: launched Unreal Editor (" .. tostring(launch_pid) .. "), waiting to attach",
+					vim.log.levels.INFO
+				)
+				wait_for_editor_attach_target(launch_ctx, launch_pid, function(process, wait_err)
+					state.launch_in_progress = false
 					if not process then
 						return vim.notify("UCore debug: " .. tostring(wait_err), vim.log.levels.WARN)
 					end
 
-					attach_with_process(process)
+					attach_with_process(process, launch_ctx)
 				end)
 			end)
 		end)
@@ -1904,6 +2213,8 @@ function M.setup()
 		local ok, dap = pcall(require, "dap")
 		if ok and dap and dap.listeners then
 			dap.listeners.after.event_initialized.ucore_debug = function()
+				state.attach_in_progress = false
+				state.attach_target_pid = nil
 				local root = active_root()
 				if root then
 					restore_project_breakpoints(root)
@@ -1926,11 +2237,15 @@ function M.setup()
 				end
 			end
 			dap.listeners.before.event_terminated.ucore_debug = function()
+				state.attach_in_progress = false
+				state.attach_target_pid = nil
 				if auto_close_ui_enabled() then
 					require("ucore.debug.ui").close()
 				end
 			end
 			dap.listeners.before.event_exited.ucore_debug = function()
+				state.attach_in_progress = false
+				state.attach_target_pid = nil
 				if auto_close_ui_enabled() then
 					require("ucore.debug.ui").close()
 				end
