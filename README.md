@@ -117,7 +117,10 @@ Recommended setup:
 
 ```lua
 {
-  "neovim/nvim-lspconfig", -- optional on Neovim 0.11+
+  "vlicecream/UCore.nvim",
+  dependencies = {
+    { "neovim/nvim-lspconfig" }, -- optional on Neovim 0.11+
+  },
 }
 ```
 
@@ -441,7 +444,10 @@ UCore 自己主要负责：
 
 ```lua
 {
-  "neovim/nvim-lspconfig", -- Neovim 0.11+ 可选
+  "vlicecream/UCore.nvim",
+  dependencies = {
+    { "neovim/nvim-lspconfig" }, -- Neovim 0.11+ 可选
+  },
 }
 ```
 
