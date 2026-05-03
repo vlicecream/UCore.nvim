@@ -307,6 +307,57 @@ M.values = {
 		debounce_ms = 120,
 	},
 
+	-- Debugging integration powered by nvim-dap + cppvsdbg.
+	-- 基于 nvim-dap + cppvsdbg 的调试集成。
+	debug = {
+		-- Enable UCore debug integration.
+		-- 是否启用 UCore 调试集成。
+		enable = true,
+
+		-- Save modified project files before launching a debug session.
+		-- 启动调试前是否先保存项目中的已修改文件。
+		autosave_before_launch = true,
+
+		-- Redirect breakpoints placed on header declarations to the matching
+		-- source definition when possible.
+		-- 尽量把头文件声明上的断点重定向到对应 .cpp 定义。
+		redirect_header_breakpoints = true,
+
+		-- Adapter resolution. `command = nil` means auto-detect OpenDebugAD7.exe.
+		-- 调试适配器解析。`command = nil` 表示自动查找 OpenDebugAD7.exe。
+		adapter = {
+			command = nil,
+			args = {},
+		},
+
+		ui = {
+			-- Auto-open the built-in minimal debug UI on session start.
+			-- 会话开始时自动打开内置的最轻调试 UI。
+			auto_open = true,
+
+			-- Auto-close the UI when the session ends.
+			-- 会话结束时自动关闭 UI。
+			auto_close = true,
+		},
+
+		keymaps = {
+			enable = true,
+			toggle_breakpoint = "<leader>db",
+			continue = "<leader>dc",
+			attach = "<leader>da",
+			launch_editor = "<leader>de",
+			restart = "<leader>dr",
+			stop = "<leader>ds",
+			step_over = "<leader>do",
+			step_into = "<leader>di",
+			step_out = "<leader>du",
+			hover = "<leader>dh",
+			processes = "<leader>dp",
+			list_breakpoints = "<leader>dl",
+			ui = "<leader>dt",
+		},
+	},
+
 	-- Development mode: call Cargo directly so code changes are picked up.
 	-- 开发模式：直接调用 Cargo，方便 Rust 代码修改后立即生效。
 	scanner_cmd = cargo_scanner_cmd(),

@@ -6,6 +6,7 @@ local M = {}
 local build_job = nil
 local build_buf = nil
 local build_cancelled = false
+local build_pid = nil
 
 -- Accumulated diagnostics for the current build.
 -- 当前构建累积的诊断信息。
@@ -63,6 +64,10 @@ local function current_context()
 	}
 end
 
+function M.current_context()
+	return current_context()
+end
+
 local function executable(path)
 	return path and (vim.fn.executable(path) == 1 or readable(path))
 end
@@ -84,6 +89,10 @@ local function editor_exe(engine_root)
 	end
 
 	return nil
+end
+
+function M.editor_executable(engine_root)
+	return editor_exe(engine_root)
 end
 
 local function powershell()
@@ -243,7 +252,7 @@ local function parse_diagnostic_line(line, project_root)
 	end
 
 	-- UBT/UHT known error prefixes
-	if line:find("Error:", 1, true) and (line:find("^LogCompile", 1, true) or line:find("^LogLinker", 1, true)) then
+	if line:find("Error:", 1, true) and (line:match("^LogCompile") or line:match("^LogLinker")) then
 		return { type = "E", text = line }
 	end
 
@@ -257,20 +266,25 @@ local function color_build_line(buf, line_num, text)
 		return
 	end
 
+	local lower = text:lower()
 	local group
-	if text:find("error C%d+", 1, true)
-		or text:find("fatal error", 1, true)
-		or text:find(" LNK%d+", 1, true)
-		or text:find("UBT ERROR", 1, true)
-		or text:find("Error:", 1, true)
+	if text:match("^Project:") or text:match("^Engine:") or text:match("^Command:") then
+		group = "UCoreBuildCommand"
+	elseif text:match("error%s+C%d+:")
+		or lower:find("fatal error", 1, true)
+		or text:match("fatal error%s+LNK%d+")
+		or text:match("%f[%a]LNK%d+%f[%A]")
+		or lower:find("ubt error", 1, true)
+		or lower:find("error:", 1, true)
 	then
 		group = "UCoreBuildError"
-	elseif text:find("warning C%d+", 1, true) or text:find(": warning ", 1, true) or text:find("WARNING:", 1, true) then
+	elseif text:match("warning%s+C%d+:")
+		or lower:find(": warning ", 1, true)
+		or lower:find("warning:", 1, true)
+	then
 		group = "UCoreBuildWarning"
-	elseif text:find("Succeeded", 1, true) or text:find("finished with exit code 0", 1, true) then
+	elseif lower:find("succeeded", 1, true) or lower:find("finished with exit code 0", 1, true) then
 		group = "UCoreBuildSuccess"
-	elseif text:find("^Project:", 1, true) or text:find("^Engine:", 1, true) or text:find("^Command:", 1, true) then
-		group = "UCoreBuildCommand"
 	end
 
 	if group then
@@ -408,6 +422,7 @@ local function start_build(args, callback)
 		end,
 	}, function(result)
 		build_job = nil
+		build_pid = nil
 		local this_buf = build_buf
 		build_buf = nil
 		local was_cancelled = build_cancelled
@@ -427,11 +442,35 @@ local function start_build(args, callback)
 				fill_quickfix()
 				callback(ok, result, ctx)
 			else
-				vim.notify("UCore build cancelled", vim.log.levels.WARN)
+				vim.notify("UCore build stopped", vim.log.levels.WARN)
 				callback(false, "cancelled")
 			end
 		end)
 	end)
+	build_pid = build_job and build_job.pid or nil
+end
+
+local function is_windows()
+	return package.config:sub(1, 1) == "\\"
+end
+
+local function kill_process_tree(pid)
+	if not pid then
+		return false
+	end
+
+	if is_windows() then
+		vim.system({ "taskkill", "/PID", tostring(pid), "/T", "/F" }, { text = true }, function() end)
+		return true
+	end
+
+	if build_job then
+		return pcall(function()
+			build_job:kill(15)
+		end)
+	end
+
+	return false
 end
 
 local function launch_editor(ctx)
@@ -458,15 +497,15 @@ function M.cancel_build()
 
 	build_cancelled = true
 	local buf = build_buf
-	pcall(function()
-		build_job:kill(15)
-	end)
+	local pid = build_pid or (build_job and build_job.pid) or nil
+	kill_process_tree(pid)
 	build_job = nil
+	build_pid = nil
 	build_buf = nil
 
 	if buf and vim.api.nvim_buf_is_valid(buf) then
 		append_lines(buf, "")
-		append_lines(buf, "UCore build cancelled")
+		append_lines(buf, "UCore build stopped")
 	end
 end
 

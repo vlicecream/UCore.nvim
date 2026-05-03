@@ -22,8 +22,13 @@ function M.dispatch(args)
 		build = function()
 			actions.build(tail)
 		end,
+		["build-stop"] = actions.build_cancel,
 		["build-cancel"] = actions.build_cancel,
+		buildstop = actions.build_cancel,
 		buildcancel = actions.build_cancel,
+		debug = function()
+			actions.debug(tail)
+		end,
 		editor = function()
 			actions.editor(tail)
 		end,
@@ -56,7 +61,8 @@ function M.register()
 			local user_items = {
 				"boot",
 				"build",
-				"build-cancel",
+				"build-stop",
+				"debug",
 				"editor",
 				"explorer",
 				"find",
@@ -83,6 +89,20 @@ function M.register()
 				"help",
 			}
 
+			local debug_items = {
+				"attach",
+				"breakpoint",
+				"clear",
+				"condition",
+				"editor",
+				"continue",
+				"logpoint",
+				"stop",
+				"breakpoints",
+				"processes",
+				"ui",
+			}
+
 			local line = cmdline or ""
 			local before_cursor = line:sub(1, (cursorpos or (#line + 1)) - 1)
 			local tail = before_cursor:match("^%s*UCore%s*(.-)%s*$") or ""
@@ -92,6 +112,8 @@ function M.register()
 			local items
 			if in_goto then
 				items = goto_items
+			elseif first and first:lower() == "debug" then
+				items = debug_items
 			elseif first and first:lower() == "diagnostics" then
 				items = diagnostics_items
 			else
@@ -105,6 +127,10 @@ function M.register()
 			end
 
 			if in_goto and (tail:lower() == "goto" or tail:lower():match("^goto%s*$")) then
+				needle = ""
+			end
+
+			if first and first:lower() == "debug" and tail:lower():match("^debug%s*$") then
 				needle = ""
 			end
 

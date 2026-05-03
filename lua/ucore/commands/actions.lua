@@ -5,6 +5,7 @@ local ui = require("ucore.ui")
 local unreal = require("ucore.unreal")
 local bootstrap = require("ucore.bootstrap")
 local dirty = require("ucore.editing.dirty")
+local debug = require("ucore.debug")
 local navigation = require("ucore.navigation")
 local explorer = require("ucore.explorer")
 
@@ -179,6 +180,12 @@ function M.editor(args)
 			unreal.open_editor(args)
 		end
 	end)
+end
+
+-- Minimal Unreal debug entrypoints powered by nvim-dap.
+-- 基于 nvim-dap 的最小 Unreal 调试入口。
+function M.debug(tail)
+	debug.dispatch(tail)
 end
 
 -- Pick and open a registered Unreal project.
@@ -626,7 +633,8 @@ UCore commands:
   :UCore              Smart entry: boot, pick, or Dashboard
   :UCore boot         Boot current project, or pick a registered one
   :UCore build        Build current Unreal Editor target
-  :UCore build-cancel Cancel the currently running Unreal build
+  :UCore build-stop   Stop the currently running Unreal build
+  :UCore debug        Unreal debug entrypoints (attach/editor/stop/...)
   :UCore editor       Open current project in Unreal Editor
   :UCore explorer     Open the left-side Project/Source/Config tree
   :UCore find         Find indexed symbols, modules, assets, config

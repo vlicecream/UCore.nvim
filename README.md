@@ -221,7 +221,8 @@ With `auto_boot = true`, UCore boots automatically when you enter the project.
 :UCore
 :UCore boot
 :UCore build [configuration] [platform] [target]
-:UCore build-cancel
+:UCore build-stop
+:UCore debug <attach|breakpoint|condition|logpoint|clear|editor|continue|stop|breakpoints|processes|ui>
 :UCore editor
 :UCore explorer
 :UCore find [pattern]
@@ -241,6 +242,19 @@ With `auto_boot = true`, UCore boots automatically when you enter the project.
 | `gr` | find references |
 | `gs` | toggle `.h` / `.cpp` |
 | `gf` | global find |
+| `<leader>db` | toggle breakpoint |
+| `<leader>dc` | continue / attach / launch |
+| `<leader>da` | attach to Unreal process |
+| `<leader>de` | launch Unreal Editor under debugger |
+| `<leader>dr` | restart debug session |
+| `<leader>ds` | stop debug session |
+| `<leader>do` | step over |
+| `<leader>di` | step into |
+| `<leader>du` | step out |
+| `<leader>dh` | debug hover |
+| `<leader>dp` | pick process |
+| `<leader>dl` | list breakpoints |
+| `<leader>dt` | toggle UCore debug UI |
 
 ### Configuration
 
@@ -271,6 +285,18 @@ require("ucore").setup({
       compile_commands_dir = nil,
     },
   },
+  debug = {
+    enable = true,
+    autosave_before_launch = true,
+    redirect_header_breakpoints = true,
+    adapter = {
+      command = nil, -- auto-detect OpenDebugAD7.exe when possible
+    },
+    ui = {
+      auto_open = true,  -- auto-open the minimal UCore debug UI
+      auto_close = true,
+    },
+  },
   semantic = {
     enable = true,
     debounce_ms = 120,
@@ -294,6 +320,16 @@ Neovim (Lua)
 
 The backend prefers release binaries under `u-scanner/target/release/` and falls back to `cargo run` when needed.
 
+### Unreal Debugging
+
+UCore's Unreal debugging layer is built on top of `nvim-dap`. On Windows, it targets `cppvsdbg` and auto-detects `OpenDebugAD7.exe` from common Mason / VS Code locations when possible.
+
+- install `mfussenegger/nvim-dap`
+- use `:checkhealth ucore` to verify the adapter path
+- breakpoints placed on `.h` declarations are redirected to the matching `.cpp` definition when UCore can resolve the target
+- redirected Unreal RPC / BlueprintNativeEvent declarations also map to `_Implementation` / `_Validate` when appropriate
+- UCore renders its own minimal debug UI: right side locals / current stop, bottom stack / threads / breakpoints
+
 ### Troubleshooting
 
 ```vim
@@ -306,6 +342,7 @@ Common cases:
 - Rust missing: install from `https://rustup.rs/`
 - project not indexed yet: run `:UCore` and wait for boot/indexing
 - server not ready: run `:UCore`, wait for boot, then re-run `:checkhealth ucore`
+- debug adapter missing: install `nvim-dap`, then point `debug.adapter.command` at `OpenDebugAD7.exe` if auto-detection does not find it
 - no syntax highlight: install `UTreeSitter.nvim`, then run `:checkhealth utreesitter`
 
 ### Related Repositories
@@ -539,7 +576,8 @@ require("ucore").setup({
 :UCore
 :UCore boot
 :UCore build [configuration] [platform] [target]
-:UCore build-cancel
+:UCore build-stop
+:UCore debug <attach|breakpoint|condition|logpoint|clear|editor|continue|stop|breakpoints|processes|ui>
 :UCore editor
 :UCore explorer
 :UCore find [pattern]
@@ -559,6 +597,19 @@ require("ucore").setup({
 | `gr` | 查找引用 |
 | `gs` | `.h` / `.cpp` 切换 |
 | `gf` | 全局搜索 |
+| `<leader>db` | 切换断点 |
+| `<leader>dc` | 继续 / attach / 启动调试 |
+| `<leader>da` | attach 到 Unreal 进程 |
+| `<leader>de` | 在调试器下启动 Unreal Editor |
+| `<leader>dr` | 重启调试会话 |
+| `<leader>ds` | 停止调试会话 |
+| `<leader>do` | step over |
+| `<leader>di` | step into |
+| `<leader>du` | step out |
+| `<leader>dh` | 调试 hover |
+| `<leader>dp` | 选择进程 |
+| `<leader>dl` | 查看断点列表 |
+| `<leader>dt` | 切换 UCore 调试 UI |
 
 ### 配置
 
@@ -588,6 +639,18 @@ require("ucore").setup({
       compile_commands_dir = nil,
     },
   },
+  debug = {
+    enable = true,
+    autosave_before_launch = true,
+    redirect_header_breakpoints = true,
+    adapter = {
+      command = nil, -- 尽量自动查找 OpenDebugAD7.exe
+    },
+    ui = {
+      auto_open = true,  -- 自动打开 UCore 自带的最轻调试 UI
+      auto_close = true,
+    },
+  },
   semantic = {
     enable = true,
     debounce_ms = 120,
@@ -611,6 +674,16 @@ Neovim (Lua)
 
 后端优先使用 `u-scanner/target/release/` 下的 release 二进制，缺失时回退到 `cargo run`。
 
+### Unreal 调试
+
+UCore 的 Unreal 调试层建立在 `nvim-dap` 之上。Windows 下默认走 `cppvsdbg`，并尽量从常见的 Mason / VS Code 路径自动找到 `OpenDebugAD7.exe`。
+
+- 安装 `mfussenegger/nvim-dap`
+- 用 `:checkhealth ucore` 检查 adapter 路径
+- 在 `.h` 声明行上下断点时，UCore 会尽量重定向到对应 `.cpp` 定义
+- Unreal RPC / BlueprintNativeEvent 这类声明，会尽量映射到 `_Implementation` / `_Validate`
+- UCore 会渲染自己的最轻调试 UI：右侧 locals / 当前停住位置，底部 stack / threads / breakpoints
+
 ### 排查
 
 ```vim
@@ -623,6 +696,7 @@ Neovim (Lua)
 - 没装 Rust：从 `https://rustup.rs/` 安装
 - 项目还没建索引：运行 `:UCore` 并等待 boot/index 完成
 - 服务没有起来：先执行 `:UCore`，等待 boot 完成后再运行 `:checkhealth ucore`
+- 调试 adapter 没找到：先安装 `nvim-dap`，如果自动检测不到，再手动配置 `debug.adapter.command = '.../OpenDebugAD7.exe'`
 - 没有语法高亮：安装 `UTreeSitter.nvim`，然后运行 `:checkhealth utreesitter`
 
 ### 相关仓库
