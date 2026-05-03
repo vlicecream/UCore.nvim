@@ -1343,4 +1343,13 @@ function M.setup()
 	})
 end
 
+function M.reset()
+	enabled = true
+	refresh_sequence = refresh_sequence + 1
+	float_sequence = float_sequence + 1
+	close_cursor_float()
+	pcall(vim.api.nvim_del_augroup_by_name, group_name)
+	vim.diagnostic.reset(ns)
+end
+
 return M

@@ -376,4 +376,11 @@ function M.setup()
 	})
 end
 
+function M.reset()
+	auto_sequence = auto_sequence + 1
+	request_sequence = request_sequence + 1
+	pending_request = nil
+	pcall(vim.api.nvim_del_augroup_by_name, "UCoreCompletion")
+end
+
 return M

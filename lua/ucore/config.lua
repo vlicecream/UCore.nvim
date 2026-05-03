@@ -49,11 +49,10 @@ local function cargo_server_cmd()
 	}
 end
 
--- Default runtime configuration for the Rust bridge.
--- Rust 桥接层的默认运行配置。
-M.values = {
-	port = 30110,
-	scanner_dir = scanner_dir,
+local function default_values()
+	return {
+		port = 30110,
+		scanner_dir = scanner_dir,
 
 	-- Root directory for UCore registry, databases, and runtime logs.
 	-- UCore 注册表、数据库和运行时日志的根目录。
@@ -297,8 +296,11 @@ M.values = {
 
 	-- Server command kept here for later start/stop integration.
 	-- server 启动命令先放这里，后面接 :UCoreStart 时复用。
-	server_cmd = cargo_server_cmd(),
-}
+		server_cmd = cargo_server_cmd(),
+	}
+end
+
+M.values = default_values()
 
 -- Return the release binary path for one backend executable.
 -- 返回某个后端可执行文件的 release binary 路径。
@@ -346,7 +348,7 @@ function M.setup(opts)
 	local has_custom_scanner_cmd = opts and opts.scanner_cmd ~= nil
 	local has_custom_server_cmd = opts and opts.server_cmd ~= nil
 
-	M.values = vim.tbl_deep_extend("force", M.values, opts or {})
+	M.values = vim.tbl_deep_extend("force", default_values(), opts or {})
 	M.refresh_backend_commands({
 		scanner = not has_custom_scanner_cmd,
 		server = not has_custom_server_cmd,

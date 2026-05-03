@@ -112,6 +112,20 @@ local function is_unreal_path(path)
 	return project.find_project_root(path) ~= nil
 end
 
+local function delete_buffer_map(bufnr, lhs)
+	lhs = normalize_lhs(lhs)
+	if not lhs then
+		return
+	end
+
+	for _, item in ipairs(vim.api.nvim_buf_get_keymap(bufnr, "n")) do
+		if item.lhs == lhs and tostring(item.desc or ""):find("^UCore ") then
+			pcall(vim.keymap.del, "n", lhs, { buffer = bufnr })
+			break
+		end
+	end
+end
+
 function M.setup()
 	local keymaps = keymap_config()
 	if keymaps.enable == false then
@@ -146,6 +160,24 @@ function M.setup()
 		pattern = filetypes,
 		callback = setup_buffer,
 	})
+end
+
+function M.reset()
+	pcall(vim.api.nvim_del_augroup_by_name, group_name)
+
+	local keymaps = keymap_config()
+	local diagnostics_config = config.values.diagnostics or {}
+	for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+		if vim.api.nvim_buf_is_valid(bufnr) then
+			delete_buffer_map(bufnr, keymaps.definition or keymaps.goto_definition)
+			delete_buffer_map(bufnr, keymaps.declaration or keymaps.global_declaration)
+			delete_buffer_map(bufnr, keymaps.references)
+			delete_buffer_map(bufnr, keymaps.implementation or keymaps.goto_implementation)
+			delete_buffer_map(bufnr, keymaps.source_toggle)
+			delete_buffer_map(bufnr, keymaps.global_find)
+			delete_buffer_map(bufnr, diagnostics_config.action_keymap)
+		end
+	end
 end
 
 return M

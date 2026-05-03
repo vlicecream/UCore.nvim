@@ -420,4 +420,22 @@ function M.setup()
 	})
 end
 
+function M.reset()
+	for bufnr, timer in pairs(pending) do
+		if timer then
+			timer:stop()
+			timer:close()
+		end
+		pending[bufnr] = nil
+	end
+
+	pcall(vim.api.nvim_del_augroup_by_name, group_name)
+
+	for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+		if vim.api.nvim_buf_is_valid(bufnr) then
+			vim.api.nvim_buf_clear_namespace(bufnr, ns, 0, -1)
+		end
+	end
+end
+
 return M

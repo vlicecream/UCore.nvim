@@ -1,8 +1,43 @@
 local M = {}
+local initialized = false
+
+local function clear_augroup(name)
+	pcall(vim.api.nvim_del_augroup_by_name, name)
+end
+
+function M.reset()
+	pcall(function()
+		require("ucore.autocmd").reset()
+	end)
+	pcall(function()
+		require("ucore.keymaps").reset()
+	end)
+	pcall(function()
+		require("ucore.completion").reset()
+	end)
+	pcall(function()
+		require("ucore.semantic").reset()
+	end)
+	pcall(function()
+		require("ucore.diagnostics").reset()
+	end)
+	pcall(function()
+		require("ucore.autosave").reset()
+	end)
+
+	clear_augroup("UCoreAutopairs")
+	clear_augroup("UCoreEditing")
+	pcall(vim.api.nvim_del_user_command, "UCore")
+	initialized = false
+end
 
 -- Configure UCore, register commands, and setup optional autocmds.
 -- 配置 UCore、注册命令，并设置可选的自动命令。
 function M.setup(opts)
+	if initialized then
+		M.reset()
+	end
+
 	require("ucore.config").setup(opts)
 	require("ucore.commands").register()
 	require("ucore.completion").setup()
@@ -26,6 +61,7 @@ function M.setup(opts)
 	pcall(function()
 		require("ucore.autopairs").setup()
 	end)
+	initialized = true
 end
 
 return M
