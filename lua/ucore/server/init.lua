@@ -5,6 +5,23 @@ local M = {}
 
 local job = nil
 local log_file = nil
+local expected_exit = false
+
+-- Force-kill a process tree on Windows when graceful termination is unreliable.
+-- Windows 上优雅终止不稳定时，强制结束整棵进程树。
+local function kill_process_tree(pid)
+	if not pid or vim.fn.has("win32") ~= 1 then
+		return
+	end
+
+	local shell = vim.fn.executable("pwsh") == 1 and "pwsh" or "powershell"
+	vim.system({
+		shell,
+		"-NoProfile",
+		"-Command",
+		string.format("taskkill /PID %d /T /F *> $null", pid),
+	}, { text = true })
+end
 
 -- Check whether the managed server job is still running.
 -- 检查当前由 nvim 管理的 server job 是否还在运行。
@@ -79,7 +96,9 @@ function M.start(callback, opts)
 			append_log(data)
 		end,
 	}, function(result)
+		local was_expected = expected_exit
 		job = nil
+		expected_exit = false
 
 		-- Allow auto_boot to re-trigger (e.g. after lazy sync rebuild kills server).
 		-- 允许 auto_boot 重新触发（如 lazy sync 重构杀掉了 server）。
@@ -89,7 +108,7 @@ function M.start(callback, opts)
 			end)
 		end)
 
-		if result.code ~= 0 then
+		if result.code ~= 0 and not was_expected then
 			vim.schedule(function()
 				vim.notify("UCore server exited: " .. tostring(result.code), vim.log.levels.WARN)
 			end)
@@ -108,7 +127,14 @@ function M.stop(callback)
 		return callback(true, "Server is not managed by this nvim session")
 	end
 
+	expected_exit = true
+	local pid = job.pid
 	job:kill(15)
+	vim.defer_fn(function()
+		if job and job.pid == pid then
+			kill_process_tree(pid)
+		end
+	end, 300)
 	job = nil
 
 	callback(true, "Server stopped")

@@ -5,6 +5,18 @@ local function clear_augroup(name)
 	pcall(vim.api.nvim_del_augroup_by_name, name)
 end
 
+local function setup_lifecycle_autocmds()
+	local group = vim.api.nvim_create_augroup("UCoreLifecycle", { clear = true })
+	vim.api.nvim_create_autocmd("VimLeavePre", {
+		group = group,
+		callback = function()
+			pcall(function()
+				require("ucore.server").stop()
+			end)
+		end,
+	})
+end
+
 function M.reset()
 	pcall(function()
 		require("ucore.autocmd").reset()
@@ -27,6 +39,7 @@ function M.reset()
 
 	clear_augroup("UCoreAutopairs")
 	clear_augroup("UCoreEditing")
+	clear_augroup("UCoreLifecycle")
 	pcall(vim.api.nvim_del_user_command, "UCore")
 	initialized = false
 end
@@ -58,6 +71,7 @@ function M.setup(opts)
 	require("ucore.diagnostics").setup()
 	require("ucore.autocmd").setup()
 	require("ucore.autosave").setup()
+	setup_lifecycle_autocmds()
 	pcall(function()
 		require("ucore.autopairs").setup()
 	end)
