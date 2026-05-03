@@ -4,6 +4,23 @@ local spinner_frames = { "⣾", "⣷", "⣯", "⣟", "⡿", "⢿", "⣻", "⣽" 
 local spinner_index = 1
 local spinner_scheduled = false
 
+local function uses_builtin_notify()
+	local info = debug.getinfo(vim.notify, "S")
+	local source = tostring(info and info.source or "")
+	return source:find("vim/_core/editor.lua", 1, true) ~= nil
+end
+
+local function parse_percent(text)
+	local best = nil
+	for token in tostring(text or ""):gmatch("(%d?%d?%d)%%") do
+		local value = tonumber(token)
+		if value and value >= 0 and value <= 100 then
+			best = best and math.max(best, value) or value
+		end
+	end
+	return best
+end
+
 local function make_panel(title, notify_id, ordered_keys)
 	return {
 		title = title,
@@ -13,6 +30,7 @@ local function make_panel(title, notify_id, ordered_keys)
 		suppressed_keys = {},
 		spinner_active_keys = {},
 		notify_handle = nil,
+		progress_id = nil,
 		boot_active = false,
 		state = "running",
 		pending_finish_message = nil,
@@ -92,6 +110,7 @@ local function render_panel(panel)
 	end
 
 	if #lines == 0 then
+		panel.progress_id = nil
 		if panel.notify_handle then
 			pcall(vim.notify, "", vim.log.levels.INFO, {
 				id = panel.notify_id,
@@ -101,6 +120,41 @@ local function render_panel(panel)
 			})
 		end
 		panel.notify_handle = nil
+		return
+	end
+
+	if uses_builtin_notify() then
+		local percent = panel.state == "complete" and 100 or nil
+		if percent == nil then
+			for _, line in ipairs(lines) do
+				local value = parse_percent(line)
+				if value then
+					percent = percent and math.max(percent, value) or value
+				end
+			end
+		end
+
+		local status = "running"
+		if panel.state == "failed" then
+			status = "failed"
+		elseif panel.state == "complete" then
+			status = "success"
+		end
+
+		local ok, id = pcall(vim.api.nvim_echo, {
+			{ table.concat(lines, " | "), "Normal" },
+		}, false, {
+			id = panel.progress_id,
+			kind = "progress",
+			title = panel.title,
+			status = status,
+			percent = percent,
+			source = panel.notify_id,
+		})
+
+		if ok and id then
+			panel.progress_id = id
+		end
 		return
 	end
 
@@ -123,6 +177,11 @@ local function render()
 end
 
 local function dismiss_panel(panel)
+	panel.progress_id = nil
+	if uses_builtin_notify() then
+		return
+	end
+
 	if not panel.notify_handle then
 		return
 	end
@@ -247,6 +306,7 @@ local function reset_panel(panel)
 	clear_panel_contents(panel)
 	panel.suppressed_keys = {}
 	panel.state = "running"
+	panel.progress_id = nil
 	bump_dismiss_version(panel)
 end
 
