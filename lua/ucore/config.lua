@@ -191,12 +191,6 @@ local function default_values()
 			},
 		},
 
-		-- Alias for the shared bottom output workspace.
-		-- 底部共享日志 workspace 的直白别名开关。
-		ucore_log = {
-			enable = true,
-		},
-
 		-- Navigation keymaps.
 		-- 导航快捷键。
 		navigation = {
@@ -458,14 +452,6 @@ local function normalize_user_opts(opts)
 		normalized.backend = normalized.backend or {}
 		if normalized.backend.source_dir == nil then
 			normalized.backend.source_dir = normalized.scanner_dir
-		end
-	end
-
-	if normalized.ucore_log ~= nil and normalized.ucore_log.enable ~= nil then
-		normalized.ui = normalized.ui or {}
-		normalized.ui.output = normalized.ui.output or {}
-		if normalized.ui.output.enable == nil then
-			normalized.ui.output.enable = normalized.ucore_log.enable
 		end
 	end
 

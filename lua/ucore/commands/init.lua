@@ -23,6 +23,7 @@ function M.dispatch(args)
 		find = function()
 			actions.find(tail)
 		end,
+		log = actions.log,
 		["goto"] = function()
 			actions.goto(tail)
 		end,
@@ -48,6 +49,7 @@ function M.register()
 				"boot",
 				"explorer",
 				"find",
+				"log",
 				"goto",
 				"help",
 			}
@@ -65,7 +67,8 @@ function M.register()
 			local before_cursor = line:sub(1, (cursorpos or (#line + 1)) - 1)
 			local tail = before_cursor:match("^%s*UCore%s*(.-)%s*$") or ""
 			local first = tail:match("^(%S+)")
-			local in_goto = first and first:lower() == "goto"
+			local first_lower = first and first:lower() or nil
+			local in_goto = first_lower == "goto"
 
 			local items
 			if in_goto then

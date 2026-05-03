@@ -737,6 +737,16 @@ function M.toggle()
 	ensure_workspace()
 end
 
+function M.hide()
+	if defer_if_fast(function()
+		M.hide()
+	end) then
+		return
+	end
+
+	close_workspace()
+end
+
 function M.is_open()
 	return valid_win(state.tabbar.win) and valid_win(state.content.win)
 end
