@@ -99,12 +99,16 @@ local function cargo_server_cmd(source_dir)
 end
 
 local function default_values()
+	local cache_dir = vim.fn.stdpath("data") .. "/ucore"
+	local managed_root = normalize(cache_dir .. "/backend")
+	local managed_source_dir = normalize(managed_root .. "/UScanner")
+
 	return {
 		port = 30110,
 
 		-- Root directory for UCore registry, databases, and runtime logs.
 		-- UCore 注册表、数据库和运行时日志的根目录。
-		cache_dir = vim.fn.stdpath("data") .. "/ucore",
+		cache_dir = cache_dir,
 
 		-- Prefer release binaries when they exist.
 		-- release binary 存在时优先使用它们。
@@ -117,7 +121,8 @@ local function default_values()
 			repo_url = "https://github.com/vlicecream/UScanner.git",
 			source_dir = nil,
 			bin_dir = nil,
-			sibling_source_dir = normalize(repo_root .. "/../UScanner"),
+			managed_root = managed_root,
+			managed_source_dir = managed_source_dir,
 		},
 
 		-- Current backend mode: "missing", "cargo", or "release".
@@ -296,7 +301,7 @@ function M.backend_source_candidates(values)
 	local backend = values.backend or {}
 	local dirs = {}
 	push_unique(dirs, backend.source_dir)
-	push_unique(dirs, backend.sibling_source_dir)
+	push_unique(dirs, backend.managed_source_dir)
 	return dirs
 end
 

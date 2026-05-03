@@ -107,8 +107,9 @@ Optional companion plugins:
 
 During build, `UCore.nvim` resolves the backend like this:
 
-1. use a sibling `../UScanner` checkout for local development
-2. otherwise point `backend.source_dir` at an external `UScanner` checkout
+1. clone `UScanner` into `stdpath("data")/ucore/backend/UScanner` when missing
+2. update that managed checkout on later builds
+3. compile `u_scanner` and `u_core_server` there
 
 ### Semantic Diagnostics
 
@@ -302,7 +303,7 @@ Neovim (Lua)
           └── SQLite caches / project index
 ```
 
-`UCore.nvim` prefers built binaries from the resolved `UScanner` checkout. If no release binaries are available, it falls back to `cargo run` against that checkout.
+`UCore.nvim` prefers built binaries from the managed `UScanner` checkout under `stdpath("data")/ucore/backend/UScanner`. If no release binaries are available, it falls back to `cargo run` against that checkout.
 
 ### Split Responsibilities
 
@@ -447,8 +448,9 @@ return {
 
 构建时，`UCore.nvim` 会按这个顺序解析后端：
 
-1. 本地开发优先使用同级 `../UScanner`
-2. 否则通过 `backend.source_dir` 指向任意外部 `UScanner` checkout
+1. 缺失时自动把 `UScanner` 拉到 `stdpath("data")/ucore/backend/UScanner`
+2. 后续构建自动更新这份托管 checkout
+3. 并在那里面编译 `u_scanner` 和 `u_core_server`
 
 ### 语义诊断
 
@@ -641,7 +643,7 @@ Neovim (Lua)
           └── SQLite 缓存 / 项目索引
 ```
 
-`UCore.nvim` 运行时优先使用已构建好的二进制；若 release binary 不可用，则回退到解析出的 `UScanner` 源码树上执行 `cargo run`。
+`UCore.nvim` 运行时优先使用托管 `UScanner` checkout 里已经构建好的二进制；若 release binary 不可用，则回退到这份源码树上执行 `cargo run`。
 
 ### 职责拆分
 

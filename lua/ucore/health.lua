@@ -118,8 +118,8 @@ local function report_static_checks()
 		info("backend source dir not found")
 	end
 
-	if backend.sibling_source_dir then
-		info("preferred sibling backend dir: " .. tostring(backend.sibling_source_dir))
+	if backend.managed_source_dir then
+		info("managed backend source dir: " .. tostring(backend.managed_source_dir))
 	end
 
 	if preferred_bin_dir then
@@ -176,8 +176,7 @@ local function report_static_checks()
 
 	if config.values.backend_mode == "missing" then
 		error("No usable UScanner backend was resolved", {
-			"Local development: keep a sibling ../UScanner checkout next to UCore.nvim.",
-			"Or set require('ucore').setup({ backend = { source_dir = '...' } }) to point at an external UScanner checkout.",
+			"Run the UCore build step so it can clone UScanner into the managed backend cache.",
 		})
 	end
 end
