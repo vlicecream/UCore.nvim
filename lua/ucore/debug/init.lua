@@ -150,6 +150,46 @@ local function format_megabytes(bytes)
 	return string.format("%.1f MB", bytes / (1024 * 1024))
 end
 
+local function curl_command()
+	if vim.fn.executable("curl.exe") == 1 then
+		return "curl.exe"
+	end
+	if vim.fn.executable("curl") == 1 then
+		return "curl"
+	end
+	return nil
+end
+
+local function fetch_url_content_length_async(url, callback)
+	local curl_cmd = curl_command()
+	if not curl_cmd or not url or url == "" then
+		return callback(nil)
+	end
+
+	vim.system({ curl_cmd, "-I", "-L", "-s", url }, { text = true }, function(result)
+		local best_value = nil
+		if result.code == 0 then
+			local header_text = table.concat({
+				tostring(result.stdout or ""),
+				tostring(result.stderr or ""),
+			}, "\n")
+			for _, line in ipairs(vim.split(header_text, "\n", { plain = true })) do
+				local value = line:match("^[Cc]ontent%-[Ll]ength:%s*(%d+)")
+				if value then
+					local bytes = tonumber(value)
+					if bytes and bytes > 0 then
+						best_value = bytes
+					end
+				end
+			end
+		end
+
+		vim.schedule(function()
+			callback(best_value)
+		end)
+	end)
+end
+
 local function mason_install_root()
 	local ok, settings = pcall(require, "mason.settings")
 	if ok and settings and settings.current and settings.current.install_root_dir then
@@ -704,40 +744,138 @@ local function install_signer_async(callback)
 
 	vim.fn.mkdir(root, "p")
 	adapter_progress(10, "Preparing Signer")
-
-	local script = table.concat({
-		"$ErrorActionPreference = 'Stop'",
-		"$root = " .. ps_quote(root),
-		"$archive = " .. ps_quote(archive),
-		"$target = " .. ps_quote(target),
-		"$marker = " .. ps_quote(marker),
-		"$url = " .. ps_quote(url),
-		"New-Item -ItemType Directory -Force -Path $root | Out-Null",
-		"Invoke-WebRequest -Uri $url -OutFile $archive",
-		"Add-Type -AssemblyName System.IO.Compression.FileSystem",
-		"$zip = [System.IO.Compression.ZipFile]::OpenRead($archive)",
-		"try {",
-		"  $entry = $zip.Entries | Where-Object { $_.FullName -like '*/resources/app/node_modules.asar.unpacked/vsda/build/Release/vsda.node' } | Select-Object -First 1",
-		"  if (-not $entry) { throw 'vsda.node was not found in the VS Code archive' }",
-		"  if (Test-Path $target) { Remove-Item -LiteralPath $target -Force }",
-		"  [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $target, $true)",
-		"} finally {",
-		"  $zip.Dispose()",
-		"}",
-		"Set-Content -LiteralPath $marker -Value $url -NoNewline",
-		"Write-Output $target",
-	}, "; ")
-
 	local ps = vim.fn.executable("pwsh") == 1 and "pwsh" or "powershell"
-	vim.system({
-		ps,
-		"-NoProfile",
-		"-ExecutionPolicy",
-		"Bypass",
-		"-Command",
-		script,
-	}, { text = true }, function(result)
+	local watch = {
+		timer = nil,
+		total_bytes = nil,
+		last_size = 0,
+		last_change = vim.loop.hrtime(),
+	}
+
+	local function stop_watch()
+		if watch.timer then
+			watch.timer:stop()
+			watch.timer:close()
+			watch.timer = nil
+		end
+	end
+
+	local function update_watch()
+		local stat = vim.loop.fs_stat(archive)
+		if not stat or stat.type ~= "file" then
+			return
+		end
+
+		local size = tonumber(stat.size) or 0
+		if size > (watch.last_size or 0) then
+			watch.last_size = size
+			watch.last_change = vim.loop.hrtime()
+		end
+
+		local now = vim.loop.hrtime()
+		local stalled = ((now - (watch.last_change or now)) / 1e9) >= 8
+		local detail
+		local percent
+
+		if watch.total_bytes and watch.total_bytes > 0 then
+			local ratio = math.max(0, math.min(1, size / watch.total_bytes))
+			percent = 15 + math.floor(ratio * 45)
+			detail = string.format(
+				"%s %s / %s",
+				stalled and "Download Stalled" or "Downloading Signer",
+				format_megabytes(size),
+				format_megabytes(watch.total_bytes)
+			)
+		else
+			local size_mb = size / (1024 * 1024)
+			percent = math.min(60, 20 + math.floor(size_mb / 4))
+			detail = string.format(
+				"%s %s / ?",
+				stalled and "Download Stalled" or "Downloading Signer",
+				format_megabytes(size)
+			)
+		end
+
+		adapter_progress(percent, detail)
+	end
+
+	fetch_url_content_length_async(url, function(total_bytes)
+		watch.total_bytes = total_bytes
+	end)
+
+	watch.timer = vim.loop.new_timer()
+	watch.timer:start(0, 1000, vim.schedule_wrap(update_watch))
+
+	local function extract_archive()
+		adapter_progress(70, "Extracting Signer")
+		local script = table.concat({
+			"$ErrorActionPreference = 'Stop'",
+			"$target = " .. ps_quote(target),
+			"$marker = " .. ps_quote(marker),
+			"$url = " .. ps_quote(url),
+			"$archive = " .. ps_quote(archive),
+			"Add-Type -AssemblyName System.IO.Compression.FileSystem",
+			"$zip = [System.IO.Compression.ZipFile]::OpenRead($archive)",
+			"try {",
+			"  $entry = $zip.Entries | Where-Object { $_.FullName -like '*/resources/app/node_modules.asar.unpacked/vsda/build/Release/vsda.node' } | Select-Object -First 1",
+			"  if (-not $entry) { throw 'vsda.node was not found in the VS Code archive' }",
+			"  if (Test-Path $target) { Remove-Item -LiteralPath $target -Force }",
+			"  [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $target, $true)",
+			"} finally {",
+			"  $zip.Dispose()",
+			"}",
+			"Set-Content -LiteralPath $marker -Value $url -NoNewline",
+			"Write-Output $target",
+		}, "; ")
+
+		vim.system({
+			ps,
+			"-NoProfile",
+			"-ExecutionPolicy",
+			"Bypass",
+			"-Command",
+			script,
+		}, { text = true }, function(result)
+			vim.schedule(function()
+				if result.code ~= 0 then
+					local err = vim.trim(result.stderr ~= "" and result.stderr or result.stdout or "")
+					if err == "" then
+						err = "failed to provision VS Code handshake signer"
+					end
+					return callback(false, err)
+				end
+
+				if not file_readable(target) then
+					return callback(false, "vsda.node provisioning finished but target file is missing")
+				end
+
+				callback(true, normalize(vim.trim(result.stdout or target)))
+			end)
+		end)
+	end
+
+	local curl_cmd = curl_command()
+	local download_cmd
+	if curl_cmd then
+		download_cmd = { curl_cmd, "-L", "-o", archive, url }
+	else
+		local script = table.concat({
+			"$ErrorActionPreference = 'Stop'",
+			"Invoke-WebRequest -Uri " .. ps_quote(url) .. " -OutFile " .. ps_quote(archive),
+		}, "; ")
+		download_cmd = {
+			ps,
+			"-NoProfile",
+			"-ExecutionPolicy",
+			"Bypass",
+			"-Command",
+			script,
+		}
+	end
+
+	vim.system(download_cmd, { text = true }, function(result)
 		vim.schedule(function()
+			stop_watch()
 			if result.code ~= 0 then
 				local err = vim.trim(result.stderr ~= "" and result.stderr or result.stdout or "")
 				if err == "" then
@@ -746,11 +884,11 @@ local function install_signer_async(callback)
 				return callback(false, err)
 			end
 
-			if not file_readable(target) then
-				return callback(false, "vsda.node provisioning finished but target file is missing")
+			if vim.fn.filereadable(archive) ~= 1 then
+				return callback(false, "signer archive download finished but archive file is missing")
 			end
 
-			callback(true, normalize(vim.trim(result.stdout or target)))
+			extract_archive()
 		end)
 	end)
 end
@@ -2182,6 +2320,27 @@ function M.status(root)
 	return dap_status(root)
 end
 
+function M.prewarm()
+	local debug_config = config.values.debug or {}
+	if debug_config.enable == false then
+		return
+	end
+
+	if not is_windows() or state.adapter_installing then
+		return
+	end
+
+	local status_snapshot = dap_status()
+	if status_snapshot.adapter_ready then
+		return
+	end
+
+	ensure_dap_adapter_async(function()
+		-- Background prewarm is best-effort. `de` / `attach` still provide the
+		-- interactive fallback path and user-facing errors when needed.
+	end)
+end
+
 function M.setup()
 	local debug_config = config.values.debug or {}
 	if debug_config.enable == false then
@@ -2252,6 +2411,10 @@ function M.setup()
 			end
 		end
 	end
+
+	vim.schedule(function()
+		pcall(M.prewarm)
+	end)
 end
 
 return M
