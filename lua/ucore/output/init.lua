@@ -216,6 +216,28 @@ local function close_workspace()
 	state.content.win = nil
 end
 
+local function tab_for_buf(buf)
+	for _, tab in pairs(state.tabs) do
+		if tab.buf == buf then
+			return tab
+		end
+	end
+	return nil
+end
+
+local function trigger_line_action()
+	local tab = tab_for_buf(vim.api.nvim_get_current_buf())
+	if not tab or type(tab.line_actions) ~= "table" then
+		return
+	end
+
+	local line = vim.api.nvim_win_get_cursor(0)[1]
+	local action = tab.line_actions[line]
+	if type(action) == "function" then
+		action()
+	end
+end
+
 local function close_active_tab()
 	local key = state.active
 	if not key then
@@ -289,6 +311,7 @@ local function install_buffer_keymaps(buf)
 	end
 
 	map("q", close_active_tab, "UCore output close tab")
+	map("<CR>", trigger_line_action, "UCore output line action")
 	map("h", function()
 		select_relative(-1)
 	end, "UCore output previous tab")
@@ -479,6 +502,7 @@ local function append_to_tab(tab, lines, opts)
 
 	local buf = ensure_tab_buffer(tab)
 	local groups = opts and opts.line_groups or nil
+	local actions = opts and opts.line_actions or nil
 	local group = opts and opts.highlight or nil
 	set_modifiable(buf, true)
 	local start_line = vim.api.nvim_buf_line_count(buf)
@@ -486,6 +510,9 @@ local function append_to_tab(tab, lines, opts)
 	for index, text in ipairs(lines) do
 		local line_group = groups and groups[index] or group
 		apply_line_group(buf, start_line + index - 1, text, line_group)
+		if actions then
+			tab.line_actions[start_line + index] = actions[index]
+		end
 	end
 	set_modifiable(buf, false)
 
@@ -499,11 +526,16 @@ local function replace_tab_lines(tab, lines, opts)
 	set_modifiable(buf, true)
 	vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
 	vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
+	tab.line_actions = {}
 	local groups = opts and opts.line_groups or nil
+	local actions = opts and opts.line_actions or nil
 	local group = opts and opts.highlight or nil
 	for index, text in ipairs(lines) do
 		local line_group = groups and groups[index] or group
 		apply_line_group(buf, index - 1, text, line_group)
+		if actions then
+			tab.line_actions[index] = actions[index]
+		end
 	end
 	set_modifiable(buf, false)
 	if state.active == tab.key and valid_win(state.content.win) and vim.api.nvim_win_get_buf(state.content.win) == buf then
@@ -535,6 +567,7 @@ local function get_or_create_tab(opts)
 		created_at = vim.loop.hrtime(),
 		key = key,
 		kind = tostring(opts.kind or "output"),
+		line_actions = {},
 		partial = "",
 		status = tostring(opts.status or "running"),
 		title = tostring(opts.title or key),
