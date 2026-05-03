@@ -19,19 +19,6 @@ function M.dispatch(args)
 		smart_entry = actions.smart_entry,
 		dashboard = actions.dashboard,
 		boot = actions.boot,
-		build = function()
-			actions.build(tail)
-		end,
-		["build-stop"] = actions.build_cancel,
-		["build-cancel"] = actions.build_cancel,
-		buildstop = actions.build_cancel,
-		buildcancel = actions.build_cancel,
-		debug = function()
-			actions.debug(tail)
-		end,
-		editor = function()
-			actions.editor(tail)
-		end,
 		explorer = actions.explorer,
 		find = function()
 			actions.find(tail)
@@ -57,10 +44,6 @@ function M.register()
 		complete = function(arglead, cmdline, cursorpos)
 			local user_items = {
 				"boot",
-				"build",
-				"build-stop",
-				"debug",
-				"editor",
 				"explorer",
 				"find",
 				"goto",
@@ -76,20 +59,6 @@ function M.register()
 				"help",
 			}
 
-			local debug_items = {
-				"attach",
-				"breakpoint",
-				"clear",
-				"condition",
-				"editor",
-				"continue",
-				"logpoint",
-				"stop",
-				"breakpoints",
-				"processes",
-				"ui",
-			}
-
 			local line = cmdline or ""
 			local before_cursor = line:sub(1, (cursorpos or (#line + 1)) - 1)
 			local tail = before_cursor:match("^%s*UCore%s*(.-)%s*$") or ""
@@ -99,8 +68,6 @@ function M.register()
 			local items
 			if in_goto then
 				items = goto_items
-			elseif first and first:lower() == "debug" then
-				items = debug_items
 			else
 				items = user_items
 			end
@@ -108,10 +75,6 @@ function M.register()
 			local needle = (arglead or ""):lower()
 
 			if in_goto and (tail:lower() == "goto" or tail:lower():match("^goto%s*$")) then
-				needle = ""
-			end
-
-			if first and first:lower() == "debug" and tail:lower():match("^debug%s*$") then
 				needle = ""
 			end
 

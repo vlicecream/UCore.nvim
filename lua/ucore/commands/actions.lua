@@ -2,10 +2,7 @@ local project = require("ucore.project")
 local remote = require("ucore.remote")
 local server = require("ucore.server")
 local ui = require("ucore.ui")
-local unreal = require("ucore.unreal")
 local bootstrap = require("ucore.bootstrap")
-local dirty = require("ucore.editing.dirty")
-local debug = require("ucore.debug")
 local navigation = require("ucore.navigation")
 local explorer = require("ucore.explorer")
 
@@ -148,46 +145,6 @@ function M.references()
 	navigation.references()
 end
 
--- Build the current Unreal Editor target and stream logs into a buffer.
--- 构建当前 Unreal Editor target，并实时输出日志到 buffer。
-function M.build(args)
-	local root = project.find_project_root_from_context()
-	if not root then
-		return unreal.build(args)
-	end
-	dirty.confirm_save(root, { action = "build" }, function(ok)
-		if ok then
-			unreal.build(args)
-		end
-	end)
-end
-
--- Cancel the currently running Unreal build.
--- 取消当前正在运行的 Unreal build。
-function M.build_cancel()
-	unreal.cancel_build()
-end
-
--- Open the current Unreal project with its resolved Unreal Editor.
--- 使用解析到的 Unreal Editor 打开当前 Unreal 工程。
-function M.editor(args)
-	local root = project.find_project_root_from_context()
-	if not root then
-		return unreal.open_editor(args)
-	end
-	dirty.confirm_save(root, { action = "open editor" }, function(ok)
-		if ok then
-			unreal.open_editor(args)
-		end
-	end)
-end
-
--- Minimal Unreal debug entrypoints powered by nvim-dap.
--- 基于 nvim-dap 的最小 Unreal 调试入口。
-function M.debug(tail)
-	debug.dispatch(tail)
-end
-
 -- Pick and open a registered Unreal project.
 -- 选择并打开一个已注册 Unreal 项目。
 function M.open_project()
@@ -284,20 +241,6 @@ local function cursor_label(state)
 		return "[no project]"
 	end
 	return "[cursor symbol]"
-end
-
-local function build_label(state)
-	if not state.project_root then
-		return "[no project]"
-	end
-	return "[Win64 Development]"
-end
-
-local function editor_label(state)
-	if not state.project_root then
-		return "[no project]"
-	end
-	return "[build first]"
 end
 
 local function registered_label(state)
@@ -431,22 +374,6 @@ function M.dashboard()
 			badge = cursor_label(s),
 			description = "Find references for symbol under cursor",
 			run = project_guard(M.references),
-		},
-		{
-			label = "Build editor target",
-			badge = build_label(s),
-			description = "Build current Editor target",
-			run = project_guard(function()
-				M.build("")
-			end),
-		},
-		{
-			label = "Open Unreal Editor",
-			badge = editor_label(s),
-			description = "Build then launch Unreal Editor",
-			run = project_guard(function()
-				M.editor("")
-			end),
 		},
 		{
 			label = "Open registered project",
@@ -632,10 +559,6 @@ UCore commands:
 
   :UCore              Smart entry: boot, pick, or Dashboard
   :UCore boot         Boot current project, or pick a registered one
-  :UCore build        Build current Unreal Editor target
-  :UCore build-stop   Stop the currently running Unreal build
-  :UCore debug        Unreal debug entrypoints (attach/editor/stop/...)
-  :UCore editor       Open current project in Unreal Editor
   :UCore explorer     Open the left-side Project/Source/Config tree
   :UCore find         Find indexed symbols, modules, assets, config
   :UCore goto         Navigation subcommands (see :UCore goto help)

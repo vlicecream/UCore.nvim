@@ -15,7 +15,6 @@ It focuses on:
 - Unreal project boot and registry
 - Rust-backed indexing for symbols, modules, assets, and config
 - definition / declaration / implementation / references navigation
-- build + Unreal Editor launch
 - project explorer, global search, completion, diagnostics, semantic overlay
 
 It does **not** own syntax highlighting or VCS anymore:
@@ -28,8 +27,6 @@ It does **not** own syntax highlighting or VCS anymore:
 - `:UCore` smart entry for booting the current Unreal project
 - Rust backend (`u_scanner` + `u_core_server`) with SQLite caches
 - `gd` / `gD` / `gi` / `gr` / `gs` / `gf` navigation workflow
-- Unreal build integration with live log streaming
-- Unreal Editor launch from Neovim
 - explorer for `Project / Source / Config`
 - `blink.cmp` completion source
 - buffer diagnostics and semantic highlights from the UCore index
@@ -99,6 +96,8 @@ Optional companion plugins:
 
 - install `UTreeSitter.nvim` if you want Unreal tree-sitter highlighting
 - install `UVersionControlSystem.nvim` if you want the Unreal VCS dashboard and actions
+- install `UBuildTool.nvim` if you want Unreal build / editor launch
+- install `UDebugTool.nvim` if you want Unreal debugging
 
 `extend_blink_opts()` only prepares `blink.cmp` at config time. UCore does not patch blink at runtime.
 
@@ -220,10 +219,6 @@ With `auto_boot = true`, UCore boots automatically when you enter the project.
 ```vim
 :UCore
 :UCore boot
-:UCore build [configuration] [platform] [target]
-:UCore build-stop
-:UCore debug <attach|breakpoint|condition|logpoint|clear|editor|continue|stop|breakpoints|processes|ui>
-:UCore editor
 :UCore explorer
 :UCore find [pattern]
 :UCore goto <definition|declaration|implementation|references|source>
@@ -241,19 +236,6 @@ With `auto_boot = true`, UCore boots automatically when you enter the project.
 | `gr` | find references |
 | `gs` | toggle `.h` / `.cpp` |
 | `gf` | global find |
-| `<leader>db` | toggle breakpoint |
-| `<leader>dc` | continue / attach / launch |
-| `<leader>da` | attach to Unreal process |
-| `<leader>de` | launch Unreal Editor under debugger |
-| `<leader>dr` | restart debug session |
-| `<leader>ds` | stop debug session |
-| `<leader>do` | step over |
-| `<leader>di` | step into |
-| `<leader>du` | step out |
-| `<leader>dh` | debug hover |
-| `<leader>dp` | pick process |
-| `<leader>dl` | list breakpoints |
-| `<leader>dt` | toggle UCore debug UI |
 
 ### Configuration
 
@@ -284,19 +266,6 @@ require("ucore").setup({
       compile_commands_dir = nil,
     },
   },
-  debug = {
-    enable = true,
-    autosave_before_launch = true,
-    redirect_header_breakpoints = true,
-    adapter = {
-      command = nil, -- auto-detect vsdbg.exe when possible
-      signer = nil,  -- auto-detect VS Code's vsda.node when possible
-    },
-    ui = {
-      auto_open = true,  -- auto-open the minimal UCore debug UI
-      auto_close = true,
-    },
-  },
   semantic = {
     enable = true,
     debounce_ms = 120,
@@ -320,15 +289,14 @@ Neovim (Lua)
 
 The backend prefers release binaries under `u-scanner/target/release/` and falls back to `cargo run` when needed.
 
-### Unreal Debugging
+### Split Responsibilities
 
-UCore's Unreal debugging layer is built on top of `nvim-dap`. On Windows, it targets `cppvsdbg`, auto-detects `vsdbg.exe` from common Mason / VS Code locations, and provisions the required `vsda.node` handshake signer into the UCore cache when needed.
+`UCore.nvim` now focuses on index / navigation / completion / diagnostics.
 
-- install `mfussenegger/nvim-dap`
-- use `:checkhealth ucore` to verify the adapter path
-- breakpoints placed on `.h` declarations are redirected to the matching `.cpp` definition when UCore can resolve the target
-- redirected Unreal RPC / BlueprintNativeEvent declarations also map to `_Implementation` / `_Validate` when appropriate
-- UCore renders its own minimal debug UI: right side locals / current stop, bottom stack / threads / breakpoints
+Use the split repos for runtime workflows:
+
+- `UBuildTool.nvim` for Unreal build, build cancel, editor launch, and clangd database preparation
+- `UDebugTool.nvim` for Unreal attach / launch-under-debugger / breakpoints / minimal debug UI
 
 ### Troubleshooting
 
@@ -342,7 +310,6 @@ Common cases:
 - Rust missing: install from `https://rustup.rs/`
 - project not indexed yet: run `:UCore` and wait for boot/indexing
 - server not ready: run `:UCore`, wait for boot, then re-run `:checkhealth ucore`
-- debug adapter or signer missing: install `nvim-dap`, let UCore provision the signer automatically, or point `debug.adapter.command` at `vsdbg.exe` and `debug.adapter.signer` at `vsda.node` yourself
 - no syntax highlight: install `UTreeSitter.nvim`, then run `:checkhealth utreesitter`
 
 ### Related Repositories
@@ -351,6 +318,8 @@ Common cases:
 UTreeSitter                  grammar + queries + parser tests
 UTreeSitter.nvim             Neovim parser/filetype/highlight integration
 UVersionControlSystem.nvim   Unreal VCS dashboard and actions
+UBuildTool.nvim              Unreal build, editor launch, clangd database prep
+UDebugTool.nvim              Unreal debugging on top of nvim-dap
 UCore.nvim                   Unreal project index, RPC, navigation, completion
 ```
 
@@ -369,7 +338,6 @@ MIT
 - Unreal 项目启动和注册
 - Rust 后端索引符号、模块、资产、配置
 - 定义 / 声明 / 实现 / 引用跳转
-- 构建和 Unreal Editor 启动
 - 项目浏览器、全局搜索、补全、诊断、语义高亮
 
 它**不再**负责语法高亮和版本控制：
@@ -382,8 +350,6 @@ MIT
 - `:UCore` 作为当前 Unreal 项目的智能入口
 - Rust 后端（`u_scanner` + `u_core_server`）+ SQLite 缓存
 - `gd` / `gD` / `gi` / `gr` / `gs` / `gf` 导航工作流
-- Unreal 构建集成，实时日志输出
-- 从 Neovim 内直接启动 Unreal Editor
 - `Project / Source / Config` 三栏浏览器
 - `blink.cmp` 补全源
 - 基于 UCore 索引的 buffer 诊断和语义高亮
@@ -454,6 +420,8 @@ return {
 
 - 需要 Unreal tree-sitter 高亮时再装 `UTreeSitter.nvim`
 - 需要 Unreal VCS 面板和操作时再装 `UVersionControlSystem.nvim`
+- 需要 Unreal 构建、启动 Editor、clangd 数据库准备时再装 `UBuildTool.nvim`
+- 需要 Unreal 调试时再装 `UDebugTool.nvim`
 
 `extend_blink_opts()` 只在配置阶段补全 `blink.cmp` 选项，UCore 不会在运行时改写 blink 配置。
 
@@ -575,10 +543,6 @@ require("ucore").setup({
 ```vim
 :UCore
 :UCore boot
-:UCore build [configuration] [platform] [target]
-:UCore build-stop
-:UCore debug <attach|breakpoint|condition|logpoint|clear|editor|continue|stop|breakpoints|processes|ui>
-:UCore editor
 :UCore explorer
 :UCore find [pattern]
 :UCore goto <definition|declaration|implementation|references|source>
@@ -596,19 +560,6 @@ require("ucore").setup({
 | `gr` | 查找引用 |
 | `gs` | `.h` / `.cpp` 切换 |
 | `gf` | 全局搜索 |
-| `<leader>db` | 切换断点 |
-| `<leader>dc` | 继续 / attach / 启动调试 |
-| `<leader>da` | attach 到 Unreal 进程 |
-| `<leader>de` | 在调试器下启动 Unreal Editor |
-| `<leader>dr` | 重启调试会话 |
-| `<leader>ds` | 停止调试会话 |
-| `<leader>do` | step over |
-| `<leader>di` | step into |
-| `<leader>du` | step out |
-| `<leader>dh` | 调试 hover |
-| `<leader>dp` | 选择进程 |
-| `<leader>dl` | 查看断点列表 |
-| `<leader>dt` | 切换 UCore 调试 UI |
 
 ### 配置
 
@@ -638,19 +589,6 @@ require("ucore").setup({
       compile_commands_dir = nil,
     },
   },
-  debug = {
-    enable = true,
-    autosave_before_launch = true,
-    redirect_header_breakpoints = true,
-    adapter = {
-      command = nil, -- 尽量自动查找 vsdbg.exe
-      signer = nil,  -- 尽量自动查找 VS Code 的 vsda.node
-    },
-    ui = {
-      auto_open = true,  -- 自动打开 UCore 自带的最轻调试 UI
-      auto_close = true,
-    },
-  },
   semantic = {
     enable = true,
     debounce_ms = 120,
@@ -674,15 +612,14 @@ Neovim (Lua)
 
 后端优先使用 `u-scanner/target/release/` 下的 release 二进制，缺失时回退到 `cargo run`。
 
-### Unreal 调试
+### 职责拆分
 
-UCore 的 Unreal 调试层建立在 `nvim-dap` 之上。Windows 下默认走 `cppvsdbg`，并尽量从常见的 Mason / VS Code 路径自动找到 `vsdbg.exe`；如果缺少必须的 `vsda.node`，UCore 会自动把 signer 下到自己的缓存里。
+`UCore.nvim` 现在只负责索引 / 跳转 / 补全 / 诊断。
 
-- 安装 `mfussenegger/nvim-dap`
-- 用 `:checkhealth ucore` 检查 adapter 路径
-- 在 `.h` 声明行上下断点时，UCore 会尽量重定向到对应 `.cpp` 定义
-- Unreal RPC / BlueprintNativeEvent 这类声明，会尽量映射到 `_Implementation` / `_Validate`
-- UCore 会渲染自己的最轻调试 UI：右侧 locals / 当前停住位置，底部 stack / threads / breakpoints
+运行时工作流请使用拆分仓库：
+
+- `UBuildTool.nvim`：负责 Unreal 构建、停止构建、启动 Editor、准备 clangd 数据库
+- `UDebugTool.nvim`：负责 Unreal attach、调试器下启动、断点、最轻调试 UI
 
 ### 排查
 
@@ -696,7 +633,6 @@ UCore 的 Unreal 调试层建立在 `nvim-dap` 之上。Windows 下默认走 `cp
 - 没装 Rust：从 `https://rustup.rs/` 安装
 - 项目还没建索引：运行 `:UCore` 并等待 boot/index 完成
 - 服务没有起来：先执行 `:UCore`，等待 boot 完成后再运行 `:checkhealth ucore`
-- 调试 adapter 或 signer 没找到：先安装 `nvim-dap`，让 UCore 自动补 signer；如果还不行，再手动配置 `debug.adapter.command = '.../vsdbg.exe'` 与 `debug.adapter.signer = '.../vsda.node'`
 - 没有语法高亮：安装 `UTreeSitter.nvim`，然后运行 `:checkhealth utreesitter`
 
 ### 相关仓库
@@ -705,6 +641,8 @@ UCore 的 Unreal 调试层建立在 `nvim-dap` 之上。Windows 下默认走 `cp
 UTreeSitter                  grammar + queries + parser tests
 UTreeSitter.nvim             Neovim parser/filetype/highlight integration
 UVersionControlSystem.nvim   Unreal VCS dashboard and actions
+UBuildTool.nvim              Unreal 构建、启动 Editor、准备 clangd 数据库
+UDebugTool.nvim              基于 nvim-dap 的 Unreal 调试
 UCore.nvim                   Unreal project index, RPC, navigation, completion
 ```
 

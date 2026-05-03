@@ -1,5 +1,4 @@
 local config = require("ucore.config")
-local debug = require("ucore.debug")
 local navigation = require("ucore.navigation")
 local project = require("ucore.project")
 
@@ -106,42 +105,6 @@ local function setup_diagnostics_action(args)
 	})
 end
 
-local function debug_keymap_config()
-	local debug_config = config.values.debug
-	if type(debug_config) ~= "table" then
-		return {}
-	end
-
-	local keymaps = debug_config.keymaps
-	if type(keymaps) ~= "table" then
-		return {}
-	end
-
-	return keymaps
-end
-
-local function setup_debug_keymaps(args)
-	local keymaps = debug_keymap_config()
-	if keymaps.enable == false then
-		return
-	end
-
-	local bufnr = args.buf
-	set_buffer_map(bufnr, keymaps.toggle_breakpoint, debug.toggle_breakpoint, "UCore debug toggle breakpoint")
-	set_buffer_map(bufnr, keymaps.continue, debug.continue, "UCore debug continue")
-	set_buffer_map(bufnr, keymaps.attach, debug.attach, "UCore debug attach")
-	set_buffer_map(bufnr, keymaps.launch_editor, debug.launch_editor, "UCore debug launch editor")
-	set_buffer_map(bufnr, keymaps.restart, debug.restart, "UCore debug restart")
-	set_buffer_map(bufnr, keymaps.stop, debug.stop, "UCore debug stop")
-	set_buffer_map(bufnr, keymaps.step_over, debug.step_over, "UCore debug step over")
-	set_buffer_map(bufnr, keymaps.step_into, debug.step_into, "UCore debug step into")
-	set_buffer_map(bufnr, keymaps.step_out, debug.step_out, "UCore debug step out")
-	set_buffer_map(bufnr, keymaps.hover, debug.hover, "UCore debug hover")
-	set_buffer_map(bufnr, keymaps.processes, debug.pick_process, "UCore debug processes")
-	set_buffer_map(bufnr, keymaps.list_breakpoints, debug.list_breakpoints, "UCore debug breakpoints")
-	set_buffer_map(bufnr, keymaps.ui, debug.toggle_ui, "UCore debug UI")
-end
-
 local function is_unreal_path(path)
 	if path == "" then
 		return false
@@ -166,7 +129,6 @@ function M.setup()
 			if is_unreal_path(path) then
 				setup_global_find(args)
 				setup_diagnostics_action(args)
-				setup_debug_keymaps(args)
 			end
 		end,
 	})

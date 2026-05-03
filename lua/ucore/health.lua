@@ -392,63 +392,6 @@ local function report_lsp_checks()
 	end
 end
 
-local function report_debug_checks()
-	start("Unreal debugging")
-
-	local debug_config = config.values.debug or {}
-	local root = project.find_project_root()
-	local status = require("ucore.debug").status(root)
-
-	info("enabled: " .. yes_no(debug_config.enable ~= false))
-	info("platform: " .. (status.windows and "windows" or "non-windows"))
-	info("adapter auto install: " .. yes_no(status.adapter_auto_install))
-	info("mason available: " .. yes_no(status.mason_available))
-	info("adapter package: " .. tostring(status.adapter_package or "cpptools"))
-	if status.adapter_installing then
-		info("adapter install: in progress")
-	end
-
-	if status.dap_available then
-		ok("nvim-dap available")
-	else
-		warn("nvim-dap not available", {
-			"Install mfussenegger/nvim-dap to enable Unreal breakpoints and debug sessions.",
-		})
-	end
-
-	ok("UCore uses its own minimal debug UI for stack + locals rendering")
-
-	if not status.windows then
-		info("cppvsdbg adapter checks are only relevant on Windows")
-	elseif not status.dap_available then
-		info("cppvsdbg adapter check skipped until nvim-dap is available")
-	elseif status.adapter_ready then
-		ok("cppvsdbg adapter available: " .. tostring(status.adapter_command))
-		ok("cppvsdbg handshake signer available: " .. tostring(status.adapter_signer))
-		ok("cppvsdbg signer runtime available: " .. tostring(status.adapter_node_command))
-	else
-		local missing = {}
-		if not status.adapter_command then
-			table.insert(missing, "vsdbg.exe")
-		end
-		if not status.adapter_signer then
-			table.insert(missing, "vsda.node")
-		end
-		if not status.adapter_node_command then
-			table.insert(missing, "node")
-		end
-		warn("cppvsdbg prerequisites missing: " .. table.concat(missing, ", "), {
-			"With the default UCore policy, debug commands will try to install Mason package '" .. tostring(status.adapter_package or "cpptools") .. "' automatically when mason.nvim is available.",
-			"UCore will also provision the cppvsdbg handshake signer into its cache when needed.",
-			"Or set require('ucore').setup({ debug = { adapter = { command = '.../vsdbg.exe', signer = '.../vsda.node' } } }) to use explicit paths.",
-		})
-	end
-
-	if status.breakpoint_store then
-		info("breakpoint store: " .. tostring(status.breakpoint_store))
-	end
-end
-
 local function report_treesitter_checks()
 	start("Unreal C++ highlighting")
 
@@ -475,7 +418,6 @@ function M.check()
 	report_ui_checks()
 	report_completion_checks()
 	report_lsp_checks()
-	report_debug_checks()
 	report_treesitter_checks()
 end
 
