@@ -20,6 +20,14 @@ local state = {
 	tabs = {},
 }
 
+local function defer_if_fast(fn)
+	if vim.in_fast_event() then
+		vim.schedule(fn)
+		return true
+	end
+	return false
+end
+
 local function output_config()
 	local ui = (config.values or {}).ui or {}
 	local output = ui.output or {}
@@ -528,6 +536,12 @@ local function touch_tab(tab, opts)
 end
 
 function M.open_tab(opts)
+	if defer_if_fast(function()
+		M.open_tab(opts)
+	end) then
+		return nil
+	end
+
 	if not output_config().enable then
 		return nil
 	end
@@ -541,6 +555,12 @@ function M.open_tab(opts)
 end
 
 function M.append(key, data, opts)
+	if defer_if_fast(function()
+		M.append(key, data, opts)
+	end) then
+		return
+	end
+
 	if not output_config().enable then
 		return
 	end
@@ -559,6 +579,12 @@ function M.append(key, data, opts)
 end
 
 function M.replace(key, data, opts)
+	if defer_if_fast(function()
+		M.replace(key, data, opts)
+	end) then
+		return
+	end
+
 	if not output_config().enable then
 		return
 	end
@@ -581,6 +607,12 @@ function M.replace(key, data, opts)
 end
 
 function M.flush(key)
+	if defer_if_fast(function()
+		M.flush(key)
+	end) then
+		return
+	end
+
 	local tab = key and state.tabs[key] or nil
 	if not tab or not tab.partial or tab.partial == "" then
 		return
@@ -592,6 +624,12 @@ function M.flush(key)
 end
 
 function M.finish(key, message, opts)
+	if defer_if_fast(function()
+		M.finish(key, message, opts)
+	end) then
+		return
+	end
+
 	opts = opts or {}
 	M.flush(key)
 	if message and message ~= "" then
@@ -614,6 +652,12 @@ function M.finish(key, message, opts)
 end
 
 function M.fail(key, message, opts)
+	if defer_if_fast(function()
+		M.fail(key, message, opts)
+	end) then
+		return
+	end
+
 	opts = opts or {}
 	M.flush(key)
 	if message and message ~= "" then
@@ -636,6 +680,12 @@ function M.fail(key, message, opts)
 end
 
 function M.select(key)
+	if defer_if_fast(function()
+		M.select(key)
+	end) then
+		return
+	end
+
 	local tab = key and state.tabs[key] or nil
 	if not tab then
 		return
@@ -650,6 +700,12 @@ function M.select(key)
 end
 
 function M.toggle()
+	if defer_if_fast(function()
+		M.toggle()
+	end) then
+		return
+	end
+
 	if valid_win(state.tabbar.win) or valid_win(state.content.win) then
 		close_workspace()
 		return
@@ -667,6 +723,12 @@ function M.setup()
 end
 
 function M.reset()
+	if defer_if_fast(function()
+		M.reset()
+	end) then
+		return
+	end
+
 	close_workspace()
 	for key, tab in pairs(state.tabs) do
 		if valid_buf(tab.buf) then
