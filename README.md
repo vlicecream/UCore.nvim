@@ -226,7 +226,6 @@ With `auto_boot = true`, UCore boots automatically when you enter the project.
 :UCore editor
 :UCore explorer
 :UCore find [pattern]
-:UCore diagnostics [refresh|clear|action|fix|qflist|toggle]
 :UCore goto <definition|declaration|implementation|references|source>
 :UCore help
 :checkhealth ucore
@@ -582,7 +581,6 @@ require("ucore").setup({
 :UCore editor
 :UCore explorer
 :UCore find [pattern]
-:UCore diagnostics [refresh|clear|action|fix|qflist|toggle]
 :UCore goto <definition|declaration|implementation|references|source>
 :UCore help
 :checkhealth ucore

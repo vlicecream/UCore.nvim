@@ -158,14 +158,6 @@ function M.clear(bufnr)
 	end
 end
 
-function M.toggle()
-	enabled = not enabled
-	if not enabled then
-		M.clear()
-	end
-	vim.notify("UCore diagnostics " .. (enabled and "enabled" or "disabled"), vim.log.levels.INFO)
-end
-
 local function close_cursor_float()
 	if float_winid and vim.api.nvim_win_is_valid(float_winid) then
 		pcall(vim.api.nvim_win_close, float_winid, true)
@@ -253,10 +245,6 @@ local function schedule_cursor_float(bufnr)
 			show_cursor_float(bufnr)
 		end)
 	end, math.max(delay, 0))
-end
-
-function M.to_qflist()
-	vim.diagnostic.setqflist({ namespace = ns, open = true })
 end
 
 local function current_ucore_diagnostic()
@@ -352,18 +340,6 @@ local function apply_ucore_fix(bufnr, diagnostic)
 
 	M.refresh(bufnr, { force = true, silent = true })
 	return true
-end
-
-function M.fix()
-	local diagnostic, bufnr = current_ucore_diagnostic()
-	if not diagnostic then
-		return vim.notify("No UCore diagnostic on the current line", vim.log.levels.INFO)
-	end
-
-	local ok, code = apply_ucore_fix(bufnr, diagnostic)
-	if not ok then
-		return vim.notify("No quick fix available for " .. tostring(code), vim.log.levels.INFO)
-	end
 end
 
 local function lsp_clients_supporting_code_action(bufnr)
@@ -1290,26 +1266,6 @@ local function schedule_refresh(args)
 			M.refresh(bufnr, { silent = true })
 		end
 	end, delay)
-end
-
-function M.dispatch(args)
-	local sub = (args or ""):match("^(%S+)") or "refresh"
-
-	if sub == "refresh" then
-		return M.refresh(0, { force = true })
-	elseif sub == "clear" then
-		return M.clear()
-	elseif sub == "qflist" or sub == "quickfix" then
-		return M.to_qflist()
-	elseif sub == "action" then
-		return M.smart_action()
-	elseif sub == "fix" then
-		return M.fix()
-	elseif sub == "toggle" then
-		return M.toggle()
-	end
-
-	vim.notify("Unknown UCore diagnostics command: " .. sub, vim.log.levels.ERROR)
 end
 
 function M.setup()

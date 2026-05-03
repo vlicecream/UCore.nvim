@@ -638,7 +638,6 @@ UCore commands:
   :UCore editor       Open current project in Unreal Editor
   :UCore explorer     Open the left-side Project/Source/Config tree
   :UCore find         Find indexed symbols, modules, assets, config
-  :UCore diagnostics  UCore diagnostics actions and toggles
   :UCore goto         Navigation subcommands (see :UCore goto help)
   :UCore help         Show this help
 ]])

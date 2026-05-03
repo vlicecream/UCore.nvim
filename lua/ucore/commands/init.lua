@@ -36,9 +36,6 @@ function M.dispatch(args)
 		find = function()
 			actions.find(tail)
 		end,
-		diagnostics = function()
-			require("ucore.diagnostics").dispatch(tail)
-		end,
 		["goto"] = function()
 			actions.goto(tail)
 		end,
@@ -66,18 +63,8 @@ function M.register()
 				"editor",
 				"explorer",
 				"find",
-				"diagnostics",
 				"goto",
 				"help",
-			}
-
-			local diagnostics_items = {
-				"refresh",
-				"clear",
-				"action",
-				"fix",
-				"qflist",
-				"toggle",
 			}
 
 			local goto_items = {
@@ -114,17 +101,11 @@ function M.register()
 				items = goto_items
 			elseif first and first:lower() == "debug" then
 				items = debug_items
-			elseif first and first:lower() == "diagnostics" then
-				items = diagnostics_items
 			else
 				items = user_items
 			end
 
 			local needle = (arglead or ""):lower()
-
-			if first and first:lower() == "diagnostics" and tail:lower():match("^diagnostics%s*$") then
-				needle = ""
-			end
 
 			if in_goto and (tail:lower() == "goto" or tail:lower():match("^goto%s*$")) then
 				needle = ""
