@@ -18,6 +18,7 @@ local state = {
 		win = nil,
 	},
 	tabs = {},
+	dismissed = {},
 }
 
 local function defer_if_fast(fn)
@@ -121,7 +122,7 @@ local function render_tabbar()
 
 	local line = ""
 	local spans = {}
-	local hint = "  h/l switch  q close tab  x close panel"
+	local hint = "  h/l switch  q close tab"
 
 	if #state.order == 0 then
 		line = " UCore Output "
@@ -230,6 +231,7 @@ local function close_active_tab()
 	end
 
 	state.tabs[key] = nil
+	state.dismissed[key] = true
 	for index, value in ipairs(state.order) do
 		if value == key then
 			table.remove(state.order, index)
@@ -291,7 +293,6 @@ local function install_buffer_keymaps(buf)
 	end
 
 	map("q", close_active_tab, "UCore output close tab")
-	map("x", close_workspace, "UCore output close panel")
 	map("h", function()
 		select_relative(-1)
 	end, "UCore output previous tab")
@@ -496,6 +497,9 @@ end
 local function get_or_create_tab(opts)
 	opts = opts or {}
 	local key = tostring(opts.key or ("output:" .. tostring(state.seq + 1)))
+	if state.dismissed[key] and opts.explicit ~= true then
+		return nil
+	end
 	local tab = state.tabs[key]
 	if tab then
 		if opts.title and opts.title ~= "" then
@@ -507,6 +511,7 @@ local function get_or_create_tab(opts)
 		return tab
 	end
 
+	state.dismissed[key] = nil
 	state.seq = state.seq + 1
 	tab = {
 		buf = nil,
@@ -556,7 +561,10 @@ function M.open_tab(opts)
 		return nil
 	end
 
-	local tab = get_or_create_tab(opts)
+	local tab = get_or_create_tab(vim.tbl_extend("force", opts or {}, { explicit = true }))
+	if not tab then
+		return nil
+	end
 	touch_tab(tab, {
 		focus = opts == nil or opts.focus ~= false,
 		open = true,
@@ -577,6 +585,9 @@ function M.append(key, data, opts)
 
 	opts = opts or {}
 	local tab = get_or_create_tab(vim.tbl_extend("force", opts, { key = key }))
+	if not tab then
+		return
+	end
 	if opts.status and opts.status ~= "" then
 		tab.status = tostring(opts.status)
 	end
@@ -601,6 +612,9 @@ function M.replace(key, data, opts)
 
 	opts = opts or {}
 	local tab = get_or_create_tab(vim.tbl_extend("force", opts, { key = key }))
+	if not tab then
+		return
+	end
 	tab.partial = ""
 	if opts.status and opts.status ~= "" then
 		tab.status = tostring(opts.status)
@@ -761,6 +775,7 @@ function M.reset()
 	state.tabbar.buf = nil
 	state.tabbar.win = nil
 	state.tabs = {}
+	state.dismissed = {}
 	rawset(_G, "__ucore_output_panel_api", nil)
 end
 
