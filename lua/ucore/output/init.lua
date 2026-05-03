@@ -329,13 +329,16 @@ local function ensure_workspace()
 		state.tabbar.buf = buf
 	end
 
-	vim.cmd("botright " .. tostring(output_config().height) .. "new")
+	local content_buf = current_content_buf()
+	install_buffer_keymaps(content_buf)
+
+	vim.cmd("botright split")
 	state.content.win = vim.api.nvim_get_current_win()
 	window_options(state.content.win, { wrap = false, cursorline = false })
-	install_buffer_keymaps(current_content_buf())
-	vim.api.nvim_win_set_buf(state.content.win, current_content_buf())
+	vim.api.nvim_win_set_buf(state.content.win, content_buf)
+	vim.api.nvim_win_set_height(state.content.win, output_config().height)
 
-	vim.cmd("topleft 1split")
+	vim.cmd("topleft split")
 	state.tabbar.win = vim.api.nvim_get_current_win()
 	window_options(state.tabbar.win, { wrap = false, cursorline = false })
 	vim.api.nvim_win_set_buf(state.tabbar.win, state.tabbar.buf)
