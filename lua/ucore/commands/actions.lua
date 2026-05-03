@@ -89,7 +89,7 @@ end
 -- Open the left-side UCore Explorer tree.
 -- 打开左侧 UCore Explorer 目录树。
 function M.explorer()
-	explorer.open()
+	explorer.toggle()
 end
 
 -- :UCore goto <definition|declaration|implementation|references|source>
@@ -559,7 +559,7 @@ UCore commands:
 
   :UCore              Smart entry: boot, pick, or Dashboard
   :UCore boot         Boot current project, or pick a registered one
-  :UCore explorer     Open the left-side Project/Source/Config tree
+  :UCore explorer     Toggle the left-side Project/Source/Config tree
   :UCore find         Find indexed symbols, modules, assets, config
   :UCore goto         Navigation subcommands (see :UCore goto help)
   :UCore help         Show this help

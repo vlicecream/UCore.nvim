@@ -80,6 +80,9 @@ return {
     },
     opts = {
       auto_boot = true,
+      explorer = {
+        auto_open = false,
+      },
       completion = {
         min_chars = 2,
         debounce_ms = 180,
@@ -222,7 +225,7 @@ With `auto_boot = true`, UCore boots automatically when you enter the project.
 ```vim
 :UCore
 :UCore boot
-:UCore explorer
+:UCore explorer        " toggle the explorer
 :UCore find [pattern]
 :UCore goto <definition|declaration|implementation|references|source>
 :UCore help
@@ -245,6 +248,9 @@ With `auto_boot = true`, UCore boots automatically when you enter the project.
 ```lua
 require("ucore").setup({
   auto_boot = true,
+  explorer = {
+    auto_open = false,
+  },
   port = 30110,
   use_release_binary = true,
   ui = {
@@ -407,6 +413,9 @@ return {
     },
     opts = {
       auto_boot = true,
+      explorer = {
+        auto_open = false,
+      },
       completion = {
         min_chars = 2,
         debounce_ms = 180,
@@ -549,7 +558,7 @@ require("ucore").setup({
 ```vim
 :UCore
 :UCore boot
-:UCore explorer
+:UCore explorer        " 切换 explorer
 :UCore find [pattern]
 :UCore goto <definition|declaration|implementation|references|source>
 :UCore help
@@ -572,6 +581,9 @@ require("ucore").setup({
 ```lua
 require("ucore").setup({
   auto_boot = true,
+  explorer = {
+    auto_open = false,
+  },
   port = 30110,
   use_release_binary = true,
   ui = {

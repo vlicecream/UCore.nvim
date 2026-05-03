@@ -246,17 +246,21 @@ local function map(lhs, rhs, desc)
 end
 
 local function setup_maps()
-	map("q", function() switch_tab(-1) end, "UCore Explorer previous tab")
+	map("q", close_window, "UCore Explorer close")
 	map("e", function() switch_tab(1) end, "UCore Explorer next tab")
 	map("Q", function() switch_tab(-1) end, "UCore Explorer previous tab")
 	map("E", function() switch_tab(1) end, "UCore Explorer next tab")
+	map("H", function() switch_tab(-1) end, "UCore Explorer previous tab")
+	map("L", function() switch_tab(1) end, "UCore Explorer next tab")
+	map("[", function() switch_tab(-1) end, "UCore Explorer previous tab")
+	map("]", function() switch_tab(1) end, "UCore Explorer next tab")
 	map("x", close_window, "UCore Explorer close")
+	map("<Esc>", close_window, "UCore Explorer close")
 	map("<CR>", activate, "UCore Explorer open")
 	map("<Space>", activate, "UCore Explorer toggle")
 	map("h", collapse, "UCore Explorer collapse")
 	map("l", expand, "UCore Explorer expand")
 	map("/", prompt_search, "UCore Explorer search")
-	map("<Esc>", clear_search, "UCore Explorer clear search")
 	map("r", refresh_current, "UCore Explorer refresh tab")
 	map("R", refresh_all, "UCore Explorer refresh all")
 end
@@ -288,6 +292,10 @@ function M.toggle()
 	else
 		M.open()
 	end
+end
+
+function M.close()
+	close_window()
 end
 
 function M.smart_toggle(fallback)

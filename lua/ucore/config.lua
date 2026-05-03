@@ -155,7 +155,7 @@ local function default_values()
 		max_width = 56,
 		tabs = { "Project", "Source", "Config" },
 		default_tab = "Project",
-		auto_open = true,
+		auto_open = false,
 		auto_focus = false,
 		auto_open_delay_ms = 120,
 		close_other_explorers = false,
