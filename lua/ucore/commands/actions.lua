@@ -6,7 +6,6 @@ local bootstrap = require("ucore.bootstrap")
 local navigation = require("ucore.navigation")
 local explorer = require("ucore.explorer")
 local output = require("ucore.output")
-local config = require("ucore.config")
 
 local M = {}
 
@@ -554,11 +553,9 @@ function M.find(pattern)
 end
 
 function M.log()
-	local ui = config.values.ui or {}
-	ui.output = ui.output or {}
-	local enabled = ui.output.enable ~= false
-	ui.output.enable = not enabled
-	if ui.output.enable then
+	if output.is_open() then
+		output.hide()
+	else
 		output.open_tab({
 			key = "workspace:unreal",
 			title = "Unreal",
@@ -566,10 +563,7 @@ function M.log()
 			focus = true,
 			explicit = true,
 		})
-	else
-		output.hide()
 	end
-	vim.notify("UCore log " .. (ui.output.enable and "enabled" or "disabled"), vim.log.levels.INFO)
 end
 
 -- Print :UCore command help.
