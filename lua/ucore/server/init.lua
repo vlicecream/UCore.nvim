@@ -70,7 +70,7 @@ function M.start(callback, opts)
 	}, log_file, "a")
 
 	job = vim.system(cmd, {
-		cwd = config.values.scanner_dir,
+		cwd = config.values.backend_cwd,
 		text = true,
 		stdout = function(_, data)
 			append_log(data)

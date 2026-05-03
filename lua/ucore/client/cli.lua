@@ -44,7 +44,7 @@ function M.request(method, payload, callback)
 	})
 
 	vim.system(build_cmd(method, payload), {
-		cwd = config.values.scanner_dir,
+		cwd = config.values.backend_cwd,
 		text = true,
 		env = env,
 	}, function(result)

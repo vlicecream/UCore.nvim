@@ -50,13 +50,6 @@ local function command_head(cmd)
 	return cmd[1]
 end
 
--- Build paths for release binaries.
--- 构造 release binary 路径。
-local function release_binary(name)
-	local suffix = vim.loop.os_uname().version:match("Windows") and ".exe" or ""
-	return config.values.scanner_dir .. "/target/release/" .. name .. suffix
-end
-
 local function log_path_for_current_project()
 	local session_log = server.log_path()
 	if session_log and session_log ~= "" then
@@ -112,17 +105,31 @@ local function report_static_checks()
 
 	ok("Plugin health module loaded")
 
-	if is_dir(config.values.scanner_dir) then
-		ok("u-scanner directory found: " .. config.values.scanner_dir)
+	local backend = config.values.backend or {}
+	local source_dir = config.values.backend_source_dir
+	local release_dir = config.values.backend_release_dir
+	local preferred_bin_dir = config.values.backend_bin_dir
+
+	info("backend repo: " .. tostring(backend.repo or "vlicecream/UScanner"))
+
+	if source_dir and is_dir(source_dir) then
+		ok("backend source dir found: " .. source_dir)
 	else
-		error("u-scanner directory not found: " .. tostring(config.values.scanner_dir))
+		info("backend source dir not found")
 	end
 
-	local cargo_toml = config.values.scanner_dir .. "/Cargo.toml"
-	if readable(cargo_toml) then
-		ok("u-scanner Cargo.toml found")
+	if backend.sibling_source_dir then
+		info("preferred sibling backend dir: " .. tostring(backend.sibling_source_dir))
+	end
+
+	if preferred_bin_dir then
+		info("resolved backend bin dir: " .. tostring(preferred_bin_dir))
+	end
+
+	if source_dir and readable(source_dir .. "/Cargo.toml") then
+		ok("backend Cargo.toml found")
 	else
-		error("u-scanner Cargo.toml not found: " .. cargo_toml)
+		info("backend Cargo.toml not found")
 	end
 
 	if executable("cargo") then
@@ -130,7 +137,7 @@ local function report_static_checks()
 	else
 		warn("cargo not found on PATH", {
 			"Install Rust from https://rustup.rs/",
-			"Or configure UCore to use prebuilt u_scanner/u_core_server binaries.",
+			"Or keep already-built UScanner binaries under UScanner/target/release.",
 		})
 	end
 
@@ -148,19 +155,15 @@ local function report_static_checks()
 		warn("server command may not be directly executable: " .. tostring(server_head))
 	end
 
-	local release_scanner = release_binary("u_scanner")
-	local release_server = release_binary("u_core_server")
+	local release_scanner = release_dir and config.release_binary("u_scanner", release_dir) or nil
+	local release_server = release_dir and config.release_binary("u_core_server", release_dir) or nil
 
-	if readable(release_scanner) then
-		ok("release u_scanner found: " .. release_scanner)
+	if release_dir then
+		ok("release backend dir found: " .. release_dir)
+		ok("release u_scanner found: " .. tostring(release_scanner))
+		ok("release u_core_server found: " .. tostring(release_server))
 	else
-		info("release u_scanner not found; development mode can use cargo run")
-	end
-
-	if readable(release_server) then
-		ok("release u_core_server found: " .. release_server)
-	else
-		info("release u_core_server not found; development mode can use cargo run")
+		info("release backend binaries not found yet")
 	end
 
 	info("backend mode: " .. tostring(config.values.backend_mode))
@@ -169,6 +172,13 @@ local function report_static_checks()
 		ok("cache dir exists")
 	else
 		info("cache dir does not exist yet")
+	end
+
+	if config.values.backend_mode == "missing" then
+		error("No usable UScanner backend was resolved", {
+			"Local development: keep a sibling ../UScanner checkout next to UCore.nvim.",
+			"Or set require('ucore').setup({ backend = { source_dir = '...' } }) to point at an external UScanner checkout.",
+		})
 	end
 end
 

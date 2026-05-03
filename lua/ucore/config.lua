@@ -3,8 +3,7 @@ local M = {}
 -- Resolve the plugin repository root from this file path.
 -- 从当前文件路径推导插件仓库根目录。
 local source = debug.getinfo(1, "S").source:sub(2)
-local repo_root = vim.fn.fnamemodify(source, ":p:h:h:h")
-local scanner_dir = repo_root .. "/u-scanner"
+local repo_root = vim.fn.fnamemodify(source, ":p:h:h:h"):gsub("\\", "/")
 
 -- Return the platform executable suffix.
 -- 返回当前平台的可执行文件后缀。
@@ -12,25 +11,73 @@ local function exe_suffix()
 	return package.config:sub(1, 1) == "\\" and ".exe" or ""
 end
 
+-- Normalize one filesystem path to an absolute slash-separated path.
+-- 把文件系统路径规范成绝对路径并统一为正斜杠。
+local function normalize(path)
+	if not path or path == "" then
+		return nil
+	end
+
+	local absolute = vim.fn.fnamemodify(path, ":p")
+	absolute = absolute:gsub("\\", "/")
+	local trimmed = absolute:gsub("/+$", "")
+	return trimmed
+end
+
 -- Check whether a file exists and is readable.
 -- 检查文件是否存在且可读。
 local function readable(path)
-	return vim.fn.filereadable(path) == 1
+	return path and vim.fn.filereadable(path) == 1
 end
 
--- Build a release binary path under u-scanner/target/release.
--- 构造 u-scanner/target/release 下的 release binary 路径。
-local function release_binary(scanner_root, name)
-	return scanner_root .. "/target/release/" .. name .. exe_suffix()
+-- Check whether a directory exists.
+-- 检查目录是否存在。
+local function is_dir(path)
+	return path and vim.fn.isdirectory(path) == 1
+end
+
+-- Add one unique normalized path into a list.
+-- 往列表里追加一个唯一的规范化路径。
+local function push_unique(list, path)
+	local normalized = normalize(path)
+	if not normalized then
+		return
+	end
+
+	for _, item in ipairs(list) do
+		if item == normalized then
+			return
+		end
+	end
+
+	table.insert(list, normalized)
+end
+
+-- Build an executable path inside a release directory.
+-- 在 release 目录下构造可执行文件路径。
+local function release_binary(release_dir, name)
+	if not release_dir then
+		return nil
+	end
+
+	return normalize(release_dir .. "/" .. name .. exe_suffix())
+end
+
+-- Return true when both backend release binaries exist in one directory.
+-- 当某个目录下两个后端 release binary 都存在时返回 true。
+local function has_release_binaries_in(dir)
+	return readable(release_binary(dir, "u_scanner")) and readable(release_binary(dir, "u_core_server"))
 end
 
 -- Build the development CLI command.
 -- 构造开发模式 CLI 命令。
-local function cargo_scanner_cmd()
+local function cargo_scanner_cmd(source_dir)
 	return {
 		"cargo",
 		"run",
 		"--quiet",
+		"--manifest-path",
+		source_dir .. "/Cargo.toml",
 		"--bin",
 		"u_scanner",
 		"--",
@@ -39,10 +86,12 @@ end
 
 -- Build the development server command.
 -- 构造开发模式 server 命令。
-local function cargo_server_cmd()
+local function cargo_server_cmd(source_dir)
 	return {
 		"cargo",
 		"run",
+		"--manifest-path",
+		source_dir .. "/Cargo.toml",
 		"--bin",
 		"u_core_server",
 		"--",
@@ -52,266 +101,262 @@ end
 local function default_values()
 	return {
 		port = 30110,
-		scanner_dir = scanner_dir,
 
-	-- Root directory for UCore registry, databases, and runtime logs.
-	-- UCore 注册表、数据库和运行时日志的根目录。
-	cache_dir = vim.fn.stdpath("data") .. "/ucore",
+		-- Root directory for UCore registry, databases, and runtime logs.
+		-- UCore 注册表、数据库和运行时日志的根目录。
+		cache_dir = vim.fn.stdpath("data") .. "/ucore",
 
+		-- Prefer release binaries when they exist.
+		-- release binary 存在时优先使用它们。
+		use_release_binary = true,
 
-	-- Prefer release binaries when they exist.
-	-- release binary 存在时优先使用它们。
-	use_release_binary = true,
+		-- Backend source / binary resolution.
+		-- 后端源码和二进制解析配置。
+		backend = {
+			repo = "vlicecream/UScanner",
+			repo_url = "https://github.com/vlicecream/UScanner.git",
+			source_dir = nil,
+			bin_dir = nil,
+			sibling_source_dir = normalize(repo_root .. "/../UScanner"),
+		},
 
-	-- Current backend mode: "cargo" or "release".
-	-- 当前后端模式："cargo" 或 "release"。
-	backend_mode = "cargo",
+		-- Current backend mode: "missing", "cargo", or "release".
+		-- 当前后端模式："missing"、"cargo" 或 "release"。
+		backend_mode = "missing",
 
-	-- Automatically boot UCore when opening a file inside an Unreal project.
-	-- 打开 Unreal 工程里的文件时自动启动 UCore。
-	auto_boot = true,
+		-- Resolved backend paths after setup.
+		-- setup 后解析出的后端路径。
+		backend_source_dir = nil,
+		backend_release_dir = nil,
+		backend_bin_dir = nil,
+		backend_cwd = repo_root,
+		backend_manifest_path = nil,
+		scanner_dir = nil,
 
-	-- Delay auto boot slightly to avoid fighting startup/plugin loading.
-	-- 稍微延迟自动启动，避免和 nvim 启动/插件加载抢时机。
-	auto_boot_delay_ms = 300,
+		-- Automatically boot UCore when opening a file inside an Unreal project.
+		-- 打开 Unreal 工程里的文件时自动启动 UCore。
+		auto_boot = true,
 
-	-- Maximum number of readiness checks during boot.
-	-- boot 期间最多检查多少次 server ready。
-	boot_ready_attempts = 1200,
+		-- Delay auto boot slightly to avoid fighting startup/plugin loading.
+		-- 稍微延迟自动启动，避免和 nvim 启动/插件加载抢时机。
+		auto_boot_delay_ms = 300,
 
-	-- Delay between readiness checks in milliseconds.
-	-- 每次 server ready 检查之间的延迟毫秒数。
-	boot_ready_interval_ms = 100,
+		-- Maximum number of readiness checks during boot.
+		-- boot 期间最多检查多少次 server ready。
+		boot_ready_attempts = 1200,
 
-	-- Events that may trigger auto boot.
-	-- 可能触发自动启动的事件。
-	auto_boot_events = {
-		"BufReadPost",
-		"BufNewFile",
-		"BufEnter",
-		"VimEnter",
-		"DirChanged",
-	},
+		-- Delay between readiness checks in milliseconds.
+		-- 每次 server ready 检查之间的延迟毫秒数。
+		boot_ready_interval_ms = 100,
 
-	-- Auto-save interval in seconds. `0` disables auto-save.
-	-- 自动保存间隔，单位秒。`0` 表示关闭。
-	autosave = 0,
+		-- Events that may trigger auto boot.
+		-- 可能触发自动启动的事件。
+		auto_boot_events = {
+			"BufReadPost",
+			"BufNewFile",
+			"BufEnter",
+			"VimEnter",
+			"DirChanged",
+		},
 
-	-- Refresh progress notification options.
-	-- refresh 进度通知配置。
-	progress = {
-		-- Show refresh progress notifications from the Rust server.
-		-- 显示 Rust server 返回的 refresh 进度通知。
-		enable = true,
-	},
+		-- Auto-save interval in seconds. `0` disables auto-save.
+		-- 自动保存间隔，单位秒。`0` 表示关闭。
+		autosave = 0,
 
-	-- UI integration options.
-	-- UI 集成配置。
-	ui = {
-		-- Picker backend: "auto", "vim", "fzf-lua", or "telescope".
-		-- 选择器后端："auto"、"vim"、"fzf-lua" 或 "telescope"。
-		picker = "auto",
-	},
-
-	-- Navigation keymaps.
-	-- 导航快捷键。
-	navigation = {
-		keymaps = {
-			-- Register buffer-local default navigation mappings for Unreal C++ files.
-			-- 为 Unreal C++ buffer 注册默认导航快捷键。
+		-- Refresh progress notification options.
+		-- refresh 进度通知配置。
+		progress = {
 			enable = true,
-
-			-- Go to definition. Core navigation.
-			-- 跳转到定义。核心代码跳转。
-			definition = "gd",
-
-			-- Go to declaration. Specifically jumps to .h declaration.
-			-- 跳转到声明。专门跳转到 .h 的声明。
-			declaration = "gD",
-
-			-- Find references. Searches entire project.
-			-- 查找引用。全工程搜索。
-			references = "gr",
-
-			-- Go to implementation (.h -> .cpp).
-			-- 跳转到实现（.h -> .cpp）。
-			implementation = "gi",
-
-			-- Toggle between source (.cpp) and header (.h) file.
-			-- 在 .cpp 和 .h 文件之间切换。
-			source_toggle = "gs",
-
-			-- Global find: fuzzy search indexed symbols, modules, assets, config.
-			-- 全局搜索：模糊查找已索引的符号、模块、资产、配置。
-			global_find = "gf",
 		},
-	},
 
-	-- Left-side project/source/config explorer.
-	-- 左侧 Project/Source/Config 目录浏览器。
-	explorer = {
-		width = 36,
-		min_width = 28,
-		max_width = 56,
-		tabs = { "Project", "Source", "Config" },
-		default_tab = "Project",
-		auto_open = false,
-		auto_focus = false,
-		auto_open_delay_ms = 120,
-		close_other_explorers = false,
-		show_hidden = false,
-		search_case_sensitive = false,
-		exclude_dirs = {
-			".git",
-			".svn",
-			".p4",
+		-- UI integration options.
+		-- UI 集成配置。
+		ui = {
+			picker = "auto",
 		},
-	},
 
-	-- Completion integration options.
-	-- 补全集成配置。
-	completion = {
-		-- Minimum identifier prefix length before global completion starts.
-		-- 触发全局补全所需的最短标识符前缀长度。
-		min_chars = 2,
-
-		-- Debounce delay for automatic completion requests.
-		-- 自动补全请求的防抖延迟。
-		debounce_ms = 180,
-	},
-
-	-- UCore diagnostics rendered through vim.diagnostic.
-	-- 通过 vim.diagnostic 渲染 UCore 诊断。
-	diagnostics = {
-		-- Enable UCore diagnostics.
-		-- 是否启用 UCore 诊断。
-		enable = true,
-
-		-- Smart quick-fix keymap. Set to false or "" to disable the default mapping.
-		-- 智能修复快捷键。设为 false 或 "" 可关闭默认映射。
-		action_keymap = "<leader>ca",
-
-		-- Show underline for diagnostics.
-		-- 是否显示红线/黄线下划线。
-		underline = true,
-
-		-- Show inline virtual text. Disabled by default to avoid noisy C++ buffers.
-		-- 是否显示行内虚拟文本，默认关闭以减少 C++ buffer 噪音。
-		virtual_text = false,
-
-		-- Show sign column markers.
-		-- 是否显示 sign column 标记。
-		signs = true,
-
-		-- Show a diagnostic float when the cursor stays on a red/yellow line.
-		-- 光标停留在红线/黄线上时是否自动弹出诊断浮窗。
-		float_on_cursor = true,
-
-		-- Also show the diagnostic float while typing in Insert mode.
-		-- 插入模式下是否也自动弹出诊断浮窗。
-		float_in_insert = false,
-
-		-- Delay before showing the cursor diagnostic float.
-		-- 光标诊断浮窗的延迟时间。
-		float_delay_ms = 200,
-
-		-- Update diagnostics while typing in Insert mode.
-		-- 插入模式输入时是否更新诊断。
-		update_in_insert = true,
-
-		-- Debounce delay for diagnostics refresh.
-		-- 诊断刷新的防抖延迟。
-		debounce_ms = 300,
-	},
-
-	-- Recommended LSP integration for semantic diagnostics and code actions.
-	-- 推荐的 LSP 集成，用于语义红线黄线和 code action。
-	lsp = {
-		auto_setup = true,
-		clangd = {
-			command = "clangd",
-			args = {
-				"--header-insertion=never",
-				"--completion-style=detailed",
-				"--function-arg-placeholders",
-				"--pch-storage=disk",
-				"--fallback-style=llvm",
+		-- Navigation keymaps.
+		-- 导航快捷键。
+		navigation = {
+			keymaps = {
+				enable = true,
+				definition = "gd",
+				declaration = "gD",
+				references = "gr",
+				implementation = "gi",
+				source_toggle = "gs",
+				global_find = "gf",
 			},
-			prefer_blink_capabilities = true,
-			single_file_support = false,
-			compile_commands_dir = nil,
-			require_compile_commands = true,
-			auto_generate_compile_commands = true,
-			auto_detect_windows = true,
-
-			-- Suppress clangd IncludeCleaner "unused include" diagnostics in
-			-- Unreal projects when needed. Disabled by default so users can
-			-- inspect the raw clangd warnings first.
-			-- 需要时可屏蔽 clangd IncludeCleaner 的“unused include”诊断。
-			-- 默认关闭，先保留 clangd 原始 warning 方便观察。
-			suppress_unused_include_warnings = false,
 		},
-	},
 
-	-- Auto-pairs integration via nvim-autopairs.
-	-- nvim-autopairs 自动配对集成。
-	editing = {
-		enable = true,
-		indent = {
+		-- Left-side project/source/config explorer.
+		-- 左侧 Project/Source/Config 目录浏览器。
+		explorer = {
+			width = 36,
+			min_width = 28,
+			max_width = 56,
+			tabs = { "Project", "Source", "Config" },
+			default_tab = "Project",
+			auto_open = false,
+			auto_focus = false,
+			auto_open_delay_ms = 120,
+			close_other_explorers = false,
+			show_hidden = false,
+			search_case_sensitive = false,
+			exclude_dirs = {
+				".git",
+				".svn",
+				".p4",
+			},
+		},
+
+		-- Completion integration options.
+		-- 补全集成配置。
+		completion = {
+			min_chars = 2,
+			debounce_ms = 180,
+		},
+
+		-- UCore diagnostics rendered through vim.diagnostic.
+		-- 通过 vim.diagnostic 渲染 UCore 诊断。
+		diagnostics = {
 			enable = true,
-			inherit_cpp = true,
-			fallback_cindent = true,
+			action_keymap = "<leader>ca",
+			underline = true,
+			virtual_text = false,
+			signs = true,
+			float_on_cursor = true,
+			float_in_insert = false,
+			float_delay_ms = 200,
+			update_in_insert = true,
+			debounce_ms = 300,
 		},
-	},
 
-	autopairs = {
-		-- Enable nvim-autopairs integration. Disable if using your own config.
-		-- 启用 nvim-autopairs 集成。若自行配置，可关闭。
-		enable = true,
+		-- Recommended LSP integration for semantic diagnostics and code actions.
+		-- 推荐的 LSP 集成，用于语义红线黄线和 code action。
+		lsp = {
+			auto_setup = true,
+			clangd = {
+				command = "clangd",
+				args = {
+					"--header-insertion=never",
+					"--completion-style=detailed",
+					"--function-arg-placeholders",
+					"--pch-storage=disk",
+					"--fallback-style=llvm",
+				},
+				prefer_blink_capabilities = true,
+				single_file_support = false,
+				compile_commands_dir = nil,
+				require_compile_commands = true,
+				auto_generate_compile_commands = true,
+				auto_detect_windows = true,
+				suppress_unused_include_warnings = false,
+			},
+		},
 
-		-- Let nvim-autopairs handle <CR> inside pairs such as {|}.
-		-- 允许 nvim-autopairs 处理 {|} 中的回车展开。
-		map_cr = true,
+		-- Auto-pairs integration via nvim-autopairs.
+		-- nvim-autopairs 自动配对集成。
+		editing = {
+			enable = true,
+			indent = {
+				enable = true,
+				inherit_cpp = true,
+				fallback_cindent = true,
+			},
+		},
 
-		-- Use treesitter context checks when available.
-		-- parser 可用时使用 treesitter 上下文检查。
-		check_ts = true,
-	},
+		autopairs = {
+			enable = true,
+			map_cr = true,
+			check_ts = true,
+		},
 
-	-- Semantic highlight overlay powered by the UCore index.
-	-- 基于 UCore 索引的语义高亮覆盖层。
-	semantic = {
-		-- Enable semantic extmark highlights for indexed declarations.
-		-- 是否启用已索引声明的语义 extmark 高亮。
-		enable = true,
+		-- Semantic highlight overlay powered by the UCore index.
+		-- 基于 UCore 索引的语义高亮覆盖层。
+		semantic = {
+			enable = true,
+			debounce_ms = 120,
+		},
 
-		-- Debounce delay for buffer semantic refresh.
-		-- buffer 语义高亮刷新的防抖延迟。
-		debounce_ms = 120,
-	},
-
-	-- Development mode: call Cargo directly so code changes are picked up.
-	-- 开发模式：直接调用 Cargo，方便 Rust 代码修改后立即生效。
-	scanner_cmd = cargo_scanner_cmd(),
-
-	-- Server command kept here for later start/stop integration.
-	-- server 启动命令先放这里，后面接 :UCoreStart 时复用。
-		server_cmd = cargo_server_cmd(),
+		-- Backend executable commands resolved at setup time.
+		-- setup 时解析出的后端可执行命令。
+		scanner_cmd = {},
+		server_cmd = {},
 	}
 end
 
 M.values = default_values()
 
+-- Return ordered backend source candidates.
+-- 返回有序的后端源码候选目录。
+function M.backend_source_candidates(values)
+	values = values or M.values
+
+	local backend = values.backend or {}
+	local dirs = {}
+	push_unique(dirs, backend.source_dir)
+	push_unique(dirs, backend.sibling_source_dir)
+	return dirs
+end
+
+-- Return ordered backend release binary candidates.
+-- 返回有序的后端 release 二进制候选目录。
+function M.backend_bin_candidates(values)
+	values = values or M.values
+
+	local backend = values.backend or {}
+	local dirs = {}
+	push_unique(dirs, backend.bin_dir)
+
+	local source_dir = values.backend_source_dir
+	if source_dir then
+		push_unique(dirs, source_dir .. "/target/release")
+	end
+
+	return dirs
+end
+
+-- Resolve the first usable backend source directory.
+-- 解析第一个可用的后端源码目录。
+function M.resolve_backend_source_dir(values)
+	values = values or M.values
+
+	for _, dir in ipairs(M.backend_source_candidates(values)) do
+		if is_dir(dir) and readable(dir .. "/Cargo.toml") then
+			return dir
+		end
+	end
+
+	local explicit = values.backend and values.backend.source_dir
+	return normalize(explicit)
+end
+
+-- Resolve the first usable release binary directory.
+-- 解析第一个可用的 release 二进制目录。
+function M.resolve_backend_release_dir(values)
+	values = values or M.values
+
+	for _, dir in ipairs(M.backend_bin_candidates(values)) do
+		if is_dir(dir) and has_release_binaries_in(dir) then
+			return dir
+		end
+	end
+
+	return nil
+end
+
 -- Return the release binary path for one backend executable.
 -- 返回某个后端可执行文件的 release binary 路径。
-function M.release_binary(name)
-	return release_binary(M.values.scanner_dir, name)
+function M.release_binary(name, dir)
+	local release_dir = dir or M.values.backend_release_dir or M.values.backend_bin_dir
+	return release_binary(release_dir, name)
 end
 
 -- Return true when both backend release binaries exist.
 -- 当两个后端 release binary 都存在时返回 true。
 function M.has_release_binaries()
-	return readable(M.release_binary("u_scanner")) and readable(M.release_binary("u_core_server"))
+	return M.values.backend_release_dir ~= nil
 end
 
 -- Refresh backend commands from the current config.
@@ -322,33 +367,88 @@ function M.refresh_backend_commands(opts)
 	local update_scanner = opts.scanner ~= false
 	local update_server = opts.server ~= false
 
-	if M.values.use_release_binary and M.has_release_binaries() then
+	local source_dir = M.resolve_backend_source_dir(M.values)
+	M.values.backend_source_dir = source_dir
+	M.values.backend_manifest_path = source_dir and (source_dir .. "/Cargo.toml") or nil
+	M.values.scanner_dir = source_dir
+
+	local preferred_bin_dir = normalize((M.values.backend or {}).bin_dir)
+	M.values.backend_bin_dir = preferred_bin_dir
+
+	local release_dir = M.resolve_backend_release_dir(M.values)
+	M.values.backend_release_dir = release_dir
+
+	if release_dir then
+		M.values.backend_bin_dir = release_dir
+	end
+
+	M.values.backend_cwd = source_dir or release_dir or repo_root
+	if not M.values.backend_bin_dir and source_dir then
+		M.values.backend_bin_dir = normalize(source_dir .. "/target/release")
+	end
+
+	if M.values.use_release_binary and release_dir then
 		if update_scanner then
-			M.values.scanner_cmd = { M.release_binary("u_scanner") }
+			M.values.scanner_cmd = { M.release_binary("u_scanner", release_dir) }
 		end
 		if update_server then
-			M.values.server_cmd = { M.release_binary("u_core_server") }
+			M.values.server_cmd = { M.release_binary("u_core_server", release_dir) }
 		end
 		M.values.backend_mode = "release"
 		return
 	end
 
+	if source_dir and readable(source_dir .. "/Cargo.toml") then
+		if update_scanner then
+			M.values.scanner_cmd = cargo_scanner_cmd(source_dir)
+		end
+		if update_server then
+			M.values.server_cmd = cargo_server_cmd(source_dir)
+		end
+		M.values.backend_mode = "cargo"
+		return
+	end
+
+	if not update_scanner or not update_server then
+		M.values.backend_mode = "custom"
+		return
+	end
+
 	if update_scanner then
-		M.values.scanner_cmd = cargo_scanner_cmd()
+		M.values.scanner_cmd = { M.release_binary("u_scanner", M.values.backend_bin_dir) }
 	end
 	if update_server then
-		M.values.server_cmd = cargo_server_cmd()
+		M.values.server_cmd = { M.release_binary("u_core_server", M.values.backend_bin_dir) }
 	end
-	M.values.backend_mode = "cargo"
+	M.values.backend_mode = "missing"
+end
+
+-- Merge legacy top-level options into the new backend block.
+-- 把旧的顶层配置兼容地合并到新的 backend 配置块。
+local function normalize_user_opts(opts)
+	if not opts then
+		return {}
+	end
+
+	local normalized = vim.deepcopy(opts)
+	if normalized.scanner_dir ~= nil then
+		normalized.backend = normalized.backend or {}
+		if normalized.backend.source_dir == nil then
+			normalized.backend.source_dir = normalized.scanner_dir
+		end
+	end
+
+	return normalized
 end
 
 -- Merge user options into the default config.
 -- 将用户配置合并到默认配置里。
 function M.setup(opts)
-	local has_custom_scanner_cmd = opts and opts.scanner_cmd ~= nil
-	local has_custom_server_cmd = opts and opts.server_cmd ~= nil
+	local normalized_opts = normalize_user_opts(opts)
+	local has_custom_scanner_cmd = normalized_opts.scanner_cmd ~= nil
+	local has_custom_server_cmd = normalized_opts.server_cmd ~= nil
 
-	M.values = vim.tbl_deep_extend("force", default_values(), opts or {})
+	M.values = vim.tbl_deep_extend("force", default_values(), normalized_opts)
 	M.refresh_backend_commands({
 		scanner = not has_custom_scanner_cmd,
 		server = not has_custom_server_cmd,

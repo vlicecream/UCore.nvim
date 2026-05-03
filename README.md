@@ -25,7 +25,7 @@ It does **not** own syntax highlighting or VCS anymore:
 ### Features
 
 - `:UCore` smart entry for booting the current Unreal project
-- Rust backend (`u_scanner` + `u_core_server`) with SQLite caches
+- `UScanner` Rust backend (`u_scanner` + `u_core_server`) with SQLite caches
 - `gd` / `gD` / `gi` / `gr` / `gs` / `gf` navigation workflow
 - explorer for `Project / Source / Config`
 - `blink.cmp` completion source
@@ -35,6 +35,7 @@ It does **not** own syntax highlighting or VCS anymore:
 ### Requirements
 
 - Neovim 0.10+
+- Git
 - Rust toolchain with `cargo`
 - An Unreal Engine project with a `.uproject` file
 - `telescope.nvim` or `fzf-lua` if you want richer picker UI
@@ -103,6 +104,11 @@ Optional companion plugins:
 - install `UDebugTool.nvim` if you want Unreal debugging
 
 `extend_blink_opts()` only prepares `blink.cmp` at config time. UCore does not patch blink at runtime.
+
+During build, `UCore.nvim` resolves the backend like this:
+
+1. use a sibling `../UScanner` checkout for local development
+2. otherwise point `backend.source_dir` at an external `UScanner` checkout
 
 ### Semantic Diagnostics
 
@@ -296,7 +302,7 @@ Neovim (Lua)
           └── SQLite caches / project index
 ```
 
-The backend prefers release binaries under `u-scanner/target/release/` and falls back to `cargo run` when needed.
+`UCore.nvim` prefers built binaries from the resolved `UScanner` checkout. If no release binaries are available, it falls back to `cargo run` against that checkout.
 
 ### Split Responsibilities
 
@@ -304,6 +310,7 @@ The backend prefers release binaries under `u-scanner/target/release/` and falls
 
 Use the split repos for runtime workflows:
 
+- `UScanner` for the Rust backend source (`u_scanner` and `u_core_server`)
 - `UBuildTool.nvim` for Unreal build, build cancel, editor launch, and clangd database preparation
 - `UDebugTool.nvim` for Unreal attach / launch-under-debugger / breakpoints / minimal debug UI
 
@@ -357,7 +364,7 @@ MIT
 ### 特性
 
 - `:UCore` 作为当前 Unreal 项目的智能入口
-- Rust 后端（`u_scanner` + `u_core_server`）+ SQLite 缓存
+- `UScanner` Rust 后端（`u_scanner` + `u_core_server`）+ SQLite 缓存
 - `gd` / `gD` / `gi` / `gr` / `gs` / `gf` 导航工作流
 - `Project / Source / Config` 三栏浏览器
 - `blink.cmp` 补全源
@@ -367,6 +374,7 @@ MIT
 ### 依赖
 
 - Neovim 0.10+
+- Git
 - Rust 工具链和 `cargo`
 - 含 `.uproject` 的 Unreal Engine 项目
 - `telescope.nvim` 或 `fzf-lua`（需要更完整的 picker 时）
@@ -436,6 +444,11 @@ return {
 - 需要 Unreal 调试时再装 `UDebugTool.nvim`
 
 `extend_blink_opts()` 只在配置阶段补全 `blink.cmp` 选项，UCore 不会在运行时改写 blink 配置。
+
+构建时，`UCore.nvim` 会按这个顺序解析后端：
+
+1. 本地开发优先使用同级 `../UScanner`
+2. 否则通过 `backend.source_dir` 指向任意外部 `UScanner` checkout
 
 ### 语义诊断
 
@@ -628,7 +641,7 @@ Neovim (Lua)
           └── SQLite 缓存 / 项目索引
 ```
 
-后端优先使用 `u-scanner/target/release/` 下的 release 二进制，缺失时回退到 `cargo run`。
+`UCore.nvim` 运行时优先使用已构建好的二进制；若 release binary 不可用，则回退到解析出的 `UScanner` 源码树上执行 `cargo run`。
 
 ### 职责拆分
 
@@ -636,6 +649,7 @@ Neovim (Lua)
 
 运行时工作流请使用拆分仓库：
 
+- `UScanner`：负责 Rust 后端源码（`u_scanner` 和 `u_core_server`）
 - `UBuildTool.nvim`：负责 Unreal 构建、停止构建、启动 Editor、准备 clangd 数据库
 - `UDebugTool.nvim`：负责 Unreal attach、调试器下启动、断点、最轻调试 UI
 
