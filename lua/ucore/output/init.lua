@@ -121,7 +121,7 @@ local function render_tabbar()
 
 	local line = ""
 	local spans = {}
-	local hint = "  H/L switch  q close tab  x close panel"
+	local hint = "  h/l switch  q close tab  x close panel"
 
 	if #state.order == 0 then
 		line = " UCore Output "
@@ -292,6 +292,12 @@ local function install_buffer_keymaps(buf)
 
 	map("q", close_active_tab, "UCore output close tab")
 	map("x", close_workspace, "UCore output close panel")
+	map("h", function()
+		select_relative(-1)
+	end, "UCore output previous tab")
+	map("l", function()
+		select_relative(1)
+	end, "UCore output next tab")
 	map("<Tab>", function()
 		select_relative(1)
 	end, "UCore output next tab")
@@ -333,16 +339,16 @@ local function ensure_workspace()
 	install_buffer_keymaps(content_buf)
 
 	vim.cmd("botright split")
-	state.content.win = vim.api.nvim_get_current_win()
-	window_options(state.content.win, { wrap = false, cursorline = false })
-	vim.api.nvim_win_set_buf(state.content.win, content_buf)
-	vim.api.nvim_win_set_height(state.content.win, output_config().height)
-
-	vim.cmd("topleft split")
 	state.tabbar.win = vim.api.nvim_get_current_win()
 	window_options(state.tabbar.win, { wrap = false, cursorline = false })
 	vim.api.nvim_win_set_buf(state.tabbar.win, state.tabbar.buf)
 	vim.api.nvim_win_set_height(state.tabbar.win, 1)
+
+	vim.cmd("botright split")
+	state.content.win = vim.api.nvim_get_current_win()
+	window_options(state.content.win, { wrap = false, cursorline = false })
+	vim.api.nvim_win_set_buf(state.content.win, content_buf)
+	vim.api.nvim_win_set_height(state.content.win, output_config().height)
 
 	if valid_win(state.content.win) then
 		vim.api.nvim_win_set_height(state.content.win, output_config().height)
