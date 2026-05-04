@@ -65,6 +65,7 @@ valid_win = function(win)
 end
 
 local function setup_highlights()
+	vim.api.nvim_set_hl(0, "UCorePanelBorder", { fg = "#3F3F46" })
 	vim.api.nvim_set_hl(0, "UCoreOutputTabActive", { fg = "#E5EFFF", bg = "#1F2937", bold = true })
 	vim.api.nvim_set_hl(0, "UCoreOutputTabInactive", { fg = "#94A3B8", bg = "#111827" })
 	vim.api.nvim_set_hl(0, "UCoreOutputTabUnread", { fg = "#FBBF24", bg = "#111827", bold = true })
@@ -105,6 +106,9 @@ local function window_options(win, opts)
 	vim.wo[win].winfixheight = true
 	vim.wo[win].list = false
 	vim.wo[win].conceallevel = 0
+	if opts.separator == true then
+		vim.wo[win].winhl = "Normal:Normal,SignColumn:Normal,EndOfBuffer:Normal,WinSeparator:UCorePanelBorder"
+	end
 end
 
 local function current_content_buf()
@@ -389,13 +393,13 @@ local function ensure_workspace()
 
 	vim.cmd("botright split")
 	state.tabbar.win = vim.api.nvim_get_current_win()
-	window_options(state.tabbar.win, { wrap = false, cursorline = false })
+	window_options(state.tabbar.win, { wrap = false, cursorline = false, separator = true })
 	vim.api.nvim_win_set_buf(state.tabbar.win, state.tabbar.buf)
 	vim.api.nvim_win_set_height(state.tabbar.win, 1)
 
 	vim.cmd("botright split")
 	state.content.win = vim.api.nvim_get_current_win()
-	window_options(state.content.win, { wrap = false, cursorline = false })
+	window_options(state.content.win, { wrap = false, cursorline = false, separator = true })
 	vim.api.nvim_win_set_buf(state.content.win, content_buf)
 	vim.api.nvim_win_set_height(state.content.win, output_config().height)
 

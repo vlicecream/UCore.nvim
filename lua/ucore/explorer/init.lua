@@ -17,6 +17,10 @@ local function explorer_config()
 	return config.values.explorer or {}
 end
 
+local function setup_highlights()
+	vim.api.nvim_set_hl(0, "UCorePanelBorder", { fg = "#3F3F46" })
+end
+
 local function minimum_width_for_tabs()
 	local text = " q <  " .. table.concat(state.tabs(), " | ") .. "  > e "
 	return vim.fn.strdisplaywidth(text) + 2
@@ -51,6 +55,7 @@ local function ensure_window()
 		return state.win
 	end
 
+	setup_highlights()
 	close_other_explorers()
 
 	local previous_win = vim.api.nvim_get_current_win()
@@ -74,6 +79,7 @@ local function ensure_window()
 	vim.wo[state.win].cursorline = true
 	vim.wo[state.win].winfixwidth = true
 	vim.wo[state.win].winbar = ""
+	vim.wo[state.win].winhl = "Normal:Normal,SignColumn:Normal,EndOfBuffer:Normal,WinSeparator:UCorePanelBorder"
 	if explorer_config().auto_focus == false and vim.api.nvim_win_is_valid(previous_win) then
 		vim.api.nvim_set_current_win(previous_win)
 	end
