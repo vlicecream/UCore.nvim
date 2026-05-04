@@ -3,22 +3,18 @@ local M = {}
 local spinner_frames = { "⣾", "⣷", "⣯", "⣟", "⡿", "⢿", "⣻", "⣽" }
 local spinner_index = 1
 local spinner_scheduled = false
+local render_scheduled = false
+local highlight_ns = vim.api.nvim_create_namespace("ucore.status.float")
+
+local float_state = {
+	bufs = {},
+	wins = {},
+}
 
 local function uses_builtin_notify()
 	local info = debug.getinfo(vim.notify, "S")
 	local source = tostring(info and info.source or "")
 	return source:find("vim/_core/editor.lua", 1, true) ~= nil
-end
-
-local function parse_percent(text)
-	local best = nil
-	for token in tostring(text or ""):gmatch("(%d?%d?%d)%%") do
-		local value = tonumber(token)
-		if value and value >= 0 and value <= 100 then
-			best = best and math.max(best, value) or value
-		end
-	end
-	return best
 end
 
 local function make_panel(title, notify_id, ordered_keys)
@@ -30,7 +26,6 @@ local function make_panel(title, notify_id, ordered_keys)
 		suppressed_keys = {},
 		spinner_active_keys = {},
 		notify_handle = nil,
-		progress_id = nil,
 		boot_active = false,
 		state = "running",
 		pending_finish_message = nil,
@@ -92,7 +87,7 @@ local function render_line(panel, key, message)
 	return message
 end
 
-local function render_panel(panel)
+local function panel_lines(panel)
 	local lines = {}
 	local seen = {}
 
@@ -109,8 +104,110 @@ local function render_panel(panel)
 		end
 	end
 
+	return lines
+end
+
+local function close_float(panel_key)
+	local win = float_state.wins[panel_key]
+	if win and vim.api.nvim_win_is_valid(win) then
+		pcall(vim.api.nvim_win_close, win, true)
+	end
+	float_state.wins[panel_key] = nil
+
+	local buf = float_state.bufs[panel_key]
+	if buf and vim.api.nvim_buf_is_valid(buf) then
+		pcall(vim.api.nvim_buf_delete, buf, { force = true })
+	end
+	float_state.bufs[panel_key] = nil
+end
+
+local function ensure_float_buf(panel_key)
+	local buf = float_state.bufs[panel_key]
+	if buf and vim.api.nvim_buf_is_valid(buf) then
+		return buf
+	end
+
+	buf = vim.api.nvim_create_buf(false, true)
+	vim.bo[buf].bufhidden = "wipe"
+	vim.bo[buf].buftype = "nofile"
+	vim.bo[buf].swapfile = false
+	float_state.bufs[panel_key] = buf
+	return buf
+end
+
+local function float_text_width(lines)
+	local width = 0
+	for _, line in ipairs(lines) do
+		width = math.max(width, vim.fn.strdisplaywidth(line))
+	end
+	return math.max(width, 1)
+end
+
+local function float_display_lines(panel)
+	local lines = panel_lines(panel)
 	if #lines == 0 then
-		panel.progress_id = nil
+		return lines
+	end
+
+	lines[1] = string.format("%s: %s", panel.title, lines[1])
+	for index = 2, #lines do
+		lines[index] = string.format("%s  %s", panel.title, lines[index])
+	end
+	return lines
+end
+
+local function render_float_panel(panel_key, panel, row)
+	local lines = float_display_lines(panel)
+	if #lines == 0 then
+		close_float(panel_key)
+		return 0
+	end
+
+	local width = math.min(float_text_width(lines), math.max(vim.o.columns - 4, 1))
+	local height = #lines
+	local buf = ensure_float_buf(panel_key)
+	vim.bo[buf].modifiable = true
+	vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+	vim.api.nvim_buf_clear_namespace(buf, highlight_ns, 0, -1)
+	vim.bo[buf].modifiable = false
+
+	local config = {
+		relative = "editor",
+		anchor = "NE",
+		row = row,
+		col = vim.o.columns - 1,
+		width = width,
+		height = height,
+		style = "minimal",
+		focusable = false,
+		noautocmd = true,
+		zindex = 250,
+	}
+
+	local win = float_state.wins[panel_key]
+	if win and vim.api.nvim_win_is_valid(win) then
+		pcall(vim.api.nvim_win_set_config, win, config)
+	else
+		win = vim.api.nvim_open_win(buf, false, config)
+		float_state.wins[panel_key] = win
+		vim.wo[win].winblend = 0
+		vim.wo[win].wrap = false
+		vim.wo[win].cursorline = false
+	end
+
+	local highlight = panel.state == "failed" and "DiagnosticError" or "Comment"
+	for index, _ in ipairs(lines) do
+		local prefix = panel.title .. ":"
+		local prefix_len = #prefix
+		pcall(vim.api.nvim_buf_add_highlight, buf, highlight_ns, highlight, index - 1, 0, prefix_len)
+	end
+
+	return height
+end
+
+local function render_notify_panel(panel)
+	local lines = panel_lines(panel)
+	if #lines == 0 then
 		if panel.notify_handle then
 			pcall(vim.notify, "", vim.log.levels.INFO, {
 				id = panel.notify_id,
@@ -120,41 +217,6 @@ local function render_panel(panel)
 			})
 		end
 		panel.notify_handle = nil
-		return
-	end
-
-	if uses_builtin_notify() then
-		local percent = panel.state == "complete" and 100 or nil
-		if percent == nil then
-			for _, line in ipairs(lines) do
-				local value = parse_percent(line)
-				if value then
-					percent = percent and math.max(percent, value) or value
-				end
-			end
-		end
-
-		local status = "running"
-		if panel.state == "failed" then
-			status = "failed"
-		elseif panel.state == "complete" then
-			status = "success"
-		end
-
-		local ok, id = pcall(vim.api.nvim_echo, {
-			{ table.concat(lines, " | "), "Normal" },
-		}, false, {
-			id = panel.progress_id,
-			kind = "progress",
-			title = panel.title,
-			status = status,
-			percent = percent,
-			source = panel.notify_id,
-		})
-
-		if ok and id then
-			panel.progress_id = id
-		end
 		return
 	end
 
@@ -171,14 +233,49 @@ local function render_panel(panel)
 	end
 end
 
+local function render_now()
+	if uses_builtin_notify() then
+		local row = 1
+		row = row + render_float_panel("init", panels.init, row)
+		if panels.init and #panel_lines(panels.init) > 0 and #panel_lines(panels.clang) > 0 then
+			row = row + 1
+		end
+		render_float_panel("clang", panels.clang, row)
+		panels.init.notify_handle = nil
+		panels.clang.notify_handle = nil
+		return
+	end
+
+	close_float("init")
+	close_float("clang")
+	render_notify_panel(panels.init)
+	render_notify_panel(panels.clang)
+end
+
 local function render()
-	render_panel(panels.init)
-	render_panel(panels.clang)
+	if vim.in_fast_event() then
+		if render_scheduled then
+			return
+		end
+		render_scheduled = true
+		vim.schedule(function()
+			render_scheduled = false
+			render_now()
+		end)
+		return
+	end
+
+	render_now()
 end
 
 local function dismiss_panel(panel)
-	panel.progress_id = nil
 	if uses_builtin_notify() then
+		if panel == panels.init then
+			close_float("init")
+		elseif panel == panels.clang then
+			close_float("clang")
+		end
+		panel.notify_handle = nil
 		return
 	end
 
@@ -306,7 +403,6 @@ local function reset_panel(panel)
 	clear_panel_contents(panel)
 	panel.suppressed_keys = {}
 	panel.state = "running"
-	panel.progress_id = nil
 	bump_dismiss_version(panel)
 end
 
