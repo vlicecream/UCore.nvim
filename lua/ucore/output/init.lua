@@ -185,6 +185,15 @@ local function centered_rule(width, title)
 	return line, left, left + #label
 end
 
+local function current_frame_title()
+	local tab = state.active and state.tabs[state.active] or nil
+	local title = tab and tostring(tab.title or "") or ""
+	if title == "" then
+		return "Output"
+	end
+	return title
+end
+
 local function render_frame()
 	local win = current_frame_win()
 	if not valid_win(win) then
@@ -193,7 +202,7 @@ local function render_frame()
 
 	local buf = ensure_frame_buffer()
 	local width = math.max(1, vim.api.nvim_win_get_width(win))
-	local line, title_start, title_end = centered_rule(width, "Output")
+	local line, title_start, title_end = centered_rule(width, current_frame_title())
 	vim.bo[buf].modifiable = true
 	vim.bo[buf].readonly = false
 	vim.api.nvim_buf_set_lines(buf, 0, -1, false, { line })
@@ -260,6 +269,8 @@ local function render_tabbar()
 	if not valid_buf(state.tabbar.buf) then
 		return
 	end
+
+	render_frame()
 
 	local line = ""
 	local spans = {}
