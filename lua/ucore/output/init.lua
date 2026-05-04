@@ -1,6 +1,7 @@
 local config = require("ucore.config")
 
 local M = {}
+local valid_buf, valid_win, install_buffer_keymaps
 
 local ns = vim.api.nvim_create_namespace("ucore_output_panel")
 
@@ -10,6 +11,7 @@ local state = {
 		buf = nil,
 		win = nil,
 	},
+	host = nil,
 	order = {},
 	placeholder = nil,
 	seq = 0,
@@ -20,6 +22,20 @@ local state = {
 	tabs = {},
 	dismissed = {},
 }
+
+local function current_tabbar_win()
+	if state.host and valid_win(state.host.tabbar_win) then
+		return state.host.tabbar_win
+	end
+	return state.tabbar.win
+end
+
+local function current_content_win()
+	if state.host and valid_win(state.host.content_win) then
+		return state.host.content_win
+	end
+	return state.content.win
+end
 
 local function defer_if_fast(fn)
 	if vim.in_fast_event() then
@@ -40,11 +56,11 @@ local function output_config()
 	}
 end
 
-local function valid_buf(buf)
+valid_buf = function(buf)
 	return buf and vim.api.nvim_buf_is_valid(buf)
 end
 
-local function valid_win(win)
+valid_win = function(win)
 	return win and vim.api.nvim_win_is_valid(win)
 end
 
@@ -192,16 +208,23 @@ local function render_tabbar()
 	end
 	vim.bo[state.tabbar.buf].modifiable = false
 	vim.bo[state.tabbar.buf].readonly = true
+
+	local win = current_tabbar_win()
+	if valid_win(win) and vim.api.nvim_win_get_buf(win) ~= state.tabbar.buf then
+		vim.api.nvim_win_set_buf(win, state.tabbar.buf)
+	end
 end
 
 local function sync_content_buffer()
-	if not valid_win(state.content.win) then
+	local win = current_content_win()
+	if not valid_win(win) then
 		return
 	end
 
 	local buf = current_content_buf()
-	if vim.api.nvim_win_get_buf(state.content.win) ~= buf then
-		vim.api.nvim_win_set_buf(state.content.win, buf)
+	install_buffer_keymaps(buf)
+	if vim.api.nvim_win_get_buf(win) ~= buf then
+		vim.api.nvim_win_set_buf(win, buf)
 	end
 end
 
@@ -300,7 +323,7 @@ local function select_relative(direction)
 	sync_content_buffer()
 end
 
-local function install_buffer_keymaps(buf)
+install_buffer_keymaps = function(buf)
 	local function map(lhs, rhs, desc)
 		vim.keymap.set("n", lhs, rhs, {
 			buffer = buf,
@@ -335,6 +358,12 @@ end
 local function ensure_workspace()
 	if not output_config().enable then
 		return false
+	end
+
+	if state.host then
+		render_tabbar()
+		sync_content_buffer()
+		return true
 	end
 
 	if valid_win(state.tabbar.win) and valid_win(state.content.win) then
@@ -782,6 +811,9 @@ function M.toggle()
 		close_workspace()
 		return
 	end
+	if state.host then
+		return
+	end
 	ensure_workspace()
 end
 
@@ -796,7 +828,51 @@ function M.hide()
 end
 
 function M.is_open()
-	return valid_win(state.tabbar.win) and valid_win(state.content.win)
+	return valid_win(state.tabbar.win) == true and valid_win(state.content.win) == true
+end
+
+function M.attach_host_windows(name, tabbar_win, content_win)
+	if not valid_win(tabbar_win) or not valid_win(content_win) then
+		return false
+	end
+
+	close_workspace()
+	state.host = {
+		name = tostring(name or "embedded"),
+		tabbar_win = tabbar_win,
+		content_win = content_win,
+	}
+
+	setup_highlights()
+
+	if not valid_buf(state.tabbar.buf) then
+		local buf = vim.api.nvim_create_buf(false, true)
+		buffer_options(buf, "ucore-output-tabs")
+		pcall(vim.api.nvim_buf_set_name, buf, "UCoreOutputTabs")
+		install_buffer_keymaps(buf)
+		state.tabbar.buf = buf
+	end
+
+	window_options(tabbar_win, { wrap = false, cursorline = false })
+	window_options(content_win, { wrap = false, cursorline = false })
+	vim.api.nvim_win_set_buf(tabbar_win, state.tabbar.buf)
+	sync_content_buffer()
+	render_tabbar()
+	return true
+end
+
+function M.detach_host(name)
+	if not state.host then
+		return
+	end
+	if name and tostring(name) ~= state.host.name then
+		return
+	end
+	state.host = nil
+end
+
+function M.host_name()
+	return state.host and state.host.name or nil
 end
 
 function M.setup()
@@ -834,6 +910,7 @@ function M.reset()
 	state.tabbar.win = nil
 	state.tabs = {}
 	state.dismissed = {}
+	state.host = nil
 	rawset(_G, "__ucore_output_panel_api", nil)
 end
 
