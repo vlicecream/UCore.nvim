@@ -7,6 +7,14 @@ local ns = vim.api.nvim_create_namespace("ucore_output_panel")
 
 local state = {
 	active = nil,
+	divider = {
+		buf = nil,
+		win = nil,
+	},
+	frame = {
+		buf = nil,
+		win = nil,
+	},
 	content = {
 		buf = nil,
 		win = nil,
@@ -23,6 +31,15 @@ local state = {
 	dismissed = {},
 }
 
+local function ensure_output_fillchars()
+	local fillchars = vim.opt.fillchars:get()
+	fillchars.horiz = "─"
+	fillchars.horizup = "┻"
+	fillchars.horizdown = "┳"
+	fillchars.vert = fillchars.vert or "│"
+	vim.opt.fillchars = fillchars
+end
+
 local function current_tabbar_win()
 	if state.host and valid_win(state.host.tabbar_win) then
 		return state.host.tabbar_win
@@ -35,6 +52,20 @@ local function current_content_win()
 		return state.host.content_win
 	end
 	return state.content.win
+end
+
+local function current_frame_win()
+	if state.host then
+		return nil
+	end
+	return state.frame.win
+end
+
+local function current_divider_win()
+	if state.host then
+		return nil
+	end
+	return state.divider.win
 end
 
 local function defer_if_fast(fn)
@@ -66,12 +97,13 @@ end
 
 local function setup_highlights()
 	vim.api.nvim_set_hl(0, "UCorePanelBorder", { fg = "#3F3F46" })
-	vim.api.nvim_set_hl(0, "UCoreOutputTabActive", { fg = "#E5EFFF", bg = "#1F2937", bold = true })
-	vim.api.nvim_set_hl(0, "UCoreOutputTabInactive", { fg = "#94A3B8", bg = "#111827" })
-	vim.api.nvim_set_hl(0, "UCoreOutputTabUnread", { fg = "#FBBF24", bg = "#111827", bold = true })
-	vim.api.nvim_set_hl(0, "UCoreOutputTabFailed", { fg = "#F87171", bg = "#111827", bold = true })
-	vim.api.nvim_set_hl(0, "UCoreOutputTabSuccess", { fg = "#86EFAC", bg = "#111827", bold = true })
-	vim.api.nvim_set_hl(0, "UCoreOutputTabBar", { fg = "#CBD5E1", bg = "#111827" })
+	vim.api.nvim_set_hl(0, "UCoreOutputSeparator", { fg = "#E5E7EB" })
+	vim.api.nvim_set_hl(0, "UCoreOutputTabActive", { fg = "#F8FAFC", bold = true })
+	vim.api.nvim_set_hl(0, "UCoreOutputTabInactive", { fg = "#94A3B8" })
+	vim.api.nvim_set_hl(0, "UCoreOutputTabUnread", { fg = "#FBBF24", bold = true })
+	vim.api.nvim_set_hl(0, "UCoreOutputTabFailed", { fg = "#F87171", bold = true })
+	vim.api.nvim_set_hl(0, "UCoreOutputTabSuccess", { fg = "#F8FAFC" })
+	vim.api.nvim_set_hl(0, "UCoreOutputTabBar", { fg = "#F8FAFC" })
 	vim.api.nvim_set_hl(0, "UCoreOutputMuted", { fg = "#64748B" })
 	vim.api.nvim_set_hl(0, "UCoreOutputTitle", { fg = "#E5EFFF", bold = true })
 	vim.api.nvim_set_hl(0, "UCoreOutputCommand", { fg = "#4FC1FF" })
@@ -107,8 +139,97 @@ local function window_options(win, opts)
 	vim.wo[win].list = false
 	vim.wo[win].conceallevel = 0
 	if opts.separator == true then
-		vim.wo[win].winhl = "Normal:Normal,SignColumn:Normal,EndOfBuffer:Normal,WinSeparator:UCorePanelBorder"
+		ensure_output_fillchars()
+		vim.wo[win].winhl = "Normal:Normal,SignColumn:Normal,EndOfBuffer:Normal,WinSeparator:UCoreOutputSeparator"
 	end
+end
+
+local function ensure_frame_buffer()
+	if valid_buf(state.frame.buf) then
+		return state.frame.buf
+	end
+	local buf = vim.api.nvim_create_buf(false, true)
+	buffer_options(buf, "ucore-output-frame")
+	pcall(vim.api.nvim_buf_set_name, buf, "UCoreOutputFrame")
+	state.frame.buf = buf
+	return buf
+end
+
+local function ensure_divider_buffer()
+	if valid_buf(state.divider.buf) then
+		return state.divider.buf
+	end
+	local buf = vim.api.nvim_create_buf(false, true)
+	buffer_options(buf, "ucore-output-divider")
+	pcall(vim.api.nvim_buf_set_name, buf, "UCoreOutputDivider")
+	state.divider.buf = buf
+	return buf
+end
+
+local function centered_rule(width, title)
+	width = math.max(1, tonumber(width) or 1)
+	title = vim.trim(tostring(title or ""))
+	if title == "" or width < 6 then
+		return string.rep("─", width), 0, width
+	end
+
+	local label = " " .. title .. " "
+	if #label >= width then
+		label = " " .. title:sub(1, math.max(1, width - 3)) .. " "
+	end
+
+	local remaining = math.max(0, width - #label)
+	local left = math.floor(remaining / 2)
+	local right = remaining - left
+	local line = string.rep("─", left) .. label .. string.rep("─", right)
+	return line, left, left + #label
+end
+
+local function render_frame()
+	local win = current_frame_win()
+	if not valid_win(win) then
+		return
+	end
+
+	local buf = ensure_frame_buffer()
+	local width = math.max(1, vim.api.nvim_win_get_width(win))
+	local line, title_start, title_end = centered_rule(width, "Output")
+	vim.bo[buf].modifiable = true
+	vim.bo[buf].readonly = false
+	vim.api.nvim_buf_set_lines(buf, 0, -1, false, { line })
+	vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
+	vim.api.nvim_buf_add_highlight(buf, ns, "UCoreOutputSeparator", 0, 0, -1)
+	if title_end > title_start then
+		vim.api.nvim_buf_add_highlight(buf, ns, "UCoreOutputTitle", 0, title_start, title_end)
+	end
+	vim.bo[buf].modifiable = false
+	vim.bo[buf].readonly = true
+	if vim.api.nvim_win_get_buf(win) ~= buf then
+		vim.api.nvim_win_set_buf(win, buf)
+	end
+	window_options(win, { wrap = false, cursorline = false, separator = false })
+end
+
+local function render_divider()
+	local win = current_divider_win()
+	if not valid_win(win) then
+		return
+	end
+
+	local buf = ensure_divider_buffer()
+	local width = math.max(1, vim.api.nvim_win_get_width(win))
+	local line = string.rep("─", width)
+	vim.bo[buf].modifiable = true
+	vim.bo[buf].readonly = false
+	vim.api.nvim_buf_set_lines(buf, 0, -1, false, { line })
+	vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
+	vim.api.nvim_buf_add_highlight(buf, ns, "UCoreOutputSeparator", 0, 0, -1)
+	vim.bo[buf].modifiable = false
+	vim.bo[buf].readonly = true
+	if vim.api.nvim_win_get_buf(win) ~= buf then
+		vim.api.nvim_win_set_buf(win, buf)
+	end
+	window_options(win, { wrap = false, cursorline = false, separator = false })
 end
 
 local function current_content_buf()
@@ -142,7 +263,7 @@ local function render_tabbar()
 
 	local line = ""
 	local spans = {}
-	local hint = "  h/l switch  q close tab"
+	local hint = "  q/e switch  x close"
 
 	if #state.order == 0 then
 		line = " UCore Output "
@@ -160,16 +281,9 @@ local function render_tabbar()
 					title = title:sub(1, 19) .. "..."
 				end
 
-				local prefix = " "
-				if tab.status == "failed" then
-					prefix = "!"
-				elseif tab.unread and key ~= state.active then
-					prefix = "*"
-				end
-
-				local piece = string.format("[%s %s]", prefix, title)
+				local piece = string.format("[ %s ]", title)
 				if index > 1 then
-					line = line .. " "
+					line = line .. "  "
 				end
 				local start_col = #line
 				line = line .. piece
@@ -233,12 +347,20 @@ local function sync_content_buffer()
 end
 
 local function close_workspace()
+	if valid_win(state.divider.win) then
+		pcall(vim.api.nvim_win_close, state.divider.win, true)
+	end
+	if valid_win(state.frame.win) then
+		pcall(vim.api.nvim_win_close, state.frame.win, true)
+	end
 	if valid_win(state.tabbar.win) then
 		pcall(vim.api.nvim_win_close, state.tabbar.win, true)
 	end
 	if valid_win(state.content.win) then
 		pcall(vim.api.nvim_win_close, state.content.win, true)
 	end
+	state.divider.win = nil
+	state.frame.win = nil
 	state.tabbar.win = nil
 	state.content.win = nil
 end
@@ -337,26 +459,27 @@ install_buffer_keymaps = function(buf)
 		})
 	end
 
-	map("q", close_active_tab, "UCore output close tab")
-	map("<CR>", trigger_line_action, "UCore output line action")
-	map("h", function()
+	map("q", function()
 		select_relative(-1)
 	end, "UCore output previous tab")
-	map("l", function()
+	map("e", function()
 		select_relative(1)
 	end, "UCore output next tab")
+	map("x", close_active_tab, "UCore output close tab")
+	map("<CR>", trigger_line_action, "UCore output line action")
 	map("<Tab>", function()
 		select_relative(1)
 	end, "UCore output next tab")
 	map("<S-Tab>", function()
 		select_relative(-1)
 	end, "UCore output previous tab")
-	map("L", function()
+	map("E", function()
 		select_relative(1)
 	end, "UCore output next tab")
-	map("H", function()
+	map("Q", function()
 		select_relative(-1)
 	end, "UCore output previous tab")
+	map("X", close_active_tab, "UCore output close tab")
 end
 
 local function ensure_workspace()
@@ -370,7 +493,8 @@ local function ensure_workspace()
 		return true
 	end
 
-	if valid_win(state.tabbar.win) and valid_win(state.content.win) then
+	if valid_win(state.frame.win) and valid_win(state.tabbar.win) and valid_win(state.content.win) then
+		render_frame()
 		render_tabbar()
 		sync_content_buffer()
 		return true
@@ -392,14 +516,20 @@ local function ensure_workspace()
 	install_buffer_keymaps(content_buf)
 
 	vim.cmd("botright split")
+	state.frame.win = vim.api.nvim_get_current_win()
+	window_options(state.frame.win, { wrap = false, cursorline = false, separator = false })
+	vim.api.nvim_win_set_buf(state.frame.win, ensure_frame_buffer())
+	vim.api.nvim_win_set_height(state.frame.win, 1)
+
+	vim.cmd("botright split")
 	state.tabbar.win = vim.api.nvim_get_current_win()
-	window_options(state.tabbar.win, { wrap = false, cursorline = false, separator = true })
+	window_options(state.tabbar.win, { wrap = false, cursorline = false, separator = false })
 	vim.api.nvim_win_set_buf(state.tabbar.win, state.tabbar.buf)
 	vim.api.nvim_win_set_height(state.tabbar.win, 1)
 
 	vim.cmd("botright split")
 	state.content.win = vim.api.nvim_get_current_win()
-	window_options(state.content.win, { wrap = false, cursorline = false, separator = true })
+	window_options(state.content.win, { wrap = false, cursorline = false, separator = false })
 	vim.api.nvim_win_set_buf(state.content.win, content_buf)
 	vim.api.nvim_win_set_height(state.content.win, output_config().height)
 
@@ -411,6 +541,7 @@ local function ensure_workspace()
 		pcall(vim.api.nvim_set_current_win, previous)
 	end
 
+	render_frame()
 	render_tabbar()
 	sync_content_buffer()
 	return true
@@ -857,8 +988,8 @@ function M.attach_host_windows(name, tabbar_win, content_win)
 		state.tabbar.buf = buf
 	end
 
-	window_options(tabbar_win, { wrap = false, cursorline = false })
-	window_options(content_win, { wrap = false, cursorline = false })
+	window_options(tabbar_win, { wrap = false, cursorline = false, separator = false })
+	window_options(content_win, { wrap = false, cursorline = false, separator = false })
 	vim.api.nvim_win_set_buf(tabbar_win, state.tabbar.buf)
 	sync_content_buffer()
 	render_tabbar()
@@ -901,10 +1032,20 @@ function M.reset()
 	if valid_buf(state.tabbar.buf) then
 		pcall(vim.api.nvim_buf_delete, state.tabbar.buf, { force = true })
 	end
+	if valid_buf(state.frame.buf) then
+		pcall(vim.api.nvim_buf_delete, state.frame.buf, { force = true })
+	end
+	if valid_buf(state.divider.buf) then
+		pcall(vim.api.nvim_buf_delete, state.divider.buf, { force = true })
+	end
 	if valid_buf(state.placeholder) then
 		pcall(vim.api.nvim_buf_delete, state.placeholder, { force = true })
 	end
 	state.active = nil
+	state.divider.buf = nil
+	state.divider.win = nil
+	state.frame.buf = nil
+	state.frame.win = nil
 	state.content.buf = nil
 	state.content.win = nil
 	state.order = {}
