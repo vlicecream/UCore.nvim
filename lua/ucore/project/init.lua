@@ -535,6 +535,30 @@ function M.find_engine_root_from_registry(association)
 	return nil
 end
 
+-- Infer engine root by walking upward from a project nested inside a source tree.
+-- 当项目内嵌在源码版引擎目录中时，通过向上查找推断引擎根目录。
+function M.find_engine_root_from_project_path(project_root)
+	project_root = normalize(project_root)
+	if not project_root or project_root == "" then
+		return nil
+	end
+
+	local current = project_root
+	while current and current ~= "" do
+		if M.is_engine_root(current) then
+			return current
+		end
+
+		local parent = normalize(vim.fn.fnamemodify(current, ":h"))
+		if not parent or parent == "" or parent == current then
+			break
+		end
+		current = parent
+	end
+
+	return nil
+end
+
 -- Resolve EngineAssociation to an Unreal Engine root path.
 -- 将 EngineAssociation 解析成 Unreal Engine 根目录。
 function M.resolve_engine_root(project_root)
@@ -544,6 +568,10 @@ function M.resolve_engine_root(project_root)
 	local association = M.read_engine_association(uproject_path)
 
 	if not association or association == "" then
+		local inferred_root = M.find_engine_root_from_project_path(project_root)
+		if inferred_root then
+			return inferred_root, inferred_root
+		end
 		return nil, "No EngineAssociation in .uproject"
 	end
 
