@@ -977,6 +977,32 @@ function M.is_open()
 	return valid_win(state.tabbar.win) == true and valid_win(state.content.win) == true
 end
 
+function M.is_focused()
+	local current = vim.api.nvim_get_current_win()
+	return current == current_tabbar_win() or current == current_content_win() or current == current_frame_win()
+end
+
+function M.focus(key)
+	if defer_if_fast(function()
+		M.focus(key)
+	end) then
+		return false
+	end
+
+	if key and state.tabs[key] then
+		M.select(key)
+	elseif not M.is_open() and not state.host then
+		ensure_workspace()
+	end
+
+	local target = current_content_win() or current_tabbar_win()
+	if valid_win(target) then
+		pcall(vim.api.nvim_set_current_win, target)
+		return true
+	end
+	return false
+end
+
 function M.attach_host_windows(name, tabbar_win, content_win)
 	if not valid_win(tabbar_win) or not valid_win(content_win) then
 		return false
