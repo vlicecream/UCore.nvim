@@ -105,52 +105,6 @@ local function configured_lsp()
 	return (config.values.lsp and config.values.lsp.clangd) or {}
 end
 
-local function has_arg(args, prefix)
-	for _, arg in ipairs(args or {}) do
-		if tostring(arg):find(prefix, 1) == 1 then
-			return true
-		end
-	end
-	return false
-end
-
-local function add_arg_once(args, arg, prefix)
-	prefix = prefix or vim.pesc(arg)
-	if not has_arg(args, prefix) then
-		table.insert(args, arg)
-	end
-end
-
-local function effective_clangd_args(clangd)
-	clangd = clangd or configured_lsp()
-	local args = deep_copy(clangd.args or default_clangd_args)
-	local indexing = clangd.indexing or {}
-
-	if indexing.enable ~= false and indexing.full ~= false then
-		add_arg_once(args, "--background-index", "^%-%-background%-index$")
-	end
-
-	if indexing.priority and tostring(indexing.priority) ~= "" then
-		add_arg_once(
-			args,
-			"--background-index-priority=" .. tostring(indexing.priority),
-			"^%-%-background%-index%-priority="
-		)
-	end
-
-	local workers = tonumber(indexing.workers)
-	if not workers or workers < 1 then
-		workers = 2
-	end
-	add_arg_once(args, "--j=" .. tostring(math.floor(workers)), "^%-%-j=")
-
-	if indexing.malloc_trim == true then
-		add_arg_once(args, "--malloc-trim", "^%-%-malloc%-trim$")
-	end
-
-	return args
-end
-
 local function configured_auto_setup()
 	local lsp = config.values.lsp or {}
 	return lsp.auto_setup ~= false
@@ -978,7 +932,6 @@ function M.clangd_status(root)
 		auto_setup = configured_auto_setup(),
 		auto_generate_compile_commands = clangd.auto_generate_compile_commands ~= false,
 		command = command,
-		args = effective_clangd_args(clangd),
 		command_available = executable(command),
 		require_compile_commands = clangd.require_compile_commands ~= false,
 		project_root = root,
@@ -1132,7 +1085,7 @@ function M.clangd_config(opts)
 			cmd = function(dispatchers, client_config)
 				local root = normalize(client_config.root_dir)
 				local resolved = { command }
-				for _, arg in ipairs(effective_clangd_args(clangd)) do
+				for _, arg in ipairs(clangd.args or default_clangd_args) do
 					table.insert(resolved, arg)
 				end
 
@@ -1149,7 +1102,7 @@ function M.clangd_config(opts)
 			end
 		else
 			cmd = { command }
-			for _, arg in ipairs(effective_clangd_args(clangd)) do
+			for _, arg in ipairs(clangd.args or default_clangd_args) do
 				table.insert(cmd, arg)
 			end
 		end
@@ -1266,10 +1219,6 @@ function M.setup_clangd(opts)
 
 	lspconfig.clangd.setup(cfg)
 	return cfg
-end
-
-function M.effective_clangd_args()
-	return effective_clangd_args(configured_lsp())
 end
 
 return M

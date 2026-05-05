@@ -360,7 +360,6 @@ local function report_lsp_checks()
 	local clangd_cmd = status.command or lsp_config.command or "clangd"
 	info("configured clangd command: " .. tostring(lsp_config.command or "clangd"))
 	info("resolved clangd command: " .. tostring(clangd_cmd))
-	info("resolved clangd args: " .. table.concat(status.args or lsp.effective_clangd_args(), " "))
 	info("auto setup: " .. yes_no((config.values.lsp or {}).auto_setup ~= false))
 	info("auto generate compile_commands.json: " .. yes_no(status.auto_generate_compile_commands))
 
