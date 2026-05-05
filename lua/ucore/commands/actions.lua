@@ -5,7 +5,6 @@ local ui = require("ucore.ui")
 local bootstrap = require("ucore.bootstrap")
 local navigation = require("ucore.navigation")
 local explorer = require("ucore.explorer")
-local output = require("ucore.output")
 
 local M = {}
 
@@ -552,20 +551,6 @@ function M.find(pattern)
 	end)
 end
 
-function M.log()
-	if output.is_open() then
-		output.hide()
-	else
-		output.open_tab({
-			key = "workspace:unreal",
-			title = "Unreal",
-			kind = "unreal",
-			focus = true,
-			explicit = true,
-		})
-	end
-end
-
 -- Print :UCore command help.
 -- 打印 :UCore 命令帮助。
 function M.help()
@@ -576,7 +561,6 @@ UCore commands:
   :UCore boot         Boot current project, or pick a registered one
   :UCore explorer     Toggle the left-side Project/Source/Config tree
   :UCore find         Find indexed symbols, modules, assets, config
-  :UCore log          Toggle bottom log workspace
   :UCore goto         Navigation subcommands (see :UCore goto help)
   :UCore help         Show this help
 ]])

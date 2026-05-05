@@ -23,7 +23,6 @@ function M.dispatch(args)
 		find = function()
 			actions.find(tail)
 		end,
-		log = actions.log,
 		["goto"] = function()
 			actions.goto(tail)
 		end,
@@ -49,7 +48,6 @@ function M.register()
 				"boot",
 				"explorer",
 				"find",
-				"log",
 				"goto",
 				"help",
 			}
