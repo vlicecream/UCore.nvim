@@ -41,7 +41,7 @@ local panels = {
 		"progress:UCore Project Index",
 		"progress:UCore Engine Index",
 	}),
-	clang = make_panel("UCore Clang Init", "ucore.status.clang", {
+	clang = make_panel("Clangd Init", "ucore.status.clang", {
 		"progress:UCore Clangd Database",
 		"progress:UCore Clangd Index",
 	}),
