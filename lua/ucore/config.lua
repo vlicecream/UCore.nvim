@@ -261,6 +261,13 @@ local function default_values()
 					"--pch-storage=disk",
 					"--fallback-style=llvm",
 				},
+				indexing = {
+					enable = true,
+					full = true,
+					workers = 2,
+					priority = "low",
+					malloc_trim = true,
+				},
 				prefer_blink_capabilities = true,
 				single_file_support = false,
 				compile_commands_dir = nil,
