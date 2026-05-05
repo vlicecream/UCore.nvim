@@ -345,13 +345,11 @@ function M.boot(callback, opts)
 							return callback(false, watch_err)
 						end
 						other_progress(80)
-
-						run_clangd_prepare(payload, function()
-							booting = false
-							other_progress(100)
-							callback(true)
-							run_engine_refresh_in_background(payload)
-						end)
+						booting = false
+						other_progress(100)
+						callback(true)
+						run_engine_refresh_in_background(payload)
+						run_clangd_prepare(payload, function() end)
 					end)
 				end)
 			end)

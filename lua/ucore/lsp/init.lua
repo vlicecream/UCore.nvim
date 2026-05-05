@@ -976,6 +976,8 @@ function M.generate_compile_commands(root, opts, callback)
 			platform,
 			configuration,
 			"-Project=" .. uproject,
+			"-NoExecCodeGenActions",
+			"-OutputDir=" .. root,
 		}
 	else
 		cmd = {
@@ -985,6 +987,8 @@ function M.generate_compile_commands(root, opts, callback)
 			platform,
 			configuration,
 			"-Project=" .. uproject,
+			"-NoExecCodeGenActions",
+			"-OutputDir=" .. root,
 		}
 	end
 
