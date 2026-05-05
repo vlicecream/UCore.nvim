@@ -144,7 +144,7 @@ local function effective_clangd_args(clangd)
 	end
 	add_arg_once(args, "--j=" .. tostring(math.floor(workers)), "^%-%-j=")
 
-	if indexing.malloc_trim ~= false then
+	if indexing.malloc_trim == true then
 		add_arg_once(args, "--malloc-trim", "^%-%-malloc%-trim$")
 	end
 

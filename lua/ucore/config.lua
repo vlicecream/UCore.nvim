@@ -266,7 +266,7 @@ local function default_values()
 					full = true,
 					workers = 2,
 					priority = "low",
-					malloc_trim = true,
+					malloc_trim = false,
 				},
 				prefer_blink_capabilities = true,
 				single_file_support = false,
