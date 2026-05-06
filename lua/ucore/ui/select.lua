@@ -3,7 +3,8 @@ local config = require("ucore.config")
 local M = {}
 local FIND_PREVIEW_MAX_LINES = 200
 local FIND_PAGE_SIZE = 50
-local FIND_DEBOUNCE_MS = 150
+local FIND_DEBOUNCE_MS = 500
+local FIND_MIN_QUERY_LENGTH = 2
 
 -- Check whether a Lua module can be required.
 -- 检查某个 Lua 模块是否可用。
@@ -837,6 +838,7 @@ local function pick_telescope_find_live(initial_symbols, opts)
 	local state = {
 		query = tostring(opts.default_text or ""),
 		symbols = initial_symbols or {},
+		cached_initial_symbols = initial_symbols or {},
 		static_items = opts.static_items or {},
 		offset = #(initial_symbols or {}),
 		limit = opts.page_size or FIND_PAGE_SIZE,
@@ -844,6 +846,7 @@ local function pick_telescope_find_live(initial_symbols, opts)
 		loading = false,
 		request_id = 0,
 		input_seq = 0,
+		pending_reset_query = nil,
 	}
 
 	local picker_ref
@@ -877,8 +880,34 @@ local function pick_telescope_find_live(initial_symbols, opts)
 		end
 	end
 
+	local function should_fetch_query(query)
+		return #vim.trim(tostring(query or "")) >= FIND_MIN_QUERY_LENGTH
+	end
+
+	if not should_fetch_query(state.query) then
+		state.has_more = false
+	end
+
 	local function request_symbols(query, reset)
 		if type(opts.fetch_symbols) ~= "function" then
+			return
+		end
+		query = tostring(query or "")
+		if reset and not should_fetch_query(query) then
+			state.pending_reset_query = nil
+			state.request_id = state.request_id + 1
+			state.loading = false
+			state.symbols = vim.trim(query) == "" and state.cached_initial_symbols or {}
+			state.offset = 0
+			state.has_more = false
+			refresh_picker()
+			return
+		end
+		if not reset and not should_fetch_query(state.query) then
+			return
+		end
+		if reset and state.loading then
+			state.pending_reset_query = query
 			return
 		end
 		if state.loading and not reset then
@@ -892,7 +921,7 @@ local function pick_telescope_find_live(initial_symbols, opts)
 		state.request_id = state.request_id + 1
 		local request_id = state.request_id
 		local offset = reset and 0 or state.offset
-		query = tostring(query or "")
+		state.pending_reset_query = reset and nil or state.pending_reset_query
 
 		opts.fetch_symbols(query, {
 			limit = state.limit,
@@ -904,6 +933,12 @@ local function pick_telescope_find_live(initial_symbols, opts)
 				end
 
 				state.loading = false
+				local pending_reset_query = state.pending_reset_query
+				state.pending_reset_query = nil
+				if pending_reset_query and pending_reset_query ~= query then
+					request_symbols(pending_reset_query, true)
+					return
+				end
 
 				if err then
 					vim.notify("UCore find failed:\n" .. tostring(err), vim.log.levels.ERROR)
@@ -954,9 +989,10 @@ local function pick_telescope_find_live(initial_symbols, opts)
 				end
 
 				if state.query == "" and type(snapshot.initial_symbols) == "table" then
+					state.cached_initial_symbols = snapshot.initial_symbols
 					state.symbols = snapshot.initial_symbols
 					state.offset = #snapshot.initial_symbols
-					state.has_more = #snapshot.initial_symbols >= state.limit
+					state.has_more = false
 				end
 
 				refresh_picker()
