@@ -416,9 +416,8 @@ local function prepare_find_items(items)
 		item._ucore_find_line = line
 		item._ucore_find_text = name
 		item._ucore_find_display = string.format(
-			"%s  %s  %s  %s  %s",
+			"%s  %s  %s  %s",
 			pad_right(group, 7),
-			pad_right(label, 9),
 			pad_right(truncate_left(name, 34), 34),
 			pad_right(source_label, 7),
 			location
@@ -453,9 +452,8 @@ local function apply_find_item_metadata(item, index, current)
 	item._ucore_find_text = name
 	item._ucore_find_score = find_item_score(item, current)
 	item._ucore_find_display = string.format(
-		"%s  %s  %s  %s  %s",
+		"%s  %s  %s  %s",
 		pad_right(group, 7),
-		pad_right(label, 9),
 		pad_right(truncate_left(name, 34), 34),
 		pad_right(source_label, 7),
 		location
