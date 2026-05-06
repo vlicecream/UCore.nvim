@@ -3,18 +3,90 @@ local config = require("ucore.config")
 local M = {}
 local read_json_file
 
+local uv = vim.uv or vim.loop
+
 -- Normalize paths to slash-separated strings for JSON/Rust interop.
 -- 统一路径为斜杠格式，方便 JSON 和 Rust 侧处理。
 local function normalize(path)
 	return path and path:gsub("\\", "/") or nil
 end
 
+local function basename(path)
+	path = normalize(path or "")
+	path = path:gsub("/+$", "")
+	return path:match("([^/]+)$") or ""
+end
+
+local function stable_hash12(text)
+	text = tostring(text or "")
+	local bitlib = bit or bit32
+	local h1 = 2166136261
+	local h2 = 16777619
+	for i = 1, #text do
+		local b = text:byte(i)
+		h1 = bitlib.bxor(h1, b)
+		h1 = (h1 * 16777619) % 4294967296
+		h2 = bitlib.bxor(h2, b + i)
+		h2 = (h2 * 2166136261) % 4294967296
+	end
+	return string.format("%08x%08x", h1, h2):sub(1, 12)
+end
+
+local function dirname(path)
+	path = normalize(path or ""):gsub("/+$", "")
+	return path:match("^(.*)/[^/]*$") or ""
+end
+
+local function fs_stat(path)
+	return path and uv.fs_stat(path) or nil
+end
+
+local function is_file(path)
+	local stat = fs_stat(path)
+	return stat and stat.type == "file"
+end
+
+local function is_dir(path)
+	local stat = fs_stat(path)
+	return stat and stat.type == "directory"
+end
+
+local function mkdirp(path)
+	path = normalize(path or "")
+	if path == "" or is_dir(path) then
+		return
+	end
+
+	local prefix = ""
+	local rest = path
+	local drive = rest:match("^%a:")
+	if drive then
+		prefix = drive
+		rest = rest:sub(#drive + 1):gsub("^/+", "")
+	elseif rest:sub(1, 1) == "/" then
+		prefix = "/"
+		rest = rest:gsub("^/+", "")
+	end
+
+	local current = prefix
+	for part in rest:gmatch("[^/]+") do
+		current = current == "" and part or (current:gsub("/$", "") .. "/" .. part)
+		if not is_dir(current) then
+			pcall(uv.fs_mkdir, current, 493)
+		end
+	end
+end
+
+local function is_windows()
+	return package.config:sub(1, 1) == "\\"
+end
+
 -- Return a readable project cache directory name.
 -- 返回可读性较好的工程缓存目录名。
 local function project_cache_name(project_root)
 	local normalized = normalize(project_root)
-	local name = vim.fn.fnamemodify(normalized, ":t")
-	local hash = vim.fn.sha256(normalized):sub(1, 12)
+	local name = basename(normalized)
+	local hash = stable_hash12(normalized)
 
 	if name == "" then
 		return hash
@@ -37,10 +109,10 @@ function M.find_project_file(start_path)
 	end
 
 	local dir
-	if vim.fn.isdirectory(start_path) == 1 then
+	if is_dir(start_path) then
 		dir = start_path
 	else
-		dir = vim.fn.fnamemodify(start_path, ":p:h")
+		dir = dirname(normalize(vim.fs.abspath(start_path)))
 	end
 
 	local found = vim.fs.find(function(name)
@@ -63,7 +135,7 @@ function M.find_project_root(start_path)
 		return nil
 	end
 
-	return normalize(vim.fn.fnamemodify(project_file, ":p:h"))
+	return dirname(normalize(vim.fs.abspath(project_file)))
 end
 
 -- Search for an Unreal project root from multiple context sources.
@@ -90,7 +162,7 @@ function M.find_project_root_from_context(opts)
 	end
 
 	-- 3. Alternate buffer
-	local alt = vim.fn.bufnr("#")
+	local alt = tonumber(vim.v.alternate)
 	if alt and alt > 0 then
 		local alt_path = vim.api.nvim_buf_get_name(alt)
 		if alt_path and alt_path ~= "" then
@@ -131,7 +203,7 @@ end
 function M.build_paths(project_root)
 	local cache_dir = normalize(config.values.cache_dir)
 	local project_cache_dir = cache_dir .. "/projects/" .. project_cache_name(project_root)
-	vim.fn.mkdir(project_cache_dir, "p")
+	mkdirp(project_cache_dir)
 
 	return {
 		project_root = project_root,
@@ -149,7 +221,7 @@ end
 function M.build_engine_paths(engine)
 	local cache_dir = normalize(config.values.cache_dir)
 	local engine_cache_dir = cache_dir .. "/engines/" .. engine.engine_id
-	vim.fn.mkdir(engine_cache_dir, "p")
+	mkdirp(engine_cache_dir)
 
 	return {
 		engine_id = engine.engine_id,
@@ -179,7 +251,10 @@ function M.write_engine_index_metadata(engine)
 		indexed_at = os.time(),
 	}
 
-	vim.fn.writefile(vim.split(vim.json.encode(metadata), "\n"), paths.metadata_path)
+	mkdirp(dirname(paths.metadata_path))
+	local file = assert(io.open(paths.metadata_path, "wb"))
+	file:write(vim.json.encode(metadata))
+	file:close()
 
 	local registry = M.read_registry()
 	registry.engines[engine.engine_id] = vim.tbl_deep_extend("force", registry.engines[engine.engine_id] or {}, metadata)
@@ -193,7 +268,7 @@ end
 function M.engine_needs_refresh(engine)
 	local paths = M.build_engine_paths(engine)
 
-	if vim.fn.filereadable(paths.db_path) ~= 1 then
+	if not is_file(paths.db_path) then
 		return true
 	end
 
@@ -240,7 +315,7 @@ end
 -- 返回 UCore 全局注册表路径。
 function M.global_registry_path()
 	local cache_dir = normalize(config.values.cache_dir)
-	vim.fn.mkdir(cache_dir, "p")
+	mkdirp(cache_dir)
 	return cache_dir .. "/registry.json"
 end
 
@@ -248,7 +323,7 @@ end
 -- 返回 Rust server 运行态 registry 路径。
 function M.server_registry_path()
 	local cache_dir = normalize(config.values.cache_dir)
-	vim.fn.mkdir(cache_dir, "p")
+	mkdirp(cache_dir)
 	return cache_dir .. "/server-registry.json"
 end
 
@@ -257,22 +332,24 @@ end
 function M.read_registry()
 	local path = M.global_registry_path()
 
-	if vim.fn.filereadable(path) ~= 1 then
+	if not is_file(path) then
 		return {
 			projects = {},
 			engines = {},
 		}
 	end
 
-	local ok, lines = pcall(vim.fn.readfile, path)
-	if not ok then
+	local file = io.open(path, "rb")
+	if not file then
 		return {
 			projects = {},
 			engines = {},
 		}
 	end
+	local content = file:read("*a")
+	file:close()
 
-	local ok_decode, data = pcall(vim.json.decode, table.concat(lines, "\n"))
+	local ok_decode, data = pcall(vim.json.decode, content or "")
 	if not ok_decode or type(data) ~= "table" then
 		return {
 			projects = {},
@@ -292,30 +369,42 @@ function M.write_registry(data)
 	data.projects = data.projects or {}
 	data.engines = data.engines or {}
 
-	vim.fn.mkdir(vim.fn.fnamemodify(path, ":p:h"), "p")
-	vim.fn.writefile(vim.split(vim.json.encode(data), "\n"), path)
+	mkdirp(dirname(path))
+	local file = assert(io.open(path, "wb"))
+	file:write(vim.json.encode(data))
+	file:close()
 end
 
 -- Find the .uproject file directly under a project root.
 -- 在项目根目录下查找 .uproject 文件。
 function M.find_project_file_in_root(project_root)
-	local files = vim.fn.glob(project_root .. "/*.uproject", false, true)
-	return files[1] and normalize(files[1]) or nil
+	local scan = uv.fs_scandir(project_root)
+	if not scan then
+		return nil
+	end
+	while true do
+		local name, t = uv.fs_scandir_next(scan)
+		if not name then
+			break
+		end
+		if t == "file" and name:match("%.uproject$") then
+			return normalize(project_root .. "/" .. name)
+		end
+	end
+	return nil
 end
 
 -- Read EngineAssociation from a .uproject file.
 -- 从 .uproject 文件读取 EngineAssociation。
 function M.read_engine_association(uproject_path)
-	if not uproject_path or vim.fn.filereadable(uproject_path) ~= 1 then
+	local file = uproject_path and io.open(uproject_path, "rb")
+	if not file then
 		return nil
 	end
+	local content = file:read("*a")
+	file:close()
 
-	local ok, lines = pcall(vim.fn.readfile, uproject_path)
-	if not ok then
-		return nil
-	end
-
-	local ok_decode, data = pcall(vim.json.decode, table.concat(lines, "\n"))
+	local ok_decode, data = pcall(vim.json.decode, content or "")
 	if not ok_decode or type(data) ~= "table" then
 		return nil
 	end
@@ -328,7 +417,7 @@ end
 function M.project_metadata(project_root)
 	project_root = normalize(project_root)
 	local uproject_path = M.find_project_file_in_root(project_root)
-	local name = vim.fn.fnamemodify(project_root, ":t")
+	local name = basename(project_root)
 	local engine = M.engine_metadata(project_root)
 
 	return {
@@ -398,12 +487,12 @@ function M.open_project(project_root)
 	project_root = normalize(project_root)
 	local metadata = M.register_project(project_root)
 
-	vim.cmd.cd(vim.fn.fnameescape(project_root))
+	vim.api.nvim_set_current_dir(project_root)
 
 	if metadata.uproject_path then
-		vim.cmd.edit(vim.fn.fnameescape(metadata.uproject_path))
+		vim.api.nvim_cmd({ cmd = "edit", args = { metadata.uproject_path } }, {})
 	else
-		vim.cmd.edit(vim.fn.fnameescape(project_root))
+		vim.api.nvim_cmd({ cmd = "edit", args = { project_root } }, {})
 	end
 
 	return metadata
@@ -417,23 +506,20 @@ function M.is_engine_root(path)
 	end
 
 	path = normalize(path)
-	return vim.fn.isdirectory(path .. "/Engine/Source") == 1
-		or vim.fn.filereadable(path .. "/Engine/Build/Build.version") == 1
+	return is_dir(path .. "/Engine/Source") or is_file(path .. "/Engine/Build/Build.version")
 end
 
 -- Read a JSON file safely.
 -- 安全读取 JSON 文件。
 function read_json_file(path)
-	if vim.fn.filereadable(path) ~= 1 then
+	local file = path and io.open(path, "rb")
+	if not file then
 		return nil
 	end
+	local content = file:read("*a")
+	file:close()
 
-	local ok, lines = pcall(vim.fn.readfile, path)
-	if not ok then
-		return nil
-	end
-
-	local ok_decode, data = pcall(vim.json.decode, table.concat(lines, "\n"))
+	local ok_decode, data = pcall(vim.json.decode, content or "")
 	if not ok_decode then
 		return nil
 	end
@@ -502,17 +588,17 @@ end
 -- Find engine root from Unreal source-build registry entries.
 -- 从 Unreal 源码版 registry entries 查找 engine root。
 function M.find_engine_root_from_registry(association)
-	if vim.fn.has("win32") ~= 1 then
+	if not is_windows() then
 		return nil
 	end
 
-	local output = vim.fn.systemlist({
+	local result = vim.system({
 		"reg",
 		"query",
 		"HKCU\\Software\\Epic Games\\Unreal Engine\\Builds",
-	})
+	}, { text = true }):wait()
 
-	if vim.v.shell_error ~= 0 then
+	if result.code ~= 0 then
 		return nil
 	end
 
@@ -521,7 +607,7 @@ function M.find_engine_root_from_registry(association)
 		candidates[key] = true
 	end
 
-	for _, line in ipairs(output) do
+	for line in (result.stdout or ""):gmatch("[^\r\n]+") do
 		line = vim.trim(line)
 
 		local name, path = line:match("^(%S+)%s+REG_SZ%s+(.+)$")
@@ -549,7 +635,7 @@ function M.find_engine_root_from_project_path(project_root)
 			return current
 		end
 
-		local parent = normalize(vim.fn.fnamemodify(current, ":h"))
+		local parent = dirname(current)
 		if not parent or parent == "" or parent == current then
 			break
 		end
@@ -597,8 +683,8 @@ function M.engine_id(engine_root, association)
 		return nil
 	end
 
-	local name = association or vim.fn.fnamemodify(engine_root, ":t")
-	local hash = vim.fn.sha256(normalize(engine_root)):sub(1, 12)
+	local name = association or basename(engine_root)
+	local hash = stable_hash12(normalize(engine_root))
 	return tostring(name):gsub("[^%w_.-]", "_") .. "-" .. hash
 end
 
