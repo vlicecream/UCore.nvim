@@ -144,7 +144,7 @@ Recommended setup:
 - stages the active `compile_commands.json` into the UCore project cache and points clangd there
 - by default, skips attaching clangd when no compilation database is found, to avoid noisy false diagnostics
 - defaults to a low-memory clangd profile for Unreal projects; background indexing stays opt-in
-- disables clangd formatting by default so format-on-save will not rewrite Unreal brace style
+- disables clangd formatting and marks Unreal buffers as non-autoformat by default, so format-on-save will not rewrite Unreal brace style
 
 For a normal Windows Unreal setup, you usually do not need to hardcode a `clangd.exe` path or manage `compile_commands.json` manually. UCore tries to resolve both automatically.
 
@@ -182,6 +182,9 @@ require("ucore").setup({
     clangd = {
       formatting = true,
     },
+  },
+  editing = {
+    disable_autoformat = false,
   },
 })
 ```
@@ -515,7 +518,7 @@ UCore 自己主要负责：
 - 把当前生效的 `compile_commands.json` 归档到 UCore 项目缓存目录，再让 clangd 指向那里
 - 默认在找不到编译数据库时不 attach clangd，避免满屏错误红线
 - 默认使用更保守的低内存 clangd 参数，后台索引改成按需开启
-- 默认关闭 clangd 格式化能力，避免 format-on-save 把 Unreal 代码改成非 UE 大括号风格
+- 默认关闭 clangd 格式化能力，并把 Unreal buffer 标记为不自动格式化，避免 format-on-save 把 Unreal 代码改成非 UE 大括号风格
 
 对大多数 Windows Unreal 环境来说，通常不需要手写 `clangd.exe` 路径，也不需要自己管理 `compile_commands.json` 放哪里，UCore 会优先自动处理。
 
@@ -553,6 +556,9 @@ require("ucore").setup({
     clangd = {
       formatting = true,
     },
+  },
+  editing = {
+    disable_autoformat = false,
   },
 })
 ```

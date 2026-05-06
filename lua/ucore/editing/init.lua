@@ -38,6 +38,29 @@ function M.apply_indent(bufnr)
 	end)
 end
 
+function M.apply_autoformat_guard(bufnr)
+	if config.values.editing.disable_autoformat == false then
+		return
+	end
+
+	bufnr = bufnr or vim.api.nvim_get_current_buf()
+	if not valid_buffer(bufnr) or not filetypes[vim.bo[bufnr].filetype] then
+		return
+	end
+
+	-- LazyVim and many format-on-save setups honor one of these buffer flags.
+	-- This keeps Unreal projects from being reformatted by clang-format/conform
+	-- unless the user explicitly opts back in.
+	vim.b[bufnr].autoformat = false
+	vim.b[bufnr].disable_autoformat = true
+	vim.b[bufnr].ucore_autoformat_disabled = true
+end
+
+function M.apply_buffer_settings(bufnr)
+	M.apply_indent(bufnr)
+	M.apply_autoformat_guard(bufnr)
+end
+
 function M.info(bufnr)
 	bufnr = bufnr or vim.api.nvim_get_current_buf()
 	local cr_map = vim.fn.maparg("<CR>", "i", false, true)
@@ -64,6 +87,9 @@ function M.info(bufnr)
 		"shiftwidth: " .. tostring(vim.bo[bufnr].shiftwidth),
 		"expandtab: " .. tostring(vim.bo[bufnr].expandtab),
 		"formatoptions: " .. tostring(vim.bo[bufnr].formatoptions),
+		"b:autoformat: " .. tostring(vim.b[bufnr].autoformat),
+		"b:disable_autoformat: " .. tostring(vim.b[bufnr].disable_autoformat),
+		"b:ucore_autoformat_disabled: " .. tostring(vim.b[bufnr].ucore_autoformat_disabled),
 		"b:did_indent: " .. tostring(vim.b[bufnr].did_indent),
 		"nvim-autopairs available: " .. tostring(ok_autopairs),
 		"ucore autopairs rules: " .. tostring(rule_count),
@@ -83,7 +109,7 @@ function M.setup()
 		callback = function(ev)
 			vim.schedule(function()
 				if vim.api.nvim_buf_is_valid(ev.buf) then
-					M.apply_indent(ev.buf)
+					M.apply_buffer_settings(ev.buf)
 				end
 			end)
 		end,
@@ -91,7 +117,7 @@ function M.setup()
 
 	vim.schedule(function()
 		for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
-			M.apply_indent(bufnr)
+			M.apply_buffer_settings(bufnr)
 		end
 	end)
 end

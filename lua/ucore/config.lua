@@ -276,6 +276,7 @@ local function default_values()
 		-- nvim-autopairs 自动配对集成。
 		editing = {
 			enable = true,
+			disable_autoformat = true,
 			indent = {
 				enable = true,
 				inherit_cpp = true,
