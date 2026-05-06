@@ -154,6 +154,7 @@ local function fetch_live_find(root, query, request, callback)
 	local limit = request.limit or FIND_PAGE_SIZE
 	local offset = request.offset or 0
 	local query_limit = offset == 0 and math.max(limit, 120) or limit
+	local fallback_limit = math.min(query_limit, 60)
 	local primary = live_find_backend_query(query)
 	local fallback = live_find_fallback_query(query)
 	local code_limit = math.min(limit, 40)
@@ -218,7 +219,7 @@ local function fetch_live_find(root, query, request, callback)
 				end
 				finish()
 			end, {
-				limit = query_limit,
+				limit = fallback_limit,
 				offset = offset,
 				scope = scope,
 			})
@@ -226,20 +227,22 @@ local function fetch_live_find(root, query, request, callback)
 	end
 
 	run_fast("project", false, false, function()
-		remote.search_code_text(root, primary, function(result, err)
-			if err then
-				return callback(nil, err, { append = true, done = false })
-			end
+		if #primary >= 4 then
+			remote.search_code_text(root, primary, function(result, err)
+				if err then
+					return callback(nil, err, { append = true, done = false })
+				end
 
-			callback(collect(result), nil, {
-				append = true,
-				done = false,
+				callback(collect(result), nil, {
+					append = true,
+					done = false,
+				})
+			end, {
+				limit = code_limit,
+				offset = offset,
+				scope = "project",
 			})
-		end, {
-			limit = code_limit,
-			offset = offset,
-			scope = "project",
-		})
+		end
 
 		run_fast("engine", true, true)
 	end)

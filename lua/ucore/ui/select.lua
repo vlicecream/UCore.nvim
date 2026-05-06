@@ -960,17 +960,16 @@ local function pick_telescope_find_live(initial_symbols, opts)
 	local picker_ref
 
 	local function combined_items()
-		local items = {}
-
-		for _, item in ipairs(state.symbols or {}) do
-			table.insert(items, item)
+		local results = filter_live_find_items(state.symbols or {}, state.query, state.limit)
+		if #results >= state.limit then
+			return results
 		end
 
-		for _, item in ipairs(state.static_items or {}) do
-			table.insert(items, item)
+		local static = filter_static_find_items(state.static_items or {}, state.query, state.limit - #results)
+		for _, item in ipairs(static) do
+			table.insert(results, item)
 		end
-
-		return filter_live_find_items(items, state.query, state.limit)
+		return results
 	end
 
 	local function make_finder()
@@ -1019,10 +1018,6 @@ local function pick_telescope_find_live(initial_symbols, opts)
 		if not reset and not should_fetch_query(state.query) then
 			return
 		end
-		if reset and state.loading then
-			state.pending_reset_query = query
-			return
-		end
 		if state.loading and not reset then
 			return
 		end
@@ -1035,6 +1030,12 @@ local function pick_telescope_find_live(initial_symbols, opts)
 		local request_id = state.request_id
 		local offset = reset and 0 or state.offset
 		state.pending_reset_query = reset and nil or state.pending_reset_query
+		if reset then
+			state.symbols = {}
+			state.offset = 0
+			state.has_more = false
+			refresh_picker()
+		end
 
 		opts.fetch_symbols(backend_find_query(query), {
 			limit = state.limit,
