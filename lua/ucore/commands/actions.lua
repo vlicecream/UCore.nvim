@@ -153,57 +153,96 @@ end
 local function fetch_live_find(root, query, request, callback)
 	local limit = request.limit or FIND_PAGE_SIZE
 	local offset = request.offset or 0
-	local query_limit = offset == 0 and math.max(limit, 200) or limit
+	local query_limit = offset == 0 and math.max(limit, 120) or limit
 	local primary = live_find_backend_query(query)
 	local fallback = live_find_fallback_query(query)
-	local pending = fallback and 2 or 1
-	local results = {}
-	local errors = {}
+	local code_limit = math.min(limit, 40)
 
-	local function append(values)
+	local function collect(values)
+		local results = {}
 		for _, item in ipairs(values or {}) do
 			table.insert(results, item)
 		end
+		return results
 	end
 
-	local function finish()
-		pending = pending - 1
-		if pending > 0 then
-			return
+	local function run_fast(scope, append, done, after)
+		local pending = fallback and 2 or 1
+		local results = {}
+		local errors = {}
+
+		local function add(values)
+			for _, item in ipairs(values or {}) do
+				table.insert(results, item)
+			end
 		end
 
-		if vim.tbl_isempty(results) and not vim.tbl_isempty(errors) then
-			return callback(nil, table.concat(errors, "\n"))
+		local function finish()
+			pending = pending - 1
+			if pending > 0 then
+				return
+			end
+
+			if vim.tbl_isempty(results) and not vim.tbl_isempty(errors) then
+				return callback(nil, table.concat(errors, "\n"), { done = done ~= false })
+			end
+
+			callback(results, nil, {
+				append = append == true,
+				done = done ~= false,
+			})
+			if type(after) == "function" then
+				after()
+			end
 		end
 
-		callback(results, nil)
-	end
-
-	remote.search_symbols(root, primary, function(result, err)
-		if err then
-			table.insert(errors, tostring(err))
-		else
-			append(result)
-		end
-		finish()
-	end, {
-		limit = query_limit,
-		offset = offset,
-	})
-
-	if fallback then
-		remote.search_symbols(root, fallback, function(result, err)
+		remote.fast_find(root, primary, function(result, err)
 			if err then
 				table.insert(errors, tostring(err))
 			else
-				append(result)
+				add(result)
 			end
 			finish()
 		end, {
 			limit = query_limit,
 			offset = offset,
+			scope = scope,
 		})
+
+		if fallback then
+			remote.fast_find(root, fallback, function(result, err)
+				if err then
+					table.insert(errors, tostring(err))
+				else
+					add(result)
+				end
+				finish()
+			end, {
+				limit = query_limit,
+				offset = offset,
+				scope = scope,
+			})
+		end
 	end
+
+	run_fast("project", false, false, function()
+		remote.search_code_text(root, primary, function(result, err)
+			if err then
+				return callback(nil, err, { append = true, done = false })
+			end
+
+			callback(collect(result), nil, {
+				append = true,
+				done = false,
+			})
+		end, {
+			limit = code_limit,
+			offset = offset,
+			scope = "project",
+		})
+
+		run_fast("engine", true, true)
+	end)
 end
 
 local function subscribe_find_cache(root, callback)

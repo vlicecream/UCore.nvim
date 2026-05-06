@@ -244,9 +244,9 @@ end
 local function find_group_order(item)
 	return ({
 		Code = 1,
-		Modules = 2,
+		Text = 2,
 		Files = 3,
-		Text = 4,
+		Modules = 4,
 		Assets = 5,
 		Config = 6,
 	})[find_group(item)] or 9
@@ -425,7 +425,8 @@ local function prepare_find_items(items)
 	return result
 end
 
-local function apply_find_item_metadata(item, index)
+local function apply_find_item_metadata(item, index, current)
+	current = current or current_buffer_path()
 	local name = tostring(item.name or item.symbol_name or "<unknown>")
 	if item.type == "text" and tostring(item.text or "") ~= "" then
 		name = tostring(item.text)
@@ -443,6 +444,7 @@ local function apply_find_item_metadata(item, index)
 	item._ucore_find_path = path
 	item._ucore_find_line = line
 	item._ucore_find_text = name
+	item._ucore_find_score = find_item_score(item, current)
 	item._ucore_find_display = string.format(
 		"%s  %s  %s  %s  %s",
 		pad_right(group, 7),
@@ -454,12 +456,10 @@ local function apply_find_item_metadata(item, index)
 	item._ucore_find_ordinal = find_search_text(item, name, kind, label, path)
 end
 
--- Prepare live search results without re-sorting them. The backend already
--- ranks exact, prefix, and continuous substring matches before loose fuzzy
--- matches, so the picker must preserve SQL order.
--- 准备 live 搜索结果但不重新排序。后端已经按完全匹配、前缀、连续子串排序，
--- 前端必须保留 SQL 顺序，避免再次 fuzzy 后把精确结果挤下去。
+-- Prepare live search results in backend order, then let the live filter add
+-- group/source priority when ranking the visible rows.
 local function prepare_find_items_in_order(items)
+	local current = current_buffer_path()
 	local seen = {}
 	local result = {}
 
@@ -472,7 +472,7 @@ local function prepare_find_items_in_order(items)
 	end
 
 	for index, item in ipairs(result) do
-		apply_find_item_metadata(item, index)
+		apply_find_item_metadata(item, index, current)
 	end
 
 	return result
@@ -1039,12 +1039,14 @@ local function pick_telescope_find_live(initial_symbols, opts)
 		opts.fetch_symbols(backend_find_query(query), {
 			limit = state.limit,
 			offset = offset,
-		}, function(result, err)
+		}, function(result, err, meta)
 			vim.schedule(function()
 				if request_id ~= state.request_id then
 					return
 				end
 
+				meta = type(meta) == "table" and meta or {}
+				local done = meta.done ~= false
 				state.loading = false
 				local pending_reset_query = state.pending_reset_query
 				state.pending_reset_query = nil
@@ -1054,12 +1056,14 @@ local function pick_telescope_find_live(initial_symbols, opts)
 				end
 
 				if err then
-					vim.notify("UCore find failed:\n" .. tostring(err), vim.log.levels.ERROR)
+					if done then
+						vim.notify("UCore find failed:\n" .. tostring(err), vim.log.levels.ERROR)
+					end
 					return
 				end
 
 				local values = result or {}
-				if reset then
+				if reset and meta.append ~= true then
 					state.symbols = values
 					state.offset = #values
 				else
