@@ -243,8 +243,8 @@ end
 
 local function find_group_order(item)
 	return ({
-		Code = 1,
-		Text = 2,
+		Text = 1,
+		Code = 2,
 		Files = 3,
 		Modules = 4,
 		Assets = 5,
@@ -1065,7 +1065,11 @@ local function pick_telescope_find_live(initial_symbols, opts)
 
 				local values = result or {}
 				if reset and meta.append ~= true then
+					local appended = state.symbols or {}
 					state.symbols = values
+					for _, item in ipairs(appended) do
+						table.insert(state.symbols, item)
+					end
 					state.offset = #values
 				else
 					for _, item in ipairs(values) do

@@ -157,7 +157,7 @@ local function fetch_live_find(root, query, request, callback)
 	local fallback_limit = math.min(query_limit, 60)
 	local primary = live_find_backend_query(query)
 	local fallback = live_find_fallback_query(query)
-	local code_limit = math.min(limit, 40)
+	local code_limit = math.min(math.max(limit, 80), 120)
 
 	local function collect(values)
 		local results = {}
@@ -226,24 +226,24 @@ local function fetch_live_find(root, query, request, callback)
 		end
 	end
 
-	run_fast("project", false, false, function()
-		if #primary >= 4 then
-			remote.search_code_text(root, primary, function(result, err)
-				if err then
-					return callback(nil, err, { append = true, done = false })
-				end
+	if #primary >= 4 then
+		remote.search_code_text(root, primary, function(result, err)
+			if err then
+				return callback(nil, err, { append = true, done = false })
+			end
 
-				callback(collect(result), nil, {
-					append = true,
-					done = false,
-				})
-			end, {
-				limit = code_limit,
-				offset = offset,
-				scope = "project",
+			callback(collect(result), nil, {
+				append = true,
+				done = false,
 			})
-		end
+		end, {
+			limit = code_limit,
+			offset = offset,
+			scope = "project",
+		})
+	end
 
+	run_fast("project", false, false, function()
 		run_fast("engine", true, true)
 	end)
 end
