@@ -738,6 +738,20 @@ local function progress_message_title(value)
 	return table.concat(parts, " - ")
 end
 
+local function clangd_file_status_label(file_status)
+	local text = vim.trim(tostring(file_status or ""))
+	if text == "" then
+		return ""
+	end
+
+	local lowered = text:lower()
+	if lowered:find("idle", 1, true) or lowered:find("ready", 1, true) then
+		return text
+	end
+
+	return "indexing"
+end
+
 local function render_clangd_progress(client_id)
 	local state = clangd_progress_state[client_id]
 	local title = "UCore Clangd Index"
@@ -799,7 +813,8 @@ local function render_clangd_progress(client_id)
 
 	local file_status = state.file_status
 	if file_status and file_status ~= "" then
-		local lowered = file_status:lower()
+		local label = clangd_file_status_label(file_status)
+		local lowered = label:lower()
 		if lowered:find("idle", 1, true) or lowered:find("ready", 1, true) then
 			if is_completed and not has_active_tokens then
 				return
@@ -808,7 +823,7 @@ local function render_clangd_progress(client_id)
 			status.progress_finish(title, "UCore Clangd Index 100%")
 		else
 			state.completed = false
-			status.progress(title, "UCore Clangd Index - " .. file_status)
+			status.progress(title, "UCore Clangd Index - " .. label)
 		end
 		return
 	end
