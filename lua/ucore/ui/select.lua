@@ -13,6 +13,23 @@ local function has_module(name)
 	return ok
 end
 
+local function sanitize_buffer_lines(lines)
+	local result = {}
+	for _, line in ipairs(lines or {}) do
+		line = tostring(line or "")
+		line = line:gsub("\r\n", "\n"):gsub("\r", "\n")
+		for _, part in ipairs(vim.split(line, "\n", { plain = true })) do
+			table.insert(result, part)
+		end
+	end
+
+	if #result == 0 then
+		return { "" }
+	end
+
+	return result
+end
+
 -- Pick the best available picker backend.
 -- 选择当前可用的最佳 picker 后端。
 local function picker_backend()
@@ -603,7 +620,7 @@ local function preview_find_item(entry, bufnr)
 		lines = vim.split(vim.inspect(item), "\n", { plain = true })
 	end
 
-	vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
+	vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, sanitize_buffer_lines(lines))
 	vim.bo[bufnr].filetype = "text"
 	vim.b[bufnr].ucore_preview_path = nil
 end
@@ -625,7 +642,7 @@ local function preview_find_file(previewer, entry)
 		return false
 	end
 
-	vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
+	vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, sanitize_buffer_lines(lines))
 	vim.bo[bufnr].filetype = vim.filetype.match({ filename = path }) or ""
 	vim.b[bufnr].ucore_preview_path = path
 	return true
@@ -882,7 +899,16 @@ local function pick_telescope_find_live(initial_symbols, opts)
 
 	local function should_fetch_query(query)
 		query = vim.trim(tostring(query or ""))
-		return #query >= FIND_MIN_QUERY_LENGTH and not query:match("_$")
+		return #query >= FIND_MIN_QUERY_LENGTH
+	end
+
+	local function backend_find_query(query)
+		query = tostring(query or "")
+		if query:find("_", 1, true) then
+			return query:gsub("_+", " ")
+		end
+
+		return query
 	end
 
 	if not should_fetch_query(state.query) then
@@ -924,7 +950,7 @@ local function pick_telescope_find_live(initial_symbols, opts)
 		local offset = reset and 0 or state.offset
 		state.pending_reset_query = reset and nil or state.pending_reset_query
 
-		opts.fetch_symbols(query, {
+		opts.fetch_symbols(backend_find_query(query), {
 			limit = state.limit,
 			offset = offset,
 		}, function(result, err)
