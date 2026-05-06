@@ -4,6 +4,8 @@ local status = require("ucore.status")
 
 local M = {}
 local uv = vim.uv or vim.loop
+local env_path = os.getenv("PATH") or ""
+local env_pathext = os.getenv("PATHEXT") or ".COM;.EXE;.BAT;.CMD"
 
 local default_markers = {
 	".clangd",
@@ -40,16 +42,100 @@ local function path_join(...)
 	return normalize(table.concat({ ... }, "/"):gsub("//+", "/"))
 end
 
+local function basename(path)
+	path = normalize(path or ""):gsub("/+$", "")
+	return path:match("([^/]+)$") or ""
+end
+
+local function dirname(path)
+	path = normalize(path or ""):gsub("/+$", "")
+	return path:match("^(.*)/[^/]*$") or ""
+end
+
+local function fs_stat(path)
+	return path and uv.fs_stat(path) or nil
+end
+
+local function is_file(path)
+	local stat = fs_stat(path)
+	return stat and stat.type == "file"
+end
+
+local function is_dir(path)
+	local stat = fs_stat(path)
+	return stat and stat.type == "directory"
+end
+
+local function mkdirp(path)
+	path = normalize(path or "")
+	if path == "" or is_dir(path) then
+		return
+	end
+
+	local prefix = ""
+	local rest = path
+	local drive = rest:match("^%a:")
+	if drive then
+		prefix = drive
+		rest = rest:sub(#drive + 1):gsub("^/+", "")
+	elseif rest:sub(1, 1) == "/" then
+		prefix = "/"
+		rest = rest:gsub("^/+", "")
+	end
+
+	local current = prefix
+	for part in rest:gmatch("[^/]+") do
+		current = current == "" and part or (current:gsub("/$", "") .. "/" .. part)
+		if not is_dir(current) then
+			pcall(uv.fs_mkdir, current, 493)
+		end
+	end
+end
+
+local function is_windows()
+	return package.config:sub(1, 1) == "\\"
+end
+
 local function readable(path)
-	return path and vim.fn.filereadable(path) == 1
+	return is_file(path)
 end
 
 local function executable(path)
-	return path and (vim.fn.executable(path) == 1 or readable(path))
+	path = normalize(path)
+	if not path or path == "" then
+		return false
+	end
+
+	if path:find("[/\\]") or path:match("^%a:") then
+		return readable(path)
+	end
+
+	local extensions = { "" }
+	if is_windows() then
+		for ext in env_pathext:gmatch("[^;]+") do
+			table.insert(extensions, ext:lower())
+		end
+	end
+
+	local separator = is_windows() and ";" or ":"
+	for dir in env_path:gmatch("[^" .. separator .. "]+") do
+		dir = normalize(dir)
+		for _, ext in ipairs(extensions) do
+			local candidate = path_join(dir, path)
+			if ext ~= "" and not candidate:lower():match(vim.pesc(ext) .. "$") then
+				candidate = candidate .. ext
+			end
+			if readable(candidate) then
+				return true
+			end
+		end
+	end
+
+	return false
 end
 
 local function path_exists(path)
-	return readable(path) or vim.fn.isdirectory(path) == 1
+	return fs_stat(path) ~= nil
 end
 
 local function parent_dir(path)
@@ -58,7 +144,7 @@ local function parent_dir(path)
 		return nil
 	end
 
-	local parent = vim.fn.fnamemodify(normalized, ":h")
+	local parent = dirname(normalized)
 	if parent == normalized then
 		return nil
 	end
@@ -76,8 +162,8 @@ local function find_upward(start_path, markers)
 	end
 
 	current = normalize(current)
-	if vim.fn.isdirectory(current) ~= 1 then
-		current = normalize(vim.fn.fnamemodify(current, ":p:h"))
+	if not is_dir(current) then
+		current = dirname(normalize(vim.fs.abspath(current)))
 	end
 
 	while current and current ~= "" do
@@ -188,14 +274,30 @@ local function windows_clangd_candidates()
 		"C:/Program Files/LLVM/bin/clangd.exe",
 	}
 
-	local patterns = {
-		"C:/Program Files/Microsoft Visual Studio/*/*/VC/Tools/Llvm/x64/bin/clangd.exe",
-		"C:/Program Files/Microsoft Visual Studio/*/*/VC/Tools/Llvm/bin/clangd.exe",
-	}
-
-	for _, pattern in ipairs(patterns) do
-		for _, path in ipairs(vim.fn.glob(pattern, false, true)) do
-			table.insert(candidates, normalize(path))
+	local vs_root = "C:/Program Files/Microsoft Visual Studio"
+	local year_scan = uv.fs_scandir(vs_root)
+	if year_scan then
+		while true do
+			local year, year_type = uv.fs_scandir_next(year_scan)
+			if not year then
+				break
+			end
+			if year_type == "directory" then
+				local year_dir = path_join(vs_root, year)
+				local edition_scan = uv.fs_scandir(year_dir)
+				if edition_scan then
+					while true do
+						local edition, edition_type = uv.fs_scandir_next(edition_scan)
+						if not edition then
+							break
+						end
+						if edition_type == "directory" then
+							table.insert(candidates, path_join(year_dir, edition, "VC/Tools/Llvm/x64/bin/clangd.exe"))
+							table.insert(candidates, path_join(year_dir, edition, "VC/Tools/Llvm/bin/clangd.exe"))
+						end
+					end
+				end
+			end
 		end
 	end
 
@@ -219,7 +321,7 @@ local function normalize_compile_db_dir(value)
 	end
 
 	if value:match("compile_commands%.json$") then
-		return normalize(vim.fn.fnamemodify(value, ":p:h"))
+		return dirname(normalize(vim.fs.abspath(value)))
 	end
 
 	return value
@@ -238,7 +340,7 @@ local function project_cache_compile_commands_dir(root)
 
 	local paths = project.build_paths(root)
 	local clangd_dir = path_join(paths.cache_dir, "clangd")
-	vim.fn.mkdir(clangd_dir, "p")
+	mkdirp(clangd_dir)
 	return normalize(clangd_dir)
 end
 
@@ -258,24 +360,28 @@ local function project_compile_commands_dir(root)
 end
 
 local function copy_file(source_path, target_path)
-	if uv and uv.fs_copyfile then
+	if uv.fs_copyfile then
 		local ok_copy = pcall(uv.fs_copyfile, source_path, target_path)
 		if ok_copy or readable(target_path) then
 			return true
 		end
-	else
-		local ok_read, lines = pcall(vim.fn.readfile, source_path)
-		if not ok_read then
-			return false
-		end
-
-		local ok_write = pcall(vim.fn.writefile, lines, target_path)
-		if ok_write then
-			return true
-		end
 	end
 
-	return false
+	local source = io.open(source_path, "rb")
+	if not source then
+		return false
+	end
+	local content = source:read("*a")
+	source:close()
+
+	mkdirp(dirname(target_path))
+	local target = io.open(target_path, "wb")
+	if not target then
+		return false
+	end
+	target:write(content or "")
+	target:close()
+	return true
 end
 
 local function delete_file(path)
@@ -283,27 +389,49 @@ local function delete_file(path)
 		return false
 	end
 
-	if uv and uv.fs_unlink then
+	if uv.fs_unlink then
 		local ok = pcall(uv.fs_unlink, path)
 		return ok
 	end
 
-	return pcall(vim.fn.delete, path) and vim.fn.filereadable(path) == 0
+	return false
 end
 
 local function project_name(root)
 	local project_file = project.find_project_file_in_root(root)
 	if not project_file then
-		return vim.fn.fnamemodify(root, ":t")
+		return basename(root)
 	end
 
-	return vim.fn.fnamemodify(project_file, ":t:r")
+	return (basename(project_file):gsub("%.uproject$", ""))
+end
+
+local function list_target_files(root)
+	local source_dir = path_join(root, "Source")
+	local scan = uv.fs_scandir(source_dir)
+	local result = {}
+
+	if not scan then
+		return result
+	end
+
+	while true do
+		local name, typ = uv.fs_scandir_next(scan)
+		if not name then
+			break
+		end
+		if typ == "file" and name:match("%.Target%.cs$") then
+			table.insert(result, path_join(source_dir, name))
+		end
+	end
+
+	return result
 end
 
 local function editor_target_name(root)
 	local base_name = project_name(root)
 	local preferred = base_name .. "Editor"
-	local candidates = vim.fn.glob(path_join(root, "Source/*.Target.cs"), false, true)
+	local candidates = list_target_files(root)
 	local fallback = nil
 
 	for _, path in ipairs(candidates) do
@@ -798,7 +926,7 @@ function M.resolve_clangd_command()
 	local clangd = configured_lsp()
 	local configured = clangd.command or "clangd"
 
-	if vim.fn.has("win32") == 1 and clangd.auto_detect_windows ~= false then
+	if is_windows() and clangd.auto_detect_windows ~= false then
 		if configured == "clangd" or configured == "clangd.exe" or is_windows_vs_llvm_bin_clangd(configured) then
 			for _, candidate in ipairs(windows_clangd_candidates()) do
 				if executable(candidate) then
