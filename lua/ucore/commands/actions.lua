@@ -7,11 +7,213 @@ local navigation = require("ucore.navigation")
 local explorer = require("ucore.explorer")
 
 local M = {}
+local FIND_PAGE_SIZE = 50
+local find_cache = {}
 
 local function show_find_results(pattern, items)
 	ui.select.find(items, {
 		default_text = pattern ~= "" and pattern or nil,
 	})
+end
+
+local function copy_list(items)
+	local result = {}
+	for _, item in ipairs(items or {}) do
+		table.insert(result, item)
+	end
+	return result
+end
+
+local function find_cache_snapshot(cache)
+	return {
+		initial_symbols = copy_list(cache.initial_symbols),
+		static_items = copy_list(cache.static_items),
+		ready = cache.ready == true,
+		loading = cache.loading == true,
+		errors = copy_list(cache.errors),
+	}
+end
+
+local function notify_find_cache(cache)
+	local snapshot = find_cache_snapshot(cache)
+	local listeners = cache.listeners or {}
+	cache.listeners = {}
+
+	for _, callback in ipairs(listeners) do
+		pcall(callback, snapshot)
+	end
+end
+
+local function find_cache_for(root)
+	root = tostring(root or "")
+	if root == "" then
+		return nil
+	end
+
+	local cache = find_cache[root]
+	if cache then
+		return cache
+	end
+
+	cache = {
+		root = root,
+		initial_symbols = {},
+		static_items = {},
+		errors = {},
+		loading = false,
+		ready = false,
+		listeners = {},
+	}
+	find_cache[root] = cache
+	return cache
+end
+
+local function append_modules(static_items, result)
+	if type(result) ~= "table" then
+		return
+	end
+
+	for _, module in ipairs(result or {}) do
+		local path = module.build_cs_path or module.path
+		if path and path ~= vim.NIL and path ~= "" then
+			table.insert(static_items, {
+				name = module.name,
+				type = "module",
+				source = "project",
+				path = path,
+				module_name = module.name,
+				class_name = module.owner_name or module.component_name,
+			})
+		end
+	end
+end
+
+local function append_assets(static_items, result)
+	if type(result) ~= "table" then
+		return
+	end
+
+	for _, asset in ipairs(result or {}) do
+		local asset_path = type(asset) == "table" and (asset.path or asset.asset_path) or asset
+		asset_path = tostring(asset_path or "")
+		if asset_path ~= "" then
+			table.insert(static_items, {
+				name = vim.fn.fnamemodify(asset_path, ":t"),
+				type = "asset",
+				source = "project",
+				asset_path = asset_path,
+			})
+		end
+	end
+end
+
+local function append_config_data(static_items, result)
+	if type(result) ~= "table" then
+		return
+	end
+
+	for _, platform in ipairs(result or {}) do
+		for _, section in ipairs(platform.sections or {}) do
+			for _, param in ipairs(section.parameters or {}) do
+				local history = param.history or {}
+				local latest = history[#history] or {}
+				table.insert(static_items, {
+					name = tostring(param.key or ""),
+					type = "config",
+					source = tostring(platform.platform or platform.name or "config"),
+					path = latest.full_path,
+					line = latest.line,
+					config_section = section.name,
+					config_value = param.value,
+					config_file = latest.file,
+				})
+			end
+		end
+	end
+end
+
+local function subscribe_find_cache(root, callback)
+	local cache = find_cache_for(root)
+	if not cache or type(callback) ~= "function" then
+		return
+	end
+
+	if cache.ready then
+		local snapshot = find_cache_snapshot(cache)
+		vim.schedule(function()
+			callback(snapshot)
+		end)
+		return
+	end
+
+	table.insert(cache.listeners, callback)
+end
+
+function M.prewarm_find(root, opts)
+	opts = opts or {}
+	local cache = find_cache_for(root)
+	if not cache or cache.loading or (cache.ready and not opts.force) then
+		return cache
+	end
+
+	cache.loading = true
+	cache.ready = false
+	cache.initial_symbols = {}
+	cache.static_items = {}
+	cache.errors = {}
+
+	local pending = 4
+	local function finish()
+		pending = pending - 1
+		if pending > 0 then
+			return
+		end
+
+		cache.loading = false
+		cache.ready = true
+		notify_find_cache(cache)
+	end
+
+	remote.global_find(root, "", function(result, err)
+		if err then
+			table.insert(cache.errors, tostring(err))
+		else
+			cache.initial_symbols = type(result) == "table" and result or {}
+		end
+		finish()
+	end, {
+		limit = FIND_PAGE_SIZE,
+		offset = 0,
+	})
+
+	remote.get_modules(root, function(result, err)
+		if err then
+			table.insert(cache.errors, tostring(err))
+		else
+			append_modules(cache.static_items, result)
+		end
+		finish()
+	end)
+
+	remote.get_assets(root, function(result, err)
+		if err then
+			table.insert(cache.errors, tostring(err))
+		else
+			append_assets(cache.static_items, result)
+		end
+		finish()
+	end)
+
+	remote.get_config_data(root, function(result, err)
+		if err then
+			table.insert(cache.errors, tostring(err))
+		else
+			append_config_data(cache.static_items, result)
+		end
+		finish()
+	end)
+
+	return cache
 end
 
 local function current_project_label()
@@ -396,130 +598,36 @@ function M.find(pattern)
 		return vim.notify("Could not find .uproject", vim.log.levels.ERROR)
 	end
 
-	local page_size = 50
-	local pending = 4
-	local initial_symbols = {}
-	local static_items = {}
-	local errors = {}
+	local cache = M.prewarm_find(root)
+	local snapshot = find_cache_snapshot(cache)
+	local initial_symbols = pattern == "" and snapshot.initial_symbols or {}
 
-	local function append_many(values)
-		for _, item in ipairs(values or {}) do
-			table.insert(static_items, item)
-		end
+	if ui.select.find_live then
+		return ui.select.find_live(initial_symbols, {
+			default_text = pattern ~= "" and pattern or nil,
+			static_items = snapshot.static_items,
+			page_size = FIND_PAGE_SIZE,
+			initial_loading = snapshot.loading and pattern == "",
+			subscribe_updates = function(callback)
+				subscribe_find_cache(root, callback)
+			end,
+			fetch_symbols = function(query, request, callback)
+				remote.global_find(root, query or "", callback, {
+					limit = request.limit or FIND_PAGE_SIZE,
+					offset = request.offset or 0,
+				})
+			end,
+		})
 	end
 
-	local function finish()
-		pending = pending - 1
-		if pending > 0 then
-			return
-		end
-
-		if vim.tbl_isempty(initial_symbols) and vim.tbl_isempty(static_items) and not vim.tbl_isempty(errors) then
-			return vim.notify("UCore find failed:\n" .. table.concat(errors, "\n"), vim.log.levels.ERROR)
-		end
-
-		if ui.select.find_live then
-			return ui.select.find_live(initial_symbols, {
-				default_text = pattern ~= "" and pattern or nil,
-				static_items = static_items,
-				page_size = page_size,
-				fetch_symbols = function(query, request, callback)
-					remote.global_find(root, query or "", callback, {
-						limit = request.limit or page_size,
-						offset = request.offset or 0,
-					})
-				end,
-			})
-		end
-
-		local fallback_items = {}
-		for _, item in ipairs(initial_symbols) do
-			table.insert(fallback_items, item)
-		end
-		for _, item in ipairs(static_items) do
-			table.insert(fallback_items, item)
-		end
-		show_find_results(pattern, fallback_items)
+	local fallback_items = {}
+	for _, item in ipairs(initial_symbols) do
+		table.insert(fallback_items, item)
 	end
-
-	remote.global_find(root, pattern, function(result, err)
-		if err then
-			table.insert(errors, tostring(err))
-		else
-			initial_symbols = result or {}
-		end
-		finish()
-	end, {
-		limit = page_size,
-		offset = 0,
-	})
-
-	remote.get_modules(root, function(result, err)
-		if err then
-			table.insert(errors, tostring(err))
-		else
-			for _, module in ipairs(result or {}) do
-				local path = module.build_cs_path or module.path
-				if path and path ~= vim.NIL and path ~= "" then
-					table.insert(static_items, {
-						name = module.name,
-						type = "module",
-						source = "project",
-						path = path,
-						module_name = module.name,
-						class_name = module.owner_name or module.component_name,
-					})
-				end
-			end
-		end
-		finish()
-	end)
-
-	remote.get_assets(root, function(result, err)
-		if err then
-			table.insert(errors, tostring(err))
-		else
-			for _, asset in ipairs(result or {}) do
-				local asset_path = type(asset) == "table" and (asset.path or asset.asset_path) or asset
-				asset_path = tostring(asset_path or "")
-				if asset_path ~= "" then
-					table.insert(static_items, {
-						name = vim.fn.fnamemodify(asset_path, ":t"),
-						type = "asset",
-						source = "project",
-						asset_path = asset_path,
-					})
-				end
-			end
-		end
-		finish()
-	end)
-
-	remote.get_config_data(root, function(result, err)
-		if err then
-			table.insert(errors, tostring(err))
-		else
-			for _, platform in ipairs(result or {}) do
-				for _, section in ipairs(platform.sections or {}) do
-					for _, param in ipairs(section.parameters or {}) do
-						local history = param.history or {}
-						local latest = history[#history] or {}
-						table.insert(static_items, {
-							name = tostring(param.key or ""),
-							type = "config",
-							source = tostring(platform.platform or platform.name or "config"),
-							path = latest.full_path,
-							line = latest.line,
-							config_section = section.name,
-							config_value = param.value,
-							config_file = latest.file,
-						})
-					end
-				end
-			end
-		end
-		finish()
-	end)
+	for _, item in ipairs(snapshot.static_items) do
+		table.insert(fallback_items, item)
+	end
+	show_find_results(pattern, fallback_items)
 end
 
 -- Print :UCore command help.

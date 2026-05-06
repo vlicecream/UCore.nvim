@@ -871,7 +871,9 @@ local function pick_telescope_find_live(initial_symbols, opts)
 
 	local function refresh_picker()
 		if picker_ref then
-			picker_ref:refresh(make_finder(), { reset_prompt = false })
+			pcall(function()
+				picker_ref:refresh(make_finder(), { reset_prompt = false })
+			end)
 		end
 	end
 
@@ -938,6 +940,28 @@ local function pick_telescope_find_live(initial_symbols, opts)
 		if total > 0 and row >= total - 10 then
 			request_symbols(state.query, false)
 		end
+	end
+
+	if type(opts.subscribe_updates) == "function" then
+		opts.subscribe_updates(function(snapshot)
+			vim.schedule(function()
+				if type(snapshot) ~= "table" then
+					return
+				end
+
+				if type(snapshot.static_items) == "table" then
+					state.static_items = snapshot.static_items
+				end
+
+				if state.query == "" and type(snapshot.initial_symbols) == "table" then
+					state.symbols = snapshot.initial_symbols
+					state.offset = #snapshot.initial_symbols
+					state.has_more = #snapshot.initial_symbols >= state.limit
+				end
+
+				refresh_picker()
+			end)
+		end)
 	end
 
 	picker_ref = pickers.new({}, {
@@ -1009,7 +1033,10 @@ local function pick_telescope_find_live(initial_symbols, opts)
 		end,
 	})
 
-	if vim.tbl_isempty(initial_symbols or {}) and vim.tbl_isempty(opts.static_items or {}) then
+	if vim.tbl_isempty(initial_symbols or {})
+		and vim.tbl_isempty(opts.static_items or {})
+		and not (opts.initial_loading and state.query == "")
+	then
 		request_symbols(state.query, true)
 	end
 

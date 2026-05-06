@@ -9,6 +9,13 @@ local booted_projects = {}
 local pending_projects = {}
 local attempts_scheduled = false
 local clangd_warm_requested = {}
+local find_warm_requested = {}
+
+local function prewarm_find(root, opts)
+	pcall(function()
+		require("ucore.commands.actions").prewarm_find(root, opts)
+	end)
+end
 
 local function buffer_allows_auto_boot(bufnr)
 	local bo = vim.bo[bufnr]
@@ -45,6 +52,9 @@ local function schedule_boot(project_root)
 		bootstrap.boot(function(ok, err)
 			if ok then
 				booted_projects[project_root] = true
+				vim.defer_fn(function()
+					prewarm_find(project_root, { force = true })
+				end, 500)
 			end
 		end, {
 			project_root = project_root,
@@ -88,6 +98,12 @@ local function try_auto_boot(args)
 				clangd_warm_requested[root] = true
 				bootstrap.prewarm_clangd(root)
 			end
+			if not find_warm_requested[root] then
+				find_warm_requested[root] = true
+				vim.defer_fn(function()
+					prewarm_find(root)
+				end, 1000)
+			end
 			schedule_boot(root)
 			return
 		end
@@ -122,6 +138,7 @@ function M.reset()
 	pending_projects = {}
 	attempts_scheduled = false
 	clangd_warm_requested = {}
+	find_warm_requested = {}
 end
 
 return M
