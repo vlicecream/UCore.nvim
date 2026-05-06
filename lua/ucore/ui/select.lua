@@ -2,6 +2,8 @@ local config = require("ucore.config")
 
 local M = {}
 local FIND_PREVIEW_MAX_LINES = 200
+local FIND_PAGE_SIZE = 50
+local FIND_DEBOUNCE_MS = 150
 
 -- Check whether a Lua module can be required.
 -- 检查某个 Lua 模块是否可用。
@@ -384,6 +386,106 @@ local function prepare_find_items(items)
 	return result
 end
 
+local function apply_find_item_metadata(item, index)
+	local name = tostring(item.name or item.symbol_name or "<unknown>")
+	local kind = normalize_kind(item.symbol_type or item.type)
+	local source = normalize_source(item.source)
+	local path = tostring(item.path or item.file_path or item.asset_path or "")
+	local line = tonumber(item.line or item.line_number or 1) or 1
+	local label = find_category_label(item)
+	local group = find_group(item)
+	local source_label = source ~= "" and source or "index"
+	local location = find_display_location(item, path, line)
+
+	item._ucore_find_index = index
+	item._ucore_find_path = path
+	item._ucore_find_line = line
+	item._ucore_find_text = name
+	item._ucore_find_display = string.format(
+		"%s  %s  %s  %s  %s",
+		pad_right(group, 7),
+		pad_right(label, 9),
+		pad_right(truncate_left(name, 34), 34),
+		pad_right(source_label, 7),
+		location
+	)
+	item._ucore_find_ordinal = find_search_text(item, name, kind, label, path)
+end
+
+-- Prepare live search results without re-sorting them. The backend already
+-- ranks exact, prefix, and continuous substring matches before loose fuzzy
+-- matches, so the picker must preserve SQL order.
+-- 准备 live 搜索结果但不重新排序。后端已经按完全匹配、前缀、连续子串排序，
+-- 前端必须保留 SQL 顺序，避免再次 fuzzy 后把精确结果挤下去。
+local function prepare_find_items_in_order(items)
+	local seen = {}
+	local result = {}
+
+	for _, item in ipairs(items or {}) do
+		local key = find_item_key(item)
+		if not seen[key] then
+			seen[key] = true
+			table.insert(result, item)
+		end
+	end
+
+	for index, item in ipairs(result) do
+		apply_find_item_metadata(item, index)
+	end
+
+	return result
+end
+
+local function make_find_entry(item)
+	return {
+		value = item,
+		display = item._ucore_find_display or tostring(item.name or item.symbol_name or "<unknown>"),
+		ordinal = item._ucore_find_ordinal or tostring(item.name or item.symbol_name or "<unknown>"),
+		filename = item._ucore_find_path or tostring(item.path or item.file_path or item.asset_path or ""),
+		path = item._ucore_find_path or tostring(item.path or item.file_path or item.asset_path or ""),
+		lnum = item._ucore_find_line or tonumber(item.line or item.line_number or 1) or 1,
+		col = 1,
+		text = item._ucore_find_text or tostring(item.name or item.symbol_name or "<unknown>"),
+	}
+end
+
+local function filter_static_find_items(items, query, limit)
+	local prepared = prepare_find_items(items or {})
+	query = vim.trim(tostring(query or "")):lower()
+	limit = limit or FIND_PAGE_SIZE
+
+	if query == "" then
+		local result = {}
+		for index = 1, math.min(#prepared, limit) do
+			table.insert(result, prepared[index])
+		end
+		return result
+	end
+
+	local tokens = vim.split(query, "%s+", { trimempty = true })
+	local result = {}
+
+	for _, item in ipairs(prepared) do
+		local ordinal = tostring(item._ucore_find_ordinal or ""):lower()
+		local matched = true
+		for _, token in ipairs(tokens) do
+			if not ordinal:find(token, 1, true) then
+				matched = false
+				break
+			end
+		end
+
+		if matched then
+			table.insert(result, item)
+			if #result >= limit then
+				break
+			end
+		end
+	end
+
+	return result
+end
+
 local function reference_label(kind)
 	kind = tostring(kind or "unknown")
 
@@ -665,18 +767,7 @@ local function pick_telescope_find(items, default_text)
 			selection_strategy = "row",
 			finder = finders.new_table({
 				results = items,
-				entry_maker = function(item)
-					return {
-						value = item,
-						display = item._ucore_find_display or tostring(item.name or item.symbol_name or "<unknown>"),
-						ordinal = item._ucore_find_ordinal or tostring(item.name or item.symbol_name or "<unknown>"),
-						filename = item._ucore_find_path or tostring(item.path or item.file_path or item.asset_path or ""),
-						path = item._ucore_find_path or tostring(item.path or item.file_path or item.asset_path or ""),
-						lnum = item._ucore_find_line or tonumber(item.line or item.line_number or 1) or 1,
-						col = 1,
-						text = item._ucore_find_text or tostring(item.name or item.symbol_name or "<unknown>"),
-					}
-				end,
+				entry_maker = make_find_entry,
 			}),
 			previewer = previewers.new_buffer_previewer({
 				get_buffer_by_name = function(_, entry)
@@ -705,6 +796,200 @@ local function pick_telescope_find(items, default_text)
 			end,
 		})
 		:find()
+end
+
+-- Open project-wide find with backend-driven live search and pagination.
+-- 使用后端实时搜索和分页打开项目全局查找。
+local function pick_telescope_find_live(initial_symbols, opts)
+	local pickers = require("telescope.pickers")
+	local finders = require("telescope.finders")
+	local previewers = require("telescope.previewers")
+	local actions = require("telescope.actions")
+	local action_state = require("telescope.actions.state")
+	local sorters = require("telescope.sorters")
+
+	opts = opts or {}
+
+	local state = {
+		query = tostring(opts.default_text or ""),
+		symbols = initial_symbols or {},
+		static_items = opts.static_items or {},
+		offset = #(initial_symbols or {}),
+		limit = opts.page_size or FIND_PAGE_SIZE,
+		has_more = #(initial_symbols or {}) >= (opts.page_size or FIND_PAGE_SIZE),
+		loading = false,
+		request_id = 0,
+		input_seq = 0,
+	}
+
+	local picker_ref
+
+	local function combined_items()
+		local items = {}
+
+		for _, item in ipairs(state.symbols or {}) do
+			table.insert(items, item)
+		end
+
+		for _, item in ipairs(filter_static_find_items(state.static_items, state.query, state.limit)) do
+			table.insert(items, item)
+		end
+
+		return prepare_find_items_in_order(items)
+	end
+
+	local function make_finder()
+		return finders.new_table({
+			results = combined_items(),
+			entry_maker = make_find_entry,
+		})
+	end
+
+	local function refresh_picker()
+		if picker_ref then
+			picker_ref:refresh(make_finder(), { reset_prompt = false })
+		end
+	end
+
+	local function request_symbols(query, reset)
+		if type(opts.fetch_symbols) ~= "function" then
+			return
+		end
+		if state.loading and not reset then
+			return
+		end
+		if not reset and not state.has_more then
+			return
+		end
+
+		state.loading = true
+		state.request_id = state.request_id + 1
+		local request_id = state.request_id
+		local offset = reset and 0 or state.offset
+		query = tostring(query or "")
+
+		opts.fetch_symbols(query, {
+			limit = state.limit,
+			offset = offset,
+		}, function(result, err)
+			vim.schedule(function()
+				if request_id ~= state.request_id then
+					return
+				end
+
+				state.loading = false
+
+				if err then
+					vim.notify("UCore find failed:\n" .. tostring(err), vim.log.levels.ERROR)
+					return
+				end
+
+				local values = result or {}
+				if reset then
+					state.symbols = values
+					state.offset = #values
+				else
+					for _, item in ipairs(values) do
+						table.insert(state.symbols, item)
+					end
+					state.offset = state.offset + #values
+				end
+
+				state.has_more = #values >= state.limit
+				refresh_picker()
+			end)
+		end)
+	end
+
+	local function maybe_load_more(prompt_bufnr)
+		if not picker_ref then
+			picker_ref = action_state.get_current_picker(prompt_bufnr)
+		end
+		if not picker_ref or not picker_ref.manager then
+			return
+		end
+
+		local total = picker_ref.manager:num_results()
+		local row = picker_ref:get_selection_row() or 0
+		if total > 0 and row >= total - 10 then
+			request_symbols(state.query, false)
+		end
+	end
+
+	picker_ref = pickers.new({}, {
+		prompt_title = "UCore find",
+		default_text = state.query ~= "" and state.query or nil,
+		sorting_strategy = "ascending",
+		selection_strategy = "row",
+		finder = make_finder(),
+		previewer = previewers.new_buffer_previewer({
+			get_buffer_by_name = function(_, entry)
+				if entry.filename and entry.filename ~= "" then
+					return entry.filename
+				end
+			end,
+			define_preview = function(self, entry)
+				if not preview_find_file(self, entry) then
+					preview_find_item(entry, self.state.bufnr)
+				end
+			end,
+		}),
+		sorter = sorters.empty(),
+		on_input_filter_cb = function(prompt)
+			prompt = tostring(prompt or "")
+			if prompt == state.query then
+				return
+			end
+
+			state.query = prompt
+			state.input_seq = state.input_seq + 1
+			local input_seq = state.input_seq
+
+			vim.defer_fn(function()
+				if input_seq == state.input_seq then
+					state.has_more = true
+					request_symbols(state.query, true)
+				end
+			end, FIND_DEBOUNCE_MS)
+		end,
+		attach_mappings = function(prompt_bufnr, map)
+			actions.select_default:replace(function()
+				local selection = action_state.get_selected_entry()
+				actions.close(prompt_bufnr)
+
+				if selection and selection.value then
+					open_source_item(selection.value)
+				end
+			end)
+
+			local function move_next_and_load()
+				actions.move_selection_next(prompt_bufnr)
+				maybe_load_more(prompt_bufnr)
+			end
+
+			local function page_down_and_load()
+				actions.results_scrolling_down(prompt_bufnr)
+				maybe_load_more(prompt_bufnr)
+			end
+
+			map("i", "<C-n>", move_next_and_load)
+			map("i", "<Down>", move_next_and_load)
+			map("i", "<C-d>", page_down_and_load)
+			map("i", "<PageDown>", page_down_and_load)
+			map("n", "j", move_next_and_load)
+			map("n", "<Down>", move_next_and_load)
+			map("n", "<C-d>", page_down_and_load)
+			map("n", "<PageDown>", page_down_and_load)
+
+			return true
+		end,
+	})
+
+	if vim.tbl_isempty(initial_symbols or {}) and vim.tbl_isempty(opts.static_items or {}) then
+		request_symbols(state.query, true)
+	end
+
+	picker_ref:find()
 end
 
 -- Open a generic selection UI with a label formatter.
@@ -811,6 +1096,26 @@ function M.find(items, opts)
 
 		return string.format("%s%s [%s]", name, source, kind)
 	end, open_source_item)
+end
+
+-- Pick symbols using live backend search when Telescope is available.
+-- Telescope 可用时使用后端实时搜索选择 symbol。
+function M.find_live(initial_symbols, opts)
+	opts = opts or {}
+
+	if picker_backend() == "telescope" then
+		return pick_telescope_find_live(initial_symbols or {}, opts)
+	end
+
+	local items = {}
+	for _, item in ipairs(initial_symbols or {}) do
+		table.insert(items, item)
+	end
+	for _, item in ipairs(filter_static_find_items(opts.static_items or {}, opts.default_text or "", opts.page_size or FIND_PAGE_SIZE)) do
+		table.insert(items, item)
+	end
+
+	return M.find(items, opts)
 end
 
 function M.prepare_find_items(items)

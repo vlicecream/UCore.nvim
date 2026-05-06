@@ -8,56 +8,6 @@ local explorer = require("ucore.explorer")
 
 local M = {}
 
-local FIND_CACHE_TTL_MS = 30000
-local find_cache = {
-	root = nil,
-	items = nil,
-	prepared_items = nil,
-	prepared_for_path = nil,
-	expires_at = 0,
-}
-
-local function now_ms()
-	return vim.loop.hrtime() / 1000000
-end
-
-local function clear_find_cache()
-	find_cache = {
-		root = nil,
-		items = nil,
-		prepared_items = nil,
-		prepared_for_path = nil,
-		expires_at = 0,
-	}
-end
-
-local function current_find_context_path()
-	return tostring(vim.api.nvim_buf_get_name(0) or ""):gsub("\\", "/"):lower()
-end
-
-local function cached_find_results(root)
-	if find_cache.root ~= root or not find_cache.items or find_cache.expires_at <= now_ms() then
-		return nil
-	end
-
-	local current_path = current_find_context_path()
-	if not find_cache.prepared_items or find_cache.prepared_for_path ~= current_path then
-		find_cache.prepared_items = ui.select.prepare_find_items(find_cache.items)
-		find_cache.prepared_for_path = current_path
-	end
-
-	return find_cache.prepared_items
-end
-
-local function store_find_cache(root, items)
-	find_cache.root = root
-	find_cache.items = items
-	find_cache.prepared_items = ui.select.prepare_find_items(items)
-	find_cache.prepared_for_path = current_find_context_path()
-	find_cache.expires_at = now_ms() + FIND_CACHE_TTL_MS
-	return find_cache.prepared_items
-end
-
 local function show_find_results(pattern, items)
 	ui.select.find(items, {
 		default_text = pattern ~= "" and pattern or nil,
@@ -446,18 +396,15 @@ function M.find(pattern)
 		return vim.notify("Could not find .uproject", vim.log.levels.ERROR)
 	end
 
-	local cached_items = cached_find_results(root)
-	if cached_items then
-		return show_find_results(pattern, cached_items)
-	end
-
+	local page_size = 50
 	local pending = 4
-	local items = {}
+	local initial_symbols = {}
+	local static_items = {}
 	local errors = {}
 
 	local function append_many(values)
 		for _, item in ipairs(values or {}) do
-			table.insert(items, item)
+			table.insert(static_items, item)
 		end
 	end
 
@@ -467,21 +414,45 @@ function M.find(pattern)
 			return
 		end
 
-		if vim.tbl_isempty(items) and not vim.tbl_isempty(errors) then
+		if vim.tbl_isempty(initial_symbols) and vim.tbl_isempty(static_items) and not vim.tbl_isempty(errors) then
 			return vim.notify("UCore find failed:\n" .. table.concat(errors, "\n"), vim.log.levels.ERROR)
 		end
 
-		show_find_results(pattern, store_find_cache(root, items))
+		if ui.select.find_live then
+			return ui.select.find_live(initial_symbols, {
+				default_text = pattern ~= "" and pattern or nil,
+				static_items = static_items,
+				page_size = page_size,
+				fetch_symbols = function(query, request, callback)
+					remote.search_symbols(root, query or "", callback, {
+						limit = request.limit or page_size,
+						offset = request.offset or 0,
+					})
+				end,
+			})
+		end
+
+		local fallback_items = {}
+		for _, item in ipairs(initial_symbols) do
+			table.insert(fallback_items, item)
+		end
+		for _, item in ipairs(static_items) do
+			table.insert(fallback_items, item)
+		end
+		show_find_results(pattern, fallback_items)
 	end
 
-	remote.search_symbols(root, "", function(result, err)
+	remote.search_symbols(root, pattern, function(result, err)
 		if err then
 			table.insert(errors, tostring(err))
 		else
-			append_many(result or {})
+			initial_symbols = result or {}
 		end
 		finish()
-	end, 5000)
+	end, {
+		limit = page_size,
+		offset = 0,
+	})
 
 	remote.get_modules(root, function(result, err)
 		if err then
@@ -490,7 +461,7 @@ function M.find(pattern)
 			for _, module in ipairs(result or {}) do
 				local path = module.build_cs_path or module.path
 				if path and path ~= vim.NIL and path ~= "" then
-					table.insert(items, {
+					table.insert(static_items, {
 						name = module.name,
 						type = "module",
 						source = "project",
@@ -512,7 +483,7 @@ function M.find(pattern)
 				local asset_path = type(asset) == "table" and (asset.path or asset.asset_path) or asset
 				asset_path = tostring(asset_path or "")
 				if asset_path ~= "" then
-					table.insert(items, {
+					table.insert(static_items, {
 						name = vim.fn.fnamemodify(asset_path, ":t"),
 						type = "asset",
 						source = "project",
@@ -533,7 +504,7 @@ function M.find(pattern)
 					for _, param in ipairs(section.parameters or {}) do
 						local history = param.history or {}
 						local latest = history[#history] or {}
-						table.insert(items, {
+						table.insert(static_items, {
 							name = tostring(param.key or ""),
 							type = "config",
 							source = tostring(platform.platform or platform.name or "config"),

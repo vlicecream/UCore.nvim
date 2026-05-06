@@ -140,11 +140,17 @@ end
 
 -- Search symbols by text pattern.
 -- 按文本模式搜索符号。
-function M.search_symbols(project_root, pattern, callback, limit)
+function M.search_symbols(project_root, pattern, callback, opts)
+	if type(opts) == "number" then
+		opts = { limit = opts }
+	end
+	opts = opts or {}
+
 	M.query(project_root, {
 		kind = "SearchSymbols",
 		pattern = pattern,
-		limit = limit or 50,
+		limit = opts.limit or 50,
+		offset = opts.offset or 0,
 	}, callback)
 end
 
