@@ -248,6 +248,14 @@ local function find_group(item)
 end
 
 local function find_group_order(item)
+	-- Live find bucket order:
+	-- 1. Project classes/structs/enums;
+	-- 2. Project files;
+	-- 3. Project symbols such as functions, methods, properties, members;
+	-- 4. Project code text;
+	-- 5. Modules, assets, config;
+	-- 6. Engine results, applied by the source penalty in find_item_score().
+	-- 实时搜索排序：Project 类 > 文件 > symbol > 代码正文，Engine 整体最后。
 	return ({
 		Classes = 1,
 		Files = 2,
@@ -319,6 +327,10 @@ local function find_item_key(item)
 end
 
 local function find_item_score(item, current)
+	-- Lower score wins. Source priority is applied before bucket priority:
+	-- project results are pulled forward; Engine results are pushed behind all
+	-- project buckets even when they are exact matches.
+	-- 分数越低越靠前。先按 source 拉开 Project / Engine，再按桶排序。
 	local source = normalize_source(item.source)
 	local kind = normalize_kind(item.symbol_type or item.type):lower()
 	local path = normalize_path(item.path or item.file_path or item.asset_path or "")
@@ -461,8 +473,14 @@ local function apply_find_item_metadata(item, index, current)
 	item._ucore_find_ordinal = find_search_text(item, name, kind, label, path)
 end
 
--- Prepare live search results in backend order, then let the live filter add
--- group/source priority when ranking the visible rows.
+-- Prepare live search results for picker-side ranking.
+--
+-- Backend stages provide candidates in this order: Project FastFind,
+-- Project SearchCodeText, then Engine FastFind. This step dedupes candidates
+-- and annotates each row with the current bucket/source score; filter_live_find_items()
+-- then applies token matching and sorts by that score.
+-- 后端分阶段给候选：Project FastFind、Project SearchCodeText、Engine FastFind。
+-- 这里去重并记录桶/source 分数，后续过滤函数再按 query token 和分数排序。
 local function prepare_find_items_in_order(items)
 	local current = current_buffer_path()
 	local seen = {}
@@ -568,6 +586,13 @@ local function find_query_tokens(query)
 end
 
 local function filter_live_find_items(items, query, limit)
+	-- Token matching rules:
+	-- - whitespace splits multiple required tokens;
+	-- - underscore stays literal, so `ability_death` searches the real `_`;
+	-- - continuous substring beats loose character-order fuzzy;
+	-- - bucket/source score keeps Classes > Files > Symbols > Text > Engine.
+	-- 匹配规则：空白分 token；`_` 是字面量；连续子串优先于字符级 fuzzy；
+	-- 最终排序保持 类 > 文件 > symbol > 正文 > Engine。
 	local prepared = prepare_find_items_in_order(items or {})
 	query = vim.trim(tostring(query or ""))
 	limit = limit or FIND_PAGE_SIZE
