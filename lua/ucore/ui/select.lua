@@ -3,7 +3,7 @@ local config = require("ucore.config")
 local M = {}
 local FIND_PREVIEW_MAX_LINES = 200
 local FIND_PAGE_SIZE = 50
-local FIND_DEBOUNCE_MS = 500
+local FIND_DEBOUNCE_MS = 400
 local FIND_MIN_QUERY_LENGTH = 2
 
 -- Check whether a Lua module can be required.
@@ -881,7 +881,8 @@ local function pick_telescope_find_live(initial_symbols, opts)
 	end
 
 	local function should_fetch_query(query)
-		return #vim.trim(tostring(query or "")) >= FIND_MIN_QUERY_LENGTH
+		query = vim.trim(tostring(query or ""))
+		return #query >= FIND_MIN_QUERY_LENGTH and not query:match("_$")
 	end
 
 	if not should_fetch_query(state.query) then
