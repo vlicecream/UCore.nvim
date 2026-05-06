@@ -154,4 +154,29 @@ function M.search_symbols(project_root, pattern, callback, opts)
 	}, callback)
 end
 
+-- Unified global find: symbols, files, and code text.
+-- 统一全局搜索：symbol、文件名/路径和代码文本。
+function M.global_find(project_root, pattern, callback, opts)
+	if type(opts) == "number" then
+		opts = { limit = opts }
+	end
+	opts = opts or {}
+
+	M.query(project_root, {
+		kind = "GlobalFind",
+		pattern = pattern or "",
+		limit = opts.limit or 50,
+		offset = opts.offset or 0,
+	}, callback)
+end
+
+-- Search indexed files by filename or path part.
+-- 按文件名或路径片段搜索已索引文件。
+function M.search_files(project_root, pattern, callback)
+	M.query(project_root, {
+		kind = "SearchFilesByPathPart",
+		part = pattern or "",
+	}, callback)
+end
+
 return M

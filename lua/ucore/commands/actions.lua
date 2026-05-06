@@ -424,7 +424,7 @@ function M.find(pattern)
 				static_items = static_items,
 				page_size = page_size,
 				fetch_symbols = function(query, request, callback)
-					remote.search_symbols(root, query or "", callback, {
+					remote.global_find(root, query or "", callback, {
 						limit = request.limit or page_size,
 						offset = request.offset or 0,
 					})
@@ -442,7 +442,7 @@ function M.find(pattern)
 		show_find_results(pattern, fallback_items)
 	end
 
-	remote.search_symbols(root, pattern, function(result, err)
+	remote.global_find(root, pattern, function(result, err)
 		if err then
 			table.insert(errors, tostring(err))
 		else

@@ -160,6 +160,12 @@ local function find_category(item)
 	if item.asset_path or kind == "asset" then
 		return "asset"
 	end
+	if kind == "file" then
+		return "file"
+	end
+	if kind == "text" then
+		return "text"
+	end
 	if kind == "config" then
 		return "config"
 	end
@@ -185,11 +191,13 @@ local function find_category_label(item)
 		class = "[class]",
 		config = "[config]",
 		enum = "[enum]",
+		file = "[file]",
 		["function"] = "[func]",
 		member = "[member]",
 		module = "[module]",
 		struct = "[struct]",
 		symbol = "[symbol]",
+		text = "[text]",
 	})[find_category(item)] or "[symbol]"
 end
 
@@ -202,6 +210,12 @@ local function find_group(item)
 	if category == "asset" then
 		return "Assets"
 	end
+	if category == "file" then
+		return "Files"
+	end
+	if category == "text" then
+		return "Text"
+	end
 	if category == "config" then
 		return "Config"
 	end
@@ -213,8 +227,10 @@ local function find_group_order(item)
 	return ({
 		Code = 1,
 		Modules = 2,
-		Assets = 3,
-		Config = 4,
+		Files = 3,
+		Text = 4,
+		Assets = 5,
+		Config = 6,
 	})[find_group(item)] or 9
 end
 
@@ -238,6 +254,10 @@ local function find_display_location(item, path, line)
 		return string.format("%s [%s]", filename, tostring(item.config_section))
 	end
 
+	if item.type == "text" then
+		return string.format("%s:%d", filename, line)
+	end
+
 	return string.format("%s:%d", filename, line)
 end
 
@@ -249,6 +269,7 @@ local function find_search_text(item, name, kind, label, path)
 		name,
 		kind,
 		label,
+		tostring(item.text or ""),
 		find_group(item),
 		tostring(item.class_name or ""),
 		tostring(item.module_name or ""),
@@ -388,6 +409,9 @@ end
 
 local function apply_find_item_metadata(item, index)
 	local name = tostring(item.name or item.symbol_name or "<unknown>")
+	if item.type == "text" and tostring(item.text or "") ~= "" then
+		name = tostring(item.text)
+	end
 	local kind = normalize_kind(item.symbol_type or item.type)
 	local source = normalize_source(item.source)
 	local path = tostring(item.path or item.file_path or item.asset_path or "")
