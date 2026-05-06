@@ -558,7 +558,7 @@ local function fuzzy_token_score(text, token)
 end
 
 local function find_query_tokens(query)
-	query = vim.trim(tostring(query or "")):lower():gsub("_+", " ")
+	query = vim.trim(tostring(query or "")):lower()
 	return vim.split(query, "%s+", { trimempty = true })
 end
 
@@ -994,12 +994,7 @@ local function pick_telescope_find_live(initial_symbols, opts)
 	end
 
 	local function backend_find_query(query)
-		query = tostring(query or "")
-		if query:find("_", 1, true) then
-			return query:gsub("_+", " ")
-		end
-
-		return query
+		return tostring(query or "")
 	end
 
 	if not should_fetch_query(state.query) then

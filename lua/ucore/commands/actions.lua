@@ -134,13 +134,12 @@ end
 
 local function live_find_backend_query(query)
 	query = vim.trim(tostring(query or ""))
-	query = query:gsub("_+", " ")
 	return query
 end
 
 local function live_find_fallback_query(query)
 	query = live_find_backend_query(query):lower()
-	if query:find("%s") then
+	if query:find("%s") or query:find("_", 1, true) then
 		return nil
 	end
 
@@ -151,23 +150,13 @@ local function live_find_fallback_query(query)
 	return nil
 end
 
-local function normalize_live_file_items(items)
-	local result = {}
-	for _, item in ipairs(items or {}) do
-		if type(item) == "table" then
-			item.type = item.type or "file"
-			table.insert(result, item)
-		end
-	end
-	return result
-end
-
 local function fetch_live_find(root, query, request, callback)
 	local limit = request.limit or FIND_PAGE_SIZE
 	local offset = request.offset or 0
+	local query_limit = offset == 0 and math.max(limit, 200) or limit
 	local primary = live_find_backend_query(query)
 	local fallback = live_find_fallback_query(query)
-	local pending = fallback and 4 or 2
+	local pending = fallback and 2 or 1
 	local results = {}
 	local errors = {}
 
@@ -198,19 +187,7 @@ local function fetch_live_find(root, query, request, callback)
 		end
 		finish()
 	end, {
-		limit = limit,
-		offset = offset,
-	})
-
-	remote.search_files_limited(root, primary, function(result, err)
-		if err then
-			table.insert(errors, tostring(err))
-		else
-			append(normalize_live_file_items(result))
-		end
-		finish()
-	end, {
-		limit = limit,
+		limit = query_limit,
 		offset = offset,
 	})
 
@@ -223,19 +200,7 @@ local function fetch_live_find(root, query, request, callback)
 			end
 			finish()
 		end, {
-			limit = limit,
-			offset = offset,
-		})
-
-		remote.search_files_limited(root, fallback, function(result, err)
-			if err then
-				table.insert(errors, tostring(err))
-			else
-				append(normalize_live_file_items(result))
-			end
-			finish()
-		end, {
-			limit = limit,
+			limit = query_limit,
 			offset = offset,
 		})
 	end
