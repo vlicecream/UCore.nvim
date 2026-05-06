@@ -179,4 +179,24 @@ function M.search_files(project_root, pattern, callback)
 	}, callback)
 end
 
+function M.search_files_limited(project_root, pattern, callback, opts)
+	opts = opts or {}
+	M.search_files(project_root, pattern, function(result, err)
+		if err then
+			return callback(nil, err)
+		end
+
+		local limit = tonumber(opts.limit or 50) or 50
+		local offset = tonumber(opts.offset or 0) or 0
+		local values = type(result) == "table" and result or {}
+		local page = {}
+
+		for index = offset + 1, math.min(#values, offset + limit) do
+			table.insert(page, values[index])
+		end
+
+		callback(page, nil)
+	end)
+end
+
 return M

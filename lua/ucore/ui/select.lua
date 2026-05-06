@@ -528,6 +528,97 @@ local function filter_static_find_items(items, query, limit)
 	return result
 end
 
+local function fuzzy_token_score(text, token)
+	text = tostring(text or ""):lower()
+	token = tostring(token or ""):lower()
+
+	if token == "" then
+		return 0
+	end
+
+	local exact_start = text:find(token, 1, true)
+	if exact_start then
+		return exact_start == 1 and 0 or exact_start
+	end
+
+	local cursor = 1
+	local score = 1000
+	for index = 1, #token do
+		local char = token:sub(index, index)
+		local found = text:find(char, cursor, true)
+		if not found then
+			return nil
+		end
+
+		score = score + (found - cursor)
+		cursor = found + 1
+	end
+
+	return score
+end
+
+local function find_query_tokens(query)
+	query = vim.trim(tostring(query or "")):lower():gsub("_+", " ")
+	return vim.split(query, "%s+", { trimempty = true })
+end
+
+local function filter_live_find_items(items, query, limit)
+	local prepared = prepare_find_items_in_order(items or {})
+	query = vim.trim(tostring(query or ""))
+	limit = limit or FIND_PAGE_SIZE
+
+	if query == "" then
+		local result = {}
+		for index = 1, math.min(#prepared, limit) do
+			table.insert(result, prepared[index])
+		end
+		return result
+	end
+
+	local tokens = find_query_tokens(query)
+	if vim.tbl_isempty(tokens) then
+		return prepared
+	end
+
+	local ranked = {}
+	for _, item in ipairs(prepared) do
+		local ordinal = tostring(item._ucore_find_ordinal or "")
+		local score = tonumber(item._ucore_find_score or 0) or 0
+		local matched = true
+
+		for _, token in ipairs(tokens) do
+			local token_score = fuzzy_token_score(ordinal, token)
+			if not token_score then
+				matched = false
+				break
+			end
+			score = score + token_score
+		end
+
+		if matched then
+			table.insert(ranked, {
+				item = item,
+				score = score,
+				index = item._ucore_find_index or #ranked + 1,
+			})
+		end
+	end
+
+	table.sort(ranked, function(left, right)
+		if left.score ~= right.score then
+			return left.score < right.score
+		end
+		return left.index < right.index
+	end)
+
+	local result = {}
+	for index = 1, math.min(#ranked, limit) do
+		table.insert(result, ranked[index].item)
+	end
+
+	return result
+end
+
 local function reference_label(kind)
 	kind = tostring(kind or "unknown")
 
@@ -875,11 +966,11 @@ local function pick_telescope_find_live(initial_symbols, opts)
 			table.insert(items, item)
 		end
 
-		for _, item in ipairs(filter_static_find_items(state.static_items, state.query, state.limit)) do
+		for _, item in ipairs(state.static_items or {}) do
 			table.insert(items, item)
 		end
 
-		return prepare_find_items_in_order(items)
+		return filter_live_find_items(items, state.query, state.limit)
 	end
 
 	local function make_finder()

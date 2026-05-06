@@ -132,6 +132,115 @@ local function append_config_data(static_items, result)
 	end
 end
 
+local function live_find_backend_query(query)
+	query = vim.trim(tostring(query or ""))
+	query = query:gsub("_+", " ")
+	return query
+end
+
+local function live_find_fallback_query(query)
+	query = live_find_backend_query(query):lower()
+	if query:find("%s") then
+		return nil
+	end
+
+	if #query >= 4 then
+		return query:sub(2)
+	end
+
+	return nil
+end
+
+local function normalize_live_file_items(items)
+	local result = {}
+	for _, item in ipairs(items or {}) do
+		if type(item) == "table" then
+			item.type = item.type or "file"
+			table.insert(result, item)
+		end
+	end
+	return result
+end
+
+local function fetch_live_find(root, query, request, callback)
+	local limit = request.limit or FIND_PAGE_SIZE
+	local offset = request.offset or 0
+	local primary = live_find_backend_query(query)
+	local fallback = live_find_fallback_query(query)
+	local pending = fallback and 4 or 2
+	local results = {}
+	local errors = {}
+
+	local function append(values)
+		for _, item in ipairs(values or {}) do
+			table.insert(results, item)
+		end
+	end
+
+	local function finish()
+		pending = pending - 1
+		if pending > 0 then
+			return
+		end
+
+		if vim.tbl_isempty(results) and not vim.tbl_isempty(errors) then
+			return callback(nil, table.concat(errors, "\n"))
+		end
+
+		callback(results, nil)
+	end
+
+	remote.search_symbols(root, primary, function(result, err)
+		if err then
+			table.insert(errors, tostring(err))
+		else
+			append(result)
+		end
+		finish()
+	end, {
+		limit = limit,
+		offset = offset,
+	})
+
+	remote.search_files_limited(root, primary, function(result, err)
+		if err then
+			table.insert(errors, tostring(err))
+		else
+			append(normalize_live_file_items(result))
+		end
+		finish()
+	end, {
+		limit = limit,
+		offset = offset,
+	})
+
+	if fallback then
+		remote.search_symbols(root, fallback, function(result, err)
+			if err then
+				table.insert(errors, tostring(err))
+			else
+				append(result)
+			end
+			finish()
+		end, {
+			limit = limit,
+			offset = offset,
+		})
+
+		remote.search_files_limited(root, fallback, function(result, err)
+			if err then
+				table.insert(errors, tostring(err))
+			else
+				append(normalize_live_file_items(result))
+			end
+			finish()
+		end, {
+			limit = limit,
+			offset = offset,
+		})
+	end
+end
+
 local function subscribe_find_cache(root, callback)
 	local cache = find_cache_for(root)
 	if not cache or type(callback) ~= "function" then
@@ -612,10 +721,7 @@ function M.find(pattern)
 				subscribe_find_cache(root, callback)
 			end,
 			fetch_symbols = function(query, request, callback)
-				remote.global_find(root, query or "", callback, {
-					limit = request.limit or FIND_PAGE_SIZE,
-					offset = request.offset or 0,
-				})
+				fetch_live_find(root, query, request, callback)
 			end,
 		})
 	end
