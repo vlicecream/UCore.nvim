@@ -31,7 +31,7 @@ local default_clangd_args = {
 	"--completion-style=detailed",
 	"--function-arg-placeholders",
 	"--pch-storage=disk",
-	"--fallback-style=llvm",
+	"--fallback-style=Microsoft",
 }
 
 local function normalize(path)
@@ -1271,6 +1271,7 @@ function M.clangd_config(opts)
 	end
 
 	local capabilities = M.get_capabilities(opts.capabilities or clangd.capabilities)
+	local user_on_attach = opts.on_attach or clangd.on_attach
 	local user_on_new_config = opts.on_new_config or clangd.on_new_config
 	local user_handlers = deep_copy(opts.handlers or clangd.handlers or {})
 	user_handlers["textDocument/publishDiagnostics"] = filtered_publish_diagnostics_handler(
@@ -1289,6 +1290,16 @@ function M.clangd_config(opts)
 			or clangd.single_file_support
 			or false,
 		capabilities = capabilities,
+		on_attach = function(client, bufnr)
+			if clangd.formatting ~= true then
+				client.server_capabilities.documentFormattingProvider = false
+				client.server_capabilities.documentRangeFormattingProvider = false
+			end
+
+			if type(user_on_attach) == "function" then
+				user_on_attach(client, bufnr)
+			end
+		end,
 		init_options = vim.tbl_deep_extend("force", {
 			clangdFileStatus = true,
 		}, deep_copy(clangd.init_options or {})),
