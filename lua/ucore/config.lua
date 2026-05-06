@@ -69,6 +69,50 @@ local function has_release_binaries_in(dir)
 	return readable(release_binary(dir, "u_scanner")) and readable(release_binary(dir, "u_core_server"))
 end
 
+local function mtime(path)
+	path = normalize(path)
+	if not path then
+		return nil
+	end
+
+	local stat = vim.loop.fs_stat(path)
+	return stat and stat.mtime and stat.mtime.sec or nil
+end
+
+local function backend_source_stamp(source_dir)
+	source_dir = normalize(source_dir)
+	if not source_dir then
+		return nil
+	end
+
+	local stamp = 0
+	for _, path in ipairs({
+		source_dir .. "/Cargo.toml",
+		source_dir .. "/Cargo.lock",
+		source_dir .. "/.git/index",
+		source_dir .. "/.git/HEAD",
+	}) do
+		stamp = math.max(stamp, mtime(path) or 0)
+	end
+
+	return stamp > 0 and stamp or nil
+end
+
+local function release_binaries_are_fresh(release_dir, source_dir)
+	if not has_release_binaries_in(release_dir) then
+		return false
+	end
+
+	local source_stamp = backend_source_stamp(source_dir)
+	if not source_stamp then
+		return true
+	end
+
+	local scanner_stamp = mtime(release_binary(release_dir, "u_scanner")) or 0
+	local server_stamp = mtime(release_binary(release_dir, "u_core_server")) or 0
+	return scanner_stamp >= source_stamp and server_stamp >= source_stamp
+end
+
 -- Build the development CLI command.
 -- 构造开发模式 CLI 命令。
 local function cargo_scanner_cmd(source_dir)
@@ -357,7 +401,7 @@ function M.resolve_backend_release_dir(values)
 	values = values or M.values
 
 	for _, dir in ipairs(M.backend_bin_candidates(values)) do
-		if is_dir(dir) and has_release_binaries_in(dir) then
+		if is_dir(dir) and release_binaries_are_fresh(dir, values.backend_source_dir) then
 			return dir
 		end
 	end

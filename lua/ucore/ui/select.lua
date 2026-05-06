@@ -222,6 +222,12 @@ end
 local function find_group(item)
 	local category = find_category(item)
 
+	if category == "class" or category == "struct" or category == "enum" then
+		return "Classes"
+	end
+	if category == "function" or category == "member" or category == "symbol" then
+		return "Symbols"
+	end
 	if category == "module" then
 		return "Modules"
 	end
@@ -243,12 +249,13 @@ end
 
 local function find_group_order(item)
 	return ({
-		Text = 1,
-		Code = 2,
-		Files = 3,
-		Modules = 4,
-		Assets = 5,
-		Config = 6,
+		Classes = 1,
+		Files = 2,
+		Symbols = 3,
+		Text = 4,
+		Modules = 5,
+		Assets = 6,
+		Config = 7,
 	})[find_group(item)] or 9
 end
 
@@ -320,7 +327,7 @@ local function find_item_score(item, current)
 	if source == "project" then
 		score = score - 300
 	elseif source == "engine" then
-		score = score + 300
+		score = score + 1000
 	end
 
 	score = score + (find_group_order(item) * 100)
