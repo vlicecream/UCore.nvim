@@ -177,6 +177,8 @@ local function relative_unreal_path(path)
 	return display_path(path)
 end
 
+M.relative_unreal_path = relative_unreal_path
+
 local function compact_path(path, width)
 	return truncate_left(display_path(path), width)
 end

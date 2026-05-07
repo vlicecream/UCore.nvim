@@ -1,5 +1,6 @@
 local project = require("ucore.project")
 local remote = require("ucore.remote")
+local select_ui = require("ucore.ui.select")
 
 local M = {}
 
@@ -85,12 +86,7 @@ local function close_float()
 end
 
 local function display_path(path)
-	path = normalize_path(path)
-	local cwd = normalize_path(vim.loop.cwd() or "")
-	if cwd ~= "" and path:sub(1, #cwd):lower() == cwd:lower() then
-		return path:sub(#cwd + 2)
-	end
-	return path
+	return select_ui.relative_unreal_path(normalize_path(path))
 end
 
 local function float_width(lines, min_width, max_width)
@@ -176,63 +172,101 @@ local function signature_label(entry, active_param, active)
 	return string.format("%s%s%s(%s)", prefix, scope, name, table.concat(parts, ", "))
 end
 
-local function hover_lines(item)
+local function push_labeled_line(lines, highlights, label, value, group)
+	value = vim.trim(tostring(value or ""))
+	if value == "" then
+		return
+	end
+
+	local line = string.format("%s %s", label, value)
+	local index = #lines
+	table.insert(lines, line)
+	table.insert(highlights, {
+		line = index,
+		start_col = 0,
+		end_col = #label,
+		group = "Keyword",
+	})
+	table.insert(highlights, {
+		line = index,
+		start_col = #label + 1,
+		end_col = #line,
+		group = group or "Normal",
+	})
+end
+
+local function hover_content(item)
 	local lines = {}
+	local highlights = {}
 	local hover_kind = text_value(not is_json_null(item.hover_kind) and item.hover_kind or item.kind)
 	local name = text_value(item.name ~= vim.NIL and item.name or item.symbol_name)
 	local kind = text_value(item.kind)
 	local class_name = text_value(item.class_name ~= vim.NIL and item.class_name or item.owner_class)
-	local return_type = vim.trim(text_value(item.return_type))
 	local params = text_value(not is_json_null(item.parameters) and item.parameters or item.detail)
-	local flags = vim.trim(text_value(item.flags))
-	local access = text_value(item.access)
 	local source = text_value(item.source)
 	local line_number = tonumber(item.line_number or item.line or 0) or 0
 	local file_path = text_value(item.file_path)
 
 	if hover_kind == "local" then
 		table.insert(lines, name)
-		table.insert(lines, "type: " .. (text_value(item.type_name) ~= "" and text_value(item.type_name) or "unknown"))
+		table.insert(highlights, {
+			line = 0,
+			start_col = 0,
+			end_col = #name,
+			group = "Identifier",
+		})
+		push_labeled_line(
+			lines,
+			highlights,
+			"type:",
+			text_value(item.type_name) ~= "" and text_value(item.type_name) or "unknown",
+			"Type"
+		)
 		if class_name ~= "" then
-			table.insert(lines, "scope: " .. class_name)
+			push_labeled_line(lines, highlights, "scope:", class_name, "Type")
 		end
 		local resolved_type = item.resolved_type
 		if type(resolved_type) == "table" and resolved_type ~= vim.NIL then
 			local resolved_name = tostring(resolved_type.name or resolved_type.symbol_name or "")
-			local resolved_kind = text_value(resolved_type.kind)
 			if resolved_name ~= "" then
-				table.insert(lines, "resolved: " .. resolved_name .. (resolved_kind ~= "" and (" [" .. resolved_kind .. "]") or ""))
+				push_labeled_line(lines, highlights, "resolved:", resolved_name, "Type")
 			end
 		end
 	else
 		if kind:lower():find("function", 1, true) then
 			table.insert(lines, signature_label(item, -1, false))
+			table.insert(highlights, {
+				line = 0,
+				start_col = 0,
+				end_col = #lines[1],
+				group = "Function",
+			})
 		elseif class_name ~= "" and name ~= "" then
 			table.insert(lines, class_name .. "::" .. name)
+			table.insert(highlights, {
+				line = 0,
+				start_col = 0,
+				end_col = #lines[1],
+				group = "Identifier",
+			})
 		else
 			table.insert(lines, name)
+			table.insert(highlights, {
+				line = 0,
+				start_col = 0,
+				end_col = #lines[1],
+				group = "Identifier",
+			})
 		end
 
-		if kind ~= "" then
-			table.insert(lines, "kind: " .. kind)
-		end
-		if return_type ~= "" then
-			table.insert(lines, "return: " .. return_type)
-		end
 		if params ~= "" and params ~= "()" and not kind:lower():find("function", 1, true) then
-			table.insert(lines, "params: " .. params)
+			push_labeled_line(lines, highlights, "params:", params, "Normal")
 		end
 		if item.base_class and item.base_class ~= vim.NIL and tostring(item.base_class) ~= "" then
-			table.insert(lines, "base: " .. tostring(item.base_class))
+			push_labeled_line(lines, highlights, "base:", tostring(item.base_class), "Type")
 		end
 		if item.module_name and item.module_name ~= vim.NIL and tostring(item.module_name) ~= "" then
-			table.insert(lines, "module: " .. tostring(item.module_name))
-		end
-		if flags ~= "" then
-			table.insert(lines, "flags: " .. flags)
-		end
-		if access ~= "" then
-			table.insert(lines, "access: " .. access)
+			push_labeled_line(lines, highlights, "module:", tostring(item.module_name), "Directory")
 		end
 	end
 
@@ -241,14 +275,14 @@ local function hover_lines(item)
 		if line_number > 0 then
 			location = location .. ":" .. line_number
 		end
-		table.insert(lines, "path: " .. location)
+		push_labeled_line(lines, highlights, "path:", location, "Directory")
 	end
 
 	if source ~= "" then
-		table.insert(lines, "source: " .. source)
+		push_labeled_line(lines, highlights, "source:", source, "Comment")
 	end
 
-	return lines
+	return lines, highlights
 end
 
 local function signature_lines(result)
@@ -295,6 +329,10 @@ local function open_float(lines, opts)
 	vim.bo[buf].swapfile = false
 	vim.bo[buf].modifiable = false
 	vim.bo[buf].filetype = opts.filetype or "text"
+
+	for _, item in ipairs(opts.highlights or {}) do
+		pcall(vim.api.nvim_buf_add_highlight, buf, -1, item.group, item.line, item.start_col, item.end_col)
+	end
 
 	local width = float_width(lines, opts.min_width, opts.max_width)
 	local height = math.min(#lines, math.max(vim.o.lines - 4, 1))
@@ -398,11 +436,13 @@ function M.hover_auto(opts)
 		end
 
 		vim.schedule(function()
-			open_float(hover_lines(result), {
+			local lines, highlights = hover_content(result)
+			open_float(lines, {
 				filetype = "text",
 				min_width = 28,
 				kind = "hover",
 				auto = opts.auto == true,
+				highlights = highlights,
 			})
 		end)
 	end)
