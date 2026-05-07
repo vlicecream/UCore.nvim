@@ -35,6 +35,10 @@ local function normalize_space(text)
 	return tostring(text or ""):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
 end
 
+local function cursor_cword()
+	return tostring(vim.fn.expand("<cword>") or "")
+end
+
 local function refresh_opened_buffer_filetype(path, bufnr)
 	bufnr = bufnr or vim.api.nvim_get_current_buf()
 	if not vim.api.nvim_buf_is_valid(bufnr) then
@@ -237,6 +241,28 @@ local function declaration_target_names(cursor_info)
 	return names
 end
 
+local function cursor_matches_function_name(cursor_info)
+	local symbol = cursor_cword()
+	if symbol == "" then
+		return false
+	end
+
+	for _, name in ipairs(declaration_target_names(cursor_info)) do
+		if symbol == name then
+			return true
+		end
+	end
+
+	for _, item in ipairs(cursor_info.generated_definitions or {}) do
+		local generated_name = tostring(type(item) == "table" and item.name or "")
+		if generated_name ~= "" and symbol == generated_name then
+			return true
+		end
+	end
+
+	return false
+end
+
 local function find_function_signature(lines, opts)
 	local signature = normalize_space(opts.signature)
 	local locator = opts.locator or opts.signature
@@ -309,7 +335,9 @@ local function try_counterpart_from_header(root, file_path, line, character, cal
 
 		local cursor_info = type(result) == "table" and result.cursor_info or {}
 		if tostring(cursor_info.kind or "") == "function_definition" then
-			return callback(false)
+			if not cursor_matches_function_name(cursor_info) then
+				return callback(false)
+			end
 		end
 
 		local class_name = extract_declaring_class(cursor_info)
@@ -327,7 +355,7 @@ local function try_counterpart_from_header(root, file_path, line, character, cal
 		for _, name in ipairs(implementation_target_names(cursor_info)) do
 			local match = find_function_signature(lines, {
 				signature = string.format("%s::%s%s", class_name, name, params),
-				locator = string.format("%s::%s", class_name, name),
+				locator = name,
 			})
 			if match then
 				return callback(open_path_at(source_path, match.line, match.col))
@@ -351,6 +379,9 @@ local function try_counterpart_from_source(root, file_path, line, character, cal
 		local cursor_info = type(result) == "table" and result.cursor_info or {}
 		local full_text = tostring(cursor_info.full_text or "")
 		if tostring(cursor_info.kind or "") ~= "function_definition" and not full_text:find("::", 1, true) then
+			return callback(false)
+		end
+		if not cursor_matches_function_name(cursor_info) then
 			return callback(false)
 		end
 
