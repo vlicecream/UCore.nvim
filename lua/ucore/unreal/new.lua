@@ -97,6 +97,20 @@ local function open_files(h_path, cpp_path, class_name)
   end)
 end
 
+local function detect_uvcs_provider(path)
+  local ok_uvcs, uvcs = pcall(require, "uvcs")
+  if not ok_uvcs or type(uvcs) ~= "table" or type(uvcs.detect_for_path) ~= "function" then
+    return nil
+  end
+
+  local ok_provider, provider = pcall(uvcs.detect_for_path, path)
+  if not ok_provider or type(provider) ~= "table" or type(provider.add_file) ~= "function" then
+    return nil
+  end
+
+  return provider
+end
+
 function M.create(class_name)
   if not class_name or class_name == "" then
     vim.notify("UCore new: class name is required", vim.log.levels.ERROR)
@@ -225,30 +239,28 @@ function M.create(class_name)
           cpp_fd:close()
         end
 
-        -- P4 add prompt: check if p4 is available and connected
-        local p4_available = vim.fn.executable("p4") == 1
-        if p4_available then
-          local p4_check = vim.fn.system({"p4", "info", "-s"})
-          p4_available = vim.v.shell_error == 0
-        end
-        if p4_available then
-            vim.ui.select({ "Yes", "No" }, {
-              prompt = "p4 add " .. class_name .. ".h/.cpp?",
-            }, function(add_choice)
-              if add_choice == "Yes" then
-                pcall(vim.fn.system, {"p4", "add", h_path})
-                pcall(vim.fn.system, {"p4", "add", cpp_path})
+        local provider = detect_uvcs_provider(h_path) or detect_uvcs_provider(cpp_path)
+        if provider then
+          local provider_name = type(provider.name) == "function" and provider.name() or "uvcs"
+          vim.ui.select({ "Yes", "No" }, {
+            prompt = string.format("%s add %s.h/.cpp?", tostring(provider_name), class_name),
+          }, function(add_choice)
+            if add_choice == "Yes" then
+              local ok_h, err_h = provider.add_file(h_path, root)
+              local ok_cpp, err_cpp = provider.add_file(cpp_path, root)
+              if not ok_h then
+                vim.notify("UCore new: add failed for " .. h_path .. "\n" .. tostring(err_h), vim.log.levels.ERROR)
               end
-              vim.schedule(function()
-                vim.cmd.edit(vim.fn.fnameescape(h_path))
-                vim.cmd("vsplit " .. vim.fn.fnameescape(cpp_path))
-                vim.notify("UCore new: created " .. class_name, vim.log.levels.INFO)
-              end)
-            end)
-          else
+              if not ok_cpp then
+                vim.notify("UCore new: add failed for " .. cpp_path .. "\n" .. tostring(err_cpp), vim.log.levels.ERROR)
+              end
+            end
             open_files(h_path, cpp_path, class_name)
-          end
+          end)
         else
+          open_files(h_path, cpp_path, class_name)
+        end
+      else
         open_files(h_path, nil, class_name)
       end
     end)
