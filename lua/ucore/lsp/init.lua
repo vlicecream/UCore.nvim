@@ -1239,9 +1239,7 @@ function M.clangd_config(opts)
 
 				return vim.lsp.rpc.start(resolved, dispatchers, {
 					cwd = root or client_config.cmd_cwd,
-					env = vim.tbl_extend("keep", {
-						XDG_CACHE_HOME = project.build_paths(root).cache_dir,
-					}, client_config.cmd_env or {}),
+					env = client_config.cmd_env,
 					detached = client_config.detached,
 				})
 			end
