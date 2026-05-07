@@ -342,128 +342,6 @@ local function apply_ucore_fix(bufnr, diagnostic)
 	return true
 end
 
-local function lsp_clients_supporting_code_action(bufnr)
-	return vim.tbl_filter(function(client)
-		return client.supports_method and client:supports_method("textDocument/codeAction")
-	end, vim.lsp.get_clients({ bufnr = bufnr }))
-end
-
-local function make_action_title(action)
-	local kind = type(action.kind) == "string" and action.kind or ""
-	if kind ~= "" then
-		return string.format("%s [%s]", action.title or "Code Action", kind)
-	end
-	return action.title or "Code Action"
-end
-
-local function apply_lsp_action(bufnr, action, client_id, callback)
-	callback = callback or function() end
-
-	local function finish(ok, err)
-		vim.schedule(function()
-			callback(ok, err)
-		end)
-	end
-
-	if action.edit then
-		vim.lsp.util.apply_workspace_edit(action.edit, "utf-8")
-	end
-
-	if action.command then
-		local command = action.command
-		if type(command) == "table" then
-			local client = vim.lsp.get_client_by_id(client_id)
-			if client then
-				client:request("workspace/executeCommand", command, function(err)
-					finish(err == nil, err)
-				end, bufnr)
-				return
-			end
-		elseif type(command) == "string" then
-			local client = vim.lsp.get_client_by_id(client_id)
-			local payload = {
-				command = command,
-				arguments = action.arguments,
-			}
-			if client then
-				client:request("workspace/executeCommand", payload, function(err)
-					finish(err == nil, err)
-				end, bufnr)
-				return
-			end
-			vim.lsp.buf.execute_command(payload)
-		end
-	end
-
-	finish(true, nil)
-end
-
-local function try_lsp_code_action(bufnr, callback)
-	callback = callback or function() end
-	local diagnostics, row = current_line_diagnostics(bufnr)
-	local clients = lsp_clients_supporting_code_action(bufnr)
-
-	if vim.tbl_isempty(clients) then
-		return callback(false, "no_clients")
-	end
-
-	local params = vim.lsp.util.make_range_params(0, "utf-8")
-	params.context = {
-		diagnostics = diagnostics,
-		only = { "quickfix", "source.fixAll" },
-		triggerKind = vim.lsp.protocol.CodeActionTriggerKind.Invoked,
-	}
-	params.range.start.line = row
-	params.range["end"].line = row
-
-	vim.lsp.buf_request_all(bufnr, "textDocument/codeAction", params, function(results)
-		local actions = {}
-
-		for client_id, payload in pairs(results or {}) do
-			for _, action in ipairs(payload.result or {}) do
-				table.insert(actions, {
-					client_id = client_id,
-					action = action,
-					is_preferred = action.isPreferred == true,
-				})
-			end
-		end
-
-		if vim.tbl_isempty(actions) then
-			return callback(false, "empty")
-		end
-
-		table.sort(actions, function(left, right)
-			if left.is_preferred ~= right.is_preferred then
-				return left.is_preferred
-			end
-			return make_action_title(left.action) < make_action_title(right.action)
-		end)
-
-		if #actions == 1 or actions[1].is_preferred then
-			return apply_lsp_action(bufnr, actions[1].action, actions[1].client_id, function(ok)
-				callback(ok, ok and nil or "apply_failed")
-			end)
-		end
-
-		vim.schedule(function()
-			vim.ui.select(actions, {
-				prompt = "Code Actions",
-				format_item = function(item)
-					return make_action_title(item.action)
-				end,
-			}, function(choice)
-				if not choice then
-					return callback(false, "cancelled")
-				end
-				apply_lsp_action(bufnr, choice.action, choice.client_id, function(ok)
-					callback(ok, ok and nil or "apply_failed")
-				end)
-			end)
-		end)
-	end)
-end
-
 local function normalize(path)
 	return path and path:gsub("\\", "/") or nil
 end
@@ -1185,30 +1063,20 @@ end
 
 function M.smart_action()
 	local bufnr = vim.api.nvim_get_current_buf()
-
-	try_lsp_code_action(bufnr, function(applied, reason)
-		if applied then
+	local diagnostic = current_ucore_diagnostic()
+	if diagnostic then
+		local ok = apply_ucore_fix(bufnr, diagnostic)
+		if ok then
 			return
 		end
-		if reason == "cancelled" then
-			return
-		end
+	end
 
-		local diagnostic = current_ucore_diagnostic()
-		if diagnostic then
-			local ok = apply_ucore_fix(bufnr, diagnostic)
-			if ok then
-				return
-			end
-		end
+	local handled = try_generate_definition(bufnr)
+	if handled then
+		return
+	end
 
-		local handled = try_generate_definition(bufnr)
-		if handled then
-			return
-		end
-
-		try_include_symbol(bufnr)
-	end)
+	try_include_symbol(bufnr)
 end
 
 function M.from_build_output(output, project_root)
@@ -1287,9 +1155,9 @@ function M.setup()
 		},
 	}
 
-	-- Apply the visual presentation globally so LSP diagnostics (for example
-	-- clangd) and UCore diagnostics render consistently.
-	-- 全局应用显示配置，让 clangd 这类 LSP 诊断和 UCore 诊断表现一致。
+	-- Apply the visual presentation globally so editor diagnostics and UCore
+	-- build/index diagnostics render consistently.
+	-- 全局应用显示配置，让编辑器诊断与 UCore 的构建/索引诊断表现一致。
 	vim.diagnostic.config(display_config)
 	vim.diagnostic.config(display_config, ns)
 

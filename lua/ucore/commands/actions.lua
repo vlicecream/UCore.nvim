@@ -413,6 +413,22 @@ function M.references()
 	navigation.references()
 end
 
+function M.hover()
+	require("ucore.assist").hover()
+end
+
+function M.signature_help()
+	require("ucore.assist").signature_help()
+end
+
+function M.rename(tail)
+	local new_name = vim.trim(tostring(tail or ""))
+	if new_name == "" then
+		return require("ucore.assist").rename()
+	end
+	require("ucore.assist").rename(new_name)
+end
+
 -- Pick and open a registered Unreal project.
 -- 选择并打开一个已注册 Unreal 项目。
 function M.open_project()
@@ -754,6 +770,9 @@ UCore commands:
   :UCore explorer     Toggle the left-side Project/Source/Config tree
   :UCore find         Find indexed symbols, modules, assets, config
   :UCore goto         Navigation subcommands (see :UCore goto help)
+  :UCore hover        Show symbol hover under cursor
+  :UCore signature    Show signature help for current call
+  :UCore rename       Rename symbol under cursor
   :UCore help         Show this help
 ]])
 end

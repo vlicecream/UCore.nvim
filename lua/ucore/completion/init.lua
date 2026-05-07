@@ -6,6 +6,7 @@ local M = {}
 local auto_sequence = 0
 local request_sequence = 0
 local pending_request = nil
+local INSERT_TEXT_FORMAT_SNIPPET = 2
 
 local function blink_available()
 	local ok, _ = pcall(require, "blink.cmp")
@@ -168,7 +169,7 @@ local function to_complete_item(item)
 	local label = item.label or item.name or item.word or item.insert_text or item.insertText or item.text or ""
 
 	local insert_text = item.insert_text or item.insertText or item.word or item.name or label
-	if tonumber(item.insertTextFormat or item.insert_text_format) == vim.lsp.protocol.InsertTextFormat.Snippet then
+	if tonumber(item.insertTextFormat or item.insert_text_format) == INSERT_TEXT_FORMAT_SNIPPET then
 		insert_text = label
 	end
 

@@ -29,6 +29,19 @@ local function set_buffer_map(bufnr, lhs, rhs, desc)
 	})
 end
 
+local function set_buffer_map_modes(modes, bufnr, lhs, rhs, desc)
+	lhs = normalize_lhs(lhs)
+	if not lhs then
+		return
+	end
+
+	vim.keymap.set(modes, lhs, rhs, {
+		buffer = bufnr,
+		desc = desc,
+		silent = true,
+	})
+end
+
 local function keymap_config()
 	local navigation_config = config.values.navigation
 	if type(navigation_config) ~= "table" then
@@ -60,6 +73,15 @@ local function setup_buffer(args)
 	set_buffer_map(bufnr, keymaps.references, navigation.references, "UCore references")
 	set_buffer_map(bufnr, keymaps.implementation or keymaps.goto_implementation, navigation.goto_implementation, "UCore implementation")
 	set_buffer_map(bufnr, keymaps.source_toggle, navigation.toggle_source, "UCore toggle source/header")
+	set_buffer_map(bufnr, keymaps.hover, function()
+		require("ucore.assist").hover()
+	end, "UCore hover")
+	set_buffer_map(bufnr, keymaps.rename, function()
+		require("ucore.assist").rename()
+	end, "UCore rename")
+	set_buffer_map_modes({ "n", "i" }, bufnr, keymaps.signature, function()
+		require("ucore.assist").signature_help()
+	end, "UCore signature")
 end
 
 -- Register gf for any buffer inside an Unreal project tree, including
@@ -112,16 +134,19 @@ local function is_unreal_path(path)
 	return project.find_project_root(path) ~= nil
 end
 
-local function delete_buffer_map(bufnr, lhs)
+local function delete_buffer_map(bufnr, lhs, modes)
 	lhs = normalize_lhs(lhs)
 	if not lhs then
 		return
 	end
 
-	for _, item in ipairs(vim.api.nvim_buf_get_keymap(bufnr, "n")) do
-		if item.lhs == lhs and tostring(item.desc or ""):find("^UCore ") then
-			pcall(vim.keymap.del, "n", lhs, { buffer = bufnr })
-			break
+	modes = modes or { "n" }
+	for _, mode in ipairs(modes) do
+		for _, item in ipairs(vim.api.nvim_buf_get_keymap(bufnr, mode)) do
+			if item.lhs == lhs and tostring(item.desc or ""):find("^UCore ") then
+				pcall(vim.keymap.del, mode, lhs, { buffer = bufnr })
+				break
+			end
 		end
 	end
 end
@@ -174,6 +199,9 @@ function M.reset()
 			delete_buffer_map(bufnr, keymaps.references)
 			delete_buffer_map(bufnr, keymaps.implementation or keymaps.goto_implementation)
 			delete_buffer_map(bufnr, keymaps.source_toggle)
+			delete_buffer_map(bufnr, keymaps.hover)
+			delete_buffer_map(bufnr, keymaps.rename)
+			delete_buffer_map(bufnr, keymaps.signature, { "n", "i" })
 			delete_buffer_map(bufnr, keymaps.global_find)
 			delete_buffer_map(bufnr, diagnostics_config.action_keymap)
 		end

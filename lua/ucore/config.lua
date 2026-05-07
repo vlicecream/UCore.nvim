@@ -246,6 +246,9 @@ local function default_values()
 				implementation = "gi",
 				source_toggle = "gs",
 				global_find = "gf",
+				hover = "K",
+				signature = "<C-k>",
+				rename = "<leader>rn",
 			},
 		},
 
@@ -290,30 +293,6 @@ local function default_values()
 			float_delay_ms = 200,
 			update_in_insert = true,
 			debounce_ms = 300,
-		},
-
-		-- Recommended LSP integration for semantic diagnostics and code actions.
-		-- 推荐的 LSP 集成，用于语义红线黄线和 code action。
-		lsp = {
-			auto_setup = true,
-			clangd = {
-				command = "clangd",
-				args = {
-					"--header-insertion=never",
-					"--completion-style=detailed",
-					"--function-arg-placeholders",
-					"--pch-storage=disk",
-					"--fallback-style=Microsoft",
-				},
-				formatting = false,
-				prefer_blink_capabilities = true,
-				single_file_support = false,
-				compile_commands_dir = nil,
-				require_compile_commands = true,
-				auto_generate_compile_commands = true,
-				auto_detect_windows = true,
-				suppress_unused_include_warnings = false,
-			},
 		},
 
 		-- Auto-pairs integration via nvim-autopairs.

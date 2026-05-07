@@ -113,10 +113,31 @@ function M.goto_implementation(project_root, payload, callback)
 	M.query(project_root, payload, callback)
 end
 
+-- Fetch hover information for the current buffer context.
+-- 根据当前 buffer 上下文获取 hover 信息。
+function M.get_hover(project_root, payload, callback)
+	payload.kind = "GetHover"
+	M.query(project_root, payload, callback)
+end
+
+-- Fetch signature help for the call expression around cursor.
+-- 获取当前光标所在调用表达式的签名帮助。
+function M.get_signature_help(project_root, payload, callback)
+	payload.kind = "GetSignatureHelp"
+	M.query(project_root, payload, callback)
+end
+
 -- Find references/usages for one symbol.
 -- 查找某个符号的引用/使用位置。
 function M.find_references(project_root, payload, callback)
 	payload.kind = "FindSymbolUsages"
+	M.query(project_root, payload, callback)
+end
+
+-- Parse one in-memory buffer and return cursor metadata.
+-- 解析内存中的当前 buffer，并返回光标相关元数据。
+function M.parse_buffer(project_root, payload, callback)
+	payload.kind = "ParseBuffer"
 	M.query(project_root, payload, callback)
 end
 

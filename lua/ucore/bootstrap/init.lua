@@ -1,6 +1,5 @@
 local client = require("ucore.client")
 local config = require("ucore.config")
-local lsp = require("ucore.lsp")
 local project = require("ucore.project")
 local server = require("ucore.server")
 local status = require("ucore.status")
@@ -9,8 +8,6 @@ local M = {}
 
 local booting = false
 local engine_refreshing = {}
-local clangd_prewarmed = {}
-local clangd_prewarming = {}
 
 -- Report boot failures through the persistent initialization status.
 -- 通过持久初始化状态报告 boot 错误。
@@ -29,17 +26,6 @@ local function other_progress(percent)
 	end
 
 	status.progress(title, message)
-end
-
-local function clangd_progress(percent)
-	status.progress(
-		"UCore Clangd Database",
-		string.format("UCore Clangd Database %d%%", percent)
-	)
-end
-
-local function clangd_progress_done(result)
-	status.progress_finish("UCore Clangd Database", "UCore Clangd Database 100%")
 end
 
 -- Build a setup/refresh/watch payload for the current Unreal project.
@@ -204,83 +190,6 @@ local function run_watch(payload, callback)
 	end)
 end
 
--- Prepare clangd compile_commands.json during boot so semantic diagnostics can
--- attach without requiring a separate manual command.
--- 在 boot 期间准备 clangd 的 compile_commands.json，避免再手动跑命令。
-local function run_clangd_prepare(payload, callback)
-	local clangd = (config.values.lsp and config.values.lsp.clangd) or {}
-	local project_root = payload.project_root
-	if project_root and clangd_prewarmed[project_root] then
-		status.progress_finish("UCore Clangd Database", "UCore Clangd Database 100%")
-		return callback(true, {
-			compile_commands_dir = lsp.find_compilation_database(project_root),
-			generated = false,
-			staged = true,
-		})
-	end
-
-	if project_root and clangd_prewarming[project_root] then
-		table.insert(clangd_prewarming[project_root], callback)
-		return
-	end
-
-	if clangd.auto_generate_compile_commands == false then
-		status.progress_finish("UCore Clangd Database", "UCore Clangd Database Skipped")
-		return callback(true)
-	end
-
-	if project_root then
-		clangd_prewarming[project_root] = { callback }
-	end
-
-	local function finish_callbacks(ok, result)
-		if not project_root then
-			return callback(ok, result)
-		end
-
-		local pending = clangd_prewarming[project_root] or {}
-		clangd_prewarming[project_root] = nil
-		for _, cb in ipairs(pending) do
-			cb(ok, result)
-		end
-	end
-
-	clangd_progress(0)
-	clangd_progress(50)
-
-	lsp.prepare_compile_commands(payload.project_root, {
-		remove_source = true,
-	}, function(ok, result)
-		if ok then
-			if project_root then
-				clangd_prewarmed[project_root] = true
-			end
-			clangd_progress_done(result)
-			return finish_callbacks(true, result)
-		end
-
-		status.progress_fail("UCore Clangd Database", "UCore Clangd Database Failed")
-		vim.schedule(function()
-			vim.notify(
-				"UCore Clangd Database Generation Failed:\n" .. tostring(result),
-				vim.log.levels.WARN
-			)
-		end)
-		finish_callbacks(true)
-	end)
-end
-
--- Warm clangd compile_commands once for the current project during setup.
--- 在 setup 期间为当前工程预热一次 clangd 的 compile_commands。
-function M.prewarm_clangd(project_root)
-	local payload, err = current_project_payload(project_root)
-	if not payload or err then
-		return
-	end
-
-	run_clangd_prepare(payload, function() end)
-end
-
 -- Boot the whole UCore stack for the current Unreal project.
 -- 为当前 Unreal 工程一键启动完整 UCore 流程。
 function M.boot(callback, opts)
@@ -349,7 +258,6 @@ function M.boot(callback, opts)
 						other_progress(100)
 						callback(true)
 						run_engine_refresh_in_background(payload)
-						run_clangd_prepare(payload, function() end)
 					end)
 				end)
 			end)

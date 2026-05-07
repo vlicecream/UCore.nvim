@@ -22,6 +22,8 @@ local queued_request = nil
 local scheduled_timer = nil
 local to_blink_item
 local prune_items
+local INSERT_TEXT_FORMAT_PLAIN_TEXT = 1
+local ucore_filetype_sources = { "ucore", "path", "snippets", "buffer" }
 
 local function current_prefix(ctx)
 	if type(ctx) == "table" then
@@ -217,12 +219,11 @@ end
 function M.extend_blink_opts(opts)
 	opts = opts or {}
 	opts.sources = opts.sources or {}
-	opts.sources.default = opts.sources.default or { "lsp", "path", "snippets", "buffer" }
+	opts.sources.default = opts.sources.default or { "path", "snippets", "buffer" }
 	opts.sources.per_filetype = opts.sources.per_filetype or {}
 	opts.sources.providers = opts.sources.providers or {}
-
-	if type(opts.sources.default) == "table" and not vim.tbl_contains(opts.sources.default, "ucore") then
-		table.insert(opts.sources.default, "ucore")
+	for filetype, _ in pairs(default_opts.filetypes) do
+		opts.sources.per_filetype[filetype] = vim.deepcopy(ucore_filetype_sources)
 	end
 
 	opts.sources.providers.ucore = vim.tbl_deep_extend("force", {
@@ -275,8 +276,8 @@ function M:get_trigger_characters()
 	}
 end
 
--- Convert Vim complete-item shape into LSP/blink completion item shape.
--- 把 Vim complete-item 结构转换成 LSP/blink completion item 结构。
+-- Convert Vim complete-item shape into blink completion item shape.
+-- 把 Vim complete-item 结构转换成 blink completion item 结构。
 to_blink_item = function(item)
 	local raw = item
 	if type(item.user_data) == "string" and item.user_data ~= "" then
@@ -294,7 +295,7 @@ to_blink_item = function(item)
 	local insert_text = raw.insert_text or raw.insertText or raw.word or raw.name or label
 	local kind = tonumber(raw.kind) or raw.kind
 	local insert_text_format = tonumber(raw.insertTextFormat or raw.insert_text_format)
-		or vim.lsp.protocol.InsertTextFormat.PlainText
+		or INSERT_TEXT_FORMAT_PLAIN_TEXT
 
 	return {
 		label = tostring(label),

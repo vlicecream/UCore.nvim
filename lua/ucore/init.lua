@@ -58,12 +58,6 @@ function M.setup(opts)
 	require("ucore.output").setup()
 	require("ucore.commands").register()
 	require("ucore.completion").setup()
-	pcall(function()
-		local lsp_config = require("ucore.config").values.lsp or {}
-		if lsp_config.auto_setup ~= false then
-			require("ucore.lsp").setup_clangd()
-		end
-	end)
 	require("ucore.keymaps").setup()
 	require("ucore.editing").setup()
 	require("ucore.semantic").setup()

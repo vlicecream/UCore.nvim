@@ -41,22 +41,9 @@ local panels = {
 		"progress:UCore Project Index",
 		"progress:UCore Engine Index",
 	}),
-	clang = make_panel("Clangd Init", "ucore.status.clang", {
-		"progress:UCore Clangd Database",
-		"progress:UCore Clangd Index",
-	}),
 }
 
 local function panel_for_key(key)
-	if key == "boot" then
-		return panels.init
-	end
-
-	local lower = tostring(key or ""):lower()
-	if lower:find("clangd", 1, true) then
-		return panels.clang
-	end
-
 	return panels.init
 end
 
@@ -72,7 +59,6 @@ end
 
 local function any_spinner_items()
 	return panel_has_spinner_items(panels.init)
-		or panel_has_spinner_items(panels.clang)
 end
 
 local function spinner_frame()
@@ -235,21 +221,13 @@ end
 
 local function render_now()
 	if uses_builtin_notify() then
-		local row = 1
-		row = row + render_float_panel("init", panels.init, row)
-		if panels.init and #panel_lines(panels.init) > 0 and #panel_lines(panels.clang) > 0 then
-			row = row + 1
-		end
-		render_float_panel("clang", panels.clang, row)
+		render_float_panel("init", panels.init, 1)
 		panels.init.notify_handle = nil
-		panels.clang.notify_handle = nil
 		return
 	end
 
 	close_float("init")
-	close_float("clang")
 	render_notify_panel(panels.init)
-	render_notify_panel(panels.clang)
 end
 
 local function render()
@@ -270,11 +248,7 @@ end
 
 local function dismiss_panel(panel)
 	if uses_builtin_notify() then
-		if panel == panels.init then
-			close_float("init")
-		elseif panel == panels.clang then
-			close_float("clang")
-		end
+		close_float("init")
 		panel.notify_handle = nil
 		return
 	end
@@ -343,16 +317,6 @@ local function should_ignore_suppressed_update(panel, key, message)
 	return is_terminal_message(message)
 end
 
-local function clang_panel_ready(panel)
-	for _, key in ipairs(panel.ordered_keys) do
-		if not panel.items[key] or not is_complete_message(panel.items[key]) then
-			return false
-		end
-	end
-
-	return not panel_has_spinner_items(panel)
-end
-
 local function schedule_panel_dismiss(panel, delay_ms)
 	if not panel.notify_handle then
 		return
@@ -369,13 +333,6 @@ local function schedule_panel_dismiss(panel, delay_ms)
 				clear_panel_contents(panel)
 				dismiss_panel(panel)
 			end
-			return
-		end
-
-		if panel == panels.clang and clang_panel_ready(panel) then
-			suppress_panel_keys(panel)
-			clear_panel_contents(panel)
-			dismiss_panel(panel)
 		end
 	end, delay_ms or 5000)
 end
@@ -408,7 +365,6 @@ end
 
 local function reset_all()
 	reset_panel(panels.init)
-	reset_panel(panels.clang)
 	render()
 end
 
@@ -491,9 +447,6 @@ function M.progress_finish(title, message)
 	render()
 	if panel == panels.init then
 		apply_pending_init_finish()
-	elseif (panel == panels.clang or panel == panels.debug) and clang_panel_ready(panel) then
-		panel.state = "complete"
-		schedule_panel_dismiss(panel, 5000)
 	end
 end
 

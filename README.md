@@ -42,7 +42,6 @@ It does **not** own syntax highlighting or VCS anymore:
 - `telescope.nvim` or `fzf-lua` if you want richer picker UI
 - `blink.cmp` if you want the UCore completion source
 - `nvim-autopairs` if you want pair/newline integration
-- `nvim-lspconfig` + `clangd` if you want semantic red/yellow diagnostics and LSP quick fixes
 
 ### Installation
 
@@ -68,10 +67,6 @@ return {
           return require("ucore.completion.blink").extend_blink_opts(opts)
         end,
       },
-
-      -- Optional on Neovim 0.11+, but still useful on older setups.
-      { "neovim/nvim-lspconfig" },
-
       {
         "nvim-telescope/telescope.nvim",
         dependencies = {
@@ -114,7 +109,12 @@ During build, `UCore.nvim` resolves the backend like this:
 
 ### Semantic Diagnostics
 
-For real C++ red/yellow diagnostics, use `clangd`.
+UCore owns the editing workflow for Unreal C++:
+
+- indexed completion
+- indexed navigation / references / global find
+- Unreal-specific diagnostics and fixes
+- build-output diagnostics rendering
 
 UCore itself focuses on:
 
@@ -122,72 +122,13 @@ UCore itself focuses on:
 - smart `Alt+Enter` fallback fixes
 - index-aware include insertion
 
-Undefined symbols, type mismatches, overload resolution, template errors, and most semantic diagnostics should come from `clangd`.
-
 Recommended setup:
 
 ```lua
-{
-  "vlicecream/UCore.nvim",
-  dependencies = {
-    { "neovim/nvim-lspconfig" }, -- optional on Neovim 0.11+
-  },
-}
+{ "vlicecream/UCore.nvim" }
 ```
 
-`setup_clangd()` is Unreal-aware:
-
-- adds `unreal_cpp` to clangd filetypes
-- forwards blink capabilities when available
-- prefers the Visual Studio LLVM `x64/bin/clangd.exe` on Windows when it is available
-- auto-detects a nearby `compile_commands.json` when possible
-- stages the active `compile_commands.json` into the UCore project cache and points clangd there
-- by default, skips attaching clangd when no compilation database is found, to avoid noisy false diagnostics
-- defaults to a low-memory clangd profile for Unreal projects; background indexing stays opt-in
-- disables clangd formatting and marks Unreal buffers as non-autoformat by default, so format-on-save will not rewrite Unreal brace style
-
-For a normal Windows Unreal setup, you usually do not need to hardcode a `clangd.exe` path or manage `compile_commands.json` manually. UCore tries to resolve both automatically.
-
-During normal `:UCore` boot, UCore can generate and stage the Unreal compilation database automatically when UnrealBuildTool is available.
-
-If your compilation database lives outside the project root:
-
-```lua
-require("ucore").setup({
-  lsp = {
-    clangd = {
-      compile_commands_dir = "D:/YourProject/.vscode",
-    },
-  },
-})
-```
-
-If you explicitly want clangd to attach without `compile_commands.json`:
-
-```lua
-require("ucore").setup({
-  lsp = {
-    clangd = {
-      require_compile_commands = false,
-    },
-  },
-})
-```
-
-If you explicitly want clangd formatting, opt in:
-
-```lua
-require("ucore").setup({
-  lsp = {
-    clangd = {
-      formatting = true,
-    },
-  },
-  editing = {
-    disable_autoformat = false,
-  },
-})
-```
+Final compiler truth should come from Unreal build output / MSVC, not from a separate external diagnostics layer.
 
 ### blink.cmp Keymaps
 
@@ -310,12 +251,6 @@ require("ucore").setup({
     update_in_insert = true,
     debounce_ms = 300,
   },
-  lsp = {
-    clangd = {
-      command = "clangd",
-      compile_commands_dir = nil,
-    },
-  },
   semantic = {
     enable = true,
     debounce_ms = 120,
@@ -346,7 +281,7 @@ Neovim (Lua)
 Use the split repos for runtime workflows:
 
 - `UScanner` for the Rust backend source (`u_scanner` and `u_core_server`)
-- `UBuildTool.nvim` for Unreal build, build cancel, editor launch, and clangd database preparation
+- `UBuildTool.nvim` for Unreal build, build cancel, and editor launch
 - `UDebugTool.nvim` for Unreal attach / launch-under-debugger / breakpoints / minimal debug UI
 
 ### Troubleshooting
@@ -369,7 +304,7 @@ Common cases:
 UTreeSitter                  grammar + queries + parser tests
 UTreeSitter.nvim             Neovim parser/filetype/highlight integration
 UVersionControlSystem.nvim   Unreal VCS dashboard and actions
-UBuildTool.nvim              Unreal build, editor launch, clangd database prep
+UBuildTool.nvim              Unreal build, editor launch
 UDebugTool.nvim              Unreal debugging on top of nvim-dap
 UCore.nvim                   Unreal project index, RPC, navigation, completion
 ```
@@ -415,7 +350,6 @@ MIT
 - `telescope.nvim` 或 `fzf-lua`（需要更完整的 picker 时）
 - `blink.cmp`（需要 UCore 补全源时）
 - `nvim-autopairs`（需要自动配对和回车展开时）
-- `nvim-lspconfig` + `clangd`（需要真正的语义红线黄线和 LSP quick fix 时）
 
 ### 安装
 
@@ -440,10 +374,6 @@ return {
         opts = function(_, opts)
           return require("ucore.completion.blink").extend_blink_opts(opts)
         end,
-      },
-
-      {
-        "neovim/nvim-lspconfig", -- Neovim 0.11+ 可选，老环境建议保留
       },
 
       {
@@ -475,7 +405,7 @@ return {
 
 - 需要 Unreal tree-sitter 高亮时再装 `UTreeSitter.nvim`
 - 需要 Unreal VCS 面板和操作时再装 `UVersionControlSystem.nvim`
-- 需要 Unreal 构建、启动 Editor、clangd 数据库准备时再装 `UBuildTool.nvim`
+- 需要 Unreal 构建、启动 Editor 时再装 `UBuildTool.nvim`
 - 需要 Unreal 调试时再装 `UDebugTool.nvim`
 
 `extend_blink_opts()` 只在配置阶段补全 `blink.cmp` 选项，UCore 不会在运行时改写 blink 配置。
@@ -488,7 +418,12 @@ return {
 
 ### 语义诊断
 
-真正的 C++ 红线黄线，请交给 `clangd`。
+UCore 直接接管 Unreal C++ 的编辑工作流：
+
+- 基于索引的补全
+- 基于索引的跳转 / 引用 / 全局搜索
+- Unreal 专属诊断和修复
+- build 输出诊断展示
 
 UCore 自己主要负责：
 
@@ -496,72 +431,13 @@ UCore 自己主要负责：
 - `Alt+Enter` 的智能回退修复
 - 基于索引的 include 插入
 
-未定义符号、类型不匹配、重载解析、模板错误这类语义问题，应该由 `clangd` 提供。
-
 推荐接法：
 
 ```lua
-{
-  "vlicecream/UCore.nvim",
-  dependencies = {
-    { "neovim/nvim-lspconfig" }, -- Neovim 0.11+ 可选
-  },
-}
+{ "vlicecream/UCore.nvim" }
 ```
 
-`setup_clangd()` 会专门帮 Unreal 处理这些事：
-
-- 把 `unreal_cpp` 加进 clangd filetype
-- 有 `blink.cmp` 时自动补全 capabilities
-- 在 Windows 上优先使用 Visual Studio LLVM 里的 `x64/bin/clangd.exe`
-- 尽量自动查找附近的 `compile_commands.json`
-- 把当前生效的 `compile_commands.json` 归档到 UCore 项目缓存目录，再让 clangd 指向那里
-- 默认在找不到编译数据库时不 attach clangd，避免满屏错误红线
-- 默认使用更保守的低内存 clangd 参数，后台索引改成按需开启
-- 默认关闭 clangd 格式化能力，并把 Unreal buffer 标记为不自动格式化，避免 format-on-save 把 Unreal 代码改成非 UE 大括号风格
-
-对大多数 Windows Unreal 环境来说，通常不需要手写 `clangd.exe` 路径，也不需要自己管理 `compile_commands.json` 放哪里，UCore 会优先自动处理。
-
-正常执行 `:UCore` boot 时，只要 UnrealBuildTool 可用，UCore 就会自动生成并缓存 Unreal 的 compilation database。
-
-如果你的编译数据库不在项目根目录下：
-
-```lua
-require("ucore").setup({
-  lsp = {
-    clangd = {
-      compile_commands_dir = "D:/YourProject/.vscode",
-    },
-  },
-})
-```
-
-如果你就是要在没有 `compile_commands.json` 的情况下也强行 attach：
-
-```lua
-require("ucore").setup({
-  lsp = {
-    clangd = {
-      require_compile_commands = false,
-    },
-  },
-})
-```
-
-如果你明确想让 clangd 接管格式化，可以手动打开：
-
-```lua
-require("ucore").setup({
-  lsp = {
-    clangd = {
-      formatting = true,
-    },
-  },
-  editing = {
-    disable_autoformat = false,
-  },
-})
-```
+最终编译真相请以 Unreal build / MSVC 为准，不再依赖额外的外部诊断层。
 
 ### blink.cmp 按键
 
@@ -666,12 +542,6 @@ require("ucore").setup({
     signs = true,
     debounce_ms = 300,
   },
-  lsp = {
-    clangd = {
-      command = "clangd",
-      compile_commands_dir = nil,
-    },
-  },
   semantic = {
     enable = true,
     debounce_ms = 120,
@@ -702,7 +572,7 @@ Neovim (Lua)
 运行时工作流请使用拆分仓库：
 
 - `UScanner`：负责 Rust 后端源码（`u_scanner` 和 `u_core_server`）
-- `UBuildTool.nvim`：负责 Unreal 构建、停止构建、启动 Editor、准备 clangd 数据库
+- `UBuildTool.nvim`：负责 Unreal 构建、停止构建、启动 Editor
 - `UDebugTool.nvim`：负责 Unreal attach、调试器下启动、断点、最轻调试 UI
 
 ### 排查
@@ -725,7 +595,7 @@ Neovim (Lua)
 UTreeSitter                  grammar + queries + parser tests
 UTreeSitter.nvim             Neovim parser/filetype/highlight integration
 UVersionControlSystem.nvim   Unreal VCS dashboard and actions
-UBuildTool.nvim              Unreal 构建、启动 Editor、准备 clangd 数据库
+UBuildTool.nvim              Unreal 构建、启动 Editor
 UDebugTool.nvim              基于 nvim-dap 的 Unreal 调试
 UCore.nvim                   Unreal project index, RPC, navigation, completion
 ```

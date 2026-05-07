@@ -351,58 +351,11 @@ local function report_completion_checks()
 	end
 end
 
-local function report_lsp_checks()
-	start("C++ diagnostics / clangd")
-
-	local lsp_config = (config.values.lsp and config.values.lsp.clangd) or {}
-	local lsp = require("ucore.lsp")
-	local status = lsp.clangd_status(project.find_project_root())
-	local clangd_cmd = status.command or lsp_config.command or "clangd"
-	info("configured clangd command: " .. tostring(lsp_config.command or "clangd"))
-	info("resolved clangd command: " .. tostring(clangd_cmd))
-	info("auto setup: " .. yes_no((config.values.lsp or {}).auto_setup ~= false))
-	info("auto generate compile_commands.json: " .. yes_no(status.auto_generate_compile_commands))
-
-	if executable(clangd_cmd) or readable(clangd_cmd) then
-		ok("clangd executable available")
-	else
-		warn("clangd executable not found", {
-			"Install clangd or point UCore at a concrete clangd.exe path.",
-		})
-	end
-
-	if has_module("lspconfig") then
-		ok("nvim-lspconfig available")
-	else
-		info("nvim-lspconfig not available; native vim.lsp API can still be used")
-	end
-
-	local root = project.find_project_root()
-	if root then
-		local compile_db = status.compile_commands_dir
-		info("require compile_commands.json: " .. yes_no(lsp_config.require_compile_commands ~= false))
-		if compile_db then
-			ok("compile_commands.json found under: " .. compile_db)
-		else
-			warn("compile_commands.json not found for current project", {
-				"With the default UCore clangd policy, clangd will not attach until a compilation database is available.",
-				"During normal :UCore boot, UCore can try to generate and cache the database automatically when UnrealBuildTool is available.",
-				"Set require('ucore').setup({ lsp = { clangd = { compile_commands_dir = '...' } } }) if your database lives outside the project root.",
-				"Or set require('ucore').setup({ lsp = { clangd = { require_compile_commands = false } } }) if you want clangd to attach anyway.",
-			})
-		end
-	end
-
-	local bufnr = vim.api.nvim_get_current_buf()
-	local clients = vim.lsp.get_clients({ bufnr = bufnr, name = "clangd" })
-	if #clients > 0 then
-		ok("clangd attached to current buffer")
-		info("current buffer filetype: " .. tostring(vim.bo[bufnr].filetype))
-	else
-		info("clangd not attached to current buffer")
-		info("current buffer filetype: " .. tostring(vim.bo[bufnr].filetype))
-		info("UCore can auto-enable clangd; make sure the current buffer is inside an Unreal project and compile_commands.json is present.")
-	end
+local function report_cpp_workflow()
+	start("C++ workflow")
+	ok("UCore-owned C++ workflow enabled")
+	info("completion/navigation/diagnostics are handled by UCore")
+	info("final compiler truth should come from Unreal build / MSVC")
 end
 
 local function report_treesitter_checks()
@@ -430,7 +383,7 @@ function M.check()
 	report_server_checks()
 	report_ui_checks()
 	report_completion_checks()
-	report_lsp_checks()
+	report_cpp_workflow()
 	report_treesitter_checks()
 end
 

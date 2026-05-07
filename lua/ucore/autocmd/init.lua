@@ -8,7 +8,6 @@ local group_name = "UCoreAutoBoot"
 local booted_projects = {}
 local pending_projects = {}
 local attempts_scheduled = false
-local clangd_warm_requested = {}
 local find_warm_requested = {}
 
 local function prewarm_find(root, opts)
@@ -94,10 +93,6 @@ local function try_auto_boot(args)
 		if root then
 			attempts_scheduled = false
 			require("ucore.explorer").auto_open_for_project(root)
-			if not clangd_warm_requested[root] then
-				clangd_warm_requested[root] = true
-				bootstrap.prewarm_clangd(root)
-			end
 			if not find_warm_requested[root] then
 				find_warm_requested[root] = true
 				vim.defer_fn(function()
@@ -137,7 +132,6 @@ function M.reset()
 	booted_projects = {}
 	pending_projects = {}
 	attempts_scheduled = false
-	clangd_warm_requested = {}
 	find_warm_requested = {}
 end
 

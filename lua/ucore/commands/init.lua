@@ -27,6 +27,11 @@ function M.dispatch(args)
 		["goto"] = function()
 			actions.goto(tail)
 		end,
+		hover = actions.hover,
+		signature = actions.signature_help,
+		rename = function()
+			actions.rename(tail)
+		end,
 		new = function()
 			ucore_new.create(tail)
 		end,
@@ -53,6 +58,9 @@ function M.register()
 				"explorer",
 				"find",
 				"goto",
+				"hover",
+				"signature",
+				"rename",
 				"new",
 				"help",
 			}
