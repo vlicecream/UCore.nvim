@@ -1,5 +1,6 @@
 local client = require("ucore.client")
 local config = require("ucore.config")
+local protocol = require("ucore.protocol")
 local project = require("ucore.project")
 local server = require("ucore.server")
 local status = require("ucore.status")
@@ -83,6 +84,33 @@ local function wait_ready(attempt, callback)
 		vim.defer_fn(function()
 			wait_ready(attempt + 1, callback)
 		end, config.values.boot_ready_interval_ms)
+	end)
+end
+
+local function wait_compatible(payload, replaced, callback)
+	wait_ready(1, function(ready, result)
+		if not ready then
+			return callback(false, result)
+		end
+
+		if protocol.is_compatible(result) then
+			return callback(true, result)
+		end
+
+		if replaced then
+			return callback(false, protocol.compatibility_error(result))
+		end
+
+		other_progress(30)
+		server.replace(function(ok, replace_message)
+			if not ok then
+				return callback(false, replace_message)
+			end
+
+			wait_compatible(payload, true, callback)
+		end, {
+			project_root = payload.project_root,
+		})
 	end)
 end
 
@@ -224,7 +252,7 @@ function M.boot(callback, opts)
 		end
 		other_progress(25)
 
-		wait_ready(1, function(ready, ready_err)
+		wait_compatible(payload, false, function(ready, ready_err)
 			if not ready then
 				booting = false
 				fail(tostring(ready_err), "Log: " .. tostring(server.log_path()))

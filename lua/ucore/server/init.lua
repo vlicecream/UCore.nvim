@@ -1,4 +1,5 @@
 local config = require("ucore.config")
+local rpc = require("ucore.client.rpc")
 local project = require("ucore.project")
 
 local M = {}
@@ -21,6 +22,117 @@ local function kill_process_tree(pid)
 		"-Command",
 		string.format("taskkill /PID %d /T /F *> $null", pid),
 	}, { text = true })
+end
+
+local function find_windows_listener(port, callback)
+	local shell = vim.fn.executable("pwsh") == 1 and "pwsh" or "powershell"
+	local command = table.concat({
+		"$port = " .. tostring(port),
+		"$conn = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1",
+		"if (-not $conn) {",
+		"  $line = netstat -ano -p tcp | Select-String (':'+$port+'\\s+.*LISTENING\\s+(\\d+)$') | Select-Object -First 1",
+		"  if ($line) {",
+		"    $match = [regex]::Match($line.Line, '(\\d+)$')",
+		"    if ($match.Success) {",
+		"      $pid = [int]$match.Groups[1].Value",
+		"      $proc = Get-CimInstance Win32_Process -Filter ('ProcessId = ' + $pid) -ErrorAction SilentlyContinue",
+		"      if ($proc) { $proc | Select-Object ProcessId, Name, CommandLine | ConvertTo-Json -Compress; exit 0 }",
+		"    }",
+		"  }",
+		"  exit 0",
+		"}",
+		"$pid = [int]$conn.OwningProcess",
+		"$proc = Get-CimInstance Win32_Process -Filter ('ProcessId = ' + $pid) -ErrorAction SilentlyContinue",
+		"if ($proc) { $proc | Select-Object ProcessId, Name, CommandLine | ConvertTo-Json -Compress }",
+	}, " ")
+
+	vim.system({
+		shell,
+		"-NoProfile",
+		"-Command",
+		command,
+	}, { text = true }, function(result)
+		vim.schedule(function()
+			if result.code ~= 0 then
+				return callback(nil, result.stderr ~= "" and result.stderr or result.stdout)
+			end
+
+			local stdout = vim.trim(result.stdout or "")
+			if stdout == "" then
+				return callback(nil, nil)
+			end
+
+			local ok, decoded = pcall(vim.json.decode, stdout)
+			if not ok or type(decoded) ~= "table" then
+				return callback(nil, "Failed to decode listener info: " .. stdout)
+			end
+
+			callback(decoded, nil)
+		end)
+	end)
+end
+
+local function find_listener(port, callback)
+	if vim.fn.has("win32") == 1 then
+		return find_windows_listener(port, callback)
+	end
+
+	callback(nil, "Finding external UCore server is only implemented on Windows")
+end
+
+local function is_ucore_server_process(proc)
+	if type(proc) ~= "table" then
+		return false
+	end
+
+	local name = tostring(proc.Name or proc.name or ""):lower()
+	local command_line = tostring(proc.CommandLine or proc.commandline or ""):lower()
+	return name:find("u_core_server", 1, true) ~= nil or command_line:find("u_core_server", 1, true) ~= nil
+end
+
+local function kill_port_owner(port, callback)
+	find_listener(port, function(proc, err)
+		if err then
+			return callback(false, err)
+		end
+
+		if not proc then
+			return callback(true, "No server is listening on the UCore port")
+		end
+
+		local pid = tonumber(proc.ProcessId or proc.processid)
+		if not pid then
+			return callback(false, "Could not resolve the listening process id")
+		end
+
+		if job and job.pid == pid then
+			return M.stop(function(ok, stop_message)
+				if not ok then
+					return callback(false, stop_message)
+				end
+
+				vim.defer_fn(function()
+					callback(true, stop_message)
+				end, 500)
+			end)
+		end
+
+		if not is_ucore_server_process(proc) then
+			return callback(
+				false,
+				string.format(
+					"Port %d is occupied by a non-UCore process: %s",
+					port,
+					tostring(proc.Name or proc.name or pid)
+				)
+			)
+		end
+
+		kill_process_tree(pid)
+		vim.defer_fn(function()
+			callback(true, string.format("Stopped external UCore server pid %d", pid))
+		end, 500)
+	end)
 end
 
 -- Check whether the managed server job is still running.
@@ -160,6 +272,46 @@ function M.restart(callback)
 	M.stop(function()
 		M.start(callback)
 	end)
+end
+
+-- Replace whatever server is currently listening with the latest local build.
+-- 用当前本地最新构建替换正在监听端口的 server。
+function M.replace(callback, opts)
+	callback = callback or function() end
+	opts = opts or {}
+
+	local root = opts.project_root or project.find_project_root_from_context({
+		registered_fallback = false,
+	})
+	if not root then
+		return callback(false, "Could not find .uproject")
+	end
+
+	rpc.close()
+
+	local function start_latest()
+		kill_port_owner(config.values.port, function(ok, message)
+			if not ok then
+				return callback(false, message)
+			end
+
+			M.start(callback, {
+				project_root = root,
+			})
+		end)
+	end
+
+	if M.is_running() then
+		return M.stop(function(ok, message)
+			if not ok then
+				return callback(false, message)
+			end
+
+			start_latest()
+		end)
+	end
+
+	start_latest()
 end
 
 return M
