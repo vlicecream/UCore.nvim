@@ -7,6 +7,14 @@ local float_state = {
 	buf = nil,
 	win = nil,
 	group = nil,
+	kind = nil,
+	auto = false,
+}
+
+local auto_state = {
+	group = nil,
+	hover_seq = 0,
+	signature_seq = 0,
 }
 
 local function normalize_path(path)
@@ -72,6 +80,8 @@ local function close_float()
 
 	float_state.win = nil
 	float_state.buf = nil
+	float_state.kind = nil
+	float_state.auto = false
 end
 
 local function display_path(path)
@@ -305,16 +315,19 @@ local function open_float(lines, opts)
 	})
 
 	float_state.win = win
+	float_state.kind = opts.kind
+	float_state.auto = opts.auto == true
 
 	local group = vim.api.nvim_create_augroup("UCoreAssistFloat", { clear = true })
 	float_state.group = group
-	vim.api.nvim_create_autocmd({
+	local close_events = opts.close_events or {
 		"CursorMoved",
 		"CursorMovedI",
 		"BufLeave",
 		"WinLeave",
 		"InsertEnter",
-	}, {
+	}
+	vim.api.nvim_create_autocmd(close_events, {
 		group = group,
 		callback = close_float,
 	})
@@ -339,10 +352,19 @@ local function ensure_project_context()
 end
 
 function M.hover()
+	return M.hover_auto({ auto = false })
+end
+
+function M.hover_auto(opts)
+	opts = opts or {}
 	local ctx = ensure_project_context()
 	if not ctx then
 		return
 	end
+
+	local sequence = opts.sequence
+	local bufnr = ctx.bufnr
+	local changedtick = vim.api.nvim_buf_get_changedtick(bufnr)
 
 	remote.get_hover(ctx.root, {
 		content = ctx.content,
@@ -351,12 +373,27 @@ function M.hover()
 		file_path = ctx.file_path,
 	}, function(result, err)
 		if err then
+			if opts.auto then
+				return
+			end
 			return vim.schedule(function()
 				vim.notify("UCore hover failed:\n" .. tostring(err), vim.log.levels.ERROR)
 			end)
 		end
 
+		if opts.auto then
+			if auto_state.hover_seq ~= sequence then
+				return
+			end
+			if not vim.api.nvim_buf_is_valid(bufnr) or vim.api.nvim_buf_get_changedtick(bufnr) ~= changedtick then
+				return
+			end
+		end
+
 		if is_json_null(result) or (type(result) == "table" and vim.tbl_isempty(result)) then
+			if opts.auto and float_state.auto and float_state.kind == "hover" then
+				vim.schedule(close_float)
+			end
 			return
 		end
 
@@ -364,16 +401,27 @@ function M.hover()
 			open_float(hover_lines(result), {
 				filetype = "text",
 				min_width = 28,
+				kind = "hover",
+				auto = opts.auto == true,
 			})
 		end)
 	end)
 end
 
 function M.signature_help()
+	return M.signature_help_auto({ auto = false })
+end
+
+function M.signature_help_auto(opts)
+	opts = opts or {}
 	local ctx = ensure_project_context()
 	if not ctx then
 		return
 	end
+
+	local sequence = opts.sequence
+	local bufnr = ctx.bufnr
+	local changedtick = vim.api.nvim_buf_get_changedtick(bufnr)
 
 	remote.get_signature_help(ctx.root, {
 		content = ctx.content,
@@ -382,12 +430,27 @@ function M.signature_help()
 		file_path = ctx.file_path,
 	}, function(result, err)
 		if err then
+			if opts.auto then
+				return
+			end
 			return vim.schedule(function()
 				vim.notify("UCore signature help failed:\n" .. tostring(err), vim.log.levels.ERROR)
 			end)
 		end
 
+		if opts.auto then
+			if auto_state.signature_seq ~= sequence then
+				return
+			end
+			if not vim.api.nvim_buf_is_valid(bufnr) or vim.api.nvim_buf_get_changedtick(bufnr) ~= changedtick then
+				return
+			end
+		end
+
 		if is_json_null(result) or vim.tbl_isempty(list_value(type(result) == "table" and result.signatures or nil)) then
+			if opts.auto and float_state.auto and float_state.kind == "signature" then
+				vim.schedule(close_float)
+			end
 			return
 		end
 
@@ -395,6 +458,15 @@ function M.signature_help()
 			open_float(signature_lines(result), {
 				filetype = "text",
 				min_width = 36,
+				kind = "signature",
+				auto = opts.auto == true,
+				close_events = {
+					"CursorMoved",
+					"CursorMovedI",
+					"BufLeave",
+					"WinLeave",
+					"InsertLeave",
+				},
 			})
 		end)
 	end)
@@ -547,6 +619,91 @@ function M.rename(new_name)
 end
 
 function M.close_float()
+	close_float()
+end
+
+local function auto_hover_enabled()
+	local mode = vim.api.nvim_get_mode().mode
+	return mode == "n"
+end
+
+local function auto_signature_enabled()
+	local mode = vim.api.nvim_get_mode().mode
+	return mode == "i" or mode == "ic" or mode == "ix"
+end
+
+local function schedule_auto_hover()
+	if not auto_hover_enabled() then
+		return
+	end
+
+	auto_state.hover_seq = auto_state.hover_seq + 1
+	local sequence = auto_state.hover_seq
+
+	vim.defer_fn(function()
+		if auto_state.hover_seq ~= sequence or not auto_hover_enabled() then
+			return
+		end
+		M.hover_auto({
+			auto = true,
+			sequence = sequence,
+		})
+	end, 80)
+end
+
+local function schedule_auto_signature()
+	if not auto_signature_enabled() then
+		return
+	end
+
+	auto_state.signature_seq = auto_state.signature_seq + 1
+	local sequence = auto_state.signature_seq
+
+	vim.defer_fn(function()
+		if auto_state.signature_seq ~= sequence or not auto_signature_enabled() then
+			return
+		end
+		M.signature_help_auto({
+			auto = true,
+			sequence = sequence,
+		})
+	end, 60)
+end
+
+function M.setup()
+	M.reset()
+
+	local group = vim.api.nvim_create_augroup("UCoreAssistAuto", { clear = true })
+	auto_state.group = group
+
+	vim.api.nvim_create_autocmd("CursorHold", {
+		group = group,
+		callback = schedule_auto_hover,
+	})
+
+	vim.api.nvim_create_autocmd({ "TextChangedI", "CursorMovedI", "InsertEnter" }, {
+		group = group,
+		callback = schedule_auto_signature,
+	})
+
+	vim.api.nvim_create_autocmd({ "InsertLeave", "BufLeave", "WinLeave" }, {
+		group = group,
+		callback = function()
+			auto_state.signature_seq = auto_state.signature_seq + 1
+			if float_state.auto and float_state.kind == "signature" then
+				close_float()
+			end
+		end,
+	})
+end
+
+function M.reset()
+	auto_state.hover_seq = auto_state.hover_seq + 1
+	auto_state.signature_seq = auto_state.signature_seq + 1
+	if auto_state.group then
+		pcall(vim.api.nvim_del_augroup_by_id, auto_state.group)
+		auto_state.group = nil
+	end
 	close_float()
 end
 

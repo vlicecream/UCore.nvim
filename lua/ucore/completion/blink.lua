@@ -23,7 +23,7 @@ local scheduled_timer = nil
 local to_blink_item
 local prune_items
 local INSERT_TEXT_FORMAT_PLAIN_TEXT = 1
-local ucore_filetype_sources = { "ucore", "path", "snippets", "buffer" }
+local ucore_filetype_sources = { "ucore", "lsp", "path", "snippets", "buffer" }
 
 local function current_prefix(ctx)
 	if type(ctx) == "table" then
@@ -230,7 +230,7 @@ function M.extend_blink_opts(opts)
 		name = "UCore",
 		module = "ucore.completion.blink",
 		async = true,
-		timeout_ms = 2000,
+		timeout_ms = 8000,
 		min_keyword_length = 0,
 		score_offset = 50,
 	}, opts.sources.providers.ucore or {})
