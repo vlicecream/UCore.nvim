@@ -1,4 +1,5 @@
 local actions = require("ucore.commands.actions")
+local ucore_new = require("ucore.unreal.new")
 
 local M = {}
 
@@ -26,6 +27,9 @@ function M.dispatch(args)
 		["goto"] = function()
 			actions.goto(tail)
 		end,
+		new = function()
+			ucore_new.create(tail)
+		end,
 		help = actions.help,
 	}
 
@@ -49,6 +53,7 @@ function M.register()
 				"explorer",
 				"find",
 				"goto",
+				"new",
 				"help",
 			}
 
