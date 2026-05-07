@@ -1,4 +1,5 @@
 local config = require("ucore.config")
+local project = require("ucore.project")
 
 local M = {}
 local FIND_PREVIEW_MAX_LINES = 200
@@ -135,6 +136,45 @@ local function display_path(path)
 	end
 
 	return path
+end
+
+local function relative_unreal_path(path)
+	path = tostring(path or ""):gsub("\\", "/")
+	if path == "" then
+		return path
+	end
+
+	local project_root = project.find_project_root_from_context()
+	if project_root and project_root ~= "" then
+		project_root = project_root:gsub("\\", "/")
+		if path:lower():sub(1, #project_root) == project_root:lower() then
+			local relative = path:sub(#project_root + 2)
+			if relative ~= "" then
+				return relative
+			end
+		end
+
+		local engine = project.cached_engine_metadata(project_root) or project.engine_metadata(project_root)
+		local engine_root = engine and tostring(engine.engine_root or ""):gsub("\\", "/") or ""
+		if engine_root ~= "" and path:lower():sub(1, #engine_root) == engine_root:lower() then
+			local relative = path:sub(#engine_root + 2)
+			if relative ~= "" then
+				return relative
+			end
+		end
+	end
+
+	local source_index = path:lower():find("/source/", 1, true)
+	if source_index then
+		return path:sub(source_index + 1)
+	end
+
+	local engine_index = path:lower():find("/engine/", 1, true)
+	if engine_index then
+		return path:sub(engine_index + 1)
+	end
+
+	return display_path(path)
 end
 
 local function compact_path(path, width)
@@ -870,7 +910,7 @@ local function pick_telescope_references(references)
 					local col = tonumber(item.col or item.column or 0) or 0
 					local context = tostring(item.context or item.text or ""):gsub("^%s+", "")
 					local label = reference_label(item.kind)
-					local location = string.format("[%s] %s:%d:%d", label, display_path(path), line, col + 1)
+					local location = string.format("[%s] %s:%d:%d", label, relative_unreal_path(path), line, col + 1)
 
 					return {
 						value = item,
@@ -1386,7 +1426,7 @@ function M.references(references)
 		local context = tostring(item.context or item.text or ""):gsub("^%s+", "")
 		local label = reference_label(item.kind)
 
-		local location = string.format("[%s] %s:%d:%d", label, display_path(path), line, col + 1)
+		local location = string.format("[%s] %s:%d:%d", label, relative_unreal_path(path), line, col + 1)
 		location = pad_right(truncate_left(location, 72), 72)
 
 		if context ~= "" then

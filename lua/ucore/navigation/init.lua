@@ -266,6 +266,7 @@ end
 local function find_function_signature(lines, opts)
 	local signature = normalize_space(opts.signature)
 	local locator = opts.locator or opts.signature
+	local locator_col_offset = tonumber(opts.locator_col_offset or 0) or 0
 	local max_span = opts.max_span or 6
 
 	if signature == "" or vim.tbl_isempty(lines or {}) then
@@ -285,7 +286,7 @@ local function find_function_signature(lines, opts)
 					if col then
 						return {
 							line = target_line,
-							col = col - 1,
+							col = math.max(0, col - 1 + locator_col_offset),
 						}
 					end
 				end
@@ -353,9 +354,11 @@ local function try_counterpart_from_header(root, file_path, line, character, cal
 
 		local lines = lines_for_path(source_path)
 		for _, name in ipairs(implementation_target_names(cursor_info)) do
+			local qualified_name = string.format("%s::%s", class_name, name)
 			local match = find_function_signature(lines, {
-				signature = string.format("%s::%s%s", class_name, name, params),
-				locator = name,
+				signature = qualified_name .. params,
+				locator = qualified_name,
+				locator_col_offset = #class_name + 2,
 			})
 			if match then
 				return callback(open_path_at(source_path, match.line, match.col))
