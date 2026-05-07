@@ -1,3 +1,4 @@
+local backend = require("ucore.backend")
 local client = require("ucore.client")
 local config = require("ucore.config")
 local protocol = require("ucore.protocol")
@@ -102,15 +103,32 @@ local function wait_compatible(payload, replaced, callback)
 		end
 
 		other_progress(30)
-		server.replace(function(ok, replace_message)
+		local function replace_server()
+			server.replace(function(ok, replace_message)
+				if not ok then
+					return callback(false, replace_message)
+				end
+
+				wait_compatible(payload, true, callback)
+			end, {
+				project_root = payload.project_root,
+			})
+		end
+
+		if not backend.can_update_managed_backend() then
+			return replace_server()
+		end
+
+		status.progress("UCore Backend Update", "UCore Backend Update 0%")
+		backend.update_managed_backend(function(ok, update_message)
 			if not ok then
-				return callback(false, replace_message)
+				status.progress_fail("UCore Backend Update", "UCore Backend Update Failed")
+				return callback(false, update_message)
 			end
 
-			wait_compatible(payload, true, callback)
-		end, {
-			project_root = payload.project_root,
-		})
+			status.progress_finish("UCore Backend Update", "UCore Backend Update 100%")
+			replace_server()
+		end)
 	end)
 end
 
