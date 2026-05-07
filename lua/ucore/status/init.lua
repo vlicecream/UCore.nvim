@@ -320,7 +320,7 @@ local function is_complete_message(text)
 		return false
 	end
 
-	return text:find("100%%", 1, false) ~= nil or text:find("Skipped", 1, true) ~= nil
+	return text:find("100%", 1, true) ~= nil or text:find("Skipped", 1, true) ~= nil
 end
 
 local function is_terminal_message(text)
