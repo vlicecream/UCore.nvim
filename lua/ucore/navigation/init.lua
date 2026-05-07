@@ -495,7 +495,7 @@ function M.goto_implementation()
 				return vim.notify("UCore goto implementation failed:\n" .. tostring(err), vim.log.levels.ERROR)
 			end
 			vim.cmd("nohlsearch")
-			open_result(result)
+			open_result(result, { silent = true })
 		end)
 	end)
 end
