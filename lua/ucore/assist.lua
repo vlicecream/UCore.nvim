@@ -203,7 +203,6 @@ local function hover_content(item)
 	local kind = text_value(item.kind)
 	local class_name = text_value(item.class_name ~= vim.NIL and item.class_name or item.owner_class)
 	local params = text_value(not is_json_null(item.parameters) and item.parameters or item.detail)
-	local source = text_value(item.source)
 	local line_number = tonumber(item.line_number or item.line or 0) or 0
 	local file_path = text_value(item.file_path)
 
@@ -278,10 +277,6 @@ local function hover_content(item)
 		push_labeled_line(lines, highlights, "path:", location, "Directory")
 	end
 
-	if source ~= "" then
-		push_labeled_line(lines, highlights, "source:", source, "Comment")
-	end
-
 	return lines, highlights
 end
 
@@ -329,6 +324,10 @@ local function open_float(lines, opts)
 	vim.bo[buf].swapfile = false
 	vim.bo[buf].modifiable = false
 	vim.bo[buf].filetype = opts.filetype or "text"
+
+	if opts.syntax_filetype then
+		pcall(vim.treesitter.start, buf, opts.syntax_filetype)
+	end
 
 	for _, item in ipairs(opts.highlights or {}) do
 		pcall(vim.api.nvim_buf_add_highlight, buf, -1, item.group, item.line, item.start_col, item.end_col)
@@ -443,6 +442,7 @@ function M.hover_auto(opts)
 				kind = "hover",
 				auto = opts.auto == true,
 				highlights = highlights,
+				syntax_filetype = "cpp",
 			})
 		end)
 	end)
