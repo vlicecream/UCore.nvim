@@ -1,6 +1,7 @@
 local project = require("ucore.project")
 local remote = require("ucore.remote")
 local select_ui = require("ucore.ui.select")
+local write_access = require("ucore.write_access")
 
 local M = {}
 
@@ -503,8 +504,8 @@ local function ensure_buffer_for_path(path)
 	return bufnr
 end
 
-local function apply_rename_edits(project_root, old_name, new_name, items)
-	local grouped = {}
+local function collect_rename_items(project_root, items)
+	local results = {}
 	project_root = normalize_path(project_root)
 
 	for _, item in ipairs(items or {}) do
@@ -514,19 +515,48 @@ local function apply_rename_edits(project_root, old_name, new_name, items)
 		local col = tonumber(item.col)
 		local in_project = project_root ~= "" and path:sub(1, #project_root):lower() == project_root:lower()
 		if source ~= "engine" and in_project and path ~= "" and line and col then
-			grouped[path] = grouped[path] or {}
-			table.insert(grouped[path], {
-				line = line,
-				col = col,
-			})
+			table.insert(results, item)
 		end
+	end
+
+	return results
+end
+
+local function apply_rename_edits(project_root, old_name, new_name, items)
+	local grouped = {}
+
+	for _, item in ipairs(collect_rename_items(project_root, items)) do
+		local path = normalize_path(item.path or item.file_path)
+		grouped[path] = grouped[path] or {}
+		table.insert(grouped[path], {
+			line = tonumber(item.line),
+			col = tonumber(item.col),
+		})
 	end
 
 	local touched = {}
 	local changed_files = 0
 	local changed_items = 0
+	local paths = {}
 
-	for path, edits in pairs(grouped) do
+	for path, _ in pairs(grouped) do
+		table.insert(paths, path)
+	end
+
+	table.sort(paths)
+
+	for _, path in ipairs(paths) do
+		local ok_writable, writable_err = write_access.ensure_writable(path, {
+			action = "renaming symbol",
+		})
+		if not ok_writable then
+			vim.notify("UCore rename cancelled:\n" .. tostring(writable_err), vim.log.levels.WARN)
+			return
+		end
+	end
+
+	for _, path in ipairs(paths) do
+		local edits = grouped[path]
 		table.sort(edits, function(left, right)
 			if left.line ~= right.line then
 				return left.line > right.line
@@ -560,6 +590,56 @@ local function apply_rename_edits(project_root, old_name, new_name, items)
 		string.format("UCore rename applied: %d changes in %d files", changed_items, changed_files),
 		vim.log.levels.INFO
 	)
+end
+
+local function rename_file_count(items)
+	local seen = {}
+
+	for _, item in ipairs(items or {}) do
+		local path = normalize_path(item.path or item.file_path)
+		if path ~= "" then
+			seen[path] = true
+		end
+	end
+
+	local count = 0
+	for _, _ in pairs(seen) do
+		count = count + 1
+	end
+
+	return count
+end
+
+local function confirm_rename_preview(ctx, old_name, new_name, items)
+	local rename_items = collect_rename_items(ctx.root, items)
+	if vim.tbl_isempty(rename_items) then
+		vim.notify("UCore rename found no project files to update", vim.log.levels.WARN)
+		return
+	end
+
+	select_ui.references(rename_items, {
+		title = string.format("Rename %s -> %s", old_name, new_name),
+		on_choice = function()
+			local occurrence_count = #rename_items
+			local file_count = rename_file_count(rename_items)
+			local choice = vim.fn.confirm(
+				string.format(
+					"UCore rename\n\n%s -> %s\n\nApply to %d occurrences in %d files?",
+					old_name,
+					new_name,
+					occurrence_count,
+					file_count
+				),
+				"&Apply rename\n&Cancel",
+				1,
+				"Question"
+			)
+
+			if choice == 1 then
+				apply_rename_edits(ctx.root, old_name, new_name, rename_items)
+			end
+		end,
+	})
 end
 
 local function valid_identifier(text)
@@ -617,7 +697,7 @@ local function run_rename(ctx, old_name, new_name)
 		end
 
 		vim.schedule(function()
-			apply_rename_edits(ctx.root, old_name, new_name, items)
+			confirm_rename_preview(ctx, old_name, new_name, items)
 		end)
 	end)
 end

@@ -894,7 +894,8 @@ end
 -- left side lists locations, right side previews the whole file.
 -- 使用类似全局搜索的 Telescope 布局：
 -- 左侧列出定位信息，右侧预览整个文件内容。
-local function pick_telescope_references(references)
+local function pick_telescope_references(references, opts)
+	opts = opts or {}
 	local pickers = require("telescope.pickers")
 	local finders = require("telescope.finders")
 	local conf = require("telescope.config").values
@@ -903,7 +904,7 @@ local function pick_telescope_references(references)
 
 	pickers
 		.new({}, {
-			prompt_title = "UCore references",
+			prompt_title = opts.title or "UCore references",
 			finder = finders.new_table({
 				results = references,
 				entry_maker = function(item)
@@ -934,7 +935,8 @@ local function pick_telescope_references(references)
 					actions.close(prompt_bufnr)
 
 					if selection and selection.value then
-						open_reference(selection.value)
+						local on_choice = opts.on_choice or open_reference
+						on_choice(selection.value)
 					end
 				end)
 
@@ -1411,17 +1413,18 @@ end
 
 -- Pick a reference result and open its source location.
 -- 选择一个引用结果，并打开对应源码位置。
-function M.references(references)
+function M.references(references, opts)
+	opts = opts or {}
 	if type(references) ~= "table" or vim.tbl_isempty(references) then
-		vim.notify("UCore references: no results", vim.log.levels.WARN)
+		vim.notify((opts.title or "UCore references") .. ": no results", vim.log.levels.WARN)
 		return
 	end
 
 	if picker_backend() == "telescope" then
-		return pick_telescope_references(references)
+		return pick_telescope_references(references, opts)
 	end
 
-	pick("UCore references", references, function(item)
+	pick(opts.title or "UCore references", references, function(item)
 		local path = tostring(item.path or item.file_path or "")
 		local line = tonumber(item.line or item.line_number or 1) or 1
 		local col = tonumber(item.col or item.column or 0) or 0
@@ -1436,7 +1439,7 @@ function M.references(references)
 		end
 
 		return location
-	end, open_reference)
+	end, opts.on_choice or open_reference)
 end
 
 return M
