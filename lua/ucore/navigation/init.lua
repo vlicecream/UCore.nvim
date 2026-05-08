@@ -500,18 +500,6 @@ function M.goto_definition()
 	M._goto_definition_inner({ fallback = "gd" })
 end
 
--- Go to declaration with Vim-compatible fallback.
--- 跳转到声明；UCore 无结果时回退到 Vim 原生 gD。
-function M.goto_declaration()
-	M._goto_definition_inner({ fallback = "gD" })
-end
-
--- Implementation uses the same smart goto behavior as definition.
--- 实现跳转与定义跳转共用同一套智能逻辑。
-function M.goto_implementation()
-	return M.goto_definition()
-end
-
 -- Internal dispatcher with fallback.
 -- 内部调度，带回退机制。
 function M._goto_definition_inner(opts)
@@ -539,11 +527,35 @@ function M._goto_definition_inner(opts)
 	local character = cursor[2]
 
 	if is_header_file(file_path) then
-		return M.goto_implementation()
+		try_counterpart_from_header(root, file_path, line, character, function(found)
+			if found then
+				vim.cmd("nohlsearch")
+				return
+			end
+
+			remote.goto_implementation(root, {
+				content = current_content(),
+				line = line,
+				character = character,
+				file_path = normalize_path(file_path),
+			}, function(result, err)
+				if err then
+					if opts.fallback then
+						fallback_normal(opts.fallback)
+						return
+					end
+					return vim.notify("UCore goto failed:\n" .. tostring(err), vim.log.levels.ERROR)
+				end
+
+				if not open_result(result, { silent = opts.fallback ~= nil }) and opts.fallback then
+					fallback_normal(opts.fallback)
+				end
+			end)
+		end)
+		return
 	end
 
-	local counterpart = is_header_file(file_path) and try_counterpart_from_header or try_counterpart_from_source
-	counterpart(root, file_path, line, character, function(found)
+	try_counterpart_from_source(root, file_path, line, character, function(found)
 		if found then
 			vim.cmd("nohlsearch")
 			return

@@ -69,9 +69,7 @@ local function setup_buffer(args)
 	end
 
 	set_buffer_map(bufnr, keymaps.definition or keymaps.goto_definition, navigation.goto_definition, "UCore definition")
-	set_buffer_map(bufnr, keymaps.declaration or keymaps.global_declaration, navigation.goto_declaration, "UCore declaration")
 	set_buffer_map(bufnr, keymaps.references, navigation.references, "UCore references")
-	set_buffer_map(bufnr, keymaps.implementation or keymaps.goto_implementation, navigation.goto_implementation, "UCore implementation")
 	set_buffer_map(bufnr, keymaps.source_toggle, navigation.toggle_source, "UCore toggle source/header")
 	set_buffer_map(bufnr, keymaps.hover, function()
 		require("ucore.assist").hover()
@@ -195,9 +193,7 @@ function M.reset()
 	for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
 		if vim.api.nvim_buf_is_valid(bufnr) then
 			delete_buffer_map(bufnr, keymaps.definition or keymaps.goto_definition)
-			delete_buffer_map(bufnr, keymaps.declaration or keymaps.global_declaration)
 			delete_buffer_map(bufnr, keymaps.references)
-			delete_buffer_map(bufnr, keymaps.implementation or keymaps.goto_implementation)
 			delete_buffer_map(bufnr, keymaps.source_toggle)
 			delete_buffer_map(bufnr, keymaps.hover)
 			delete_buffer_map(bufnr, keymaps.rename)

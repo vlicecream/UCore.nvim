@@ -360,17 +360,15 @@ function M.explorer()
 	explorer.toggle()
 end
 
--- :UCore goto <definition|declaration|implementation|references|source>
--- Jump to definition, declaration, implementation, or find references at cursor.
--- 跳转定义、声明、实现或查找引用。
+-- :UCore goto <definition|references|source>
+-- Smart goto, references, or source/header toggle.
+-- 智能跳转、查找引用、源文件切换。
 function M.goto(tail)
 	local sub = (tail or ""):match("^%s*(%S+)")
 	sub = sub and sub:lower() or ""
 
 	local handlers = {
 		["definition"] = navigation.goto_definition,
-		["declaration"] = navigation.goto_declaration,
-		["implementation"] = navigation.goto_implementation,
 		["references"] = navigation.references,
 		["source"] = navigation.toggle_source,
 	}
@@ -385,8 +383,6 @@ function M.goto(tail)
 		print([[
 UCore goto subcommands:
   :UCore goto definition      Smart goto (gd)
-  :UCore goto declaration     Go to declaration, specifically .h (gD)
-  :UCore goto implementation  Smart goto alias (gi)
   :UCore goto references      Find references (gr)
   :UCore goto source          Toggle between .cpp and .h (gs)
   :UCore goto help            Show this help
