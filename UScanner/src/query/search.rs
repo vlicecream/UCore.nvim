@@ -31,6 +31,8 @@ use std::fs;
 
 use crate::db::project_path::PATH_CTE;
 
+const FIND_FUZZY_FALLBACK_LIMIT: usize = 256;
+
 /// Search indexed symbols with database-side ranking and pagination.
 /// 使用数据库侧排序和分页搜索已索引的 symbol。
 ///
@@ -244,6 +246,17 @@ pub fn global_find(
     extend_json_array(&mut results, search_files_for_global(conn, pattern, target.max(limit))?);
 
     if results.len() < target {
+        extend_json_array(
+            &mut results,
+            search_symbols_fuzzy_fallback(conn, pattern, FIND_FUZZY_FALLBACK_LIMIT)?,
+        );
+        extend_json_array(
+            &mut results,
+            search_files_fuzzy_fallback(conn, pattern, FIND_FUZZY_FALLBACK_LIMIT)?,
+        );
+    }
+
+    if results.len() < target {
         extend_json_array(&mut results, search_text_for_global(conn, pattern, target)?);
     }
 
@@ -285,6 +298,18 @@ pub fn fast_find(
 
     extend_json_array(&mut results, fast_find_symbols(conn, pattern, target.max(limit))?);
     extend_json_array(&mut results, search_files_for_global(conn, pattern, target.max(limit))?);
+
+    if results.len() < target {
+        extend_json_array(
+            &mut results,
+            search_symbols_fuzzy_fallback(conn, pattern, FIND_FUZZY_FALLBACK_LIMIT)?,
+        );
+        extend_json_array(
+            &mut results,
+            search_files_fuzzy_fallback(conn, pattern, FIND_FUZZY_FALLBACK_LIMIT)?,
+        );
+    }
+
     dedupe_find_results(&mut results);
 
     let page = results
@@ -401,6 +426,20 @@ fn search_tokens(input: &str) -> Vec<String> {
         .collect()
 }
 
+fn subsequence_like_pattern(input: &str) -> String {
+    let mut out = String::from("%");
+    for ch in input.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '%' => out.push_str("\\%"),
+            '_' => out.push_str("\\_"),
+            _ => out.push(ch),
+        }
+        out.push('%');
+    }
+    out
+}
+
 fn escape_like(input: &str) -> String {
     input
         .replace('\\', "\\\\")
@@ -505,6 +544,167 @@ fn search_files_for_global(
             }))
         },
     )?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+
+    Ok(json!(results))
+}
+
+fn search_symbols_fuzzy_fallback(
+    conn: &Connection,
+    pattern: &str,
+    limit: usize,
+) -> anyhow::Result<Value> {
+    let limit = limit.clamp(1, 1000) as i64;
+    let tokens = search_tokens(pattern);
+    if tokens.is_empty() {
+        return Ok(json!([]));
+    }
+
+    let token_filter = tokens
+        .iter()
+        .map(|_| {
+            "(lower(sfts.name) LIKE ? ESCAPE '\\' OR lower(COALESCE(sfts.class_name, '')) LIKE ? ESCAPE '\\')"
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ");
+
+    let sql = format!(
+        r#"
+        {}
+        SELECT
+            sfts.name,
+            sfts.type,
+            sfts.class_name,
+            dp.full_path || '/' || sn.text AS path,
+            COALESCE(c.line_number, mem.line_number),
+            sm.text AS module_name
+        FROM symbols_fts sfts
+        LEFT JOIN classes c
+            ON c.id = sfts.rowid_ref
+           AND {}
+        LEFT JOIN members mem
+            ON mem.id = sfts.rowid_ref
+           AND NOT ({})
+        JOIN files f ON f.id = COALESCE(c.file_id, mem.file_id)
+        JOIN dir_paths dp ON f.directory_id = dp.id
+        JOIN strings sn ON f.filename_id = sn.id
+        LEFT JOIN modules m ON f.module_id = m.id
+        LEFT JOIN strings sm ON m.name_id = sm.id
+        WHERE {}
+        ORDER BY
+            CASE
+                WHEN COALESCE(sfts.type, '') IN ('class', 'struct', 'enum', 'UCLASS', 'USTRUCT', 'UENUM') THEN 0
+                WHEN lower(COALESCE(sfts.type, '')) LIKE '%function%' OR lower(COALESCE(sfts.type, '')) LIKE '%method%' THEN 1
+                ELSE 2
+            END,
+            length(lower(sfts.name)) ASC,
+            lower(sfts.name) ASC,
+            path ASC
+        LIMIT ?
+        "#,
+        PATH_CTE,
+        class_symbol_predicate("sfts"),
+        class_symbol_predicate("sfts"),
+        token_filter
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let mut params = Vec::new();
+    for token in &tokens {
+        let like = subsequence_like_pattern(token);
+        params.push(SqlValue::Text(like.clone()));
+        params.push(SqlValue::Text(like));
+    }
+    params.push(SqlValue::Integer(limit));
+
+    let rows = stmt.query_map(params_from_iter(params), |row| {
+        Ok(json!({
+            "name": row.get::<_, String>(0)?,
+            "type": row.get::<_, String>(1)?,
+            "class_name": row.get::<_, Option<String>>(2)?,
+            "path": normalize_path(&row.get::<_, String>(3)?),
+            "line": row.get::<_, Option<i64>>(4)?,
+            "module_name": row.get::<_, Option<String>>(5)?,
+        }))
+    })?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+
+    Ok(json!(results))
+}
+
+fn search_files_fuzzy_fallback(
+    conn: &Connection,
+    pattern: &str,
+    limit: usize,
+) -> anyhow::Result<Value> {
+    let limit = limit.clamp(1, 1000) as i64;
+    let tokens = search_tokens(pattern);
+    if tokens.is_empty() {
+        return Ok(json!([]));
+    }
+
+    let token_filter = tokens
+        .iter()
+        .map(|_| {
+            "(lower(sn.text) LIKE ? ESCAPE '\\' OR lower(dp.full_path || '/' || sn.text) LIKE ? ESCAPE '\\')"
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ");
+
+    let sql = format!(
+        r#"
+        {}
+        SELECT
+            sn.text AS filename,
+            dp.full_path || '/' || sn.text AS path,
+            sm.text AS module_name,
+            rd.full_path AS module_root
+        FROM files f
+        JOIN strings sn ON f.filename_id = sn.id
+        JOIN dir_paths dp ON f.directory_id = dp.id
+        LEFT JOIN modules m ON f.module_id = m.id
+        LEFT JOIN strings sm ON m.name_id = sm.id
+        LEFT JOIN dir_paths rd ON m.root_directory_id = rd.id
+        WHERE {}
+        ORDER BY
+            length(lower(sn.text)) ASC,
+            lower(sn.text) ASC,
+            lower(dp.full_path || '/' || sn.text) ASC
+        LIMIT ?
+        "#,
+        PATH_CTE,
+        token_filter
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let mut params = Vec::new();
+    for token in &tokens {
+        let like = subsequence_like_pattern(token);
+        params.push(SqlValue::Text(like.clone()));
+        params.push(SqlValue::Text(like));
+    }
+    params.push(SqlValue::Integer(limit));
+
+    let rows = stmt.query_map(params_from_iter(params), |row| {
+        Ok(json!({
+            "name": row.get::<_, String>(0)?,
+            "type": "file",
+            "path": normalize_path(&row.get::<_, String>(1)?),
+            "line": 1,
+            "module_name": row.get::<_, Option<String>>(2)?,
+            "module_root": row.get::<_, Option<String>>(3)?.map(|p| normalize_path(&p)),
+        }))
+    })?;
 
     let mut results = Vec::new();
     for row in rows {
@@ -720,4 +920,107 @@ pub fn get_symbols_by_type(
 /// 把 Windows 反斜杠路径统一成斜杠路径。
 fn normalize_path(path: &str) -> String {
     path.replace('\\', "/").replace("//", "/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn insert_string(conn: &Connection, text: &str) -> i64 {
+        conn.execute("INSERT OR IGNORE INTO strings (text) VALUES (?)", [text])
+            .unwrap();
+        conn.query_row("SELECT id FROM strings WHERE text = ?", [text], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn get_or_create_dir(conn: &Connection, parent_id: Option<i64>, name_id: i64) -> i64 {
+        conn.execute(
+            "INSERT OR IGNORE INTO directories (parent_id, name_id) VALUES (?, ?)",
+            params![parent_id, name_id],
+        )
+        .unwrap();
+        conn.query_row(
+            "SELECT id FROM directories WHERE parent_id IS ?1 AND name_id = ?2",
+            params![parent_id, name_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn insert_project_header_file(conn: &Connection, module: &str, filename: &str) -> i64 {
+        let drive = insert_string(conn, "C:");
+        let project_name = insert_string(conn, "Project");
+        let source_name = insert_string(conn, "Source");
+        let module_name = insert_string(conn, module);
+        let public_name = insert_string(conn, "Public");
+        let filename_id = insert_string(conn, filename);
+
+        let c_dir = get_or_create_dir(conn, None, drive);
+        let project_dir = get_or_create_dir(conn, Some(c_dir), project_name);
+        let source_dir = get_or_create_dir(conn, Some(project_dir), source_name);
+        let module_dir = get_or_create_dir(conn, Some(source_dir), module_name);
+        let public_dir = get_or_create_dir(conn, Some(module_dir), public_name);
+
+        conn.execute(
+            "INSERT INTO files (directory_id, filename_id, extension, is_header) VALUES (?, ?, 'h', 1)",
+            params![public_dir, filename_id],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn insert_class_symbol(conn: &Connection, file_id: i64, name: &str) -> i64 {
+        let name_id = insert_string(conn, name);
+        conn.execute(
+            "INSERT INTO classes (name_id, file_id, line_number, end_line_number, symbol_type) VALUES (?, ?, 1, 1, 'class')",
+            params![name_id, file_id],
+        )
+        .unwrap();
+        let class_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO symbols_fts (name, type, class_name, rowid_ref) VALUES (?, 'class', ?, ?)",
+            params![name, name, class_id],
+        )
+        .unwrap();
+        class_id
+    }
+
+    #[test]
+    fn fast_find_falls_back_to_subsequence_matches_for_symbols() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let file_id = insert_project_header_file(&conn, "Game", "RangedWeapon.h");
+        insert_class_symbol(&conn, file_id, "RangedWeapon");
+
+        let items = fast_find(&conn, "rangeweapon", 20, 0).unwrap();
+        let items = items.as_array().unwrap();
+        assert!(items.iter().any(|item| item["name"] == "RangedWeapon"));
+    }
+
+    #[test]
+    fn fast_find_keeps_strong_matches_ahead_of_subsequence_fallback() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let exact_file_id = insert_project_header_file(&conn, "Game", "RangeWeapon.h");
+        insert_class_symbol(&conn, exact_file_id, "RangeWeapon");
+
+        let fuzzy_file_id = insert_project_header_file(&conn, "Game", "RangedWeapon.h");
+        insert_class_symbol(&conn, fuzzy_file_id, "RangedWeapon");
+
+        let items = fast_find(&conn, "rangeweapon", 20, 0).unwrap();
+        let items = items.as_array().unwrap();
+
+        let exact_index = items
+            .iter()
+            .position(|item| item["name"] == "RangeWeapon")
+            .unwrap();
+        let fuzzy_index = items
+            .iter()
+            .position(|item| item["name"] == "RangedWeapon")
+            .unwrap();
+
+        assert!(exact_index < fuzzy_index);
+    }
 }
