@@ -278,6 +278,7 @@ local function default_values()
 		completion = {
 			min_chars = 2,
 			debounce_ms = 180,
+			debug = false,
 		},
 
 		-- UCore diagnostics rendered through vim.diagnostic.

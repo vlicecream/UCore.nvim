@@ -1,6 +1,7 @@
 local project = require("ucore.project")
 local config = require("ucore.config")
 local remote = require("ucore.remote")
+local debug = require("ucore.completion.debug")
 
 local M = {}
 local auto_sequence = 0
@@ -208,20 +209,29 @@ end
 
 -- Request completions from Rust for the current cursor position.
 -- 根据当前光标位置向 Rust 请求补全。
-function M.request(callback)
+function M.request(opts, callback)
+	if type(opts) == "function" and callback == nil then
+		callback = opts
+		opts = {}
+	end
+
+	opts = opts or {}
 	callback = callback or function() end
 
 	if vim.b.no_cmp or vim.b.ucore_completion_disabled then
+		debug.log("request", opts.source or "unknown", "disabled")
 		return callback(nil, "disabled")
 	end
 
 	local root = project.find_project_root()
 	if not root then
+		debug.log("request", opts.source or "unknown", "no-project-root")
 		return callback(nil, "Could not find .uproject")
 	end
 
 	local file_path = vim.api.nvim_buf_get_name(0)
 	if file_path == "" then
+		debug.log("request", opts.source or "unknown", "no-file-path")
 		return callback(nil, "Current buffer has no file path")
 	end
 
@@ -239,7 +249,18 @@ function M.request(callback)
 		file_path,
 	}, ":")
 
+	debug.log(
+		"request",
+		opts.source or "unknown",
+		"send",
+		string.format("tick=%s", changedtick),
+		string.format("line=%s", line),
+		string.format("char=%s", character),
+		file_path
+	)
+
 	if pending_request and pending_request.key == request_key then
+		debug.log("request", opts.source or "unknown", "merge-pending", request_key)
 		table.insert(pending_request.callbacks, callback)
 		return
 	end
@@ -251,6 +272,7 @@ function M.request(callback)
 		key = request_key,
 		sequence = sequence,
 		callbacks = { callback },
+		opts = opts,
 	}
 
 	remote.get_completions(root, {
@@ -265,20 +287,39 @@ function M.request(callback)
 		end
 
 		local callbacks = pending and pending.callbacks or { callback }
+		local pending_opts = pending and pending.opts or opts
 		local valid_buf = vim.api.nvim_buf_is_valid(bufnr)
 		local current_tick = valid_buf and vim.api.nvim_buf_get_changedtick(bufnr) or -1
 
 		if sequence ~= request_sequence
 			or not valid_buf
-			or current_tick ~= changedtick
+			or (current_tick ~= changedtick and pending_opts.allow_stale ~= true)
 		then
+			debug.log(
+				"request",
+				pending_opts.source or "unknown",
+				"stale",
+				string.format("sent_tick=%s", changedtick),
+				string.format("current_tick=%s", current_tick)
+			)
 			for _, cb in ipairs(callbacks) do
 				cb(nil, "stale")
 			end
 			return
 		end
 
+		if current_tick ~= changedtick and pending_opts.allow_stale == true then
+			debug.log(
+				"request",
+				pending_opts.source or "unknown",
+				"allow-stale",
+				string.format("sent_tick=%s", changedtick),
+				string.format("current_tick=%s", current_tick)
+			)
+		end
+
 		if err then
+			debug.log("request", pending_opts.source or "unknown", "error", tostring(err))
 			for _, cb in ipairs(callbacks) do
 				cb(nil, err)
 			end
@@ -286,6 +327,12 @@ function M.request(callback)
 		end
 
 		local items = normalize_items(result)
+		debug.log(
+			"request",
+			pending_opts.source or "unknown",
+			"result",
+			string.format("items=%s", debug.count_items(items))
+		)
 
 		for _, cb in ipairs(callbacks) do
 			cb(items, nil)

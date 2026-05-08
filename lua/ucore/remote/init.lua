@@ -1,4 +1,5 @@
 local cli = require("ucore.client.cli")
+local completion_debug = require("ucore.completion.debug")
 local project = require("ucore.project")
 local rpc = require("ucore.client.rpc")
 
@@ -80,7 +81,29 @@ end
 -- 根据当前 buffer 上下文获取补全候选。
 function M.get_completions(project_root, payload, callback)
 	payload.kind = "GetCompletions"
-	M.query(project_root, payload, callback)
+	completion_debug.log(
+		"remote",
+		"send",
+		string.format("line=%s", tostring(payload.line)),
+		string.format("char=%s", tostring(payload.character)),
+		tostring(payload.file_path or "")
+	)
+	M.query(project_root, payload, function(result, err)
+		if err then
+			completion_debug.log("remote", "error", tostring(err))
+			return callback(result, err)
+		end
+
+		local count = 0
+		if type(result) == "table" then
+			local items = result.items or result.completions or result
+			if type(items) == "table" then
+				count = #items
+			end
+		end
+		completion_debug.log("remote", "result", string.format("items=%s", count))
+		callback(result, err)
+	end)
 end
 
 -- Fetch UCore diagnostics for the current buffer.

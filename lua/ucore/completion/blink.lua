@@ -1,5 +1,6 @@
 local completion = require("ucore.completion")
 local config = require("ucore.config")
+local debug = require("ucore.completion.debug")
 local project = require("ucore.project")
 
 local M = {}
@@ -75,6 +76,7 @@ end
 
 local function dispatch_latest()
 	if in_flight_request then
+		debug.log("blink", "dispatch-skip-inflight")
 		return
 	end
 
@@ -82,16 +84,22 @@ local function dispatch_latest()
 	queued_request = nil
 
 	if request_done(request) then
+		debug.log("blink", "dispatch-drop-cancelled")
 		return
 	end
 
 	in_flight_request = request
+	debug.log("blink", "dispatch", string.format("id=%s", request.id), string.format("prefix=%s", request.prefix))
 
-	completion.request(function(items, err)
+	completion.request({
+		source = "blink",
+		allow_stale = true,
+	}, function(items, err)
 		local active = in_flight_request
 		in_flight_request = nil
 
 		if not active or active.id ~= request.id or active.cancelled then
+			debug.log("blink", "drop-mismatched", string.format("id=%s", request.id))
 			if queued_request and not queued_request.cancelled then
 				dispatch_latest()
 			end
@@ -99,6 +107,7 @@ local function dispatch_latest()
 		end
 
 		if err == "stale" then
+			debug.log("blink", "stale", string.format("id=%s", request.id))
 			if queued_request and not queued_request.cancelled then
 				dispatch_latest()
 			end
@@ -106,6 +115,7 @@ local function dispatch_latest()
 		end
 
 		if err or not items then
+			debug.log("blink", "error", string.format("id=%s", request.id), tostring(err))
 			request.callback({
 				is_incomplete_forward = false,
 				is_incomplete_backward = false,
@@ -125,7 +135,16 @@ local function dispatch_latest()
 			end
 		end
 
+		debug.log(
+			"blink",
+			"items",
+			string.format("id=%s", request.id),
+			string.format("raw=%s", debug.count_items(items)),
+			string.format("converted=%s", debug.count_items(blink_items))
+		)
+
 		blink_items = prune_items(blink_items)
+		debug.log("blink", "pruned", string.format("id=%s", request.id), string.format("items=%s", debug.count_items(blink_items)))
 
 		request.callback({
 			is_incomplete_forward = false,
@@ -315,6 +334,7 @@ end
 -- 从 Rust 后端请求补全候选。
 function M:get_completions(_, callback)
 	if vim.b.no_cmp or vim.b.ucore_completion_disabled or vim.b.blink_cmp_disabled then
+		debug.log("blink", "disabled")
 		callback({
 			is_incomplete_forward = false,
 			is_incomplete_backward = false,
@@ -332,10 +352,12 @@ function M:get_completions(_, callback)
 	}
 
 	queued_request = request
+	debug.log("blink", "queue", string.format("id=%s", request.id), string.format("prefix=%s", request.prefix))
 	stop_timer()
 	scheduled_timer = vim.fn.timer_start(blink_delay_ms(), function()
 		scheduled_timer = nil
 		if in_flight_request then
+			debug.log("blink", "timer-hit-inflight", string.format("id=%s", request.id))
 			return
 		end
 		dispatch_latest()
