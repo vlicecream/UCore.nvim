@@ -626,24 +626,7 @@ local function apply_rename_with_confirmation(ctx, old_name, new_name, rename_it
 		return vim.notify("UCore rename only accepts C/C++ identifier names", vim.log.levels.WARN)
 	end
 
-	local occurrence_count = #rename_items
-	local file_count = rename_file_count(rename_items)
-	local choice = vim.fn.confirm(
-		string.format(
-			"UCore rename\n\n%s -> %s\n\nApply to %d occurrences in %d files?",
-			old_name,
-			new_name,
-			occurrence_count,
-			file_count
-		),
-		"&Apply rename\n&Cancel",
-		1,
-		"Question"
-	)
-
-	if choice == 1 then
-		apply_rename_edits(ctx.root, old_name, new_name, rename_items)
-	end
+	apply_rename_edits(ctx.root, old_name, new_name, rename_items)
 end
 
 local function open_rename_preview(ctx, old_name, items, preset_new_name)
@@ -715,9 +698,7 @@ local function run_rename(ctx, old_name, new_name)
 			end)
 		end
 
-		vim.schedule(function()
-			open_rename_preview(ctx, old_name, items, new_name)
-		end)
+		open_rename_preview(ctx, old_name, items, new_name)
 	end)
 end
 
