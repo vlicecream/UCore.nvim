@@ -286,7 +286,7 @@ fn missing_visible_type_diagnostics(
     let root = tree.root_node();
     let local_types = collect_local_type_visibility(root, content);
     let include_paths = collect_include_paths(content);
-    let project_visible_file_ids = reachable_file_ids(conn, file_path);
+    let project_visible_file_ids = reachable_project_file_ids(conn, file_path, &include_paths);
     let engine_seed_include_paths =
         collect_engine_seed_include_paths(conn, &project_visible_file_ids, &include_paths);
     let engine_visible_file_ids = engine_conn
@@ -1032,16 +1032,16 @@ fn requires_complete_type_for_node(node: tree_sitter::Node, content: &str) -> bo
 }
 
 fn is_indirect_type_usage(text: &str) -> bool {
-    let compact = normalize_space(text);
+    let compact = normalize_space(text).replace(' ', "");
     compact.contains('*')
         || compact.contains('&')
-        || compact.contains("TObjectPtr <")
-        || compact.contains("TWeakObjectPtr <")
-        || compact.contains("TSoftObjectPtr <")
-        || compact.contains("TSoftClassPtr <")
-        || compact.contains("TSubclassOf <")
-        || compact.contains("TNonNullSubclassOf <")
-        || compact.contains("TScriptInterface <")
+        || compact.contains("TObjectPtr<")
+        || compact.contains("TWeakObjectPtr<")
+        || compact.contains("TSoftObjectPtr<")
+        || compact.contains("TSoftClassPtr<")
+        || compact.contains("TSubclassOf<")
+        || compact.contains("TNonNullSubclassOf<")
+        || compact.contains("TScriptInterface<")
 }
 
 fn extract_candidate_type_names(text: &str) -> Vec<String> {
@@ -1527,12 +1527,22 @@ fn include_path_from_file_path(file_path: &str) -> Option<String> {
         .map(|value| value.to_string())
 }
 
-fn reachable_file_ids(conn: &Connection, file_path: &str) -> HashSet<i64> {
-    let Some(root_id) = get_file_id_by_full_path(conn, file_path) else {
-        return HashSet::new();
-    };
+fn reachable_project_file_ids(
+    conn: &Connection,
+    file_path: &str,
+    include_paths: &HashSet<String>,
+) -> HashSet<i64> {
+    let mut roots = Vec::new();
 
-    reachable_file_ids_from_roots(conn, vec![root_id])
+    if let Some(root_id) = get_file_id_by_full_path(conn, file_path) {
+        roots.push(root_id);
+    }
+
+    for include_path in include_paths {
+        roots.extend(file_ids_by_include_path(conn, include_path));
+    }
+
+    reachable_file_ids_from_roots(conn, roots)
 }
 
 fn reachable_engine_file_ids(conn: &Connection, include_paths: &HashSet<String>) -> HashSet<i64> {
@@ -2804,6 +2814,34 @@ mod tests {
     }
 
     #[test]
+    fn does_not_warn_when_unsynced_current_file_sees_engine_type_via_project_include() {
+        let project_conn = Connection::open_in_memory().unwrap();
+        let engine_conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&project_conn).unwrap();
+        crate::db::init_db(&engine_conn).unwrap();
+
+        let shared_file_id = insert_project_header_file(&project_conn, "Game", "SharedTypes.h");
+        insert_include_decl(&project_conn, shared_file_id, "CoreMinimal.h", None);
+
+        let core_minimal_file_id = insert_header_file(&engine_conn, "Core", "CoreMinimal.h");
+        let object_file_id = insert_header_file(&engine_conn, "CoreUObject", "Object.h");
+        insert_include_edge(&engine_conn, core_minimal_file_id, "UObject/Object.h", object_file_id);
+        let _object_class_id = insert_class_in_file(&engine_conn, "UObject", object_file_id);
+
+        let value = process_diagnostics(
+            &project_conn,
+            Some(&engine_conn),
+            "#include \"SharedTypes.h\"\n\nclass UMyActor\n{\npublic:\n    UObject* Object;\n};\n",
+            Some("C:/Project/Source/Game/Public/NewUnsyncedActor.h".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP004"));
+    }
+
+    #[test]
     fn warns_when_forward_declared_type_is_used_by_value() {
         let conn = Connection::open_in_memory().unwrap();
         crate::db::init_db(&conn).unwrap();
@@ -2842,6 +2880,28 @@ mod tests {
         .unwrap();
 
         let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP004"));
+    }
+
+    #[test]
+    fn does_not_warn_when_forward_declared_type_is_wrapped_in_tobjectptr() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let class_id = insert_class(&conn, "UMyDependency");
+        insert_impl_member(&conn, class_id, "DoThing", "()", Some("void"));
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "class UMyDependency;\n\nclass UMyActor\n{\npublic:\n    TObjectPtr<UMyDependency> Value;\n};\n",
+            Some("C:/Project/Source/Game/Public/MyActor.h".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP005"));
         assert!(!items.iter().any(|item| item["code"] == "UECPP004"));
     }
 
@@ -3028,6 +3088,38 @@ mod tests {
             &project_conn,
             Some(&engine_conn),
             "class UWeaponForgeMain : public UBaseWidget\n{\npublic:\n    virtual void NativeGetDesiredFocusTarget() const override;\n};\n",
+            Some("C:/Project/Source/Game/Public/WeaponForgeMain.h".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP007"));
+    }
+
+    #[test]
+    fn does_not_warn_for_override_when_project_parent_leads_to_engine_grandparent() {
+        let project_conn = Connection::open_in_memory().unwrap();
+        let engine_conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&project_conn).unwrap();
+        crate::db::init_db(&engine_conn).unwrap();
+
+        let project_parent_id = insert_class(&project_conn, "UProjectWidgetBase");
+        insert_inheritance(&project_conn, project_parent_id, "UBaseWidget", None);
+
+        let engine_base_id = insert_class(&engine_conn, "UBaseWidget");
+        insert_decl_member(
+            &engine_conn,
+            engine_base_id,
+            "NativeGetDesiredFocusTarget",
+            "() const",
+            Some("void"),
+        );
+
+        let value = process_diagnostics(
+            &project_conn,
+            Some(&engine_conn),
+            "class UWeaponForgeMain : public UProjectWidgetBase\n{\npublic:\n    virtual void NativeGetDesiredFocusTarget() const override;\n};\n",
             Some("C:/Project/Source/Game/Public/WeaponForgeMain.h".to_string()),
             &[],
         )
