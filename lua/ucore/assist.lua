@@ -559,15 +559,24 @@ local function valid_identifier(text)
 	return text:match("^[_%a][_%w]*$") ~= nil
 end
 
-local function run_rename(new_name)
+local function capture_rename_target()
 	local ctx = ensure_project_context()
 	if not ctx then
-		return
+		return nil
 	end
 
 	local old_name = current_symbol_name()
 	if not old_name then
-		return vim.notify("No symbol under cursor", vim.log.levels.WARN)
+		vim.notify("No symbol under cursor", vim.log.levels.WARN)
+		return nil
+	end
+
+	return ctx, old_name
+end
+
+local function run_rename(ctx, old_name, new_name)
+	if not ctx or not old_name then
+		return
 	end
 
 	new_name = vim.trim(tostring(new_name or ""))
@@ -607,13 +616,13 @@ local function run_rename(new_name)
 end
 
 function M.rename(new_name)
-	if new_name and vim.trim(tostring(new_name)) ~= "" then
-		return run_rename(new_name)
+	local ctx, old_name = capture_rename_target()
+	if not ctx or not old_name then
+		return
 	end
 
-	local old_name = current_symbol_name()
-	if not old_name then
-		return vim.notify("No symbol under cursor", vim.log.levels.WARN)
+	if new_name and vim.trim(tostring(new_name)) ~= "" then
+		return run_rename(ctx, old_name, new_name)
 	end
 
 	if vim.ui and vim.ui.input then
@@ -622,7 +631,7 @@ function M.rename(new_name)
 			default = old_name,
 		}, function(value)
 			if value and vim.trim(value) ~= "" and vim.trim(value) ~= old_name then
-				run_rename(value)
+				run_rename(ctx, old_name, value)
 			end
 		end)
 		return
@@ -630,7 +639,7 @@ function M.rename(new_name)
 
 	local value = vim.fn.input("Rename to: ", old_name)
 	if value and vim.trim(value) ~= "" and vim.trim(value) ~= old_name then
-		run_rename(value)
+		run_rename(ctx, old_name, value)
 	end
 end
 
