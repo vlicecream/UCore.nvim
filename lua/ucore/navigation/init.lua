@@ -492,12 +492,25 @@ local function fallback_normal(keys)
 	vim.cmd("nohlsearch")
 end
 
--- Smart goto entry.
--- Header member declarations jump to implementation, source definitions jump to
--- declarations, everything else resolves normal definitions.
--- 智能跳转入口。
+-- Smart goto-definition entry.
+-- Source definitions can hop back to declarations; headers resolve normal
+-- definitions instead of forcing implementation jumps.
+-- 定义跳转入口。
 function M.goto_definition()
-	M._goto_definition_inner({ fallback = "gd" })
+	M._goto_definition_inner({
+		fallback = "gd",
+		prefer_header_definition = true,
+	})
+end
+
+-- Smart goto-implementation entry.
+-- Header declarations prefer matching .cpp implementations.
+-- 实现跳转入口。
+function M.goto_implementation()
+	M._goto_definition_inner({
+		fallback = "gi",
+		prefer_implementation = true,
+	})
 end
 
 -- Internal dispatcher with fallback.
@@ -526,7 +539,7 @@ function M._goto_definition_inner(opts)
 	local line = cursor[1] - 1
 	local character = cursor[2]
 
-	if is_header_file(file_path) then
+	if opts.prefer_implementation and is_header_file(file_path) then
 		try_counterpart_from_header(root, file_path, line, character, function(found)
 			if found then
 				vim.cmd("nohlsearch")
@@ -551,30 +564,53 @@ function M._goto_definition_inner(opts)
 		return
 	end
 
-	try_counterpart_from_source(root, file_path, line, character, function(found)
-		if found then
-			vim.cmd("nohlsearch")
-			return
+	if opts.prefer_header_definition and is_source_file(file_path) then
+		try_counterpart_from_source(root, file_path, line, character, function(found)
+			if found then
+				vim.cmd("nohlsearch")
+				return
+			end
+
+			remote.goto_definition(root, {
+				content = current_content(),
+				line = line,
+				character = character,
+				file_path = normalize_path(file_path),
+			}, function(result, err)
+				if err then
+					if opts.fallback then
+						fallback_normal(opts.fallback)
+						return
+					end
+					return vim.notify("UCore goto failed:\n" .. tostring(err), vim.log.levels.ERROR)
+				end
+
+				if not open_result(result, { silent = opts.fallback ~= nil }) and opts.fallback then
+					fallback_normal(opts.fallback)
+				end
+			end)
+		end)
+		return
+	end
+
+	local remote_call = opts.prefer_implementation and remote.goto_implementation or remote.goto_definition
+	remote_call(root, {
+		content = current_content(),
+		line = line,
+		character = character,
+		file_path = normalize_path(file_path),
+	}, function(result, err)
+		if err then
+			if opts.fallback then
+				fallback_normal(opts.fallback)
+				return
+			end
+			return vim.notify("UCore goto failed:\n" .. tostring(err), vim.log.levels.ERROR)
 		end
 
-		remote.goto_definition(root, {
-			content = current_content(),
-			line = line,
-			character = character,
-			file_path = normalize_path(file_path),
-		}, function(result, err)
-			if err then
-				if opts.fallback then
-					fallback_normal(opts.fallback)
-					return
-				end
-				return vim.notify("UCore goto failed:\n" .. tostring(err), vim.log.levels.ERROR)
-			end
-
-			if not open_result(result, { silent = opts.fallback ~= nil }) and opts.fallback then
-				fallback_normal(opts.fallback)
-			end
-		end)
+		if not open_result(result, { silent = opts.fallback ~= nil }) and opts.fallback then
+			fallback_normal(opts.fallback)
+		end
 	end)
 end
 

@@ -369,6 +369,7 @@ function M.goto(tail)
 
 	local handlers = {
 		["definition"] = navigation.goto_definition,
+		["implementation"] = navigation.goto_implementation,
 		["references"] = navigation.references,
 		["source"] = navigation.toggle_source,
 	}
@@ -383,6 +384,7 @@ function M.goto(tail)
 		print([[
 UCore goto subcommands:
   :UCore goto definition      Smart goto (gd)
+  :UCore goto implementation  Go to implementation (gi)
   :UCore goto references      Find references (gr)
   :UCore goto source          Toggle between .cpp and .h (gs)
   :UCore goto help            Show this help
@@ -403,6 +405,10 @@ end
 -- Dashboard 使用的向后兼容别名。
 function M.goto_definition()
 	navigation.goto_definition()
+end
+
+function M.goto_implementation()
+	navigation.goto_implementation()
 end
 
 function M.references()

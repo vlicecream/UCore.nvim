@@ -419,7 +419,7 @@ local function open_float(lines, opts)
 
 	local cursor = vim.api.nvim_win_get_cursor(0)
 	local prefer_above = cursor[1] > math.floor(vim.o.lines * 0.6)
-	local row = prefer_above and -(height + 2) or 2
+	local row = prefer_above and -(height + 2) or 1
 
 	local win = vim.api.nvim_open_win(buf, false, {
 		relative = "cursor",

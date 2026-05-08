@@ -67,6 +67,7 @@ function M.register()
 
 			local goto_items = {
 				"definition",
+				"implementation",
 				"references",
 				"source",
 				"help",

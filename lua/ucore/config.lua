@@ -241,7 +241,7 @@ local function default_values()
 			keymaps = {
 				enable = true,
 				definition = "gd",
-				declaration = "gD",
+				declaration = false,
 				references = "gr",
 				implementation = "gi",
 				source_toggle = "gs",
