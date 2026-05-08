@@ -608,40 +608,78 @@ local function rename_file_count(items)
 	return count
 end
 
-local function confirm_rename_preview(ctx, old_name, new_name, items)
+local function prompt_rename_name(old_name, callback)
+	if vim.ui and vim.ui.input then
+		vim.ui.input({
+			prompt = "Rename to: ",
+			default = old_name,
+		}, function(value)
+			callback(value)
+		end)
+		return
+	end
+
+	callback(vim.fn.input("Rename to: ", old_name))
+end
+
+local function valid_identifier(text)
+	return text:match("^[_%a][_%w]*$") ~= nil
+end
+
+local function apply_rename_with_confirmation(ctx, old_name, new_name, rename_items)
+	new_name = vim.trim(tostring(new_name or ""))
+	if new_name == "" or new_name == old_name then
+		return
+	end
+
+	if not valid_identifier(new_name) then
+		return vim.notify("UCore rename only accepts C/C++ identifier names", vim.log.levels.WARN)
+	end
+
+	local occurrence_count = #rename_items
+	local file_count = rename_file_count(rename_items)
+	local choice = vim.fn.confirm(
+		string.format(
+			"UCore rename\n\n%s -> %s\n\nApply to %d occurrences in %d files?",
+			old_name,
+			new_name,
+			occurrence_count,
+			file_count
+		),
+		"&Apply rename\n&Cancel",
+		1,
+		"Question"
+	)
+
+	if choice == 1 then
+		apply_rename_edits(ctx.root, old_name, new_name, rename_items)
+	end
+end
+
+local function open_rename_preview(ctx, old_name, items, preset_new_name)
 	local rename_items = collect_rename_items(ctx.root, items)
 	if vim.tbl_isempty(rename_items) then
 		vim.notify("UCore rename found no project files to update", vim.log.levels.WARN)
 		return
 	end
 
-	select_ui.references(rename_items, {
-		title = string.format("Rename %s -> %s", old_name, new_name),
-		on_choice = function()
-			local occurrence_count = #rename_items
-			local file_count = rename_file_count(rename_items)
-			local choice = vim.fn.confirm(
-				string.format(
-					"UCore rename\n\n%s -> %s\n\nApply to %d occurrences in %d files?",
-					old_name,
-					new_name,
-					occurrence_count,
-					file_count
-				),
-				"&Apply rename\n&Cancel",
-				1,
-				"Question"
-			)
+	local title = preset_new_name
+		and string.format("Rename Preview %s -> %s", old_name, preset_new_name)
+		or string.format("Rename Preview %s", old_name)
 
-			if choice == 1 then
-				apply_rename_edits(ctx.root, old_name, new_name, rename_items)
+	select_ui.rename_preview(rename_items, {
+		title = title,
+		on_choice = function()
+			if preset_new_name and vim.trim(tostring(preset_new_name)) ~= "" then
+				apply_rename_with_confirmation(ctx, old_name, preset_new_name, rename_items)
+				return
 			end
+
+			prompt_rename_name(old_name, function(value)
+				apply_rename_with_confirmation(ctx, old_name, value, rename_items)
+			end)
 		end,
 	})
-end
-
-local function valid_identifier(text)
-	return text:match("^[_%a][_%w]*$") ~= nil
 end
 
 local function capture_rename_target()
@@ -662,15 +700,6 @@ end
 local function run_rename(ctx, old_name, new_name)
 	if not ctx or not old_name then
 		return
-	end
-
-	new_name = vim.trim(tostring(new_name or ""))
-	if new_name == "" or new_name == old_name then
-		return
-	end
-
-	if not valid_identifier(new_name) then
-		return vim.notify("UCore rename only accepts C/C++ identifier names", vim.log.levels.WARN)
 	end
 
 	remote.find_references(ctx.root, {
@@ -695,7 +724,7 @@ local function run_rename(ctx, old_name, new_name)
 		end
 
 		vim.schedule(function()
-			confirm_rename_preview(ctx, old_name, new_name, items)
+			open_rename_preview(ctx, old_name, items, new_name)
 		end)
 	end)
 end
@@ -710,22 +739,7 @@ function M.rename(new_name)
 		return run_rename(ctx, old_name, new_name)
 	end
 
-	if vim.ui and vim.ui.input then
-		vim.ui.input({
-			prompt = "Rename to: ",
-			default = old_name,
-		}, function(value)
-			if value and vim.trim(value) ~= "" and vim.trim(value) ~= old_name then
-				run_rename(ctx, old_name, value)
-			end
-		end)
-		return
-	end
-
-	local value = vim.fn.input("Rename to: ", old_name)
-	if value and vim.trim(value) ~= "" and vim.trim(value) ~= old_name then
-		run_rename(ctx, old_name, value)
-	end
+	run_rename(ctx, old_name, nil)
 end
 
 function M.close_float()

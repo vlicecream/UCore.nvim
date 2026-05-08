@@ -1442,4 +1442,12 @@ function M.references(references, opts)
 	end, opts.on_choice or open_reference)
 end
 
+-- Pick rename preview results with rename-specific semantics.
+-- 使用 rename 语义展示引用预览，而不是普通 gr 跳转。
+function M.rename_preview(references, opts)
+	opts = opts or {}
+	opts.title = opts.title or "UCore rename preview"
+	return M.references(references, opts)
+end
+
 return M
