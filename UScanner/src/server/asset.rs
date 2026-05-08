@@ -2,7 +2,7 @@ use anyhow::Result;
 use rayon::prelude::*;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -240,6 +240,14 @@ pub struct AssetScanReport {
     pub skipped: usize,
     pub errors: usize,
     pub parsed: Vec<AssetRecord>,
+    pub error_summary: Vec<AssetParseErrorSummary>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AssetParseErrorSummary {
+    pub reason: String,
+    pub count: usize,
+    pub sample_path: String,
 }
 
 /// Parsed information for one asset file.
@@ -279,15 +287,57 @@ pub fn scan_project_assets(project_root: &Path) -> Result<AssetScanReport> {
 
     let mut parsed = Vec::new();
     let mut errors = 0usize;
+    let mut error_buckets = HashMap::<String, (usize, String)>::new();
 
     for item in parsed_results {
         match item {
             Ok(record) => parsed.push(record),
             Err((path, err)) => {
                 errors += 1;
-                warn!("Failed to parse asset {}: {}", path.display(), err);
+                let reason = err.to_string();
+                let entry = error_buckets
+                    .entry(reason)
+                    .or_insert_with(|| (0usize, path.display().to_string()));
+                entry.0 += 1;
             }
         }
+    }
+
+    let mut error_summary = error_buckets
+        .into_iter()
+        .map(|(reason, (count, sample_path))| AssetParseErrorSummary {
+            reason,
+            count,
+            sample_path,
+        })
+        .collect::<Vec<_>>();
+    error_summary.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.reason.cmp(&right.reason))
+    });
+
+    if !error_summary.is_empty() {
+        let summary = error_summary
+            .iter()
+            .take(5)
+            .map(|item| {
+                format!(
+                    "{}x {} (sample: {})",
+                    item.count, item.reason, item.sample_path
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+
+        warn!(
+            "Asset scan parse summary for {}: {} total errors across {} reasons. Top failures: {}",
+            project_root.display(),
+            errors,
+            error_summary.len(),
+            summary,
+        );
     }
 
     Ok(AssetScanReport {
@@ -295,6 +345,7 @@ pub fn scan_project_assets(project_root: &Path) -> Result<AssetScanReport> {
         skipped: 0,
         errors,
         parsed,
+        error_summary,
     })
 }
 

@@ -14,6 +14,8 @@ use crate::db;
 use crate::types::{ConfigCache, PhaseInfo, Progress, ProgressPlan, ProgressReporter};
 
 const COMPLETION_CACHE_CAPACITY: usize = 50_000;
+const DIAGNOSTICS_CACHE_CAPACITY: usize = 512;
+const DIAGNOSTICS_CACHE_TTL: Duration = Duration::from_millis(1500);
 const PRIMARY_DB_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_ONLY_DB_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const CACHE_DB_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -203,6 +205,56 @@ impl CompletionCache {
     }
 }
 
+/// In-memory diagnostics cache keyed by request signature.
+/// 内存诊断缓存，key 是请求签名。
+pub struct DiagnosticsCache {
+    lru: LruCache<String, DiagnosticsCacheEntry>,
+}
+
+struct DiagnosticsCacheEntry {
+    value: serde_json::Value,
+    created_at: Instant,
+}
+
+impl DiagnosticsCache {
+    /// Create an empty diagnostics cache.
+    /// 创建一个空诊断缓存。
+    pub fn new() -> Self {
+        Self {
+            lru: LruCache::new(NonZeroUsize::new(DIAGNOSTICS_CACHE_CAPACITY).unwrap()),
+        }
+    }
+
+    /// Get a cached diagnostics result if it is still fresh.
+    /// 获取仍在有效期内的诊断缓存结果。
+    pub fn get(&mut self, key: &str) -> Option<serde_json::Value> {
+        let is_fresh = self
+            .lru
+            .peek(key)
+            .map(|entry| entry.created_at.elapsed() <= DIAGNOSTICS_CACHE_TTL)
+            .unwrap_or(false);
+
+        if !is_fresh {
+            self.lru.pop(key);
+            return None;
+        }
+
+        self.lru.get(key).map(|entry| entry.value.clone())
+    }
+
+    /// Insert or refresh a diagnostics cache entry.
+    /// 插入或刷新诊断缓存条目。
+    pub fn put(&mut self, key: String, value: serde_json::Value) {
+        self.lru.put(
+            key,
+            DiagnosticsCacheEntry {
+                value,
+                created_at: Instant::now(),
+            },
+        );
+    }
+}
+
 /// Build normalized completion cache key.
 /// 构造规范化补全缓存 key。
 fn make_completion_key(class_name: &str, prefix: &str) -> (String, String) {
@@ -228,6 +280,7 @@ pub struct AppState {
     pub asset_graphs: Mutex<HashMap<String, AssetGraph>>,
     pub config_caches: Mutex<HashMap<String, ConfigCache>>,
     pub completion_caches: Mutex<HashMap<String, Arc<Mutex<CompletionCache>>>>,
+    pub diagnostics_caches: Mutex<HashMap<String, Arc<Mutex<DiagnosticsCache>>>>,
 }
 
 impl AppState {
@@ -350,6 +403,26 @@ impl AppState {
             .or_insert_with(|| Arc::clone(&conn));
 
         Ok(Arc::clone(existing))
+    }
+
+    /// Get or create the per-project diagnostics cache.
+    /// 获取或创建某个工程的诊断缓存。
+    pub fn get_diagnostics_cache(&self, project_root: &str) -> Arc<Mutex<DiagnosticsCache>> {
+        {
+            let caches = self.diagnostics_caches.lock();
+            if let Some(cache) = caches.get(project_root) {
+                return Arc::clone(cache);
+            }
+        }
+
+        let cache = Arc::new(Mutex::new(DiagnosticsCache::new()));
+
+        let mut caches = self.diagnostics_caches.lock();
+        let existing = caches
+            .entry(project_root.to_string())
+            .or_insert_with(|| Arc::clone(&cache));
+
+        Arc::clone(existing)
     }
 
     /// Drop cached DB connections for one project.

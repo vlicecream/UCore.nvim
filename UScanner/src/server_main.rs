@@ -46,6 +46,7 @@ async fn main() -> Result<()> {
         asset_graphs: Mutex::new(HashMap::new()),
         config_caches: Mutex::new(HashMap::new()),
         completion_caches: Mutex::new(HashMap::new()),
+        diagnostics_caches: Mutex::new(HashMap::new()),
     });
 
     spawn_watch_event_loop(state.clone(), watch_rx);

@@ -2,7 +2,9 @@ use anyhow::{anyhow, Result};
 use notify::Watcher;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -16,7 +18,7 @@ use crate::server::utils::{
 };
 use crate::types::{
     ModifyResult, ModifyTargetAddModuleRequest, ModifyUprojectAddModuleRequest, QueryRequest,
-    RefreshRequest, ScanRequest, SetupRequest,
+    RefreshRequest, ScanRequest, SetupRequest, OpenBufferOverlay,
 };
 use crate::{db, query, refresh, scanner};
 
@@ -37,6 +39,44 @@ struct QueryPerfStat {
 struct QueryPerfWindow {
     started_at: Instant,
     stats: HashMap<&'static str, QueryPerfStat>,
+}
+
+fn hash_text(text: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn hash_open_files(open_files: &[OpenBufferOverlay]) -> u64 {
+    let mut entries = open_files
+        .iter()
+        .map(|item| (item.file_path.as_str(), item.content.as_str()))
+        .collect::<Vec<_>>();
+
+    entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
+
+    let mut hasher = DefaultHasher::new();
+    entries.len().hash(&mut hasher);
+
+    for (file_path, content) in entries {
+        file_path.hash(&mut hasher);
+        content.hash(&mut hasher);
+    }
+
+    hasher.finish()
+}
+
+fn diagnostics_cache_key(
+    file_path: Option<&str>,
+    content: &str,
+    open_files: &[OpenBufferOverlay],
+) -> String {
+    format!(
+        "{}:{}:{}",
+        file_path.unwrap_or("-"),
+        hash_text(content),
+        hash_open_files(open_files)
+    )
 }
 
 // -----------------------------------------------------------------------------
@@ -538,6 +578,18 @@ fn handle_state_query(
             file_path,
             open_files,
         } => {
+            let cache = state.get_diagnostics_cache(root_key);
+            let cache_key = diagnostics_cache_key(file_path.as_deref(), &content, &open_files);
+
+            if let Some(value) = cache.lock().get(&cache_key) {
+                debug!(
+                    "diagnostics cache hit: root={} file={}",
+                    root_key,
+                    file_path.as_deref().unwrap_or("-"),
+                );
+                return Ok(Some(value));
+            }
+
             let engine_conn = match engine_db_path
                 .as_deref()
                 .map(normalize_to_native)
@@ -560,6 +612,7 @@ fn handle_state_query(
                 file_path,
                 &open_files,
             )?;
+            cache.lock().put(cache_key, value.clone());
             Ok(Some(value))
         }
 
