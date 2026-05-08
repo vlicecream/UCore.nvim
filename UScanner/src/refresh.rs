@@ -19,6 +19,12 @@ use crate::scanner;
 
 const SOURCE_EXTENSIONS: &[&str] = &["h", "hh", "hpp", "cpp", "cc", "c", "cxx", "inl"];
 const BUILD_CS_SUFFIX: &str = ".build.cs";
+const ENGINE_SCAN_SUBDIRS: &[&str] = &[
+    "Engine/Source",
+    "Engine/Plugins",
+    "Engine/Config",
+    "Engine/Shaders",
+];
 
 /// Run a full project refresh.
 /// 执行一次完整工程刷新。
@@ -148,16 +154,36 @@ impl RefreshContext {
     /// Return roots that should be scanned.
     /// 返回本次需要扫描的根目录。
     fn search_roots(&self) -> Vec<PathBuf> {
-        let mut roots = vec![self.project_root.clone()];
+        let mut roots = if is_engine_root_path(&self.project_root) {
+            engine_scan_roots(&self.project_root)
+        } else {
+            vec![self.project_root.clone()]
+        };
 
         if matches!(self.scope.as_str(), "Full" | "Engine") {
             if let Some(engine_root) = &self.engine_root {
-                roots.push(engine_root.clone());
+                for root in engine_scan_roots(engine_root) {
+                    if !roots.iter().any(|existing| existing == &root) {
+                        roots.push(root);
+                    }
+                }
             }
         }
 
         roots
     }
+}
+
+fn is_engine_root_path(path: &Path) -> bool {
+    path.join("Engine/Source").is_dir() || path.join("Engine/Build/Build.version").is_file()
+}
+
+fn engine_scan_roots(engine_root: &Path) -> Vec<PathBuf> {
+    ENGINE_SCAN_SUBDIRS
+        .iter()
+        .map(|relative| engine_root.join(relative))
+        .filter(|path| path.exists())
+        .collect()
 }
 
 /// Report refresh phase plan.
@@ -1091,4 +1117,91 @@ fn reconstruct_path(
 
     segments.reverse();
     segments.join("/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_path(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("ucore_refresh_{name}_{stamp}"))
+    }
+
+    #[test]
+    fn engine_root_only_scans_whitelisted_directories() {
+        let root = temp_path("engine_whitelist");
+        std::fs::create_dir_all(root.join("Engine/Source")).unwrap();
+        std::fs::create_dir_all(root.join("Engine/Plugins")).unwrap();
+        std::fs::create_dir_all(root.join("Engine/Config")).unwrap();
+        std::fs::create_dir_all(root.join("Engine/Shaders")).unwrap();
+        std::fs::create_dir_all(root.join("Engine/Build")).unwrap();
+        std::fs::create_dir_all(root.join("Samples")).unwrap();
+        std::fs::create_dir_all(root.join("Templates")).unwrap();
+        std::fs::write(root.join("Engine/Build/Build.version"), "{}").unwrap();
+
+        let roots = engine_scan_roots(&root)
+            .into_iter()
+            .map(|path| normalize_path(&path))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            roots,
+            vec![
+                normalize_path(&root.join("Engine/Source")),
+                normalize_path(&root.join("Engine/Plugins")),
+                normalize_path(&root.join("Engine/Config")),
+                normalize_path(&root.join("Engine/Shaders")),
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lyra_style_project_keeps_project_root_and_whitelisted_engine_roots() {
+        let engine_root = temp_path("lyra_engine");
+        let project_root = engine_root.join("LyraStarterGame");
+
+        std::fs::create_dir_all(project_root.join("Source")).unwrap();
+        std::fs::create_dir_all(engine_root.join("Engine/Source")).unwrap();
+        std::fs::create_dir_all(engine_root.join("Engine/Plugins")).unwrap();
+        std::fs::create_dir_all(engine_root.join("Engine/Config")).unwrap();
+        std::fs::create_dir_all(engine_root.join("Engine/Shaders")).unwrap();
+        std::fs::create_dir_all(engine_root.join("Engine/Build")).unwrap();
+        std::fs::create_dir_all(engine_root.join("Samples/Games/Lyra")).unwrap();
+        std::fs::write(engine_root.join("Engine/Build/Build.version"), "{}").unwrap();
+
+        let ctx = RefreshContext {
+            project_root: project_root.clone(),
+            engine_root: Some(engine_root.clone()),
+            db_path_native: "C:\\tmp\\dummy.db".to_string(),
+            scope: "Full".to_string(),
+            excludes: HashSet::new(),
+            include_extensions: HashSet::new(),
+        };
+
+        let roots = ctx
+            .search_roots()
+            .into_iter()
+            .map(|path| normalize_path(&path))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            roots,
+            vec![
+                normalize_path(&project_root),
+                normalize_path(&engine_root.join("Engine/Source")),
+                normalize_path(&engine_root.join("Engine/Plugins")),
+                normalize_path(&engine_root.join("Engine/Config")),
+                normalize_path(&engine_root.join("Engine/Shaders")),
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(engine_root);
+    }
 }
