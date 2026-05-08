@@ -545,14 +545,12 @@ local function apply_rename_edits(project_root, old_name, new_name, items)
 
 	table.sort(paths)
 
-	for _, path in ipairs(paths) do
-		local ok_writable, writable_err = write_access.ensure_writable(path, {
-			action = "renaming symbol",
-		})
-		if not ok_writable then
-			vim.notify("UCore rename cancelled:\n" .. tostring(writable_err), vim.log.levels.WARN)
-			return
-		end
+	local ok_writable, writable_err = write_access.ensure_writable_many(paths, {
+		action = "renaming symbol",
+	})
+	if not ok_writable then
+		vim.notify("UCore rename cancelled:\n" .. tostring(writable_err), vim.log.levels.WARN)
+		return
 	end
 
 	for _, path in ipairs(paths) do
