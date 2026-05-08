@@ -8,7 +8,7 @@ local M = {}
 local ns = vim.api.nvim_create_namespace("ucore_diagnostics")
 local group_name = "UCoreDiagnostics"
 local enabled = true
-local refresh_sequence = 0
+local refresh_sequences = {}
 local try_include_symbol
 local float_sequence = 0
 local float_winid = nil
@@ -59,6 +59,25 @@ local function open_file_overlays(project_root)
 	end
 
 	return overlays
+end
+
+local function project_cpp_buffers(project_root)
+	local result = {}
+	local normalized_root = normalize_path(project_root or "")
+
+	for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+		if vim.api.nvim_buf_is_valid(bufnr) then
+			local name = normalize_path(vim.api.nvim_buf_get_name(bufnr))
+			if name and name ~= "" and is_cpp_like_path(name) then
+				local root = project.find_project_root(name)
+				if root and normalize_path(root) == normalized_root then
+					table.insert(result, bufnr)
+				end
+			end
+		end
+	end
+
+	return result
 end
 
 local function resolve_bufnr_for_path(file_path, fallback_bufnr)
@@ -152,8 +171,8 @@ function M.refresh(bufnr, opts)
 		return
 	end
 
-	refresh_sequence = refresh_sequence + 1
-	local sequence = refresh_sequence
+	refresh_sequences[bufnr] = (refresh_sequences[bufnr] or 0) + 1
+	local sequence = refresh_sequences[bufnr]
 	local changedtick = vim.api.nvim_buf_get_changedtick(bufnr)
 
 	remote.get_diagnostics(root, {
@@ -161,7 +180,7 @@ function M.refresh(bufnr, opts)
 		file_path = normalize_path(file_path),
 		open_files = open_file_overlays(root),
 	}, function(result, err)
-		if sequence ~= refresh_sequence
+		if sequence ~= refresh_sequences[bufnr]
 			or not vim.api.nvim_buf_is_valid(bufnr)
 			or vim.api.nvim_buf_get_changedtick(bufnr) ~= changedtick
 		then
@@ -1101,13 +1120,21 @@ local function schedule_refresh(args)
 	local diagnostics_config = config.values.diagnostics or {}
 	local delay = diagnostics_config.debounce_ms or 300
 	local bufnr = args.buf
+	local file_path = vim.api.nvim_buf_get_name(bufnr)
+	local root = file_path ~= "" and project.find_project_root(file_path) or nil
 
-	refresh_sequence = refresh_sequence + 1
-	local sequence = refresh_sequence
+	if not root then
+		return
+	end
+
+	refresh_sequences[bufnr] = (refresh_sequences[bufnr] or 0) + 1
+	local sequence = refresh_sequences[bufnr]
 
 	vim.defer_fn(function()
-		if sequence == refresh_sequence then
-			M.refresh(bufnr, { silent = true })
+		if sequence == refresh_sequences[bufnr] then
+			for _, target_bufnr in ipairs(project_cpp_buffers(root)) do
+				M.refresh(target_bufnr, { silent = true, force = true })
+			end
 		end
 	end, delay)
 end
@@ -1213,7 +1240,7 @@ end
 
 function M.reset()
 	enabled = true
-	refresh_sequence = refresh_sequence + 1
+	refresh_sequences = {}
 	float_sequence = float_sequence + 1
 	close_cursor_float()
 	pcall(vim.api.nvim_del_augroup_by_name, group_name)
