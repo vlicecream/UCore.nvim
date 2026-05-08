@@ -1123,10 +1123,28 @@ function M.setup()
 		end,
 	})
 
+	vim.api.nvim_create_autocmd("BufEnter", {
+		group = group,
+		pattern = { "*.h", "*.hpp", "*.cpp", "*.cc", "*.cxx" },
+		callback = function(args)
+			M.refresh(args.buf, { force = true, silent = true })
+		end,
+	})
+
 	vim.api.nvim_create_autocmd("InsertLeave", {
 		group = group,
 		pattern = { "*.h", "*.hpp", "*.cpp", "*.cc", "*.cxx" },
-		callback = schedule_refresh,
+		callback = function(args)
+			M.refresh(args.buf, { force = true, silent = true })
+		end,
+	})
+
+	vim.api.nvim_create_autocmd("CursorHold", {
+		group = group,
+		pattern = { "*.h", "*.hpp", "*.cpp", "*.cc", "*.cxx" },
+		callback = function(args)
+			M.refresh(args.buf, { force = true, silent = true })
+		end,
 	})
 
 	vim.api.nvim_create_autocmd({ "CursorMoved", "BufEnter" }, {

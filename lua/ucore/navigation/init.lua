@@ -568,6 +568,10 @@ function M._goto_definition_inner(opts)
 	local line = cursor[1] - 1
 	local character = cursor[2]
 
+	if is_header_file(file_path) then
+		return M.goto_implementation()
+	end
+
 	local counterpart = is_header_file(file_path) and try_counterpart_from_header or try_counterpart_from_source
 	counterpart(root, file_path, line, character, function(found)
 		if found then
