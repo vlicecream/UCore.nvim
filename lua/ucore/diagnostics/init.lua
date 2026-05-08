@@ -1108,9 +1108,98 @@ local function rank_include_candidate(item, symbol, current_path)
 	end
 
 	return {
+		action = "include",
 		item = item,
+		name = name,
 		path = path,
 		include_path = include_path,
+		score = score,
+	}
+end
+
+local function forward_decl_keyword(symbol_type)
+	symbol_type = tostring(symbol_type or "")
+	if symbol_type == "class" or symbol_type == "UCLASS" then
+		return "class"
+	end
+	if symbol_type == "struct" or symbol_type == "USTRUCT" then
+		return "struct"
+	end
+	return nil
+end
+
+local function allows_forward_declaration(symbol_info)
+	if not symbol_info then
+		return false
+	end
+
+	local before = symbol_info.before or ""
+	local after = symbol_info.after or ""
+	if before:match(":%s*$")
+		or before:match(":%s*public%s+$")
+		or before:match(":%s*protected%s+$")
+		or before:match(":%s*private%s+$")
+	then
+		return false
+	end
+
+	if before:match("[*&]%s*$") or before:match("class%s+$") or before:match("struct%s+$") then
+		return true
+	end
+
+	if after:match("^%s*[%*&]") then
+		return true
+	end
+
+	if after:match("^%s*>") then
+		for _, wrapper in ipairs({
+			"TObjectPtr<",
+			"TWeakObjectPtr<",
+			"TSoftObjectPtr<",
+			"TSoftClassPtr<",
+			"TSubclassOf<",
+			"TNonNullSubclassOf<",
+			"TScriptInterface<",
+		}) do
+			if before:find(wrapper, 1, true) then
+				return true
+			end
+		end
+	end
+
+	return false
+end
+
+local function rank_forward_decl_candidate(item, symbol_info, current_path, header_file)
+	if not header_file or not allows_forward_declaration(symbol_info) then
+		return nil
+	end
+
+	local name = tostring(item.name or "")
+	local path = normalize(item.path)
+	if not path or path == current_path then
+		return nil
+	end
+
+	local keyword = forward_decl_keyword(item.type)
+	if not keyword then
+		return nil
+	end
+
+	local score = 0
+	if name == tostring(symbol_info.symbol or "") then
+		score = score + 130
+	end
+	if path:find("/Public/", 1, true) or path:find("/Classes/", 1, true) then
+		score = score + 20
+	end
+
+	return {
+		action = "forward_decl",
+		item = item,
+		name = name,
+		path = path,
+		keyword = keyword,
 		score = score,
 	}
 end
@@ -1127,24 +1216,59 @@ local function insert_include_line(bufnr, include_path, target_line)
 	return true
 end
 
-local function choose_and_insert_include(bufnr, metadata, candidates)
+local function line_contains_forward_declaration(lines, keyword, symbol)
+	local pattern = "^%s*" .. keyword .. "%s+" .. symbol .. "%s*;%s*$"
+	for _, line in ipairs(lines or {}) do
+		line = tostring(line or "")
+		if line:match(pattern) then
+			return true
+		end
+	end
+	return false
+end
+
+local function insert_forward_declaration(bufnr, keyword, symbol, target_line)
+	local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+	if line_contains_forward_declaration(lines, keyword, symbol) then
+		return false, "already_declared"
+	end
+
+	local row = math.max((tonumber(target_line) or 1) - 1, 0)
+	local insert = string.format("%s %s;", keyword, symbol)
+	vim.api.nvim_buf_set_lines(bufnr, row, row, false, { insert })
+	return true
+end
+
+local function choose_and_insert_dependency(bufnr, metadata, candidates)
 	if vim.tbl_isempty(candidates) then
-		return vim.notify("No indexed header found for the current symbol", vim.log.levels.INFO)
+		return vim.notify("No indexed symbol found for the current symbol", vim.log.levels.INFO)
 	end
 
 	table.sort(candidates, function(left, right)
 		if left.score ~= right.score then
 			return left.score > right.score
 		end
-		return left.include_path < right.include_path
+		local left_key = left.include_path or (left.keyword .. " " .. left.name)
+		local right_key = right.include_path or (right.keyword .. " " .. right.name)
+		return left_key < right_key
 	end)
 
 	local function apply(candidate)
-		local ok, reason = insert_include_line(
-			bufnr,
-			candidate.include_path,
-			metadata.suggested_insert_line or 1
-		)
+		local ok, reason
+		if candidate.action == "forward_decl" then
+			ok, reason = insert_forward_declaration(
+				bufnr,
+				candidate.keyword,
+				candidate.name,
+				metadata.suggested_insert_line or 1
+			)
+		else
+			ok, reason = insert_include_line(
+				bufnr,
+				candidate.include_path,
+				metadata.suggested_insert_line or 1
+			)
+		end
 		if ok then
 			M.refresh(bufnr, { force = true, silent = true })
 			return
@@ -1153,7 +1277,11 @@ local function choose_and_insert_include(bufnr, metadata, candidates)
 			vim.notify("Include already exists: " .. candidate.include_path, vim.log.levels.INFO)
 			return
 		end
-		vim.notify("Failed to insert include", vim.log.levels.ERROR)
+		if reason == "already_declared" then
+			vim.notify("Forward declaration already exists: " .. candidate.keyword .. " " .. candidate.name, vim.log.levels.INFO)
+			return
+		end
+		vim.notify("Failed to insert dependency", vim.log.levels.ERROR)
 	end
 
 	if #candidates == 1 or candidates[1].score > candidates[2].score then
@@ -1161,8 +1289,11 @@ local function choose_and_insert_include(bufnr, metadata, candidates)
 	end
 
 	vim.ui.select(candidates, {
-		prompt = "Select include",
+		prompt = "Select dependency",
 		format_item = function(entry)
+			if entry.action == "forward_decl" then
+				return string.format("%s %s;", entry.keyword, entry.name)
+			end
 			return entry.include_path
 		end,
 	}, function(choice)
@@ -1203,6 +1334,7 @@ try_include_symbol = function(bufnr)
 
 		local metadata = type(buffer_result) == "table" and buffer_result.metadata or {}
 		local include_lines = type(metadata.includes) == "table" and metadata.includes or {}
+		local header_file = is_header_file(file_path)
 
 		remote.search_symbols(root, symbol, function(search_result, search_err)
 			if search_err then
@@ -1216,9 +1348,13 @@ try_include_symbol = function(bufnr)
 				if candidate and not line_contains_include(include_lines, candidate.include_path) then
 					table.insert(candidates, candidate)
 				end
+				local forward_candidate = rank_forward_decl_candidate(item, symbol_info, file_path, header_file)
+				if forward_candidate then
+					table.insert(candidates, forward_candidate)
+				end
 			end
 
-			choose_and_insert_include(bufnr, metadata, candidates)
+			choose_and_insert_dependency(bufnr, metadata, candidates)
 		end, 24)
 	end)
 end

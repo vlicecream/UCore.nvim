@@ -485,11 +485,16 @@ end
 
 local function fallback_normal(keys)
 	if not keys or keys == "" then
-		return
+		return false
 	end
 
-	vim.cmd("normal! " .. keys)
-	vim.cmd("nohlsearch")
+	local ok = pcall(vim.cmd, "normal! " .. keys)
+	if ok then
+		pcall(vim.cmd, "nohlsearch")
+		return true
+	end
+
+	return false
 end
 
 -- Smart goto-definition entry.

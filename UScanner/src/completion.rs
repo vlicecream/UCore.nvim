@@ -311,6 +311,26 @@ pub fn process_completion_with_engine(
     let prefix = text_prefix_at(content, line as usize, character as usize)
         .filter(|text| !text.is_empty())
         .unwrap_or_else(|| completion_prefix(cursor_node, content));
+
+    if is_base_class_context(cursor_node) && !prefix.is_empty() {
+        let mut items = collect_buffer_type_items(root, content, line as usize, &prefix);
+        merge_completion_items(
+            &mut items,
+            fetch_global_type_symbols(conn, &prefix)?,
+            MAX_COMPLETION_ITEMS,
+        );
+
+        if let Some(engine_ctx) = engine_ctx.as_ref() {
+            merge_completion_items(
+                &mut items,
+                fetch_global_type_symbols(engine_ctx.conn, &prefix)?,
+                MAX_COMPLETION_ITEMS,
+            );
+        }
+
+        return Ok(json!(dedupe_completion_items(items)));
+    }
+
     let mut items = collect_local_completion_items(
         cursor_node,
         content,
@@ -1606,6 +1626,19 @@ fn collect_buffer_symbol_items(
     items
 }
 
+fn collect_buffer_type_items(root: Node, content: &str, cursor_row: usize, prefix: &str) -> Vec<Value> {
+    if prefix.is_empty() {
+        return Vec::new();
+    }
+
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+
+    collect_buffer_types_recursive(root, content, cursor_row, &mut seen, &mut items, prefix);
+
+    items
+}
+
 /// Merge completion items while preserving existing order and deduplicating by label.
 /// 合并补全项，保持已有顺序，并按 label 去重。
 fn merge_completion_items(target: &mut Vec<Value>, extra: Vec<Value>, limit: usize) {
@@ -1763,6 +1796,37 @@ fn collect_buffer_symbols_recursive(
             _ => {
                 collect_buffer_symbols_recursive(child, content, cursor_row, seen, items, prefix);
             }
+        }
+    }
+}
+
+fn collect_buffer_types_recursive(
+    node: Node,
+    content: &str,
+    cursor_row: usize,
+    seen: &mut HashSet<String>,
+    items: &mut Vec<Value>,
+    prefix: &str,
+) {
+    for child in node_children(node) {
+        if child.start_position().row > cursor_row {
+            continue;
+        }
+
+        match child.kind() {
+            "class_specifier"
+            | "struct_specifier"
+            | "enum_specifier"
+            | "unreal_reflected_class_declaration"
+            | "unreal_reflected_struct_declaration"
+            | "unreal_reflected_enum_declaration" => {
+                append_buffer_type_item(child, content, prefix, seen, items);
+                collect_buffer_types_recursive(child, content, cursor_row, seen, items, prefix);
+            }
+            "namespace_definition" => {
+                collect_buffer_types_recursive(child, content, cursor_row, seen, items, prefix);
+            }
+            _ => {}
         }
     }
 }
@@ -1987,6 +2051,17 @@ fn is_member_declaration_context_text(before_cursor: &str) -> bool {
     }
 
     matches!(stack.last(), Some(BlockKind::TypeLike))
+}
+
+fn is_base_class_context(node: Node) -> bool {
+    let mut current = Some(node);
+    while let Some(item) = current {
+        if item.kind() == "base_class_clause" {
+            return true;
+        }
+        current = item.parent();
+    }
+    false
 }
 
 fn node_contains_point(node: Node, point: Point) -> bool {
@@ -2863,6 +2938,13 @@ fn fetch_global_symbols(conn: &Connection, prefix: &str) -> Result<Vec<Value>> {
     append_global_type_items(conn, prefix, &mut seen, &mut items)?;
     append_global_enum_value_items(conn, prefix, &mut seen, &mut items)?;
 
+    Ok(items)
+}
+
+fn fetch_global_type_symbols(conn: &Connection, prefix: &str) -> Result<Vec<Value>> {
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+    append_global_type_items(conn, prefix, &mut seen, &mut items)?;
     Ok(items)
 }
 
@@ -5900,6 +5982,42 @@ public:
         );
 
         assert!(has_label(&items, "PostInitializeComponents"));
+    }
+
+    #[test]
+    fn base_class_context_only_offers_type_completions() {
+        let project_conn = test_db();
+        let engine_conn = test_db();
+
+        let engine_file_id: i64 = engine_conn
+            .query_row("SELECT id FROM files WHERE extension = 'cpp' LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+
+        let gameplay_ability_id = insert_class(&engine_conn, "UGameplayAbility", engine_file_id);
+        insert_member(
+            &engine_conn,
+            gameplay_ability_id,
+            "CancelAbility",
+            "function",
+            Some("void"),
+            "public",
+            engine_file_id,
+        );
+
+        let items = completion_at_with_engine(
+            &project_conn,
+            &engine_conn,
+            r#"
+class UMyAbility : public UGame/*cursor*/
+{
+};
+"#,
+        );
+
+        assert!(has_label(&items, "UGameplayAbility"));
+        assert!(!has_label(&items, "CancelAbility"));
+        assert!(!has_label(&items, "return"));
+        assert!(!has_label(&items, "UPROPERTY"));
     }
 
     #[test]
