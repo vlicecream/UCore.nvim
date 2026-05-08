@@ -20,7 +20,12 @@ fn main() -> Result<()> {
     let server_available = is_server_running(args.server_port);
 
     match args.command {
-        Some(Command::Proxy { method, payload }) => {
+        Some(Command::Proxy {
+            method,
+            payload,
+            read_stdin,
+        }) => {
+            let payload = resolve_proxy_payload(payload.as_deref(), read_stdin)?;
             if server_available {
                 return proxy_to_server(args.server_port, &method, &payload);
             }
@@ -54,7 +59,11 @@ fn main() -> Result<()> {
 enum Command {
     /// Proxy a JSON payload to the running server.
     /// 把 JSON payload 转发给正在运行的 server。
-    Proxy { method: String, payload: String },
+    Proxy {
+        method: String,
+        payload: Option<String>,
+        read_stdin: bool,
+    },
 
     /// Query server status-like commands.
     /// 查询 server 状态类命令。
@@ -100,11 +109,17 @@ fn parse_command(args: &[String]) -> Result<Option<Command>> {
 
     match cmd.as_str() {
         "refresh" | "watch" | "query" | "setup" => {
-            let arg = args.get(2).ok_or_else(|| anyhow!("Missing JSON config or file path"))?;
-            let payload = load_payload(arg)?;
+            let arg = args.get(2).map(|value| value.as_str());
+            let read_stdin = matches!(arg, None | Some("--stdin") | Some("-"));
+            let payload = if read_stdin {
+                None
+            } else {
+                Some(load_payload(arg.unwrap())?)
+            };
             Ok(Some(Command::Proxy {
                 method: cmd.clone(),
                 payload,
+                read_stdin,
             }))
         }
 
@@ -132,6 +147,21 @@ fn load_payload(input: &str) -> Result<String> {
     }
 
     Ok(input.to_string())
+}
+
+fn resolve_proxy_payload(payload: Option<&str>, read_stdin: bool) -> Result<String> {
+    if read_stdin {
+        let mut input = String::new();
+        io::stdin().read_to_string(&mut input)?;
+        if input.trim().is_empty() {
+            return Err(anyhow!("Missing JSON payload from stdin"));
+        }
+        return Ok(input);
+    }
+
+    payload
+        .map(|value| value.to_string())
+        .ok_or_else(|| anyhow!("Missing JSON payload"))
 }
 
 // -----------------------------------------------------------------------------

@@ -18,14 +18,22 @@ local function build_cmd(method, payload)
 	table.insert(cmd, method)
 
 	if payload ~= nil then
-		if type(payload) == "table" then
-			table.insert(cmd, vim.json.encode(payload))
-		else
-			table.insert(cmd, payload)
-		end
+		table.insert(cmd, "--stdin")
 	end
 
 	return cmd
+end
+
+local function encode_payload(payload)
+	if payload == nil then
+		return nil
+	end
+
+	if type(payload) == "table" then
+		return vim.json.encode(payload)
+	end
+
+	return tostring(payload)
 end
 
 -- Decode JSON stdout when possible; otherwise return raw text.
@@ -53,6 +61,7 @@ function M.request(method, payload, callback)
 	if not cmd then
 		return callback(nil, build_err)
 	end
+	local stdin_payload = encode_payload(payload)
 
 	local env = vim.tbl_extend("force", vim.fn.environ(), {
 		UNL_SERVER_PORT = tostring(config.values.port),
@@ -62,6 +71,7 @@ function M.request(method, payload, callback)
 		cwd = config.values.backend_cwd,
 		text = true,
 		env = env,
+		stdin = stdin_payload,
 	}, function(result)
 		vim.schedule(function()
 			if result.code ~= 0 then
