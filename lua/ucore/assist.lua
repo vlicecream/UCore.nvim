@@ -179,24 +179,92 @@ local function split_params(params)
 	return items
 end
 
-local function signature_label(entry, active_param, active)
+local function signature_span(text)
+	text = tostring(text or "")
+	local start_col = text:find("%(", 1, false)
+	if not start_col then
+		return nil
+	end
+
+	local depth = 0
+	for index = start_col, #text do
+		local ch = text:sub(index, index)
+		if ch == "(" then
+			depth = depth + 1
+		elseif ch == ")" then
+			depth = math.max(depth - 1, 0)
+			if depth == 0 then
+				return start_col, index
+			end
+		end
+	end
+
+	return nil
+end
+
+local function signature_params_text(text)
+	local start_col, end_col = signature_span(text)
+	if not start_col or not end_col then
+		return "()"
+	end
+	return text:sub(start_col, end_col)
+end
+
+local function signature_suffix_text(text)
+	local _, end_col = signature_span(text)
+	if not end_col then
+		return ""
+	end
+	return vim.trim(text:sub(end_col + 1))
+end
+
+local function append_lines(target, extra)
+	for _, line in ipairs(extra or {}) do
+		table.insert(target, line)
+	end
+end
+
+local function signature_block(entry, active_param, active)
 	local owner = tostring(entry.owner_class or entry.class_name or "")
 	local name = tostring(entry.name or "")
 	local return_type = vim.trim(tostring(entry.return_type or ""))
-	local params = split_params(entry.parameters or entry.detail or "()")
-	local parts = {}
+	local raw_signature = entry.parameters or entry.detail or "()"
+	local params = split_params(signature_params_text(raw_signature))
+	local suffix = signature_suffix_text(raw_signature)
+	local prefix = return_type ~= "" and (return_type .. " ") or ""
+	local scope = owner ~= "" and (owner .. "::") or ""
+
+	if vim.tbl_isempty(params) then
+		local line = string.format("%s%s%s()", prefix, scope, name)
+		if suffix ~= "" then
+			line = line .. " " .. suffix
+		end
+		return { line }
+	end
+
+	local lines = {
+		string.format("%s%s%s(", prefix, scope, name),
+	}
 
 	for index, param in ipairs(params) do
 		param = vim.trim(param)
 		if active and index - 1 == active_param then
 			param = "[ " .. param .. " ]"
 		end
-		table.insert(parts, param)
+		local tail = index < #params and "," or ""
+		table.insert(lines, "    " .. param .. tail)
 	end
 
-	local prefix = return_type ~= "" and (return_type .. " ") or ""
-	local scope = owner ~= "" and (owner .. "::") or ""
-	return string.format("%s%s%s(%s)", prefix, scope, name, table.concat(parts, ", "))
+	local closing = ")"
+	if suffix ~= "" then
+		closing = closing .. " " .. suffix
+	end
+	table.insert(lines, closing)
+	return lines
+end
+
+local function signature_label(entry, active_param, active)
+	return table.concat(signature_block(entry, active_param, active), "\n")
 end
 
 local function push_labeled_line(lines, highlights, label, value, group)
@@ -254,7 +322,7 @@ local function hover_content(item)
 		end
 	else
 		if kind:lower():find("function", 1, true) then
-			table.insert(lines, signature_label(item, -1, false))
+			append_lines(lines, signature_block(item, -1, false))
 		elseif class_name ~= "" and name ~= "" then
 			table.insert(lines, class_name .. "::" .. name)
 		else
@@ -289,7 +357,7 @@ local function signature_lines(result)
 	local active_param = tonumber(result.active_parameter or 0) or 0
 
 	for index, entry in ipairs(signatures or {}) do
-		table.insert(lines, signature_label(entry, active_param, index == 1))
+		append_lines(lines, signature_block(entry, active_param, index == 1))
 		local location = display_path(tostring(entry.file_path or ""))
 		local line_number = tonumber(entry.line_number or 0) or 0
 		if location ~= "" then
@@ -457,6 +525,9 @@ function M.hover_auto(opts)
 		end
 
 		vim.schedule(function()
+			if opts.auto == true and hover_blocked_by_diagnostics(bufnr) then
+				return
+			end
 			local lines, highlights = hover_content(result)
 			open_float(lines, {
 				filetype = "text",
@@ -779,6 +850,13 @@ function M.active_float_kind()
 	end
 
 	return float_state.kind
+end
+
+function M.cancel_auto_hover()
+	auto_state.hover_seq = auto_state.hover_seq + 1
+	if float_state.auto and float_state.kind == "hover" then
+		close_float()
+	end
 end
 
 local function auto_hover_enabled()

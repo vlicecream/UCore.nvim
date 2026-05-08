@@ -211,6 +211,9 @@ local function show_cursor_float(bufnr)
 	end
 
 	local assist_ok, assist = pcall(require, "ucore.assist")
+	if assist_ok and assist and type(assist.cancel_auto_hover) == "function" then
+		assist.cancel_auto_hover()
+	end
 	if assist_ok and assist and type(assist.has_active_float) == "function" and assist.has_active_float() then
 		local active_kind = type(assist.active_float_kind) == "function" and assist.active_float_kind() or nil
 		if active_kind == "hover" and type(assist.close_float) == "function" then
