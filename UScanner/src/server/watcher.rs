@@ -9,10 +9,25 @@ use crate::{db, scanner};
 
 const SOURCE_EXTENSIONS: &[&str] = &["h", "hh", "hpp", "cpp", "cc", "cxx", "inl", "cs"];
 const ASSET_EXTENSIONS: &[&str] = &["uasset", "umap"];
+const IGNORED_WATCH_DIRS: &[&str] = &[
+    "Intermediate",
+    "Binaries",
+    "Build",
+    "Saved",
+    "DerivedDataCache",
+    ".git",
+    ".vs",
+    "ExternalActors",
+    "ExternalObjects",
+];
 
 /// Handle one filesystem change event.
 /// 处理一个文件系统变化事件。
 pub async fn handle_file_change(state: Arc<AppState>, path: PathBuf) {
+    if is_ignored_watch_path(&path) {
+        return;
+    }
+
     if !path.exists() || !path.is_file() {
         return;
     }
@@ -243,6 +258,28 @@ fn normalize_watched_path(path: &Path) -> String {
     normalized
 }
 
+fn is_ignored_watch_path(path: &Path) -> bool {
+    if path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .map(|name| IGNORED_WATCH_DIRS.iter().any(|ignored| name.eq_ignore_ascii_case(ignored)))
+            .unwrap_or(false)
+    }) {
+        return true;
+    }
+
+    let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+
+    let lowercase = filename.to_ascii_lowercase();
+    lowercase.ends_with(".generated.h")
+        || lowercase.ends_with(".gen.cpp")
+        || lowercase.ends_with(".gen.h")
+        || lowercase.ends_with(".designer.cs")
+}
+
 /// Get lowercase file extension without dot.
 /// 获取小写扩展名，不包含点号。
 fn file_extension(path: &Path) -> String {
@@ -261,4 +298,39 @@ fn file_mtime_seconds(path: &str) -> u64 {
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ignores_unreal_generated_files() {
+        assert!(is_ignored_watch_path(Path::new(
+            "E:/Project/Source/Game/MyActor.generated.h"
+        )));
+        assert!(is_ignored_watch_path(Path::new(
+            "E:/Project/Intermediate/Build/MyActor.gen.cpp"
+        )));
+    }
+
+    #[test]
+    fn ignores_noisy_unreal_directories() {
+        assert!(is_ignored_watch_path(Path::new(
+            "E:/Project/Intermediate/Build/Win64/MyActor.cpp"
+        )));
+        assert!(is_ignored_watch_path(Path::new(
+            "E:/Project/Saved/Autosaves/Test.uasset"
+        )));
+    }
+
+    #[test]
+    fn keeps_real_source_files() {
+        assert!(!is_ignored_watch_path(Path::new(
+            "E:/Project/Source/Game/Public/MyActor.h"
+        )));
+        assert!(!is_ignored_watch_path(Path::new(
+            "E:/Project/Plugins/Foo/Source/Foo/Private/MyActor.cpp"
+        )));
+    }
 }
