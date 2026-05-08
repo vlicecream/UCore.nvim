@@ -235,6 +235,36 @@ local function ensure_selection_defaults(completion_config)
 	return completion_config
 end
 
+local function in_ucore_special_context()
+	return in_include_context() or in_macro_context()
+end
+
+local function active_ucore_sources()
+	if in_ucore_special_context() then
+		return { "ucore" }
+	end
+
+	return vim.deepcopy(ucore_filetype_sources)
+end
+
+local function provider_should_show(prev)
+	return function(ctx, items)
+		if in_ucore_special_context() then
+			return false
+		end
+
+		if type(prev) == "function" then
+			return prev(ctx, items)
+		end
+
+		if prev == nil then
+			return true
+		end
+
+		return prev
+	end
+end
+
 function M.extend_blink_opts(opts)
 	opts = opts or {}
 	opts.sources = opts.sources or {}
@@ -242,7 +272,7 @@ function M.extend_blink_opts(opts)
 	opts.sources.per_filetype = opts.sources.per_filetype or {}
 	opts.sources.providers = opts.sources.providers or {}
 	for filetype, _ in pairs(default_opts.filetypes) do
-		opts.sources.per_filetype[filetype] = vim.deepcopy(ucore_filetype_sources)
+		opts.sources.per_filetype[filetype] = active_ucore_sources
 	end
 
 	opts.sources.providers.ucore = vim.tbl_deep_extend("force", {
@@ -253,6 +283,12 @@ function M.extend_blink_opts(opts)
 		min_keyword_length = 0,
 		score_offset = 50,
 	}, opts.sources.providers.ucore or {})
+
+	for _, provider in ipairs({ "buffer", "path", "snippets", "lsp" }) do
+		local existing = opts.sources.providers[provider] or {}
+		existing.should_show_items = provider_should_show(existing.should_show_items)
+		opts.sources.providers[provider] = existing
+	end
 
 	opts.keymap = ensure_keymap_defaults(opts.keymap)
 	opts.completion = ensure_selection_defaults(opts.completion)
@@ -325,6 +361,7 @@ to_blink_item = function(item)
 		filterText = tostring(raw.filterText or raw.filter_text or label),
 		insertText = tostring(insert_text),
 		insertTextFormat = insert_text_format,
+		textEdit = raw.textEdit or raw.text_edit,
 		sortText = tostring(raw.sortText or raw.sort_text or label),
 		score_offset = tonumber(raw.score_offset or raw.scoreOffset) or 0,
 	}
