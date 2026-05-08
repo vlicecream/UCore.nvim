@@ -540,15 +540,11 @@ function M._goto_definition_inner(opts)
 				file_path = normalize_path(file_path),
 			}, function(result, err)
 				if err then
-					if opts.fallback then
-						fallback_normal(opts.fallback)
-						return
-					end
 					return vim.notify("UCore goto failed:\n" .. tostring(err), vim.log.levels.ERROR)
 				end
 
-				if not open_result(result, { silent = opts.fallback ~= nil }) and opts.fallback then
-					fallback_normal(opts.fallback)
+				if not open_result(result, { silent = true }) then
+					vim.notify("UCore goto: implementation not found", vim.log.levels.INFO)
 				end
 			end)
 		end)
