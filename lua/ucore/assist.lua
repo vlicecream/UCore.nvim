@@ -580,6 +580,16 @@ local function apply_rename_edits(project_root, old_name, new_name, items)
 	end
 
 	for bufnr, _ in pairs(touched) do
+		local ok_write, write_err = pcall(function()
+			vim.bo[bufnr].readonly = false
+			vim.bo[bufnr].modifiable = true
+			vim.api.nvim_buf_call(bufnr, function()
+				vim.cmd("silent keepalt write")
+			end)
+		end)
+		if not ok_write then
+			vim.notify("UCore rename write failed:\n" .. tostring(write_err), vim.log.levels.ERROR)
+		end
 		pcall(require("ucore.semantic").refresh, bufnr)
 		pcall(require("ucore.diagnostics").refresh, bufnr, { force = true, silent = true })
 	end
