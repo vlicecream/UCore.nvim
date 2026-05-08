@@ -9,7 +9,7 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use crate::server::asset::handle_asset_scan;
+use crate::server::asset;
 use crate::server::state::{AppState, ProjectContext, RpcProgressReporter};
 use crate::server::utils::{
     convert_params, normalize_path_key, normalize_to_native, normalize_to_unix,
@@ -111,6 +111,10 @@ pub async fn handle_setup(state: Arc<AppState>, params: &Value) -> Result<Value>
 
     if let Some(cache_path) = req.cache_db_path.as_ref() {
         let _ = state.get_persistent_cache_connection(&normalize_to_native(cache_path));
+    }
+
+    if !needs_full_refresh {
+        ensure_asset_index_ready(&db_path_native, &req.project_root).await?;
     }
 
     let _ = state.save_registry();
@@ -397,8 +401,7 @@ fn handle_state_query(
         }
 
         QueryRequest::GetAssetUsages { asset_path } => {
-            ensure_asset_scan_started(&state, root_key, project_root);
-            Ok(Some(get_asset_usages(&state, root_key, &asset_path)))
+            Ok(Some(asset::get_asset_usages(conn, &asset_path)?))
         }
 
         QueryRequest::GetAssetDependencies { asset_path } => {
@@ -406,7 +409,6 @@ fn handle_state_query(
         }
 
         QueryRequest::FindDerivedClasses { base_class } => {
-            ensure_asset_scan_started(&state, root_key, project_root);
             let mut db_results = query::process_query(
                 conn,
                 QueryRequest::FindDerivedClasses {
@@ -417,14 +419,13 @@ fn handle_state_query(
             .cloned()
             .unwrap_or_default();
 
-            merge_asset_derived_classes(&state, root_key, &base_class, &mut db_results);
+            asset::merge_derived_classes(conn, &base_class, &mut db_results)?;
 
             Ok(Some(json!(db_results)))
         }
 
         QueryRequest::GetAssets => {
-            ensure_asset_scan_started(&state, root_key, project_root);
-            Ok(Some(get_assets_from_graph(&state, root_key)))
+            Ok(Some(asset::get_assets(conn)?))
         }
 
         QueryRequest::GetConfigData { engine_root } => {
@@ -1375,60 +1376,6 @@ fn modify_result_to_json(result: Result<()>) -> Value {
 // Asset query helpers
 // -----------------------------------------------------------------------------
 
-/// Get asset usages from in-memory AssetGraph.
-/// 从内存 AssetGraph 查询资产引用和派生关系。
-fn get_asset_usages(state: &AppState, root_key: &str, asset_path: &str) -> Value {
-    if is_asset_scan_active(state, root_key) {
-        return json!({
-            "status": "scanning",
-            "references": [],
-            "derived": [],
-        });
-    }
-
-    let graphs = state.asset_graphs.lock();
-    let Some(graph) = graphs.get(root_key) else {
-        return json!({
-            "status": "scanning",
-            "references": [],
-            "derived": [],
-        });
-    };
-
-    let try_names = make_asset_lookup_names(asset_path);
-    let mut references = HashSet::new();
-    let mut derived = HashSet::new();
-
-    for name in &try_names {
-        let dot_name = format!(".{}", name);
-
-        for (key, assets) in &graph.references {
-            if key.as_ref() == name || key.ends_with(&dot_name) {
-                references.extend(assets.iter().map(|item| item.to_string()));
-            }
-        }
-
-        for (key, assets) in &graph.derived {
-            if key.as_ref() == name || key.ends_with(&dot_name) {
-                derived.extend(assets.iter().map(|item| item.to_string()));
-            }
-        }
-
-        for (key, assets) in &graph.functions {
-            if key.as_ref() == name || key.ends_with(&dot_name) || key.contains(&format!(":{}", name))
-            {
-                references.extend(assets.iter().map(|item| item.to_string()));
-            }
-        }
-    }
-
-    json!({
-        "status": "ready",
-        "references": sorted_strings(references),
-        "derived": sorted_strings(derived),
-    })
-}
-
 /// Get dependencies for a single asset by parsing the asset file directly.
 /// 直接解析单个资产文件，获取它依赖的资源和父类。
 fn get_asset_dependencies(project_root: &str, asset_path: &str) -> Result<Value> {
@@ -1459,82 +1406,29 @@ fn get_asset_dependencies(project_root: &str, asset_path: &str) -> Result<Value>
     }))
 }
 
-/// Merge Blueprint-derived assets into class query result.
-/// 把蓝图派生资产合并进 class 派生查询结果。
-fn merge_asset_derived_classes(
-    state: &AppState,
-    root_key: &str,
-    base_class: &str,
-    results: &mut Vec<Value>,
-) {
-    if is_asset_scan_active(state, root_key) {
-        results.push(json!({
-            "name": "Scanning...",
-            "path": "",
-            "symbol_type": "scanning",
-        }));
-        return;
-    }
-
-    let graphs = state.asset_graphs.lock();
-    let Some(graph) = graphs.get(root_key) else {
-        return;
-    };
-
-    let names = make_asset_lookup_names(base_class);
-
-    for name in names {
-        let dot_name = format!(".{}", name);
-
-        for (key, assets) in &graph.derived {
-            if key.as_ref() != name && !key.ends_with(&dot_name) {
-                continue;
-            }
-
-            for asset in assets {
-                let exists = results.iter().any(|item| {
-                    item["path"]
-                        .as_str()
-                        .map(|path| path.eq_ignore_ascii_case(asset.as_ref()))
-                        .unwrap_or(false)
-                });
-
-                if !exists {
-                    results.push(json!({
-                        "name": asset.rsplit('/').next().unwrap_or(asset.as_ref()),
-                        "path": asset.to_string(),
-                        "symbol_type": "uasset",
-                    }));
-                }
-            }
-        }
-    }
-}
-
-/// Get all assets known by the in-memory graph.
-/// 从内存资产图获取所有已知资产。
-fn get_assets_from_graph(state: &AppState, root_key: &str) -> Value {
-    let graphs = state.asset_graphs.lock();
-    let Some(graph) = graphs.get(root_key) else {
-        return json!([]);
-    };
-
-    let mut assets = HashSet::new();
-
-    for values in graph.references.values() {
-        assets.extend(values.iter().map(|item| item.to_string()));
-    }
-
-    for values in graph.derived.values() {
-        assets.extend(values.iter().map(|item| item.to_string()));
-    }
-
-    json!(sorted_strings(assets))
-}
-
 // -----------------------------------------------------------------------------
 // Shared helpers
 // -----------------------------------------------------------------------------
+
+/// Ensure the persistent asset index exists for this project.
+/// 确保当前项目的持久化资产索引已经初始化。
+async fn ensure_asset_index_ready(db_path_native: &str, project_root: &str) -> Result<()> {
+    let db_path_native = db_path_native.to_string();
+    let project_root = project_root.to_string();
+
+    tokio::task::spawn_blocking(move || {
+        let mut conn = rusqlite::Connection::open(&db_path_native)?;
+        db::init_db(&conn)?;
+
+        if asset::asset_index_initialized(&conn)? {
+            return Ok(());
+        }
+
+        let reporter = Arc::new(crate::types::StdoutReporter);
+        asset::refresh_asset_index(&mut conn, Path::new(&project_root), reporter)
+    })
+    .await?
+}
 
 /// Ensure SQLite database exists, version matches, and has required data.
 /// 确保 SQLite 数据库存在、版本正确，并且不是空索引。
@@ -1624,35 +1518,6 @@ fn is_refreshing(state: &AppState, root_key: &str) -> bool {
     state.active_refreshes.lock().contains(root_key)
 }
 
-/// Check whether asset scan is active.
-/// 判断资产扫描是否正在进行。
-fn is_asset_scan_active(state: &AppState, root_key: &str) -> bool {
-    state.active_asset_scans.lock().contains(root_key)
-}
-
-/// Start asset scan if graph is missing and no scan is active.
-/// 如果缺少资产图且当前没在扫描，则启动资产扫描。
-fn ensure_asset_scan_started(state: &Arc<AppState>, root_key: &str, project_root: &str) {
-    let has_graph = state.asset_graphs.lock().contains_key(root_key);
-    if has_graph {
-        return;
-    }
-
-    let mut active = state.active_asset_scans.lock();
-    if !active.insert(root_key.to_string()) {
-        return;
-    }
-
-    drop(active);
-
-    let state_clone = state.clone();
-    let project_root = project_root.to_string();
-
-    tokio::spawn(async move {
-        handle_asset_scan(state_clone, project_root).await;
-    });
-}
-
 /// Guard for active_refreshes.
 /// active_refreshes 的自动清理保护对象。
 struct RefreshGuard<'a> {
@@ -1691,31 +1556,6 @@ fn get_project_context(state: &AppState, root_key: &str) -> Result<ProjectContex
         .ok_or_else(|| anyhow!("Project not found: {}", root_key))
 }
 
-/// Build lookup names for class or asset references.
-/// 为 class 或 asset 引用构造多个可匹配名称。
-fn make_asset_lookup_names(input: &str) -> Vec<String> {
-    let class_name = if input.starts_with("/Script/") {
-        input.rsplit('.').next().unwrap_or(input)
-    } else {
-        input
-    };
-
-    let mut names = vec![class_name.to_ascii_lowercase()];
-
-    let prefixes = ['a', 'u', 'f', 'e', 't', 's'];
-    let mut chars = class_name.chars();
-
-    if let (Some(first), Some(second)) = (chars.next(), chars.next()) {
-        if prefixes.contains(&first.to_ascii_lowercase()) && second.is_uppercase() {
-            names.push(class_name[first.len_utf8()..].to_ascii_lowercase());
-        }
-    }
-
-    names.sort();
-    names.dedup();
-    names
-}
-
 /// Locate an asset file from an Unreal /Game path.
 /// 根据 Unreal /Game 路径定位真实资产文件。
 fn find_asset_file(project_root: &str, asset_path: &str) -> Option<PathBuf> {
@@ -1752,12 +1592,4 @@ fn find_asset_file(project_root: &str, asset_path: &str) -> Option<PathBuf> {
     }
 
     None
-}
-
-/// Sort a string set into deterministic order.
-/// 把字符串集合排序成稳定输出。
-fn sorted_strings(values: HashSet<String>) -> Vec<String> {
-    let mut values = values.into_iter().collect::<Vec<_>>();
-    values.sort();
-    values
 }

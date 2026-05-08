@@ -28,16 +28,22 @@ pub async fn handle_file_change(state: Arc<AppState>, path: PathBuf) {
         return;
     }
 
-    if !path.exists() || !path.is_file() {
-        return;
-    }
-
+    let ext = file_extension(&path);
     let normalized_path = normalize_watched_path(&path);
     let Some(project) = find_project_for_path(&state, &normalized_path) else {
         return;
     };
 
-    let ext = file_extension(&path);
+    if !path.exists() {
+        if ASSET_EXTENSIONS.contains(&ext.as_str()) {
+            handle_asset_delete(state, project, path).await;
+        }
+        return;
+    }
+
+    if !path.is_file() {
+        return;
+    }
 
     if ext == "ini" {
         mark_config_cache_dirty(&state, &project.root_key);
@@ -115,7 +121,60 @@ async fn handle_asset_change(state: Arc<AppState>, root_key: String, path: PathB
         return;
     }
 
+    let db_path_unix = {
+        let projects = state.projects.lock();
+        projects.get(&root_key).map(|ctx| ctx.db_path.clone())
+    };
+
+    let Some(db_path_unix) = db_path_unix else {
+        return;
+    };
+
+    let db_path_native = normalize_to_native(&db_path_unix);
+    let conn = match state.get_connection(&db_path_native) {
+        Ok(conn) => conn,
+        Err(err) => {
+            error!("Watcher failed to open DB connection for asset update: {}", err);
+            return;
+        }
+    };
+
     crate::server::asset::update_single_asset(state, &root_key, &path).await;
+
+    tokio::task::spawn_blocking(move || {
+        let mut conn = conn.lock();
+        if let Err(err) = crate::server::asset::upsert_asset_file(&mut conn, &path) {
+            error!("Failed to persist asset update {}: {}", path.display(), err);
+            return;
+        }
+
+        info!("Asset change persisted: {}", path.display());
+    });
+}
+
+async fn handle_asset_delete(state: Arc<AppState>, project: MatchedProject, path: PathBuf) {
+    if !is_important_asset(&path, &file_extension(&path)) {
+        return;
+    }
+
+    let db_path_native = normalize_to_native(&project.db_path_unix);
+    let conn = match state.get_connection(&db_path_native) {
+        Ok(conn) => conn,
+        Err(err) => {
+            error!("Watcher failed to open DB connection for asset delete: {}", err);
+            return;
+        }
+    };
+
+    tokio::task::spawn_blocking(move || {
+        let mut conn = conn.lock();
+        if let Err(err) = crate::server::asset::delete_asset_file(&mut conn, &path) {
+            error!("Failed to delete asset index entry {}: {}", path.display(), err);
+            return;
+        }
+
+        info!("Asset removed from index: {}", path.display());
+    });
 }
 
 /// Return true if the asset is useful for navigation/search indexes.

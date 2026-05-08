@@ -16,7 +16,7 @@ use crate::types::{ParseResult, ProgressReporter};
 ///
 /// Increment this when table structures, indexes, or stored data semantics change.
 /// 当表结构、索引或存储语义变化时递增。
-pub const DB_VERSION: i32 = 19;
+pub const DB_VERSION: i32 = 20;
 
 /// Completion cache version.
 /// 补全缓存版本。
@@ -250,6 +250,28 @@ fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS assets (
+            asset_path TEXT PRIMARY KEY,
+            asset_key TEXT NOT NULL,
+            source_path TEXT NOT NULL UNIQUE,
+            source_path_key TEXT NOT NULL UNIQUE,
+            parent_class TEXT,
+            parent_class_key TEXT,
+            mtime INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS asset_references (
+            asset_path TEXT NOT NULL,
+            reference_key TEXT NOT NULL,
+            FOREIGN KEY(asset_path) REFERENCES assets(asset_path) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS asset_functions (
+            asset_path TEXT NOT NULL,
+            function_key TEXT NOT NULL,
+            FOREIGN KEY(asset_path) REFERENCES assets(asset_path) ON DELETE CASCADE
+        );
         "#,
     )?;
 
@@ -331,6 +353,13 @@ fn create_indices(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_file_includes_base_name ON file_includes(base_filename_id);
 
         CREATE INDEX IF NOT EXISTS idx_cache_last_used ON persistent_cache(last_used);
+        CREATE INDEX IF NOT EXISTS idx_assets_asset_key ON assets(asset_key);
+        CREATE INDEX IF NOT EXISTS idx_assets_source_path_key ON assets(source_path_key);
+        CREATE INDEX IF NOT EXISTS idx_assets_parent_class_key ON assets(parent_class_key);
+        CREATE INDEX IF NOT EXISTS idx_asset_references_asset_path ON asset_references(asset_path);
+        CREATE INDEX IF NOT EXISTS idx_asset_references_reference_key ON asset_references(reference_key);
+        CREATE INDEX IF NOT EXISTS idx_asset_functions_asset_path ON asset_functions(asset_path);
+        CREATE INDEX IF NOT EXISTS idx_asset_functions_function_key ON asset_functions(function_key);
         "#,
     )?;
 
@@ -357,6 +386,13 @@ fn drop_indices(conn: &Connection) -> rusqlite::Result<()> {
         "idx_file_includes_resolved_id",
         "idx_file_includes_base_name",
         "idx_cache_last_used",
+        "idx_assets_asset_key",
+        "idx_assets_source_path_key",
+        "idx_assets_parent_class_key",
+        "idx_asset_references_asset_path",
+        "idx_asset_references_reference_key",
+        "idx_asset_functions_asset_path",
+        "idx_asset_functions_function_key",
     ];
 
     for index_name in indices {

@@ -12,6 +12,7 @@ use tree_sitter::Query;
 
 use crate::db;
 use crate::db::project_path::get_or_create_directory;
+use crate::server::asset;
 use crate::types::{
     ComponentDef, InputFile, ModuleDef, ParseResult, PhaseInfo, ProgressReporter, RefreshRequest,
 };
@@ -67,6 +68,12 @@ pub fn run_refresh(req: RefreshRequest, reporter: Arc<dyn ProgressReporter>) -> 
 
     parse_changed_sources(&mut conn, plan.sources_to_parse, reporter.clone())?;
     upsert_non_source_files(&mut conn, plan.other_files)?;
+
+    if should_index_assets(&ctx) {
+        asset::refresh_asset_index(&mut conn, &ctx.project_root, reporter.clone())?;
+    } else {
+        reporter.report("asset_index", 100, 100, "Asset index skipped.");
+    }
 
     reporter.report("complete", 100, 100, "Refresh complete.");
     Ok(())
@@ -203,7 +210,12 @@ fn report_plan(reporter: &dyn ProgressReporter) {
         PhaseInfo {
             name: "analysis".to_string(),
             label: "Analysis".to_string(),
-            weight: 0.65,
+            weight: 0.55,
+        },
+        PhaseInfo {
+            name: "asset_index".to_string(),
+            label: "Asset Index".to_string(),
+            weight: 0.10,
         },
         PhaseInfo {
             name: "finalizing".to_string(),
@@ -211,6 +223,10 @@ fn report_plan(reporter: &dyn ProgressReporter) {
             weight: 0.15,
         },
     ]);
+}
+
+fn should_index_assets(ctx: &RefreshContext) -> bool {
+    !is_engine_root_path(&ctx.project_root)
 }
 
 /// Discover components, modules, and files.
