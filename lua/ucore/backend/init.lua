@@ -18,21 +18,35 @@ local function build_script_path()
 	return normalize(plugin_root .. "/scripts/build.ps1")
 end
 
-function M.can_update_managed_backend()
+local function bundled_source_dir()
 	local backend = config.values.backend or {}
-	if backend.source_dir ~= nil or backend.bin_dir ~= nil then
-		return false
+	return normalize(backend.source_dir or backend.bundled_source_dir or (plugin_root .. "/UScanner"))
+end
+
+local function bundled_manifest_path()
+	local source_dir = bundled_source_dir()
+	if not source_dir then
+		return nil
 	end
 
+	local manifest = normalize(source_dir .. "/Cargo.toml")
+	if manifest and vim.fn.filereadable(manifest) == 1 then
+		return manifest
+	end
+
+	return nil
+end
+
+function M.can_update_managed_backend()
 	local script = build_script_path()
-	return script and vim.fn.filereadable(script) == 1
+	return script and vim.fn.filereadable(script) == 1 and bundled_manifest_path() ~= nil
 end
 
 function M.update_managed_backend(callback)
 	callback = callback or function() end
 
 	if not M.can_update_managed_backend() then
-		return callback(false, "Managed backend auto-update is unavailable for the current UCore backend config")
+		return callback(false, "Bundled backend build is unavailable for the current UCore backend config")
 	end
 
 	local shell = vim.fn.executable("pwsh") == 1 and "pwsh" or "powershell"
@@ -57,13 +71,13 @@ function M.update_managed_backend(callback)
 
 			if result.code ~= 0 then
 				if output == "" then
-					output = string.format("backend build exited with code %d", result.code)
+					output = string.format("bundled backend build exited with code %d", result.code)
 				end
 				return callback(false, output)
 			end
 
 			config.refresh_backend_commands()
-			callback(true, output ~= "" and output or "Managed backend updated")
+			callback(true, output ~= "" and output or "Bundled backend built")
 		end)
 	end)
 end

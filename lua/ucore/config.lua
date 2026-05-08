@@ -79,6 +79,38 @@ local function mtime(path)
 	return stat and stat.mtime and stat.mtime.sec or nil
 end
 
+local function subtree_stamp(path)
+	path = normalize(path)
+	if not path or not is_dir(path) then
+		return 0
+	end
+
+	local stamp = 0
+	local stack = { path }
+
+	while #stack > 0 do
+		local dir = table.remove(stack)
+		local handle = vim.loop.fs_scandir(dir)
+		if handle then
+			while true do
+				local name, kind = vim.loop.fs_scandir_next(handle)
+				if not name then
+					break
+				end
+
+				local child = dir .. "/" .. name
+				if kind == "directory" then
+					table.insert(stack, child)
+				else
+					stamp = math.max(stamp, mtime(child) or 0)
+				end
+			end
+		end
+	end
+
+	return stamp
+end
+
 local function backend_source_stamp(source_dir)
 	source_dir = normalize(source_dir)
 	if not source_dir then
@@ -89,11 +121,13 @@ local function backend_source_stamp(source_dir)
 	for _, path in ipairs({
 		source_dir .. "/Cargo.toml",
 		source_dir .. "/Cargo.lock",
-		source_dir .. "/.git/index",
-		source_dir .. "/.git/HEAD",
+		source_dir .. "/build.rs",
 	}) do
 		stamp = math.max(stamp, mtime(path) or 0)
 	end
+
+	stamp = math.max(stamp, subtree_stamp(source_dir .. "/.cargo"))
+	stamp = math.max(stamp, subtree_stamp(source_dir .. "/src"))
 
 	return stamp > 0 and stamp or nil
 end
@@ -144,11 +178,7 @@ end
 
 local function default_values()
 	local cache_dir = vim.fn.stdpath("data") .. "/ucore"
-	local managed_root = normalize(cache_dir .. "/backend")
-	local managed_source_dir = normalize(managed_root .. "/UScanner")
-	local xdg_data_home = normalize(vim.env.XDG_DATA_HOME)
-	local managed_env_root = xdg_data_home and normalize(xdg_data_home .. "/ucore/backend") or nil
-	local managed_env_source_dir = managed_env_root and normalize(managed_env_root .. "/UScanner") or nil
+	local bundled_source_dir = normalize(repo_root .. "/UScanner")
 
 	return {
 		port = 30110,
@@ -166,12 +196,9 @@ local function default_values()
 		backend = {
 			repo = "vlicecream/UScanner",
 			repo_url = "https://github.com/vlicecream/UScanner.git",
-			source_dir = nil,
+			source_dir = bundled_source_dir,
 			bin_dir = nil,
-			managed_root = managed_root,
-			managed_source_dir = managed_source_dir,
-			managed_env_root = managed_env_root,
-			managed_env_source_dir = managed_env_source_dir,
+			bundled_source_dir = bundled_source_dir,
 		},
 
 		-- Current backend mode: "missing", "cargo", or "release".
@@ -338,8 +365,7 @@ function M.backend_source_candidates(values)
 	local backend = values.backend or {}
 	local dirs = {}
 	push_unique(dirs, backend.source_dir)
-	push_unique(dirs, backend.managed_source_dir)
-	push_unique(dirs, backend.managed_env_source_dir)
+	push_unique(dirs, backend.bundled_source_dir)
 	return dirs
 end
 

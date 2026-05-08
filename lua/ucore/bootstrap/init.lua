@@ -119,14 +119,14 @@ local function wait_compatible(payload, replaced, callback)
 			return replace_server()
 		end
 
-		status.progress("UCore Backend Update", "UCore Backend Update 0%")
+		status.progress("UCore Backend Build", "UCore Backend Build 0%")
 		backend.update_managed_backend(function(ok, update_message)
 			if not ok then
-				status.progress_fail("UCore Backend Update", "UCore Backend Update Failed")
+				status.progress_fail("UCore Backend Build", "UCore Backend Build Failed")
 				return callback(false, update_message)
 			end
 
-			status.progress_finish("UCore Backend Update", "UCore Backend Update 100%")
+			status.progress_finish("UCore Backend Build", "UCore Backend Build 100%")
 			replace_server()
 		end)
 	end)

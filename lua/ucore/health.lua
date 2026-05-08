@@ -118,12 +118,8 @@ local function report_static_checks()
 		info("backend source dir not found")
 	end
 
-	if backend.managed_source_dir then
-		info("managed backend source dir: " .. tostring(backend.managed_source_dir))
-	end
-
-	if backend.managed_env_source_dir and backend.managed_env_source_dir ~= backend.managed_source_dir then
-		info("managed backend source dir (env): " .. tostring(backend.managed_env_source_dir))
+	if backend.bundled_source_dir then
+		info("bundled backend source dir: " .. tostring(backend.bundled_source_dir))
 	end
 
 	if preferred_bin_dir then
@@ -180,7 +176,7 @@ local function report_static_checks()
 
 	if config.values.backend_mode == "missing" then
 		error("No usable UScanner backend was resolved", {
-			"Run the UCore build step so it can clone UScanner into the managed backend cache.",
+			"Run the UCore build step so it can compile the bundled UScanner under UCore.nvim/UScanner.",
 		})
 	end
 end
