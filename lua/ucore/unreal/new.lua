@@ -1,5 +1,6 @@
 local project = require("ucore.project")
 local remote = require("ucore.remote")
+local write_access = require("ucore.write_access")
 
 local M = {}
 
@@ -98,13 +99,8 @@ local function open_files(h_path, cpp_path, class_name)
 end
 
 local function detect_uvcs_provider(path)
-  local ok_uvcs, uvcs = pcall(require, "uvcs")
-  if not ok_uvcs or type(uvcs) ~= "table" or type(uvcs.detect_for_path) ~= "function" then
-    return nil
-  end
-
-  local ok_provider, provider = pcall(uvcs.detect_for_path, path)
-  if not ok_provider or type(provider) ~= "table" or type(provider.add_file) ~= "function" then
+  local provider = write_access.detect_provider(path)
+  if type(provider) ~= "table" or type(provider.add_file) ~= "function" then
     return nil
   end
 

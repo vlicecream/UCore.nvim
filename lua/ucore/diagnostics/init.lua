@@ -1,6 +1,7 @@
 local config = require("ucore.config")
 local project = require("ucore.project")
 local remote = require("ucore.remote")
+local write_access = require("ucore.write_access")
 
 local M = {}
 
@@ -460,89 +461,10 @@ local function lines_for_path(path)
 	return file_lines(path), nil
 end
 
-local function make_path_writable(path, provider)
-	if provider and type(provider.make_writable) == "function" then
-		provider.make_writable(path)
-	else
-		if vim.fn.has("win32") == 1 then
-			vim.fn.system({ "attrib", "-R", path })
-		else
-			vim.fn.system({ "chmod", "u+w", path })
-		end
-	end
-
-	return vim.fn.filewritable(path) == 1
-end
-
-local function prompt_target_write_access(path, provider, already_opened)
-	local fname = vim.fn.fnamemodify(path, ":t")
-	local choice = vim.fn.confirm(
-		"UCore: target source file is read-only\n\n"
-			.. fname
-			.. "\n\nChoose how to continue generating definition:",
-		"&P4 checkout/edit\n&Make writable only\n&Cancel",
-		1,
-		"Warning"
-	)
-
-	if choice == 1 then
-		if already_opened then
-			if make_path_writable(path, provider) then
-				return true, nil
-			end
-			return false, "target file is still read-only after making writable: " .. path
-		end
-
-		if not provider or type(provider.checkout) ~= "function" then
-			return false, "no P4 provider detected for target file: " .. path
-		end
-
-		local ok_checkout, checkout_err = provider.checkout(path)
-		if not ok_checkout then
-			return false, checkout_err or ("p4 edit failed for target file: " .. path)
-		end
-
-		if make_path_writable(path, provider) then
-			return true, nil
-		end
-
-		return false, "target file is still read-only after checkout: " .. path
-	end
-
-	if choice == 2 then
-		if make_path_writable(path, provider) then
-			return true, nil
-		end
-		return false, "failed to make target file writable: " .. path
-	end
-
-	return false, "definition generation cancelled"
-end
-
 local function ensure_target_writable(path)
-	path = normalize(path)
-	if not path or path == "" then
-		return false, "invalid target path"
-	end
-
-	if vim.fn.filereadable(path) ~= 1 then
-		return true, nil
-	end
-
-	if vim.fn.filewritable(path) == 1 then
-		return true, nil
-	end
-
-	local ok_uvcs, uvcs = pcall(require, "uvcs")
-	if ok_uvcs and uvcs and type(uvcs.detect_for_path) == "function" then
-		local ok_provider, provider = pcall(uvcs.detect_for_path, path)
-		if ok_provider and provider then
-			local already_opened = provider.is_opened and provider.is_opened(path) or false
-			return prompt_target_write_access(path, provider, already_opened)
-		end
-	end
-
-	return prompt_target_write_access(path, nil, false)
+	return write_access.ensure_writable(path, {
+		action = "generating definition",
+	})
 end
 
 local function ensure_parent_dir(path)
