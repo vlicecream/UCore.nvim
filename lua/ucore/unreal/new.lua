@@ -10,7 +10,7 @@ local FALLBACK_PARENT_CLASSES = {
   "UGameInstance", "UGameModeBase", "APlayerController", "APlayerState",
   "AGameStateBase", "USaveGame", "UDataAsset", "UPrimaryDataAsset",
   "UDeveloperSettings", "UBlueprintFunctionLibrary", "UAnimInstance",
-  "UAudioComponent",
+  "UAnimMontage", "UAudioComponent",
 }
 
 local PARENT_CLASS_CACHE = nil
@@ -99,20 +99,16 @@ local function pick_parent_class_live(root, common_items, default_parent, callba
 
   local function combined_items()
     local items = {}
-    local seen = {}
 
-    for _, item in ipairs(state.remote_items or {}) do
-      if not seen[item] then
-        seen[item] = true
+    if vim.trim(state.query or "") == "" then
+      for _, item in ipairs(state.common_items or {}) do
         table.insert(items, item)
       end
+      return items
     end
 
-    for _, item in ipairs(state.common_items or {}) do
-      if not seen[item] then
-        seen[item] = true
-        table.insert(items, item)
-      end
+    for _, item in ipairs(state.remote_items or {}) do
+      table.insert(items, item)
     end
 
     return items
@@ -124,7 +120,7 @@ local function pick_parent_class_live(root, common_items, default_parent, callba
       entry_maker = function(item)
         return {
           value = item,
-          display = item == default_parent and (item .. "  (default)") or item,
+          display = item,
           ordinal = item,
         }
       end,
@@ -162,8 +158,8 @@ local function pick_parent_class_live(root, common_items, default_parent, callba
   end
 
   picker_ref = pickers.new({}, {
-    prompt_title = "Select parent class",
-    default_text = default_parent or nil,
+    prompt_title = "Search parent class",
+    default_text = nil,
     sorting_strategy = "ascending",
     selection_strategy = "row",
     finder = make_finder(),
@@ -234,7 +230,7 @@ local function choose_parent_class(root, default_parent, callback)
 
       vim.ui.input({
         prompt = "Search parent class: ",
-        default = default_parent or "",
+        default = "",
       }, function(input)
         input = vim.trim(input or "")
         if input == "" then
@@ -284,10 +280,8 @@ local function detect_module_api(root, filepath)
   return module_name:upper() .. "_API"
 end
 
-local function check_name_exists(root, class_name)
-  local pattern = root .. "/**/" .. class_name .. ".h"
-  local files = vim.fn.glob(pattern, false, true)
-  return #files > 0
+local function file_exists(path)
+  return vim.fn.filereadable(path) == 1
 end
 
 local function prefix_default_parent(class_name)
@@ -489,12 +483,6 @@ function M.create(class_name)
     return
   end
 
-  -- Check for duplicates
-  if check_name_exists(root, class_name) then
-    vim.notify("UCore new: " .. class_name .. ".h already exists in project", vim.log.levels.ERROR)
-    return
-  end
-
   -- Pick source sub-directory: Root / Public / Private
   vim.ui.select(DIRECTORY_CHOICES, {
     prompt = "Create in which directory?",
@@ -537,6 +525,19 @@ function M.create(class_name)
       end
     end
 
+    local h_path = h_dir .. "/" .. class_name .. ".h"
+    local cpp_path = cpp_dir .. "/" .. class_name .. ".cpp"
+
+    if file_exists(h_path) then
+      vim.notify("UCore new: " .. class_name .. ".h already exists in target directory", vim.log.levels.ERROR)
+      return
+    end
+
+    if class_name:match("^[UA]") and file_exists(cpp_path) then
+      vim.notify("UCore new: " .. class_name .. ".cpp already exists in target directory", vim.log.levels.ERROR)
+      return
+    end
+
     vim.fn.mkdir(h_dir, "p")
     vim.fn.mkdir(cpp_dir, "p")
 
@@ -548,8 +549,6 @@ function M.create(class_name)
         local parent_include = parent_header_path(parent_class, root, module_dir)
 
         local h_content = build_h_template(class_name, parent_class, module_api, parent_include, choice_key)
-        local h_path = h_dir .. "/" .. class_name .. ".h"
-
         local h_fd = io.open(h_path, "w")
         if not h_fd then
           vim.notify("UCore new: failed to write " .. h_path, vim.log.levels.ERROR)
@@ -562,7 +561,6 @@ function M.create(class_name)
         if should_create_cpp then
           local cpp_include = header_include_path(h_path, module_dir)
           local cpp_content = build_cpp_template(class_name, cpp_include)
-          local cpp_path = cpp_dir .. "/" .. class_name .. ".cpp"
           local cpp_fd = io.open(cpp_path, "w")
           if cpp_fd then
             cpp_fd:write(cpp_content)
