@@ -402,6 +402,169 @@ fn fast_find_symbols(conn: &Connection, pattern: &str, limit: usize) -> anyhow::
     Ok(json!(results))
 }
 
+fn list_class_symbols(conn: &Connection, limit: usize, offset: usize) -> anyhow::Result<Value> {
+    let limit = limit.clamp(1, 10_000) as i64;
+    let offset = offset.min(1_000_000) as i64;
+
+    let sql = format!(
+        r#"
+        {}
+        SELECT
+            sfts.name,
+            sfts.type,
+            sfts.class_name,
+            dp.full_path || '/' || sn.text AS path,
+            COALESCE(c.line_number, mem.line_number),
+            sm.text AS module_name
+        FROM symbols_fts sfts
+        LEFT JOIN classes c
+            ON c.id = sfts.rowid_ref
+           AND {}
+        LEFT JOIN members mem
+            ON mem.id = sfts.rowid_ref
+           AND NOT ({})
+        JOIN files f ON f.id = COALESCE(c.file_id, mem.file_id)
+        JOIN dir_paths dp ON f.directory_id = dp.id
+        JOIN strings sn ON f.filename_id = sn.id
+        LEFT JOIN modules m ON f.module_id = m.id
+        LEFT JOIN strings sm ON m.name_id = sm.id
+        WHERE {} AND sfts.name NOT LIKE '(%'
+        ORDER BY lower(sfts.name) ASC
+        LIMIT ? OFFSET ?
+        "#,
+        PATH_CTE,
+        class_symbol_predicate("sfts"),
+        class_symbol_predicate("sfts"),
+        class_symbol_predicate("sfts")
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![limit, offset], |row| {
+        Ok(json!({
+            "name": row.get::<_, String>(0)?,
+            "type": row.get::<_, String>(1)?,
+            "class_name": row.get::<_, Option<String>>(2)?,
+            "path": normalize_path(&row.get::<_, String>(3)?),
+            "line": row.get::<_, Option<i64>>(4)?,
+            "module_name": row.get::<_, Option<String>>(5)?,
+        }))
+    })?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+
+    Ok(json!(results))
+}
+
+pub fn search_class_symbols(
+    conn: &Connection,
+    pattern: &str,
+    limit: usize,
+    offset: usize,
+) -> anyhow::Result<Value> {
+    let pattern = pattern.trim();
+
+    if pattern.is_empty() {
+        return list_class_symbols(conn, limit, offset);
+    }
+
+    let limit = limit.clamp(1, 10_000) as i64;
+    let offset = offset.min(1_000_000) as i64;
+    let query = pattern.to_ascii_lowercase();
+    let prefix_query = format!("{}%", escape_like(&query));
+    let contains_query = format!("%{}%", escape_like(&query));
+    let tokens = search_tokens(pattern);
+    let searchable = searchable_sql();
+    let token_filter = tokens
+        .iter()
+        .map(|_| format!("{searchable} LIKE ? ESCAPE '\\'"))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let where_clause = if token_filter.is_empty() {
+        "1 = 1".to_string()
+    } else {
+        token_filter
+    };
+
+    let sql = format!(
+        r#"
+        {}
+        SELECT
+            sfts.name,
+            sfts.type,
+            sfts.class_name,
+            dp.full_path || '/' || sn.text AS path,
+            COALESCE(c.line_number, mem.line_number),
+            sm.text AS module_name
+        FROM symbols_fts sfts
+        LEFT JOIN classes c
+            ON c.id = sfts.rowid_ref
+           AND {}
+        LEFT JOIN members mem
+            ON mem.id = sfts.rowid_ref
+           AND NOT ({})
+        JOIN files f ON f.id = COALESCE(c.file_id, mem.file_id)
+        JOIN dir_paths dp ON f.directory_id = dp.id
+        JOIN strings sn ON f.filename_id = sn.id
+        LEFT JOIN modules m ON f.module_id = m.id
+        LEFT JOIN strings sm ON m.name_id = sm.id
+        WHERE ({}) AND ({})
+        ORDER BY
+            CASE
+                WHEN lower(sfts.name) = ? THEN 0
+                WHEN lower(sfts.name) LIKE ? ESCAPE '\' THEN 1
+                WHEN lower(sfts.name) LIKE ? ESCAPE '\' THEN 2
+                WHEN lower(COALESCE(sfts.class_name, '')) LIKE ? ESCAPE '\' THEN 3
+                WHEN lower(COALESCE(sm.text, '')) LIKE ? ESCAPE '\' THEN 4
+                WHEN lower(dp.full_path || '/' || sn.text) LIKE ? ESCAPE '\' THEN 5
+                ELSE 9
+            END,
+            lower(sfts.name) ASC,
+            path ASC
+        LIMIT ? OFFSET ?
+        "#,
+        PATH_CTE,
+        class_symbol_predicate("sfts"),
+        class_symbol_predicate("sfts"),
+        where_clause,
+        class_symbol_predicate("sfts")
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let mut params = Vec::new();
+    for token in &tokens {
+        params.push(SqlValue::Text(format!("%{}%", escape_like(token))));
+    }
+    params.push(SqlValue::Text(query));
+    params.push(SqlValue::Text(prefix_query));
+    params.push(SqlValue::Text(contains_query.clone()));
+    params.push(SqlValue::Text(contains_query.clone()));
+    params.push(SqlValue::Text(contains_query.clone()));
+    params.push(SqlValue::Text(contains_query));
+    params.push(SqlValue::Integer(limit));
+    params.push(SqlValue::Integer(offset));
+
+    let rows = stmt.query_map(params_from_iter(params), |row| {
+        Ok(json!({
+            "name": row.get::<_, String>(0)?,
+            "type": row.get::<_, String>(1)?,
+            "class_name": row.get::<_, Option<String>>(2)?,
+            "path": normalize_path(&row.get::<_, String>(3)?),
+            "line": row.get::<_, Option<i64>>(4)?,
+            "module_name": row.get::<_, Option<String>>(5)?,
+        }))
+    })?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+
+    Ok(json!(results))
+}
+
 fn class_symbol_predicate(alias: &str) -> String {
     format!(
         "COALESCE({alias}.type, '') IN ('class', 'struct', 'enum', 'UCLASS', 'USTRUCT', 'UENUM')"

@@ -198,6 +198,20 @@ function M.search_symbols(project_root, pattern, callback, opts)
 	}, callback)
 end
 
+function M.search_class_symbols(project_root, pattern, callback, opts)
+	if type(opts) == "number" then
+		opts = { limit = opts }
+	end
+	opts = opts or {}
+
+	M.query(project_root, {
+		kind = "SearchClassSymbols",
+		pattern = pattern,
+		limit = opts.limit or 50,
+		offset = opts.offset or 0,
+	}, callback)
+end
+
 function M.fast_find(project_root, pattern, callback, opts)
 	if type(opts) == "number" then
 		opts = { limit = opts }

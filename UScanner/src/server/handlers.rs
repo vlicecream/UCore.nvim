@@ -351,6 +351,21 @@ fn handle_state_query(
                 search_symbols_with_engine(state, conn, engine_db_path, &pattern, limit, offset)?;
             Ok(Some(value))
         }
+        QueryRequest::SearchClassSymbols {
+            pattern,
+            limit,
+            offset,
+        } => {
+            let value = search_class_symbols_with_engine(
+                state,
+                conn,
+                engine_db_path,
+                &pattern,
+                limit,
+                offset,
+            )?;
+            Ok(Some(value))
+        }
         QueryRequest::FastFind {
             pattern,
             limit,
@@ -1226,6 +1241,50 @@ fn fast_find_with_scope(
     Ok(json!(results))
 }
 
+fn search_class_symbols_with_engine(
+    state: Arc<AppState>,
+    project_conn: &rusqlite::Connection,
+    engine_db_path: Option<String>,
+    pattern: &str,
+    limit: usize,
+    offset: usize,
+) -> Result<Value> {
+    let limit = limit.clamp(1, 10_000);
+    let mut results =
+        value_array(query::search::search_class_symbols(project_conn, pattern, limit, 0)?);
+    tag_source(&mut results, "project");
+
+    if let Some(engine_db_path) = engine_db_path {
+        let engine_db_path = normalize_to_native(&engine_db_path);
+        if Path::new(&engine_db_path).is_file() {
+            match state.get_read_only_connection(&engine_db_path) {
+                Ok(engine_conn) => match query::search::search_class_symbols(&engine_conn, pattern, limit, 0) {
+                    Ok(value) => {
+                        let mut engine_results = value_array(value);
+                        tag_source(&mut engine_results, "engine");
+                        results.extend(engine_results);
+                    }
+                    Err(err) => {
+                        warn!("Failed to query Engine DB class symbols: {}", err);
+                    }
+                },
+                Err(err) => {
+                    warn!("Failed to open Engine DB for class symbol search: {}", err);
+                }
+            }
+        }
+    }
+
+    dedupe_and_rank_class_symbol_results(&mut results, pattern);
+    let page = results
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
+
+    Ok(json!(page))
+}
+
 fn search_code_text_with_scope(
     state: Arc<AppState>,
     project_conn: &rusqlite::Connection,
@@ -1317,6 +1376,74 @@ fn merge_query_results(target: &mut Vec<Value>, extra: Vec<Value>, limit: usize)
             target.push(item);
         }
     }
+}
+
+fn class_symbol_result_rank(item: &Value, pattern: &str) -> (u8, String, String, u8) {
+    let query = pattern.trim().to_ascii_lowercase();
+    let name = item
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let class_name = item
+        .get("class_name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let module_name = item
+        .get("module_name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let path = item
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let source_rank = match item.get("source").and_then(Value::as_str).unwrap_or_default() {
+        "project" => 0,
+        "engine" => 1,
+        _ => 2,
+    };
+
+    let rank = if name == query {
+        0
+    } else if !query.is_empty() && name.starts_with(&query) {
+        1
+    } else if !query.is_empty() && name.contains(&query) {
+        2
+    } else if !query.is_empty() && class_name.contains(&query) {
+        3
+    } else if !query.is_empty() && module_name.contains(&query) {
+        4
+    } else if !query.is_empty() && path.contains(&query) {
+        5
+    } else {
+        9
+    };
+
+    (rank, name, path, source_rank)
+}
+
+fn dedupe_and_rank_class_symbol_results(results: &mut Vec<Value>, pattern: &str) {
+    let mut seen = HashSet::new();
+    results.retain(|item| {
+        let name = item
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let path = item
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let kind = item
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        seen.insert(format!("{kind}\t{name}\t{path}"))
+    });
+
+    results.sort_by(|a, b| class_symbol_result_rank(a, pattern).cmp(&class_symbol_result_rank(b, pattern)));
 }
 
 /// Build a stable identity for de-duplicating merged query results.
@@ -1532,6 +1659,7 @@ fn query_request_label(request: &QueryRequest) -> &'static str {
         QueryRequest::GlobalFind { .. } => "GlobalFind",
         QueryRequest::SearchCodeText { .. } => "SearchCodeText",
         QueryRequest::SearchSymbols { .. } => "SearchSymbols",
+        QueryRequest::SearchClassSymbols { .. } => "SearchClassSymbols",
         QueryRequest::FindSymbolUsages { .. } => "FindSymbolUsages",
         QueryRequest::GetConfigData { .. } => "GetConfigData",
         _ => "Other",

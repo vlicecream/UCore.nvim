@@ -58,6 +58,11 @@ pub fn process_query(conn: &Connection, request: QueryRequest) -> Result<Value> 
         } => {
             search::search_symbols(conn, &pattern, limit, offset)
         }
+        QueryRequest::SearchClassSymbols {
+            pattern,
+            limit,
+            offset,
+        } => search::search_class_symbols(conn, &pattern, limit, offset),
         QueryRequest::FastFind {
             pattern,
             limit,

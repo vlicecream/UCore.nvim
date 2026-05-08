@@ -548,6 +548,12 @@ pub enum QueryRequest {
         #[serde(default)]
         offset: usize,
     },
+    SearchClassSymbols {
+        pattern: String,
+        limit: usize,
+        #[serde(default)]
+        offset: usize,
+    },
     FastFind {
         pattern: String,
         limit: usize,

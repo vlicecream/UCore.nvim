@@ -54,7 +54,7 @@ local function search_parent_classes(root, pattern, callback)
     return
   end
 
-  remote.search_symbols(root, pattern, function(results, err)
+  remote.search_class_symbols(root, pattern, function(results, err)
     if err or not results then
       callback({})
       return
