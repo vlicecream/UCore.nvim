@@ -208,12 +208,6 @@ local function hover_content(item)
 
 	if hover_kind == "local" then
 		table.insert(lines, name)
-		table.insert(highlights, {
-			line = 0,
-			start_col = 0,
-			end_col = #name,
-			group = "Identifier",
-		})
 		push_labeled_line(
 			lines,
 			highlights,
@@ -234,28 +228,10 @@ local function hover_content(item)
 	else
 		if kind:lower():find("function", 1, true) then
 			table.insert(lines, signature_label(item, -1, false))
-			table.insert(highlights, {
-				line = 0,
-				start_col = 0,
-				end_col = #lines[1],
-				group = "Function",
-			})
 		elseif class_name ~= "" and name ~= "" then
 			table.insert(lines, class_name .. "::" .. name)
-			table.insert(highlights, {
-				line = 0,
-				start_col = 0,
-				end_col = #lines[1],
-				group = "Identifier",
-			})
 		else
 			table.insert(lines, name)
-			table.insert(highlights, {
-				line = 0,
-				start_col = 0,
-				end_col = #lines[1],
-				group = "Identifier",
-			})
 		end
 
 		if params ~= "" and params ~= "()" and not kind:lower():find("function", 1, true) then
