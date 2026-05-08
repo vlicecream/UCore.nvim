@@ -2,10 +2,10 @@ use anyhow::{anyhow, Result};
 use notify::Watcher;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -21,6 +21,23 @@ use crate::types::{
 use crate::{db, query, refresh, scanner};
 
 const SERVER_PROTOCOL_VERSION: u32 = 2;
+const QUERY_PERF_WINDOW: Duration = Duration::from_secs(2);
+const SLOW_QUERY_WARN_MS: u128 = 150;
+
+static QUERY_PERF: OnceLock<Mutex<QueryPerfWindow>> = OnceLock::new();
+
+#[derive(Default)]
+struct QueryPerfStat {
+    count: u64,
+    total_ms: u128,
+    max_ms: u128,
+    errors: u64,
+}
+
+struct QueryPerfWindow {
+    started_at: Instant,
+    stats: HashMap<&'static str, QueryPerfStat>,
+}
 
 // -----------------------------------------------------------------------------
 // Request types
@@ -201,6 +218,8 @@ pub async fn handle_query(
 ) -> Result<Value> {
     let req: ServerQueryRequest = convert_params(params)?;
     let root_key = normalize_path_key(&req.project_root);
+    let query_label = query_request_label(&req.query);
+    let query_detail = query_request_detail(&req.query);
 
     if is_refreshing(&state, &root_key) {
         return Ok(json!([]));
@@ -215,7 +234,9 @@ pub async fn handle_query(
         .as_deref()
         .and_then(|path| state.get_persistent_cache_connection(path).ok());
 
-    tokio::task::spawn_blocking(move || {
+    let started_at = Instant::now();
+
+    let result = tokio::task::spawn_blocking(move || {
         if let Some(value) = handle_state_query(
             state.clone(),
             &conn,
@@ -237,7 +258,36 @@ pub async fn handle_query(
             query::process_query(&conn, req.query)
         }
     })
-    .await?
+    .await?;
+
+    let elapsed = started_at.elapsed();
+    record_query_perf(query_label, elapsed, result.is_err());
+
+    if elapsed.as_millis() >= SLOW_QUERY_WARN_MS {
+        match &result {
+            Ok(_) => info!(
+                "Slow query: {} took {} ms{}",
+                query_label,
+                elapsed.as_millis(),
+                query_detail
+                    .as_deref()
+                    .map(|detail| format!(" ({})", detail))
+                    .unwrap_or_default()
+            ),
+            Err(err) => warn!(
+                "Slow query failed: {} took {} ms{}: {}",
+                query_label,
+                elapsed.as_millis(),
+                query_detail
+                    .as_deref()
+                    .map(|detail| format!(" ({})", detail))
+                    .unwrap_or_default(),
+                err
+            ),
+        }
+    }
+
+    result
 }
 
 /// Handle queries that need AppState instead of only SQLite.
@@ -1409,6 +1459,130 @@ fn get_asset_dependencies(project_root: &str, asset_path: &str) -> Result<Value>
 // -----------------------------------------------------------------------------
 // Shared helpers
 // -----------------------------------------------------------------------------
+
+fn query_request_label(request: &QueryRequest) -> &'static str {
+    match request {
+        QueryRequest::GetDiagnostics { .. } => "GetDiagnostics",
+        QueryRequest::GetCompletions { .. } => "GetCompletions",
+        QueryRequest::GetHover { .. } => "GetHover",
+        QueryRequest::GetSignatureHelp { .. } => "GetSignatureHelp",
+        QueryRequest::GotoDefinition { .. } => "GotoDefinition",
+        QueryRequest::GotoImplementation { .. } => "GotoImplementation",
+        QueryRequest::GetFileSymbols { .. } => "GetFileSymbols",
+        QueryRequest::GetClassMembers { .. } => "GetClassMembers",
+        QueryRequest::GetClassMembersRecursive { .. } => "GetClassMembersRecursive",
+        QueryRequest::FindDerivedClasses { .. } => "FindDerivedClasses",
+        QueryRequest::GetAssets => "GetAssets",
+        QueryRequest::GetAssetUsages { .. } => "GetAssetUsages",
+        QueryRequest::GetAssetDependencies { .. } => "GetAssetDependencies",
+        QueryRequest::FastFind { .. } => "FastFind",
+        QueryRequest::GlobalFind { .. } => "GlobalFind",
+        QueryRequest::SearchCodeText { .. } => "SearchCodeText",
+        QueryRequest::SearchSymbols { .. } => "SearchSymbols",
+        QueryRequest::FindSymbolUsages { .. } => "FindSymbolUsages",
+        QueryRequest::GetConfigData { .. } => "GetConfigData",
+        _ => "Other",
+    }
+}
+
+fn query_request_detail(request: &QueryRequest) -> Option<String> {
+    match request {
+        QueryRequest::GetDiagnostics { file_path, open_files, .. } => Some(format!(
+            "file={}, overlays={}",
+            short_path(file_path.as_deref()),
+            open_files.len()
+        )),
+        QueryRequest::GetCompletions { file_path, .. } => {
+            Some(format!("file={}", short_path(file_path.as_deref())))
+        }
+        QueryRequest::GetHover { file_path, .. } => {
+            Some(format!("file={}", short_path(file_path.as_deref())))
+        }
+        QueryRequest::GetSignatureHelp { file_path, .. } => {
+            Some(format!("file={}", short_path(file_path.as_deref())))
+        }
+        QueryRequest::GotoDefinition { file_path, .. } => {
+            Some(format!("file={}", short_path(file_path.as_deref())))
+        }
+        QueryRequest::GotoImplementation { file_path, .. } => {
+            Some(format!("file={}", short_path(file_path.as_deref())))
+        }
+        QueryRequest::FastFind { scope, .. } => Some(format!(
+            "scope={}",
+            scope.as_deref().unwrap_or("project")
+        )),
+        QueryRequest::SearchCodeText { scope, .. } => Some(format!(
+            "scope={}",
+            scope.as_deref().unwrap_or("project")
+        )),
+        QueryRequest::GetAssetUsages { asset_path } => Some(format!("asset={}", asset_path)),
+        QueryRequest::GetAssetDependencies { asset_path } => Some(format!("asset={}", asset_path)),
+        _ => None,
+    }
+}
+
+fn short_path(path: Option<&str>) -> String {
+    path.and_then(|value| value.rsplit('/').next().or_else(|| value.rsplit('\\').next()))
+        .unwrap_or("-")
+        .to_string()
+}
+
+fn record_query_perf(label: &'static str, elapsed: Duration, is_error: bool) {
+    let lock = QUERY_PERF.get_or_init(|| {
+        Mutex::new(QueryPerfWindow {
+            started_at: Instant::now(),
+            stats: HashMap::new(),
+        })
+    });
+
+    let mut window = match lock.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
+    if window.started_at.elapsed() >= QUERY_PERF_WINDOW && !window.stats.is_empty() {
+        flush_query_perf(&mut window);
+    }
+
+    let elapsed_ms = elapsed.as_millis();
+    let stat = window.stats.entry(label).or_default();
+    stat.count += 1;
+    stat.total_ms += elapsed_ms;
+    stat.max_ms = stat.max_ms.max(elapsed_ms);
+    if is_error {
+        stat.errors += 1;
+    }
+}
+
+fn flush_query_perf(window: &mut QueryPerfWindow) {
+    let mut parts = window
+        .stats
+        .iter()
+        .map(|(label, stat)| {
+            let avg_ms = if stat.count == 0 {
+                0
+            } else {
+                stat.total_ms / stat.count as u128
+            };
+
+            format!(
+                "{} count={} avg={}ms max={}ms errors={}",
+                label, stat.count, avg_ms, stat.max_ms, stat.errors
+            )
+        })
+        .collect::<Vec<_>>();
+
+    parts.sort();
+
+    info!(
+        "Query perf window {} ms: {}",
+        window.started_at.elapsed().as_millis(),
+        parts.join(" | ")
+    );
+
+    window.started_at = Instant::now();
+    window.stats.clear();
+}
 
 /// Ensure the persistent asset index exists for this project.
 /// 确保当前项目的持久化资产索引已经初始化。
