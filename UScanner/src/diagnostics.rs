@@ -1,6 +1,6 @@
 use anyhow::Result;
 use regex::Regex;
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -63,7 +63,7 @@ impl DiagnosticItem {
 }
 
 pub fn process_diagnostics(
-    _conn: &Connection,
+    conn: &Connection,
     _engine_conn: Option<&Connection>,
     content: &str,
     file_path: Option<String>,
@@ -76,6 +76,7 @@ pub fn process_diagnostics(
         file_path.as_deref(),
     )?);
     items.extend(missing_implementation_diagnostics(
+        conn,
         content,
         file_path.as_deref(),
         open_files,
@@ -174,6 +175,7 @@ fn unreal_rule_diagnostics(content: &str, file_path: Option<&str>) -> Result<Vec
 }
 
 fn missing_implementation_diagnostics(
+    conn: &Connection,
     content: &str,
     file_path: Option<&str>,
     open_files: &[OpenBufferOverlay],
@@ -211,13 +213,14 @@ fn missing_implementation_diagnostics(
 
     let mut items = Vec::new();
     collect_missing_impl_items(
+        conn,
         root,
         content,
         header_path,
         &source_candidates,
         &source_texts,
         &mut items,
-    );
+    )?;
     Ok(items)
 }
 
@@ -342,13 +345,14 @@ fn incomplete_member_declaration_item(
 }
 
 fn collect_missing_impl_items(
+    conn: &Connection,
     node: tree_sitter::Node,
     content: &str,
     file_path: &str,
     source_candidates: &[String],
     source_texts: &[(String, String)],
     items: &mut Vec<DiagnosticItem>,
-) {
+) -> Result<()> {
     if let Some(decl) = member_function_declaration(node, content, file_path) {
         let target = source_texts
             .first()
@@ -358,9 +362,14 @@ fn collect_missing_impl_items(
 
         for expected in &decl.expected_definitions {
             let definition_signature = build_definition_signature(&decl, expected);
-            let found = source_texts
+            let found_in_text = source_texts
                 .iter()
                 .any(|(_, text)| has_definition_text(text, &definition_signature));
+            let found = if found_in_text {
+                true
+            } else {
+                has_indexed_definition(conn, &decl, expected)?
+            };
 
             if !found {
                 items.push(
@@ -388,8 +397,18 @@ fn collect_missing_impl_items(
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_missing_impl_items(child, content, file_path, source_candidates, source_texts, items);
+        collect_missing_impl_items(
+            conn,
+            child,
+            content,
+            file_path,
+            source_candidates,
+            source_texts,
+            items,
+        )?;
     }
+
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -674,6 +693,69 @@ fn extract_noexcept_text(trailing: &str) -> Option<String> {
 fn has_definition_text(source_text: &str, signature: &str) -> bool {
     let normalized_signature = normalize_space(signature);
     !normalized_signature.is_empty() && source_text.contains(&normalized_signature)
+}
+
+fn has_indexed_definition(
+    conn: &Connection,
+    decl: &HeaderFunctionDecl,
+    expected: &ExpectedDefinition,
+) -> Result<bool> {
+    let expected_params = normalize_parameter_signature(&decl.parameters);
+    let expected_return = normalize_space(&expected.return_type);
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT
+            COALESCE(m.access, ''),
+            COALESCE(f.extension, ''),
+            COALESCE(m.detail, ''),
+            COALESCE(srt.text, '')
+        FROM members m
+        JOIN classes c ON m.class_id = c.id
+        JOIN strings sc ON c.name_id = sc.id
+        JOIN strings sm ON m.name_id = sm.id
+        JOIN strings st ON m.type_id = st.id
+        LEFT JOIN strings srt ON m.return_type_id = srt.id
+        LEFT JOIN files f ON COALESCE(m.file_id, c.file_id) = f.id
+        WHERE sc.text = ?1
+          AND sm.text = ?2
+          AND st.text = 'function'
+        "#,
+    )?;
+    let mut rows = stmt.query(params![decl.class_name, expected.name])?;
+
+    while let Some(row) = rows.next()? {
+        let access: String = row.get(0)?;
+        let extension: String = row.get(1)?;
+        let detail: String = row.get(2)?;
+        let return_type: String = row.get(3)?;
+
+        if !is_indexed_impl_candidate(&access, &extension) {
+            continue;
+        }
+
+        if detail.is_empty() || normalize_parameter_signature(&detail) != expected_params {
+            continue;
+        }
+
+        if !expected_return.is_empty() {
+            let actual_return = normalize_space(&return_type);
+            if !actual_return.is_empty() && actual_return != expected_return {
+                continue;
+            }
+        }
+
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+fn is_indexed_impl_candidate(access: &str, extension: &str) -> bool {
+    matches!(access, "impl")
+        || matches!(
+            extension.to_ascii_lowercase().as_str(),
+            "cpp" | "cc" | "cxx"
+        )
 }
 
 fn normalize_space(text: &str) -> String {
@@ -1109,6 +1191,41 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    fn insert_string(conn: &Connection, text: &str) -> i64 {
+        conn.execute("INSERT INTO strings (text) VALUES (?)", [text])
+            .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn insert_class(conn: &Connection, name: &str) -> i64 {
+        let name_id = insert_string(conn, name);
+        conn.execute(
+            "INSERT INTO classes (name_id, symbol_type, line_number, end_line_number) VALUES (?, 'class', 1, 1)",
+            [name_id],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn insert_impl_member(
+        conn: &Connection,
+        class_id: i64,
+        name: &str,
+        params_text: &str,
+        return_type: Option<&str>,
+    ) {
+        let name_id = insert_string(conn, name);
+        let type_id = insert_string(conn, "function");
+        let return_type_id = return_type.map(|text| insert_string(conn, text));
+        conn.execute(
+            "INSERT INTO members
+             (class_id, name_id, type_id, access, detail, return_type_id, line_number)
+             VALUES (?, ?, ?, 'impl', ?, ?, 1)",
+            rusqlite::params![class_id, name_id, type_id, params_text, return_type_id],
+        )
+        .unwrap();
+    }
+
     fn temp_project_path(name: &str) -> std::path::PathBuf {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1270,6 +1387,27 @@ mod tests {
         assert!(!items.iter().any(|item| item["code"] == "UECPP001"));
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn does_not_warn_when_indexed_cpp_definition_exists() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let class_id = insert_class(&conn, "UMyActor");
+        insert_impl_member(&conn, class_id, "DoThing", "(int32 Count)", Some("void"));
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "class UMyActor\n{\npublic:\n    void DoThing(int32 Count);\n};\n",
+            Some("C:/Project/Source/Game/Public/MyActor.h".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP001"));
     }
 
     #[test]
