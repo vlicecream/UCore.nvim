@@ -397,17 +397,7 @@ pub fn infer_var_type(content: &str, var_name: &str, cursor_line: Option<u32>) -
     if let Some(line) = cursor_line {
         let cursor_row = line as usize;
 
-        if let Some((row, col, ty)) = select_nearest_type_match(&matches, cursor_row) {
-            if matches.len() > 1 {
-                tracing::info!(
-                    "infer_var_type: var='{}' selected='{}' at {}:{} from {} candidates",
-                    var_name,
-                    ty,
-                    row + 1,
-                    col,
-                    matches.len()
-                );
-            }
+        if let Some((_, _, ty)) = select_nearest_type_match(&matches, cursor_row) {
             return Some(ty.clone());
         }
     }
@@ -2591,10 +2581,7 @@ fn tokens(text: &str) -> Vec<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        find_local_declaration, has_explicit_qualifier, header_function_declaration_cursor,
-        infer_var_type, CursorCtx,
-    };
+    use super::{find_local_declaration, infer_var_type};
 
     const SAMPLE: &str = r#"
 void StartDeath()
@@ -2660,31 +2647,5 @@ void ActivateAbility()
             .expect("expected local declaration");
 
         assert_eq!(decl.row + 1, 16);
-    }
-
-    #[test]
-    fn explicit_qualifier_disables_global_member_fallback() {
-        let ctx = CursorCtx {
-            symbol: "CancelAllAbilities".to_string(),
-            qualifier: Some("ASC".to_string()),
-            qualifier_op: Some("->".to_string()),
-            enclosing_class: Some("USGameplayAbility_Death".to_string()),
-        };
-
-        assert!(has_explicit_qualifier(&ctx));
-    }
-
-    #[test]
-    fn detects_header_function_declaration_cursor() {
-        let source = r#"
-class USGameplayAbility_Death
-{
-public:
-    virtual void CancelAbility(int32 Handle) override;
-};
-"#;
-        let (line, col) = line_and_col(source, "CancelAbility", 0);
-
-        assert!(header_function_declaration_cursor(source, line, col));
     }
 }

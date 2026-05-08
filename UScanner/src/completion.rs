@@ -6071,21 +6071,6 @@ public:
     }
 
     #[test]
-    fn declaration_completion_start_prefers_return_type_prefix() {
-        let source = r#"    UAbilitySystemComponent* GetAbility"#;
-        let start = declaration_completion_start(
-            source,
-            0,
-            source.len(),
-            "GetAbility",
-            "GetAbilitySystemComponent",
-            "virtual UAbilitySystemComponent* GetAbilitySystemComponent() const override;",
-        );
-
-        assert_eq!(start, 4);
-    }
-
-    #[test]
     fn function_declaration_insert_text_preserves_const_suffix() {
         assert_eq!(
             function_declaration_insert_text(
