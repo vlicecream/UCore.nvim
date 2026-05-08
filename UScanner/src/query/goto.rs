@@ -1071,6 +1071,63 @@ fn is_simple_identifier(text: &str) -> bool {
             .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
 }
 
+fn node_contains_point(node: Node, point: Point) -> bool {
+    let start = node.start_position();
+    let end = node.end_position();
+
+    (point.row > start.row || (point.row == start.row && point.column >= start.column))
+        && (point.row < end.row || (point.row == end.row && point.column < end.column))
+}
+
+fn header_function_declaration_cursor(content: &str, line: u32, character: u32) -> bool {
+    let language: tree_sitter::Language = tree_sitter_unreal_cpp::LANGUAGE.into();
+    let mut parser = Parser::new();
+    if parser.set_language(&language).is_err() {
+        return false;
+    }
+
+    let Some(tree) = parser.parse(content, None) else {
+        return false;
+    };
+
+    let root = tree.root_node();
+    let point = Point::new(line as usize, character as usize);
+    let Some(raw_node) = cursor_node_at(root, line as usize, character as usize) else {
+        return false;
+    };
+
+    let mut current = Some(raw_node);
+    while let Some(node) = current {
+        if is_function_like(node.kind()) {
+            return false;
+        }
+
+        if matches!(node.kind(), "field_declaration" | "declaration") {
+            let declarator = node
+                .child_by_field_name("declarator")
+                .and_then(|decl| {
+                    if decl.kind() == "function_declarator" {
+                        Some(decl)
+                    } else {
+                        find_descendant_of_kind(decl, "function_declarator")
+                    }
+                });
+
+            if let Some(function_decl) = declarator {
+                if let Some(name_node) = extract_decl_name_node(function_decl) {
+                    return node_contains_point(name_node, point);
+                }
+            }
+
+            return false;
+        }
+
+        current = node.parent();
+    }
+
+    false
+}
+
 fn function_signature_label(
     owner_class: Option<&str>,
     name: &str,
@@ -2040,6 +2097,20 @@ fn goto_definition_inner(
         return Ok(Value::Null);
     };
 
+    if !prefer_impl
+        && file_path
+            .as_deref()
+            .map(is_header_file)
+            .unwrap_or(false)
+        && header_function_declaration_cursor(&content, line, character)
+    {
+        tracing::debug!(
+            "goto_definition: staying put on header function declaration '{}'",
+            ctx.symbol
+        );
+        return Ok(Value::Null);
+    }
+
     let mode = if prefer_impl { "implementation" } else { "definition" };
     tracing::debug!(
         "goto_{}: symbol='{}', qualifier={:?}, op={:?}, enclosing={:?}, line={}, character={}",
@@ -2520,7 +2591,10 @@ fn tokens(text: &str) -> Vec<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{find_local_declaration, has_explicit_qualifier, infer_var_type, CursorCtx};
+    use super::{
+        find_local_declaration, has_explicit_qualifier, header_function_declaration_cursor,
+        infer_var_type, CursorCtx,
+    };
 
     const SAMPLE: &str = r#"
 void StartDeath()
@@ -2598,5 +2672,19 @@ void ActivateAbility()
         };
 
         assert!(has_explicit_qualifier(&ctx));
+    }
+
+    #[test]
+    fn detects_header_function_declaration_cursor() {
+        let source = r#"
+class USGameplayAbility_Death
+{
+public:
+    virtual void CancelAbility(int32 Handle) override;
+};
+"#;
+        let (line, col) = line_and_col(source, "CancelAbility", 0);
+
+        assert!(header_function_declaration_cursor(source, line, col));
     }
 }
