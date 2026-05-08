@@ -609,16 +609,6 @@ local function rename_file_count(items)
 end
 
 local function prompt_rename_name(old_name, callback)
-	if vim.ui and vim.ui.input then
-		vim.ui.input({
-			prompt = "Rename to: ",
-			default = old_name,
-		}, function(value)
-			callback(value)
-		end)
-		return
-	end
-
 	callback(vim.fn.input("Rename to: ", old_name))
 end
 

@@ -929,7 +929,7 @@ local function pick_telescope_references(references, opts)
 			}),
 			previewer = conf.grep_previewer({}),
 			sorter = conf.generic_sorter({}),
-			attach_mappings = function(prompt_bufnr, map)
+			attach_mappings = function(prompt_bufnr)
 				actions.select_default:replace(function()
 					local selection = action_state.get_selected_entry()
 					actions.close(prompt_bufnr)
@@ -939,18 +939,6 @@ local function pick_telescope_references(references, opts)
 						on_choice(selection.value)
 					end
 				end)
-
-				if type(opts.on_open) == "function" then
-					local function open_selected()
-						local selection = action_state.get_selected_entry()
-						if selection and selection.value then
-							opts.on_open(selection.value)
-						end
-					end
-
-					map("n", "o", open_selected)
-					map("i", "<C-o>", open_selected)
-				end
 
 				return true
 			end,
@@ -1461,8 +1449,7 @@ function M.rename_preview(references, opts)
 	local files = tonumber(opts.file_count or 0) or 0
 	local count = tonumber(opts.occurrence_count or 0) or 0
 	local base_title = opts.title or "Rename Preview"
-	opts.title = string.format("%s [%d refs / %d files]  <CR> Continue  o Open  q Cancel", base_title, count, files)
-	opts.on_open = opts.on_open or open_reference
+	opts.title = string.format("%s [%d refs / %d files]", base_title, count, files)
 	return M.references(references, opts)
 end
 
