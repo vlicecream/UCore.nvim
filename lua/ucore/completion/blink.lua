@@ -24,7 +24,7 @@ local scheduled_timer = nil
 local to_blink_item
 local prune_items
 local INSERT_TEXT_FORMAT_PLAIN_TEXT = 1
-local ucore_filetype_sources = { "ucore", "lsp", "path", "snippets", "buffer" }
+local ucore_filetype_sources = { "ucore" }
 
 local function current_prefix(ctx)
 	if type(ctx) == "table" then
@@ -60,7 +60,7 @@ end
 local function blink_delay_ms()
 	local completion_config = config.values.completion or {}
 	local base = tonumber(completion_config.debounce_ms) or 180
-	return math.max(60, math.min(base, 100))
+	return math.max(30, math.min(base, 50))
 end
 
 local function stop_timer()
