@@ -492,8 +492,10 @@ local function fallback_normal(keys)
 	vim.cmd("nohlsearch")
 end
 
--- Go to definition with Vim-compatible fallback.
--- 跳转到定义；UCore 无结果时回退到 Vim 原生 gd。
+-- Smart goto entry.
+-- Header member declarations jump to implementation, source definitions jump to
+-- declarations, everything else resolves normal definitions.
+-- 智能跳转入口。
 function M.goto_definition()
 	M._goto_definition_inner({ fallback = "gd" })
 end
@@ -504,42 +506,10 @@ function M.goto_declaration()
 	M._goto_definition_inner({ fallback = "gD" })
 end
 
--- Go to implementation at the current cursor position.
--- 从当前光标位置跳转到实现（.h -> .cpp）。
+-- Implementation uses the same smart goto behavior as definition.
+-- 实现跳转与定义跳转共用同一套智能逻辑。
 function M.goto_implementation()
-	local root = project.find_project_root()
-	if not root then
-		return vim.notify("Could not find .uproject", vim.log.levels.ERROR)
-	end
-
-	local file_path = vim.api.nvim_buf_get_name(0)
-	if file_path == "" then
-		return vim.notify("UCore goto_implementation: current buffer has no file path", vim.log.levels.WARN)
-	end
-
-	local cursor = vim.api.nvim_win_get_cursor(0)
-	local line = cursor[1] - 1
-	local character = cursor[2]
-
-	try_counterpart_from_header(root, file_path, line, character, function(found)
-		if found then
-			vim.cmd("nohlsearch")
-			return
-		end
-
-		remote.goto_implementation(root, {
-			content = current_content(),
-			line = line,
-			character = character,
-			file_path = normalize_path(file_path),
-		}, function(result, err)
-			if err then
-				return vim.notify("UCore goto implementation failed:\n" .. tostring(err), vim.log.levels.ERROR)
-			end
-			vim.cmd("nohlsearch")
-			open_result(result, { silent = true })
-		end)
-	end)
+	return M.goto_definition()
 end
 
 -- Internal dispatcher with fallback.

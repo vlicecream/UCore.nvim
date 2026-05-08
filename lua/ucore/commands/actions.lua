@@ -384,9 +384,9 @@ function M.goto(tail)
 	if sub == "" or sub == "help" then
 		print([[
 UCore goto subcommands:
-  :UCore goto definition      Go to definition (gd)
+  :UCore goto definition      Smart goto (gd)
   :UCore goto declaration     Go to declaration, specifically .h (gD)
-  :UCore goto implementation  Go to implementation (.h -> .cpp) (gi)
+  :UCore goto implementation  Smart goto alias (gi)
   :UCore goto references      Find references (gr)
   :UCore goto source          Toggle between .cpp and .h (gs)
   :UCore goto help            Show this help
