@@ -9,6 +9,8 @@ local ns = vim.api.nvim_create_namespace("ucore_diagnostics")
 local group_name = "UCoreDiagnostics"
 local enabled = true
 local refresh_sequences = {}
+local active_requests = {}
+local pending_refreshes = {}
 local try_include_symbol
 local float_sequence = 0
 local float_winid = nil
@@ -37,10 +39,11 @@ local function is_cpp_like_path(path)
 		or path:match("%.cpp$") or path:match("%.cc$") or path:match("%.cxx$")
 end
 
-local function open_file_overlays(project_root)
+local function open_file_overlays(project_root, primary_bufnr)
 	local overlays = {}
 	local seen = {}
 	local normalized_root = normalize_path(project_root or "")
+	local primary_path = primary_bufnr and normalize_path(vim.api.nvim_buf_get_name(primary_bufnr)) or nil
 
 	for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
 		if vim.api.nvim_buf_is_valid(bufnr) then
@@ -48,6 +51,11 @@ local function open_file_overlays(project_root)
 			if name and name ~= "" and is_cpp_like_path(name) and not seen[name] then
 				local root = project.find_project_root(name)
 				if root and normalize_path(root) == normalized_root then
+					local include = bufnr == primary_bufnr or vim.bo[bufnr].modified == true
+					if not include then
+						goto continue
+					end
+
 					seen[name] = true
 					table.insert(overlays, {
 						file_path = name,
@@ -56,28 +64,18 @@ local function open_file_overlays(project_root)
 				end
 			end
 		end
+
+		::continue::
+	end
+
+	if primary_path and not seen[primary_path] and primary_bufnr and vim.api.nvim_buf_is_valid(primary_bufnr) then
+		table.insert(overlays, {
+			file_path = primary_path,
+			content = current_content(primary_bufnr),
+		})
 	end
 
 	return overlays
-end
-
-local function project_cpp_buffers(project_root)
-	local result = {}
-	local normalized_root = normalize_path(project_root or "")
-
-	for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
-		if vim.api.nvim_buf_is_valid(bufnr) then
-			local name = normalize_path(vim.api.nvim_buf_get_name(bufnr))
-			if name and name ~= "" and is_cpp_like_path(name) then
-				local root = project.find_project_root(name)
-				if root and normalize_path(root) == normalized_root then
-					table.insert(result, bufnr)
-				end
-			end
-		end
-	end
-
-	return result
 end
 
 local function resolve_bufnr_for_path(file_path, fallback_bufnr)
@@ -171,15 +169,33 @@ function M.refresh(bufnr, opts)
 		return
 	end
 
+	if active_requests[bufnr] then
+		pending_refreshes[bufnr] = opts
+		return
+	end
+
 	refresh_sequences[bufnr] = (refresh_sequences[bufnr] or 0) + 1
 	local sequence = refresh_sequences[bufnr]
 	local changedtick = vim.api.nvim_buf_get_changedtick(bufnr)
+	active_requests[bufnr] = true
 
 	remote.get_diagnostics(root, {
 		content = current_content(bufnr),
 		file_path = normalize_path(file_path),
-		open_files = open_file_overlays(root),
+		open_files = open_file_overlays(root, bufnr),
 	}, function(result, err)
+		active_requests[bufnr] = nil
+
+		local pending = pending_refreshes[bufnr]
+		pending_refreshes[bufnr] = nil
+		if pending then
+			vim.schedule(function()
+				if vim.api.nvim_buf_is_valid(bufnr) then
+					M.refresh(bufnr, pending)
+				end
+			end)
+		end
+
 		if sequence ~= refresh_sequences[bufnr]
 			or not vim.api.nvim_buf_is_valid(bufnr)
 			or vim.api.nvim_buf_get_changedtick(bufnr) ~= changedtick
@@ -1435,9 +1451,7 @@ local function schedule_refresh(args)
 
 	vim.defer_fn(function()
 		if sequence == refresh_sequences[bufnr] then
-			for _, target_bufnr in ipairs(project_cpp_buffers(root)) do
-				M.refresh(target_bufnr, { silent = true, force = true })
-			end
+			M.refresh(bufnr, { silent = true, force = true })
 		end
 	end, delay)
 end
@@ -1544,6 +1558,8 @@ end
 function M.reset()
 	enabled = true
 	refresh_sequences = {}
+	active_requests = {}
+	pending_refreshes = {}
 	float_sequence = float_sequence + 1
 	close_cursor_float()
 	pcall(vim.api.nvim_del_augroup_by_name, group_name)
