@@ -15,6 +15,8 @@ local FALLBACK_PARENT_CLASSES = {
 
 local PARENT_CLASS_CACHE = nil
 
+local SEARCH_PARENT_SENTINEL = "__ucore_search_parent__"
+
 local DIRECTORY_CHOICES = {
   { label = "Root",  desc = "<Module>/" },
   { label = "Public", desc = "<Module>/Public/" },
@@ -27,28 +29,105 @@ local function ensure_parent_classes(root, callback)
     return
   end
 
-  remote.search_symbols(root, "", function(results, err)
-    local items = {}
-    local seen = {}
-    -- Add fallback defaults
-    for _, name in ipairs(FALLBACK_PARENT_CLASSES) do
+  local items = {}
+  local seen = {}
+  for _, name in ipairs(FALLBACK_PARENT_CLASSES) do
+    if not seen[name] then
       seen[name] = true
       table.insert(items, name)
     end
-    -- Add indexed classes from server
-    if not err and results then
-      for _, r in ipairs(results) do
-        local name = r.name or r.text or ""
-        if name:match("^[AU]") and not seen[name] then
-          seen[name] = true
-          table.insert(items, name)
-        end
+  end
+  PARENT_CLASS_CACHE = items
+  callback(items)
+end
+
+local VALID_PARENT_SYMBOL_TYPES = {
+  class = true,
+  struct = true,
+  UCLASS = true,
+  USTRUCT = true,
+}
+
+local function search_parent_classes(root, pattern, callback)
+  pattern = vim.trim(pattern or "")
+  if pattern == "" then
+    callback({})
+    return
+  end
+
+  remote.search_symbols(root, pattern, function(results, err)
+    if err or not results then
+      callback({})
+      return
+    end
+
+    local items = {}
+    local seen = {}
+    for _, r in ipairs(results) do
+      local name = r.name or r.text or ""
+      local symbol_type = tostring(r.type or "")
+      if VALID_PARENT_SYMBOL_TYPES[symbol_type] and name ~= "" and not seen[name] then
+        seen[name] = true
+        table.insert(items, name)
       end
     end
     table.sort(items)
-    PARENT_CLASS_CACHE = items
     callback(items)
-  end, 3000)
+  end, 200)
+end
+
+local function choose_parent_class(root, default_parent, callback)
+  ensure_parent_classes(root, function(common_items)
+    local items = vim.list_extend({ SEARCH_PARENT_SENTINEL }, vim.deepcopy(common_items))
+
+    vim.ui.select(items, {
+      prompt = "Select parent class:",
+      format_item = function(item)
+        if item == SEARCH_PARENT_SENTINEL then
+          return "Search..."
+        end
+        if item == default_parent then
+          return item .. "  (default)"
+        end
+        return item
+      end,
+    }, function(selection)
+      if not selection then
+        callback(nil)
+        return
+      end
+
+      if selection ~= SEARCH_PARENT_SENTINEL then
+        callback(selection)
+        return
+      end
+
+      vim.ui.input({
+        prompt = "Search parent class: ",
+        default = default_parent or "",
+      }, function(input)
+        if not input or vim.trim(input) == "" then
+          callback(nil)
+          return
+        end
+
+        search_parent_classes(root, input, function(search_items)
+          if #search_items == 0 then
+            vim.notify("UCore new: no parent classes found for " .. input, vim.log.levels.WARN)
+            callback(nil)
+            return
+          end
+
+          vim.ui.select(search_items, {
+            prompt = "Search results:",
+            format_item = function(item)
+              return item
+            end,
+          }, callback)
+        end)
+      end)
+    end)
+  end)
 end
 
 local function detect_module_dir(root, filepath)
@@ -86,6 +165,157 @@ local function prefix_default_parent(class_name)
   if class_name:match("^F") then return nil end
   if class_name:match("^I") then return nil end
   return "UObject"
+end
+
+local function normalize(path)
+  return (path or ""):gsub("\\", "/")
+end
+
+local function trim_module_include(path)
+  path = normalize(path)
+  return path:match("/Public/(.+)$")
+    or path:match("/Private/(.+)$")
+    or path:match("/Source/[^/]+/(.+)$")
+    or path:match("/Classes/(.+)$")
+    or path
+end
+
+local ENGINE_PARENT_HEADERS = {
+  UObject = "UObject/Object.h",
+  UInterface = "UObject/Interface.h",
+  AActor = "GameFramework/Actor.h",
+  APawn = "GameFramework/Pawn.h",
+  ACharacter = "GameFramework/Character.h",
+  UActorComponent = "Components/ActorComponent.h",
+  USceneComponent = "Components/SceneComponent.h",
+  UUserWidget = "Blueprint/UserWidget.h",
+  UWidget = "Components/Widget.h",
+  UGameInstance = "Engine/GameInstance.h",
+  UGameModeBase = "GameFramework/GameModeBase.h",
+  APlayerController = "GameFramework/PlayerController.h",
+  APlayerState = "GameFramework/PlayerState.h",
+  AGameStateBase = "GameFramework/GameStateBase.h",
+  USaveGame = "GameFramework/SaveGame.h",
+  UDataAsset = "Engine/DataAsset.h",
+  UPrimaryDataAsset = "Engine/DataAsset.h",
+  UDeveloperSettings = "Engine/DeveloperSettings.h",
+  UBlueprintFunctionLibrary = "Kismet/BlueprintFunctionLibrary.h",
+  UAnimInstance = "Animation/AnimInstance.h",
+  UAudioComponent = "Components/AudioComponent.h",
+}
+
+local function parent_header_path(parent_class, root, module_dir)
+  if not parent_class or parent_class == "" then
+    return nil
+  end
+
+  if ENGINE_PARENT_HEADERS[parent_class] then
+    return ENGINE_PARENT_HEADERS[parent_class]
+  end
+
+  local pattern = normalize(root) .. "/**/" .. parent_class .. ".h"
+  local files = vim.fn.glob(pattern, false, true)
+  if #files == 0 then
+    return parent_class .. ".h"
+  end
+
+  table.sort(files, function(a, b)
+    a = normalize(a)
+    b = normalize(b)
+
+    local a_is_module = module_dir and a:find(normalize(module_dir), 1, true) == 1
+    local b_is_module = module_dir and b:find(normalize(module_dir), 1, true) == 1
+    if a_is_module ~= b_is_module then
+      return a_is_module
+    end
+
+    local a_public = a:find("/Public/", 1, true) ~= nil
+    local b_public = b:find("/Public/", 1, true) ~= nil
+    if a_public ~= b_public then
+      return a_public
+    end
+
+    return #a < #b
+  end)
+
+  return trim_module_include(files[1])
+end
+
+local function header_include_path(header_path, module_dir)
+  header_path = normalize(header_path)
+  module_dir = normalize(module_dir)
+
+  if module_dir ~= "" and header_path:find(module_dir, 1, true) == 1 then
+    local rel = header_path:sub(#module_dir + 2)
+    rel = rel:gsub("^Public/", ""):gsub("^Private/", "")
+    return rel
+  end
+
+  return vim.fn.fnamemodify(header_path, ":t")
+end
+
+local function build_h_template(class_name, parent_class, module_api, parent_include, _choice_key)
+  local lines = {
+    "#pragma once",
+    "",
+    '#include "CoreMinimal.h"',
+  }
+
+  if parent_include and parent_include ~= "" then
+    table.insert(lines, '#include "' .. parent_include .. '"')
+  end
+
+  local prefix = class_name:sub(1, 1)
+
+  if prefix == "U" or prefix == "A" then
+    table.insert(lines, '#include "' .. class_name .. '.generated.h"')
+    table.insert(lines, "")
+    table.insert(lines, "UCLASS()")
+    table.insert(lines, "class " .. module_api .. " " .. class_name .. " : public " .. parent_class)
+    table.insert(lines, "{")
+    table.insert(lines, "\tGENERATED_BODY()")
+    table.insert(lines, "")
+    table.insert(lines, "public:")
+    table.insert(lines, "\t" .. class_name .. "();")
+    table.insert(lines, "};")
+    return table.concat(lines, "\n") .. "\n"
+  end
+
+  if prefix == "F" then
+    table.insert(lines, "")
+    table.insert(lines, "struct " .. module_api .. " " .. class_name)
+    table.insert(lines, "{")
+    table.insert(lines, "};")
+    return table.concat(lines, "\n") .. "\n"
+  end
+
+  table.insert(lines, "")
+  table.insert(lines, "class " .. module_api .. " " .. class_name)
+  if parent_class and parent_class ~= "" then
+    table.insert(lines, " : public " .. parent_class)
+  end
+  table.insert(lines, "")
+  table.insert(lines, "{")
+  table.insert(lines, "public:")
+  table.insert(lines, "\tvirtual ~" .. class_name .. "() = default;")
+  table.insert(lines, "};")
+  return table.concat(lines, "\n") .. "\n"
+end
+
+local function build_cpp_template(class_name, cpp_include)
+  local lines = {
+    '#include "' .. cpp_include .. '"',
+    "",
+  }
+
+  if class_name:match("^[UA]") then
+    table.insert(lines, class_name .. "::" .. class_name .. "()")
+    table.insert(lines, "{")
+    table.insert(lines, "}")
+    table.insert(lines, "")
+  end
+
+  return table.concat(lines, "\n")
 end
 
 local function open_files(h_path, cpp_path, class_name)
@@ -135,7 +365,6 @@ function M.create(class_name)
   end
 
   -- Pick source sub-directory: Root / Public / Private
-  local default_dir = DIRECTORY_CHOICES[1]
   vim.ui.select(DIRECTORY_CHOICES, {
     prompt = "Create in which directory?",
     format_item = function(item)
@@ -158,7 +387,6 @@ function M.create(class_name)
     end
 
     local h_dir, cpp_dir
-    local choice_key = choice.label:lower()
     if choice_key == "root" then
       h_dir = current_dir
       cpp_dir = current_dir
@@ -183,85 +411,59 @@ function M.create(class_name)
 
     -- Pick parent class
     local default_parent = prefix_default_parent(class_name)
-    ensure_parent_classes(root, function(items)
-      -- Pre-select by prefix
-      local pre_index = nil
-      for i, name in ipairs(items) do
-        if name == default_parent then
-          pre_index = i
-          break
+    choose_parent_class(root, default_parent, function(parent_selection)
+        if not parent_selection then return end
+        local parent_class = parent_selection
+        local parent_include = parent_header_path(parent_class, root, module_dir)
+
+        local h_content = build_h_template(class_name, parent_class, module_api, parent_include, choice_key)
+        local h_path = h_dir .. "/" .. class_name .. ".h"
+
+        local h_fd = io.open(h_path, "w")
+        if not h_fd then
+          vim.notify("UCore new: failed to write " .. h_path, vim.log.levels.ERROR)
+          return
         end
-      end
+        h_fd:write(h_content)
+        h_fd:close()
 
-      vim.ui.select(items, {
-        prompt = "Select parent class (" .. #items .. " available):",
-        format_item = function(item)
-          return item
-        end,
-      }, function(parent_selection)
-      if not parent_selection then return end
-      local parent_class = parent_selection
-      local parent_include = parent_header_path(parent_class, root, module_dir)
-      local h_include_path = class_name .. ".h"
+        local should_create_cpp = class_name:match("^[UA]") ~= nil
+        if should_create_cpp then
+          local cpp_include = header_include_path(h_path, module_dir)
+          local cpp_content = build_cpp_template(class_name, cpp_include)
+          local cpp_path = cpp_dir .. "/" .. class_name .. ".cpp"
+          local cpp_fd = io.open(cpp_path, "w")
+          if cpp_fd then
+            cpp_fd:write(cpp_content)
+            cpp_fd:close()
+          end
 
-      -- Build .h content
-      local h_content = build_h_template(class_name, parent_class, module_api, parent_include, choice_key)
-      local h_path = h_dir .. "/" .. class_name .. ".h"
-
-      -- Write .h
-      local h_fd = io.open(h_path, "w")
-      if not h_fd then
-        vim.notify("UCore new: failed to write " .. h_path, vim.log.levels.ERROR)
-        return
-      end
-      h_fd:write(h_content)
-      h_fd:close()
-
-      -- Build and write .cpp
-      local module_name = vim.fn.fnamemodify(module_dir, ":t")
-      local include_prefix = module_name
-      if choice_key ~= "root" then
-        include_prefix = module_name .. "/" .. choice_key
-      end
-      local inc_rel = rel_path ~= "" and rel_path .. "/" or ""
-      local cpp_include = include_prefix .. "/" .. inc_rel .. class_name .. ".h"
-
-      if class_name:match("^U") or class_name:match("^A") or not class_name:match("^F") then
-        local cpp_content = build_cpp_template(class_name, cpp_include)
-        local cpp_path = cpp_dir .. "/" .. class_name .. ".cpp"
-        local cpp_fd = io.open(cpp_path, "w")
-        if cpp_fd then
-          cpp_fd:write(cpp_content)
-          cpp_fd:close()
-        end
-
-        local provider = detect_uvcs_provider(h_path) or detect_uvcs_provider(cpp_path)
-        if provider then
-          local provider_name = type(provider.name) == "function" and provider.name() or "uvcs"
-          vim.ui.select({ "Yes", "No" }, {
-            prompt = string.format("%s add %s.h/.cpp?", tostring(provider_name), class_name),
-          }, function(add_choice)
-            if add_choice == "Yes" then
-              local ok_h, err_h = provider.add_file(h_path, root)
-              local ok_cpp, err_cpp = provider.add_file(cpp_path, root)
-              if not ok_h then
-                vim.notify("UCore new: add failed for " .. h_path .. "\n" .. tostring(err_h), vim.log.levels.ERROR)
+          local provider = detect_uvcs_provider(h_path) or detect_uvcs_provider(cpp_path)
+          if provider then
+            local provider_name = type(provider.name) == "function" and provider.name() or "uvcs"
+            vim.ui.select({ "Yes", "No" }, {
+              prompt = string.format("%s add %s.h/.cpp?", tostring(provider_name), class_name),
+            }, function(add_choice)
+              if add_choice == "Yes" then
+                local ok_h, err_h = provider.add_file(h_path, root)
+                local ok_cpp, err_cpp = provider.add_file(cpp_path, root)
+                if not ok_h then
+                  vim.notify("UCore new: add failed for " .. h_path .. "\n" .. tostring(err_h), vim.log.levels.ERROR)
+                end
+                if not ok_cpp then
+                  vim.notify("UCore new: add failed for " .. cpp_path .. "\n" .. tostring(err_cpp), vim.log.levels.ERROR)
+                end
               end
-              if not ok_cpp then
-                vim.notify("UCore new: add failed for " .. cpp_path .. "\n" .. tostring(err_cpp), vim.log.levels.ERROR)
-              end
-            end
+              open_files(h_path, cpp_path, class_name)
+            end)
+          else
             open_files(h_path, cpp_path, class_name)
-          end)
+          end
         else
-          open_files(h_path, cpp_path, class_name)
+          open_files(h_path, nil, class_name)
         end
-      else
-        open_files(h_path, nil, class_name)
-      end
     end)
   end)
-end)
 end
 
 return M

@@ -498,7 +498,6 @@ fn configure_primary_connection(conn: &rusqlite::Connection) -> Result<()> {
 /// Configure read-only query connection.
 /// 配置只读 query 连接。
 fn configure_read_only_connection(conn: &rusqlite::Connection) -> Result<()> {
-    conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "cache_size", "-4000")?;
     conn.pragma_update(None, "mmap_size", "0")?;
     conn.pragma_update(None, "temp_store", "FILE")?;
