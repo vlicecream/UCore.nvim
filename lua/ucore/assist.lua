@@ -71,6 +71,9 @@ local function current_context()
 end
 
 local function close_float()
+	local should_resume_diagnostics = float_state.kind == "hover"
+	local current_buf = vim.api.nvim_get_current_buf()
+
 	if float_state.group then
 		pcall(vim.api.nvim_del_augroup_by_id, float_state.group)
 		float_state.group = nil
@@ -84,6 +87,12 @@ local function close_float()
 	float_state.buf = nil
 	float_state.kind = nil
 	float_state.auto = false
+
+	if should_resume_diagnostics then
+		vim.schedule(function()
+			pcall(require("ucore.diagnostics").resume_cursor_float, current_buf)
+		end)
+	end
 end
 
 local function display_path(path)

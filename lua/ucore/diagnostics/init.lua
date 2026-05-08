@@ -1153,4 +1153,18 @@ function M.close_cursor_float()
 	close_cursor_float()
 end
 
+function M.resume_cursor_float(bufnr)
+	bufnr = bufnr or vim.api.nvim_get_current_buf()
+	if not vim.api.nvim_buf_is_valid(bufnr) then
+		return
+	end
+
+	local assist_ok, assist = pcall(require, "ucore.assist")
+	if assist_ok and assist and type(assist.has_active_float) == "function" and assist.has_active_float() then
+		return
+	end
+
+	schedule_cursor_float(bufnr)
+end
+
 return M
