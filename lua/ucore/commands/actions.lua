@@ -62,6 +62,8 @@ local function find_cache_for(root)
 		errors = {},
 		loading = false,
 		ready = false,
+		assets_loading = false,
+		assets_ready = false,
 		listeners = {},
 	}
 	find_cache[root] = cache
@@ -265,10 +267,43 @@ local function subscribe_find_cache(root, callback)
 	table.insert(cache.listeners, callback)
 end
 
+local function load_find_assets(root, cache)
+	cache = cache or find_cache_for(root)
+	if not cache or cache.assets_loading or cache.assets_ready then
+		return cache
+	end
+
+	cache.assets_loading = true
+
+	remote.get_assets(root, function(result, err)
+		cache.assets_loading = false
+		cache.assets_ready = true
+
+		if err then
+			table.insert(cache.errors, tostring(err))
+		else
+			append_assets(cache.static_items, result)
+		end
+
+		notify_find_cache(cache)
+	end)
+
+	return cache
+end
+
 function M.prewarm_find(root, opts)
 	opts = opts or {}
 	local cache = find_cache_for(root)
-	if not cache or cache.loading or (cache.ready and not opts.force) then
+	local include_assets = opts.include_assets == true
+	if not cache then
+		return cache
+	end
+
+	if cache.ready and include_assets and not cache.assets_ready then
+		load_find_assets(root, cache)
+	end
+
+	if cache.loading or (cache.ready and not opts.force) then
 		return cache
 	end
 
@@ -277,8 +312,10 @@ function M.prewarm_find(root, opts)
 	cache.initial_symbols = {}
 	cache.static_items = {}
 	cache.errors = {}
+	cache.assets_loading = false
+	cache.assets_ready = false
 
-	local pending = 4
+	local pending = 3
 	local function finish()
 		pending = pending - 1
 		if pending > 0 then
@@ -288,6 +325,10 @@ function M.prewarm_find(root, opts)
 		cache.loading = false
 		cache.ready = true
 		notify_find_cache(cache)
+
+		if include_assets then
+			load_find_assets(root, cache)
+		end
 	end
 
 	remote.global_find(root, "", function(result, err)
@@ -307,15 +348,6 @@ function M.prewarm_find(root, opts)
 			table.insert(cache.errors, tostring(err))
 		else
 			append_modules(cache.static_items, result)
-		end
-		finish()
-	end)
-
-	remote.get_assets(root, function(result, err)
-		if err then
-			table.insert(cache.errors, tostring(err))
-		else
-			append_assets(cache.static_items, result)
 		end
 		finish()
 	end)
@@ -732,7 +764,7 @@ function M.find(pattern)
 		return vim.notify("Could not find .uproject", vim.log.levels.ERROR)
 	end
 
-	local cache = M.prewarm_find(root)
+	local cache = M.prewarm_find(root, { include_assets = true })
 	local snapshot = find_cache_snapshot(cache)
 	local initial_symbols = pattern == "" and snapshot.initial_symbols or {}
 
