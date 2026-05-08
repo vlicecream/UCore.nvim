@@ -241,6 +241,14 @@ local function declaration_target_names(cursor_info)
 	return names
 end
 
+local function normalize_cursor_info(value)
+	if type(value) == "table" then
+		return value
+	end
+
+	return {}
+end
+
 local function cursor_matches_function_name(cursor_info)
 	local symbol = cursor_cword()
 	if symbol == "" then
@@ -334,7 +342,7 @@ local function try_counterpart_from_header(root, file_path, line, character, cal
 			return callback(false)
 		end
 
-		local cursor_info = type(result) == "table" and result.cursor_info or {}
+		local cursor_info = normalize_cursor_info(type(result) == "table" and result.cursor_info or {})
 		if tostring(cursor_info.kind or "") == "function_definition" then
 			if not cursor_matches_function_name(cursor_info) then
 				return callback(false)
@@ -379,7 +387,7 @@ local function try_counterpart_from_source(root, file_path, line, character, cal
 			return callback(false)
 		end
 
-		local cursor_info = type(result) == "table" and result.cursor_info or {}
+		local cursor_info = normalize_cursor_info(type(result) == "table" and result.cursor_info or {})
 		local full_text = tostring(cursor_info.full_text or "")
 		if tostring(cursor_info.kind or "") ~= "function_definition" and not full_text:find("::", 1, true) then
 			return callback(false)
@@ -560,7 +568,8 @@ function M._goto_definition_inner(opts)
 	local line = cursor[1] - 1
 	local character = cursor[2]
 
-	try_counterpart_from_source(root, file_path, line, character, function(found)
+	local counterpart = is_header_file(file_path) and try_counterpart_from_header or try_counterpart_from_source
+	counterpart(root, file_path, line, character, function(found)
 		if found then
 			vim.cmd("nohlsearch")
 			return
