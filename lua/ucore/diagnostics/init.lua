@@ -618,7 +618,16 @@ local function definition_targets(cursor_info)
 	return targets
 end
 
+local function normalize_cursor_info(value)
+	if type(value) == "table" then
+		return value
+	end
+
+	return {}
+end
+
 local function build_definition_specs(cursor_info)
+	cursor_info = normalize_cursor_info(cursor_info)
 	local kind = tostring(cursor_info.kind or "")
 	local class_name = tostring(cursor_info.class_name or "")
 	local name = tostring(cursor_info.name or "")
@@ -721,8 +730,8 @@ local function try_generate_definition(bufnr)
 			return vim.notify("UCore parse buffer failed:\n" .. tostring(err), vim.log.levels.ERROR)
 		end
 
-		local cursor_info = type(result) == "table" and result.cursor_info or {}
-		local definition_specs, reason = build_definition_specs(cursor_info or {})
+		local cursor_info = normalize_cursor_info(type(result) == "table" and result.cursor_info or {})
+		local definition_specs, reason = build_definition_specs(cursor_info)
 		if not definition_specs then
 			if reason == "Current declaration is not a supported member function" then
 				return try_include_symbol(bufnr)
@@ -1112,6 +1121,12 @@ function M.setup()
 		callback = function(args)
 			M.refresh(args.buf, { silent = true })
 		end,
+	})
+
+	vim.api.nvim_create_autocmd("InsertLeave", {
+		group = group,
+		pattern = { "*.h", "*.hpp", "*.cpp", "*.cc", "*.cxx" },
+		callback = schedule_refresh,
 	})
 
 	vim.api.nvim_create_autocmd({ "CursorMoved", "BufEnter" }, {
