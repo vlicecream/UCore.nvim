@@ -355,10 +355,13 @@ local function current_symbol_name()
 	return symbol
 end
 
-local function ensure_project_context()
+local function ensure_project_context(opts)
+	opts = opts or {}
 	local ctx, err = current_context()
 	if not ctx then
-		vim.notify(err, vim.log.levels.WARN)
+		if not opts.silent then
+			vim.notify(err, vim.log.levels.WARN)
+		end
 		return nil
 	end
 	return ctx
@@ -370,7 +373,9 @@ end
 
 function M.hover_auto(opts)
 	opts = opts or {}
-	local ctx = ensure_project_context()
+	local ctx = ensure_project_context({
+		silent = opts.auto == true,
+	})
 	if not ctx then
 		return
 	end
@@ -430,7 +435,9 @@ end
 
 function M.signature_help_auto(opts)
 	opts = opts or {}
-	local ctx = ensure_project_context()
+	local ctx = ensure_project_context({
+		silent = opts.auto == true,
+	})
 	if not ctx then
 		return
 	end
