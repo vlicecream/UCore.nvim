@@ -287,8 +287,10 @@ fn missing_visible_type_diagnostics(
     let local_types = collect_local_type_visibility(root, content);
     let include_paths = collect_include_paths(content);
     let project_visible_file_ids = reachable_file_ids(conn, file_path);
+    let engine_seed_include_paths =
+        collect_engine_seed_include_paths(conn, &project_visible_file_ids, &include_paths);
     let engine_visible_file_ids = engine_conn
-        .map(|engine_conn| reachable_engine_file_ids(engine_conn, &include_paths))
+        .map(|engine_conn| reachable_engine_file_ids(engine_conn, &engine_seed_include_paths))
         .unwrap_or_default();
     let mut seen = HashSet::new();
     let mut items = Vec::new();
@@ -301,6 +303,7 @@ fn missing_visible_type_diagnostics(
         file_path,
         &local_types,
         &include_paths,
+        &engine_seed_include_paths,
         &project_visible_file_ids,
         &engine_visible_file_ids,
         &mut seen,
@@ -318,6 +321,7 @@ fn collect_missing_visible_type_items(
     file_path: &str,
     local_types: &LocalTypeVisibility,
     include_paths: &HashSet<String>,
+    engine_seed_include_paths: &HashSet<String>,
     project_visible_file_ids: &HashSet<i64>,
     engine_visible_file_ids: &HashSet<i64>,
     seen: &mut HashSet<(u32, u32, String)>,
@@ -378,7 +382,7 @@ fn collect_missing_visible_type_items(
                 engine_conn,
                 &reference.name,
                 Some(engine_visible_file_ids),
-                Some(include_paths),
+                Some(engine_seed_include_paths),
             )?
         } else {
             TypeVisibilityMatch::default()
@@ -417,6 +421,7 @@ fn collect_missing_visible_type_items(
             file_path,
             local_types,
             include_paths,
+            engine_seed_include_paths,
             project_visible_file_ids,
             engine_visible_file_ids,
             seen,
@@ -736,15 +741,16 @@ fn collect_override_items(
 ) -> Result<()> {
     if let Some(decl) = member_function_declaration(node, content, file_path) {
         if contains_token(&decl.full_text, "override") {
-            let has_project_match =
-                has_base_member_named(conn, &decl.class_name, &decl.name)?;
-            let has_engine_match = if let Some(engine_conn) = engine_conn {
-                has_base_member_named(engine_conn, &decl.class_name, &decl.name)?
-            } else {
-                false
-            };
+            let buffer_base_names = enclosing_class_base_names(node, content);
+            let has_match = has_base_member_named_across_dbs(
+                conn,
+                engine_conn,
+                &decl.class_name,
+                &decl.name,
+                &buffer_base_names,
+            )?;
 
-            if !has_project_match && !has_engine_match {
+            if !has_match {
                 items.push(
                     DiagnosticItem::new(
                         decl.file_path.as_deref(),
@@ -839,34 +845,63 @@ fn collect_missing_impl_items(
     Ok(())
 }
 
-fn has_base_member_named(conn: &Connection, class_name: &str, member_name: &str) -> Result<bool> {
-    let mut queue = VecDeque::from(class_ids_by_name(conn, class_name)?);
-    let mut visited = HashSet::new();
+fn has_base_member_named_across_dbs(
+    conn: &Connection,
+    engine_conn: Option<&Connection>,
+    class_name: &str,
+    member_name: &str,
+    initial_parent_names: &[String],
+) -> Result<bool> {
+    let mut queue = VecDeque::new();
 
-    while let Some(class_id) = queue.pop_front() {
-        if !visited.insert(class_id) {
+    if initial_parent_names.is_empty() {
+        queue.extend(direct_parent_names_for_class(conn, class_name)?);
+        if let Some(engine_conn) = engine_conn {
+            queue.extend(direct_parent_names_for_class(engine_conn, class_name)?);
+        }
+    } else {
+        queue.extend(initial_parent_names.iter().cloned());
+    }
+
+    let mut visited_names = HashSet::new();
+
+    while let Some(parent_name) = queue.pop_front() {
+        let short_name = strip_namespace(&parent_name);
+        if short_name.is_empty() || !visited_names.insert(short_name.clone()) {
             continue;
         }
 
-        for (parent_id, parent_name) in parent_classes(conn, class_id)? {
-            let short_name = strip_namespace(&parent_name);
-            if member_exists_on_class_name(conn, &short_name, member_name)? {
+        if member_exists_on_class_name(conn, &short_name, member_name)? {
+            return Ok(true);
+        }
+
+        if let Some(engine_conn) = engine_conn {
+            if member_exists_on_class_name(engine_conn, &short_name, member_name)? {
                 return Ok(true);
             }
+        }
 
-            if let Some(parent_id) = parent_id {
-                queue.push_back(parent_id);
-            }
-
-            for id in class_ids_by_name(conn, &short_name)? {
-                if !visited.contains(&id) {
-                    queue.push_back(id);
-                }
-            }
+        queue.extend(direct_parent_names_for_class(conn, &short_name)?);
+        if let Some(engine_conn) = engine_conn {
+            queue.extend(direct_parent_names_for_class(engine_conn, &short_name)?);
         }
     }
 
     Ok(false)
+}
+
+fn direct_parent_names_for_class(conn: &Connection, class_name: &str) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+
+    for class_id in class_ids_by_name(conn, class_name)? {
+        for (_, parent_name) in parent_classes(conn, class_id)? {
+            if !parent_name.trim().is_empty() {
+                names.push(parent_name);
+            }
+        }
+    }
+
+    Ok(names)
 }
 
 fn class_ids_by_name(conn: &Connection, class_name: &str) -> Result<Vec<i64>> {
@@ -1381,6 +1416,43 @@ fn collect_include_paths(content: &str) -> HashSet<String> {
         .captures_iter(content)
         .filter_map(|caps| caps.get(1).map(|m| m.as_str().trim().to_string()))
         .collect()
+}
+
+fn collect_engine_seed_include_paths(
+    conn: &Connection,
+    project_visible_file_ids: &HashSet<i64>,
+    include_paths: &HashSet<String>,
+) -> HashSet<String> {
+    let mut seeds = include_paths.clone();
+
+    if project_visible_file_ids.is_empty() {
+        return seeds;
+    }
+
+    let Ok(mut stmt) = conn.prepare_cached(
+        r#"
+        SELECT s.text
+        FROM file_includes fi
+        JOIN strings s ON fi.include_path_id = s.id
+        WHERE fi.file_id = ?
+          AND fi.resolved_file_id IS NULL
+        "#,
+    ) else {
+        return seeds;
+    };
+
+    for file_id in project_visible_file_ids {
+        if let Ok(rows) = stmt.query_map([file_id], |row| row.get::<_, String>(0)) {
+            for include_path in rows.filter_map(|row| row.ok()) {
+                let trimmed = include_path.trim();
+                if !trimmed.is_empty() {
+                    seeds.insert(trimmed.to_string());
+                }
+            }
+        }
+    }
+
+    seeds
 }
 
 fn lookup_type_visibility(
@@ -2147,6 +2219,51 @@ fn find_enclosing_class_name(node: tree_sitter::Node, content: &str) -> Option<S
     None
 }
 
+fn enclosing_class_base_names(node: tree_sitter::Node, content: &str) -> Vec<String> {
+    let mut current = node.parent();
+
+    while let Some(parent) = current {
+        if matches!(
+            parent.kind(),
+            "class_specifier"
+                | "struct_specifier"
+                | "unreal_reflected_class_declaration"
+                | "unreal_reflected_struct_declaration"
+        ) {
+            return extract_base_names_from_class_text(node_text(parent, content));
+        }
+
+        current = parent.parent();
+    }
+
+    Vec::new()
+}
+
+fn extract_base_names_from_class_text(text: &str) -> Vec<String> {
+    let head = text.split('{').next().unwrap_or(text);
+    let Some((_, bases)) = head.split_once(':') else {
+        return Vec::new();
+    };
+
+    bases
+        .split(',')
+        .filter_map(|segment| {
+            segment
+                .split_whitespace()
+                .rev()
+                .find(|token| {
+                    !matches!(
+                        *token,
+                        "public" | "protected" | "private" | "virtual" | "final"
+                    )
+                })
+                .map(|token| token.trim_matches(|ch: char| ch == ',' || ch == ':'))
+                .filter(|token| !token.is_empty())
+                .map(|token| token.to_string())
+        })
+        .collect()
+}
+
 fn extract_prefix_type(
     node: tree_sitter::Node,
     declarator: Option<tree_sitter::Node>,
@@ -2387,6 +2504,30 @@ mod tests {
         conn.last_insert_rowid()
     }
 
+    fn insert_class_in_file(conn: &Connection, name: &str, file_id: i64) -> i64 {
+        let name_id = insert_string(conn, name);
+        conn.execute(
+            "INSERT INTO classes (name_id, file_id, symbol_type, line_number, end_line_number) VALUES (?, ?, 'class', 1, 1)",
+            rusqlite::params![name_id, file_id],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn insert_inheritance(
+        conn: &Connection,
+        child_id: i64,
+        parent_name: &str,
+        parent_id: Option<i64>,
+    ) {
+        let parent_name_id = insert_string(conn, parent_name);
+        conn.execute(
+            "INSERT INTO inheritance (child_id, parent_name_id, parent_class_id) VALUES (?, ?, ?)",
+            rusqlite::params![child_id, parent_name_id, parent_id],
+        )
+        .unwrap();
+    }
+
     fn insert_impl_member(
         conn: &Connection,
         class_id: i64,
@@ -2447,6 +2588,28 @@ mod tests {
         conn.last_insert_rowid()
     }
 
+    fn insert_project_header_file(conn: &Connection, module: &str, filename: &str) -> i64 {
+        let drive = insert_string(conn, "C:");
+        let project_name = insert_string(conn, "Project");
+        let source_name = insert_string(conn, "Source");
+        let module_name = insert_string(conn, module);
+        let public_name = insert_string(conn, "Public");
+        let filename_id = insert_string(conn, filename);
+
+        let c_dir = get_or_create_dir(conn, None, drive);
+        let project_dir = get_or_create_dir(conn, Some(c_dir), project_name);
+        let source_dir = get_or_create_dir(conn, Some(project_dir), source_name);
+        let module_dir = get_or_create_dir(conn, Some(source_dir), module_name);
+        let public_dir = get_or_create_dir(conn, Some(module_dir), public_name);
+
+        conn.execute(
+            "INSERT INTO files (directory_id, filename_id, extension, is_header) VALUES (?, ?, 'h', 1)",
+            rusqlite::params![public_dir, filename_id],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
     fn get_or_create_dir(conn: &Connection, parent_id: Option<i64>, name_id: i64) -> i64 {
         conn.execute(
             "INSERT OR IGNORE INTO directories (parent_id, name_id) VALUES (?, ?)",
@@ -2461,7 +2624,12 @@ mod tests {
         .unwrap()
     }
 
-    fn insert_include_edge(conn: &Connection, file_id: i64, include_path: &str, resolved_file_id: i64) {
+    fn insert_include_decl(
+        conn: &Connection,
+        file_id: i64,
+        include_path: &str,
+        resolved_file_id: Option<i64>,
+    ) {
         let include_path_id = insert_string(conn, include_path);
         let base_filename = Path::new(include_path)
             .file_name()
@@ -2473,6 +2641,10 @@ mod tests {
             rusqlite::params![file_id, include_path_id, base_filename_id, resolved_file_id],
         )
         .unwrap();
+    }
+
+    fn insert_include_edge(conn: &Connection, file_id: i64, include_path: &str, resolved_file_id: i64) {
+        insert_include_decl(conn, file_id, include_path, Some(resolved_file_id));
     }
 
     fn temp_project_path(name: &str) -> std::path::PathBuf {
@@ -2591,6 +2763,37 @@ mod tests {
             &project_conn,
             Some(&engine_conn),
             "#include \"Engine/TextureOwner.h\"\n\nclass UMyActor\n{\npublic:\n    UTexture2D* Texture;\n};\n",
+            Some("C:/Project/Source/Game/Public/MyActor.h".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP004"));
+    }
+
+    #[test]
+    fn does_not_warn_when_engine_type_is_visible_via_project_transitive_include() {
+        let project_conn = Connection::open_in_memory().unwrap();
+        let engine_conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&project_conn).unwrap();
+        crate::db::init_db(&engine_conn).unwrap();
+
+        let current_file_id = insert_project_header_file(&project_conn, "Game", "MyActor.h");
+        let shared_file_id = insert_project_header_file(&project_conn, "Game", "SharedTypes.h");
+        insert_include_edge(&project_conn, current_file_id, "SharedTypes.h", shared_file_id);
+        insert_include_decl(&project_conn, shared_file_id, "CoreMinimal.h", None);
+
+        let core_minimal_file_id = insert_header_file(&engine_conn, "Core", "CoreMinimal.h");
+        let object_file_id = insert_header_file(&engine_conn, "CoreUObject", "Object.h");
+        insert_include_edge(&engine_conn, core_minimal_file_id, "UObject/Object.h", object_file_id);
+
+        let _object_class_id = insert_class_in_file(&engine_conn, "UObject", object_file_id);
+
+        let value = process_diagnostics(
+            &project_conn,
+            Some(&engine_conn),
+            "#include \"SharedTypes.h\"\n\nclass UMyActor\n{\npublic:\n    UObject* Object;\n};\n",
             Some("C:/Project/Source/Game/Public/MyActor.h".to_string()),
             &[],
         )
@@ -2734,12 +2937,7 @@ mod tests {
         insert_decl_member(&conn, base_id, "EndAbility", "()", Some("void"));
 
         let child_id = insert_class(&conn, "UMyAbility");
-        let parent_name_id = insert_string(&conn, "UBaseAbility");
-        conn.execute(
-            "INSERT INTO inheritance (child_id, parent_name_id, parent_class_id) VALUES (?, ?, ?)",
-            rusqlite::params![child_id, parent_name_id, base_id],
-        )
-        .unwrap();
+        insert_inheritance(&conn, child_id, "UBaseAbility", Some(base_id));
 
         let value = process_diagnostics(
             &conn,
@@ -2763,12 +2961,7 @@ mod tests {
         insert_decl_member(&conn, base_id, "EndAbility", "()", Some("void"));
 
         let child_id = insert_class(&conn, "UMyAbility");
-        let parent_name_id = insert_string(&conn, "UBaseAbility");
-        conn.execute(
-            "INSERT INTO inheritance (child_id, parent_name_id, parent_class_id) VALUES (?, ?, ?)",
-            rusqlite::params![child_id, parent_name_id, base_id],
-        )
-        .unwrap();
+        insert_inheritance(&conn, child_id, "UBaseAbility", Some(base_id));
 
         let value = process_diagnostics(
             &conn,
@@ -2781,6 +2974,67 @@ mod tests {
 
         let items = value["items"].as_array().unwrap();
         assert!(items.iter().any(|item| item["code"] == "UECPP007"));
+    }
+
+    #[test]
+    fn does_not_warn_for_engine_override_name_on_project_child() {
+        let project_conn = Connection::open_in_memory().unwrap();
+        let engine_conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&project_conn).unwrap();
+        crate::db::init_db(&engine_conn).unwrap();
+
+        let child_id = insert_class(&project_conn, "UWeaponForgeMain");
+        insert_inheritance(&project_conn, child_id, "UBaseWidget", None);
+
+        let base_id = insert_class(&engine_conn, "UBaseWidget");
+        insert_decl_member(
+            &engine_conn,
+            base_id,
+            "NativeGetDesiredFocusTarget",
+            "() const",
+            Some("void"),
+        );
+
+        let value = process_diagnostics(
+            &project_conn,
+            Some(&engine_conn),
+            "class UWeaponForgeMain : public UBaseWidget\n{\npublic:\n    virtual void NativeGetDesiredFocusTarget() const override;\n};\n",
+            Some("C:/Project/Source/Game/Public/WeaponForgeMain.h".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP007"));
+    }
+
+    #[test]
+    fn does_not_warn_for_buffer_only_engine_override_name() {
+        let project_conn = Connection::open_in_memory().unwrap();
+        let engine_conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&project_conn).unwrap();
+        crate::db::init_db(&engine_conn).unwrap();
+
+        let base_id = insert_class(&engine_conn, "UBaseWidget");
+        insert_decl_member(
+            &engine_conn,
+            base_id,
+            "NativeGetDesiredFocusTarget",
+            "() const",
+            Some("void"),
+        );
+
+        let value = process_diagnostics(
+            &project_conn,
+            Some(&engine_conn),
+            "class UWeaponForgeMain : public UBaseWidget\n{\npublic:\n    virtual void NativeGetDesiredFocusTarget() const override;\n};\n",
+            Some("C:/Project/Source/Game/Public/WeaponForgeMain.h".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP007"));
     }
 
     #[test]
