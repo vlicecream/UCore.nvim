@@ -31,6 +31,36 @@ local function normalize_path(path)
 	return path and path:gsub("\\", "/") or nil
 end
 
+local function is_cpp_like_path(path)
+	path = normalize_path(path or "")
+	return path:match("%.h$") or path:match("%.hh$") or path:match("%.hpp$")
+		or path:match("%.cpp$") or path:match("%.cc$") or path:match("%.cxx$")
+end
+
+local function open_file_overlays(project_root)
+	local overlays = {}
+	local seen = {}
+	local normalized_root = normalize_path(project_root or "")
+
+	for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+		if vim.api.nvim_buf_is_valid(bufnr) then
+			local name = normalize_path(vim.api.nvim_buf_get_name(bufnr))
+			if name and name ~= "" and is_cpp_like_path(name) and not seen[name] then
+				local root = project.find_project_root(name)
+				if root and normalize_path(root) == normalized_root then
+					seen[name] = true
+					table.insert(overlays, {
+						file_path = name,
+						content = current_content(bufnr),
+					})
+				end
+			end
+		end
+	end
+
+	return overlays
+end
+
 local function resolve_bufnr_for_path(file_path, fallback_bufnr)
 	local normalized = normalize_path(file_path)
 	if not normalized or normalized == "" then
@@ -129,6 +159,7 @@ function M.refresh(bufnr, opts)
 	remote.get_diagnostics(root, {
 		content = current_content(bufnr),
 		file_path = normalize_path(file_path),
+		open_files = open_file_overlays(root),
 	}, function(result, err)
 		if sequence ~= refresh_sequence
 			or not vim.api.nvim_buf_is_valid(bufnr)
