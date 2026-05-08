@@ -664,11 +664,13 @@ local function open_rename_preview(ctx, old_name, items, preset_new_name)
 	end
 
 	local title = preset_new_name
-		and string.format("Rename Preview %s -> %s", old_name, preset_new_name)
-		or string.format("Rename Preview %s", old_name)
+		and string.format("%s -> %s", old_name, preset_new_name)
+		or string.format("%s", old_name)
 
 	select_ui.rename_preview(rename_items, {
 		title = title,
+		occurrence_count = #rename_items,
+		file_count = rename_file_count(rename_items),
 		on_choice = function()
 			if preset_new_name and vim.trim(tostring(preset_new_name)) ~= "" then
 				apply_rename_with_confirmation(ctx, old_name, preset_new_name, rename_items)
