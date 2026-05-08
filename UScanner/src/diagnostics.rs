@@ -1504,6 +1504,7 @@ struct ExpectedDefinition {
 struct UnrealFunctionSpec {
     requires_implementation: bool,
     requires_validate: bool,
+    blueprint_implementable_only: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1617,6 +1618,10 @@ fn build_definition_signature(decl: &HeaderFunctionDecl, expected: &ExpectedDefi
 
 fn expected_definitions(decl: &HeaderFunctionDecl) -> Vec<ExpectedDefinition> {
     let spec = parse_ufunction_spec(&decl.full_text);
+    if spec.blueprint_implementable_only {
+        return Vec::new();
+    }
+
     let base_name = base_unreal_function_name(&decl.name);
     let implementation_name = if spec.requires_implementation {
         format!("{}_Implementation", base_name)
@@ -1670,6 +1675,7 @@ fn parse_ufunction_spec(text: &str) -> UnrealFunctionSpec {
             || has_token("Client")
             || has_token("NetMulticast"),
         requires_validate: has_token("WithValidation"),
+        blueprint_implementable_only: has_token("BlueprintImplementableEvent"),
     }
 }
 
@@ -2883,6 +2889,30 @@ mod tests {
             &conn,
             None,
             "class UMyAbility\n{\npublic:\n    UFUNCTION(BlueprintNativeEvent)\n    void OnDeath();\n};\n",
+            Some(header.to_string_lossy().replace('\\', "/")),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP001"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn blueprint_implementable_event_does_not_require_cpp_definition() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let root = temp_project_path("blueprint_implementable_event");
+        let header = root.join("Source/Game/Public/MyAbility.h");
+        std::fs::create_dir_all(header.parent().unwrap()).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "class UMyAbility\n{\npublic:\n    UFUNCTION(BlueprintImplementableEvent)\n    void OnDeath();\n};\n",
             Some(header.to_string_lossy().replace('\\', "/")),
             &[],
         )
