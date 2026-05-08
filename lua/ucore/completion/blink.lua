@@ -235,6 +235,22 @@ local function ensure_selection_defaults(completion_config)
 	return completion_config
 end
 
+local function before_cursor()
+	local row, col = unpack(vim.api.nvim_win_get_cursor(0))
+	local line = vim.api.nvim_buf_get_lines(0, row - 1, row, false)[1] or ""
+	return line:sub(1, col), col
+end
+
+local function in_include_context()
+	local before = before_cursor()
+	return before:match("^%s*#%s*include%s*[<\"][^>\"]*$") ~= nil
+end
+
+local function in_macro_context()
+	local before = before_cursor()
+	return before:match("%f[%w_]U[A-Z_]+%s*%([^)]*$") ~= nil
+end
+
 local function in_ucore_special_context()
 	return in_include_context() or in_macro_context()
 end
