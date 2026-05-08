@@ -3,7 +3,7 @@ use regex::Regex;
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::Path;
 use tree_sitter::Parser;
@@ -64,13 +64,20 @@ impl DiagnosticItem {
 
 pub fn process_diagnostics(
     conn: &Connection,
-    _engine_conn: Option<&Connection>,
+    engine_conn: Option<&Connection>,
     content: &str,
     file_path: Option<String>,
     open_files: &[OpenBufferOverlay],
 ) -> Result<Value> {
     let mut items = Vec::new();
     items.extend(unreal_rule_diagnostics(content, file_path.as_deref())?);
+    items.extend(missing_return_diagnostics(content, file_path.as_deref())?);
+    items.extend(missing_visible_type_diagnostics(
+        conn,
+        engine_conn,
+        content,
+        file_path.as_deref(),
+    )?);
     items.extend(incomplete_member_declaration_diagnostics(
         content,
         file_path.as_deref(),
@@ -172,6 +179,286 @@ fn unreal_rule_diagnostics(content: &str, file_path: Option<&str>) -> Result<Vec
     }
 
     Ok(items)
+}
+
+fn missing_return_diagnostics(
+    content: &str,
+    file_path: Option<&str>,
+) -> Result<Vec<DiagnosticItem>> {
+    let Some(file_path) = file_path else {
+        return Ok(Vec::new());
+    };
+
+    if !is_cpp_source_or_header(file_path) {
+        return Ok(Vec::new());
+    }
+
+    let mut parser = Parser::new();
+    let language: tree_sitter::Language = tree_sitter_unreal_cpp::LANGUAGE.into();
+    parser.set_language(&language)?;
+
+    let Some(tree) = parser.parse(content, None) else {
+        return Ok(Vec::new());
+    };
+
+    let mut items = Vec::new();
+    collect_missing_return_items(tree.root_node(), content, file_path, &mut items);
+    Ok(items)
+}
+
+fn missing_visible_type_diagnostics(
+    conn: &Connection,
+    engine_conn: Option<&Connection>,
+    content: &str,
+    file_path: Option<&str>,
+) -> Result<Vec<DiagnosticItem>> {
+    let Some(file_path) = file_path else {
+        return Ok(Vec::new());
+    };
+
+    if !is_cpp_source_or_header(file_path) {
+        return Ok(Vec::new());
+    }
+
+    let mut parser = Parser::new();
+    let language: tree_sitter::Language = tree_sitter_unreal_cpp::LANGUAGE.into();
+    parser.set_language(&language)?;
+
+    let Some(tree) = parser.parse(content, None) else {
+        return Ok(Vec::new());
+    };
+
+    let root = tree.root_node();
+    let mut visible_local_types = builtin_type_names();
+    collect_local_visible_types(root, content, &mut visible_local_types);
+    let include_paths = collect_include_paths(content);
+    let project_visible_file_ids = reachable_file_ids(conn, file_path);
+    let mut seen = HashSet::new();
+    let mut items = Vec::new();
+
+    collect_missing_visible_type_items(
+        conn,
+        engine_conn,
+        root,
+        content,
+        file_path,
+        &visible_local_types,
+        &include_paths,
+        &project_visible_file_ids,
+        &mut seen,
+        &mut items,
+    )?;
+
+    Ok(items)
+}
+
+fn collect_missing_visible_type_items(
+    conn: &Connection,
+    engine_conn: Option<&Connection>,
+    node: tree_sitter::Node,
+    content: &str,
+    file_path: &str,
+    visible_local_types: &HashSet<String>,
+    include_paths: &HashSet<String>,
+    project_visible_file_ids: &HashSet<i64>,
+    seen: &mut HashSet<(u32, u32, String)>,
+    items: &mut Vec<DiagnosticItem>,
+) -> Result<()> {
+    for reference in type_references_for_node(node, content) {
+        let key = (reference.line, reference.character, reference.name.clone());
+        if !seen.insert(key) {
+            continue;
+        }
+
+        if visible_local_types.contains(&reference.name) {
+            continue;
+        }
+
+        let project_match = lookup_type_visibility(
+            conn,
+            &reference.name,
+            Some(project_visible_file_ids),
+            Some(include_paths),
+        )?;
+
+        if project_match.visible {
+            continue;
+        }
+
+        let engine_match = if let Some(engine_conn) = engine_conn {
+            lookup_type_visibility(engine_conn, &reference.name, None, Some(include_paths))?
+        } else {
+            TypeVisibilityMatch::default()
+        };
+
+        if engine_match.visible {
+            continue;
+        }
+
+        if project_match.exists || engine_match.exists {
+            items.push(
+                DiagnosticItem::new(
+                    Some(file_path),
+                    reference.line,
+                    reference.character,
+                    DiagnosticSeverity::Error,
+                    "UCore",
+                    "UECPP004",
+                    format!(
+                        "Type {} is not visible here. Missing include or forward declaration.",
+                        reference.name
+                    ),
+                )
+                .with_end(reference.end_line, reference.end_character),
+            );
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_missing_visible_type_items(
+            conn,
+            engine_conn,
+            child,
+            content,
+            file_path,
+            visible_local_types,
+            include_paths,
+            project_visible_file_ids,
+            seen,
+            items,
+        )?;
+    }
+
+    Ok(())
+}
+
+#[derive(Clone, Debug, Default)]
+struct TypeVisibilityMatch {
+    exists: bool,
+    visible: bool,
+}
+
+#[derive(Clone, Debug)]
+struct TypeReference {
+    name: String,
+    line: u32,
+    character: u32,
+    end_line: u32,
+    end_character: u32,
+}
+
+fn collect_missing_return_items(
+    node: tree_sitter::Node,
+    content: &str,
+    file_path: &str,
+    items: &mut Vec<DiagnosticItem>,
+) {
+    if let Some(item) = missing_return_item(node, content, file_path) {
+        items.push(item);
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_missing_return_items(child, content, file_path, items);
+    }
+}
+
+fn missing_return_item(
+    node: tree_sitter::Node,
+    content: &str,
+    file_path: &str,
+) -> Option<DiagnosticItem> {
+    if !matches!(node.kind(), "function_definition" | "unreal_function_definition") {
+        return None;
+    }
+
+    let declarator = find_child_by_field(node, "declarator")?;
+    let name_node = find_name_node(declarator)?;
+    let name = node_text(name_node, content).trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+
+    let return_type = find_child_by_field(node, "type")
+        .map(|type_node| node_text(type_node, content).to_string())
+        .unwrap_or_else(|| extract_prefix_type(node, Some(declarator), content));
+    let normalized_return = normalize_space(&return_type);
+
+    if normalized_return.is_empty()
+        || normalized_return == "void"
+        || normalized_return == "auto"
+        || normalized_return.ends_with("decltype(auto)")
+    {
+        return None;
+    }
+
+    let body = find_child_by_type(node, "compound_statement")?;
+    if block_guarantees_return(body) {
+        return None;
+    }
+
+    let start = name_node.start_position();
+    let end = name_node.end_position();
+    Some(
+        DiagnosticItem::new(
+            Some(file_path),
+            start.row as u32,
+            start.column as u32,
+            DiagnosticSeverity::Error,
+            "UCore",
+            "UECPP003",
+            format!(
+                "Non-void function {} can reach the end without returning a value.",
+                name
+            ),
+        )
+        .with_end(end.row as u32, end.column as u32),
+    )
+}
+
+fn block_guarantees_return(node: tree_sitter::Node) -> bool {
+    match node.kind() {
+        "return_statement" => return true,
+        "compound_statement" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if statement_guarantees_return(child) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        _ => {}
+    }
+
+    statement_guarantees_return(node)
+}
+
+fn statement_guarantees_return(node: tree_sitter::Node) -> bool {
+    match node.kind() {
+        "return_statement" => true,
+        "compound_statement" => block_guarantees_return(node),
+        "else_clause" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if statement_guarantees_return(child) {
+                    return true;
+                }
+            }
+            false
+        }
+        "if_statement" => {
+            let Some(consequence) = node.child_by_field_name("consequence") else {
+                return false;
+            };
+            let Some(alternative) = node.child_by_field_name("alternative") else {
+                return false;
+            };
+            statement_guarantees_return(consequence) && statement_guarantees_return(alternative)
+        }
+        _ => false,
+    }
 }
 
 fn missing_implementation_diagnostics(
@@ -409,6 +696,353 @@ fn collect_missing_impl_items(
     }
 
     Ok(())
+}
+
+fn type_references_for_node(node: tree_sitter::Node, content: &str) -> Vec<TypeReference> {
+    let mut refs = Vec::new();
+
+    match node.kind() {
+        "declaration"
+        | "field_declaration"
+        | "parameter_declaration"
+        | "function_definition"
+        | "unreal_function_definition" => {
+            if let Some(type_node) = find_child_by_field(node, "type") {
+                refs.extend(type_references_from_type_node(type_node, content));
+            }
+        }
+        "base_class_clause" => {
+            refs.extend(type_references_from_type_node(node, content));
+        }
+        _ => {}
+    }
+
+    refs
+}
+
+fn type_references_from_type_node(node: tree_sitter::Node, content: &str) -> Vec<TypeReference> {
+    let text = node_text(node, content);
+    let start = node.start_position();
+    let end = node.end_position();
+
+    extract_candidate_type_names(text)
+        .into_iter()
+        .map(|name| TypeReference {
+            name,
+            line: start.row as u32,
+            character: start.column as u32,
+            end_line: end.row as u32,
+            end_character: end.column as u32,
+        })
+        .collect()
+}
+
+fn extract_candidate_type_names(text: &str) -> Vec<String> {
+    let Some(regex) = Regex::new(r"[A-Za-z_][A-Za-z0-9_:]*").ok() else {
+        return Vec::new();
+    };
+
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+
+    for cap in regex.find_iter(text) {
+        let token = cap.as_str();
+        let short = token.rsplit("::").next().unwrap_or(token).trim();
+        if short.is_empty() || is_ignored_type_token(short) {
+            continue;
+        }
+        if seen.insert(short.to_string()) {
+            items.push(short.to_string());
+        }
+    }
+
+    items
+}
+
+fn is_ignored_type_token(token: &str) -> bool {
+    matches!(
+        token,
+        "const"
+            | "volatile"
+            | "class"
+            | "struct"
+            | "enum"
+            | "signed"
+            | "unsigned"
+            | "short"
+            | "long"
+            | "void"
+            | "bool"
+            | "char"
+            | "wchar_t"
+            | "char8_t"
+            | "char16_t"
+            | "char32_t"
+            | "int"
+            | "float"
+            | "double"
+            | "auto"
+            | "decltype"
+            | "typename"
+            | "mutable"
+            | "static"
+            | "virtual"
+            | "inline"
+            | "FORCEINLINE"
+            | "TArray"
+            | "TSet"
+            | "TMap"
+            | "TQueue"
+            | "TOptional"
+            | "TSharedPtr"
+            | "TSharedRef"
+            | "TWeakPtr"
+            | "TUniquePtr"
+            | "TObjectPtr"
+            | "TWeakObjectPtr"
+            | "TSoftObjectPtr"
+            | "TSoftClassPtr"
+            | "TSubclassOf"
+            | "TNonNullSubclassOf"
+            | "TScriptInterface"
+            | "TArrayView"
+            | "TConstArrayView"
+            | "FStringView"
+            | "FAnsiStringView"
+            | "FWideStringView"
+    ) || token.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+}
+
+fn builtin_type_names() -> HashSet<String> {
+    [
+        "void",
+        "bool",
+        "char",
+        "wchar_t",
+        "char8_t",
+        "char16_t",
+        "char32_t",
+        "short",
+        "int",
+        "long",
+        "float",
+        "double",
+        "size_t",
+        "ptrdiff_t",
+        "int8",
+        "int16",
+        "int32",
+        "int64",
+        "uint8",
+        "uint16",
+        "uint32",
+        "uint64",
+        "UPTRINT",
+        "PTRINT",
+        "SIZE_T",
+        "ANSICHAR",
+        "WIDECHAR",
+        "UTF8CHAR",
+        "TCHAR",
+        "FString",
+        "FName",
+        "FText",
+        "FLinearColor",
+        "FColor",
+        "FVector",
+        "FVector2D",
+        "FVector4",
+        "FRotator",
+        "FQuat",
+        "FTransform",
+    ]
+    .into_iter()
+    .map(|item| item.to_string())
+    .collect()
+}
+
+fn collect_local_visible_types(
+    root: tree_sitter::Node,
+    content: &str,
+    visible: &mut HashSet<String>,
+) {
+    collect_local_type_definitions(root, content, visible);
+    collect_forward_declared_types(content, visible);
+}
+
+fn collect_local_type_definitions(
+    node: tree_sitter::Node,
+    content: &str,
+    visible: &mut HashSet<String>,
+) {
+    if matches!(
+        node.kind(),
+        "class_specifier"
+            | "struct_specifier"
+            | "enum_specifier"
+            | "unreal_reflected_class_declaration"
+            | "unreal_reflected_struct_declaration"
+            | "unreal_reflected_enum_declaration"
+    ) {
+        if let Some(name_node) = node.child_by_field_name("name") {
+            let name = node_text(name_node, content).trim().to_string();
+            if !name.is_empty() {
+                visible.insert(name);
+            }
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_local_type_definitions(child, content, visible);
+    }
+}
+
+fn collect_forward_declared_types(content: &str, visible: &mut HashSet<String>) {
+    let Some(regex) = Regex::new(r"\b(?:class|struct|enum\s+class|enum)\s+([A-Za-z_][A-Za-z0-9_]*)\s*;").ok()
+    else {
+        return;
+    };
+
+    for caps in regex.captures_iter(content) {
+        if let Some(name) = caps.get(1).map(|m| m.as_str().trim()) {
+            if !name.is_empty() {
+                visible.insert(name.to_string());
+            }
+        }
+    }
+}
+
+fn collect_include_paths(content: &str) -> HashSet<String> {
+    let Some(regex) = Regex::new(r#"#\s*include\s*[<"]([^>"]+)[>"]"#).ok() else {
+        return HashSet::new();
+    };
+
+    regex
+        .captures_iter(content)
+        .filter_map(|caps| caps.get(1).map(|m| m.as_str().trim().to_string()))
+        .collect()
+}
+
+fn lookup_type_visibility(
+    conn: &Connection,
+    type_name: &str,
+    visible_file_ids: Option<&HashSet<i64>>,
+    include_paths: Option<&HashSet<String>>,
+) -> Result<TypeVisibilityMatch> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT
+            c.file_id,
+            CASE
+                WHEN dp.full_path IS NULL OR sf.text IS NULL THEN ''
+                ELSE dp.full_path || '/' || sf.text
+            END
+        FROM classes c
+        JOIN strings s ON c.name_id = s.id
+        LEFT JOIN files f ON c.file_id = f.id
+        LEFT JOIN dir_paths dp ON f.directory_id = dp.id
+        LEFT JOIN strings sf ON f.filename_id = sf.id
+        WHERE s.text = ?1
+        "#,
+    )?;
+
+    let mut rows = stmt.query(params![type_name])?;
+    let mut matched = TypeVisibilityMatch::default();
+
+    while let Some(row) = rows.next()? {
+        matched.exists = true;
+
+        let file_id: Option<i64> = row.get(0)?;
+        let full_path: String = row.get(1)?;
+
+        if let (Some(visible_file_ids), Some(file_id)) = (visible_file_ids, file_id) {
+            if visible_file_ids.contains(&file_id) {
+                matched.visible = true;
+                return Ok(matched);
+            }
+        }
+
+        if let Some(include_paths) = include_paths {
+            if let Some(include_path) = include_path_from_file_path(&full_path) {
+                if include_paths.contains(&include_path) {
+                    matched.visible = true;
+                    return Ok(matched);
+                }
+            }
+        }
+    }
+
+    Ok(matched)
+}
+
+fn include_path_from_file_path(file_path: &str) -> Option<String> {
+    let normalized = file_path.replace('\\', "/");
+    if normalized.is_empty() {
+        return None;
+    }
+
+    for marker in ["/Public/", "/Classes/", "/Private/"] {
+        if let Some(index) = normalized.find(marker) {
+            return normalized
+                .get(index + marker.len()..)
+                .map(|value| value.to_string());
+        }
+    }
+
+    Path::new(&normalized)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|value| value.to_string())
+}
+
+fn reachable_file_ids(conn: &Connection, file_path: &str) -> HashSet<i64> {
+    let Some(root_id) = get_file_id_by_full_path(conn, file_path) else {
+        return HashSet::new();
+    };
+
+    let mut included = HashSet::new();
+    let mut queue = VecDeque::from([root_id]);
+
+    while let Some(file_id) = queue.pop_front() {
+        if !included.insert(file_id) {
+            continue;
+        }
+
+        if let Ok(mut stmt) = conn.prepare_cached(
+            "SELECT resolved_file_id FROM file_includes WHERE file_id = ? AND resolved_file_id IS NOT NULL",
+        ) {
+            if let Ok(rows) = stmt.query_map([file_id], |row| row.get::<_, i64>(0)) {
+                for id in rows.filter_map(|row| row.ok()) {
+                    if !included.contains(&id) {
+                        queue.push_back(id);
+                    }
+                }
+            }
+        }
+    }
+
+    included
+}
+
+fn get_file_id_by_full_path(conn: &Connection, file_path: &str) -> Option<i64> {
+    let normalized = file_path.replace('\\', "/");
+    let sql = r#"
+        SELECT f.id
+        FROM files f
+        JOIN dir_paths dp ON f.directory_id = dp.id
+        JOIN strings sf ON f.filename_id = sf.id
+        WHERE
+            CASE
+                WHEN dp.full_path = '/' THEN '/' || sf.text
+                WHEN substr(dp.full_path, -1) = '/' THEN dp.full_path || sf.text
+                ELSE dp.full_path || '/' || sf.text
+            END = ?
+        LIMIT 1
+    "#;
+
+    conn.query_row(sql, [&normalized], |row| row.get::<_, i64>(0))
+        .ok()
 }
 
 #[derive(Clone, Debug)]
@@ -854,6 +1488,17 @@ fn is_header_file(path: &str) -> bool {
     )
 }
 
+fn is_cpp_source_or_header(path: &str) -> bool {
+    matches!(
+        Path::new(path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .as_deref(),
+        Some("h" | "hpp" | "hh" | "hxx" | "cpp" | "cc" | "cxx")
+    )
+}
+
 fn header_to_source_candidates(path: &str) -> Vec<String> {
     let normalized = path.replace('\\', "/");
     let Some(dot) = normalized.rfind('.') else {
@@ -1248,6 +1893,96 @@ mod tests {
         .unwrap();
         let items = value["items"].as_array().unwrap();
         assert!(items.iter().any(|item| item["code"] == "UHT002"));
+    }
+
+    #[test]
+    fn detects_missing_return_in_non_void_function() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "int32 ComputeValue()\n{\n    const int32 Local = 42;\n}\n",
+            Some("C:/Project/Source/Game/MyActor.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| item["code"] == "UECPP003"));
+    }
+
+    #[test]
+    fn does_not_warn_when_non_void_function_returns_on_all_if_branches() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "int32 ComputeValue(bool bFlag)\n{\n    if (bFlag)\n    {\n        return 1;\n    }\n    else\n    {\n        return 2;\n    }\n}\n",
+            Some("C:/Project/Source/Game/MyActor.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP003"));
+    }
+
+    #[test]
+    fn does_not_warn_for_void_function_without_return() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "void RunTask()\n{\n    const int32 Local = 42;\n}\n",
+            Some("C:/Project/Source/Game/MyActor.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP003"));
+    }
+
+    #[test]
+    fn warns_when_known_type_is_not_visible_in_header() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let class_id = insert_class(&conn, "UMyDependency");
+        insert_impl_member(&conn, class_id, "DoThing", "()", Some("void"));
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "class UMyActor\n{\npublic:\n    UMyDependency Value;\n};\n",
+            Some("C:/Project/Source/Game/Public/MyActor.h".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| item["code"] == "UECPP004"));
+    }
+
+    #[test]
+    fn does_not_warn_when_type_is_forward_declared() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let class_id = insert_class(&conn, "UMyDependency");
+        insert_impl_member(&conn, class_id, "DoThing", "()", Some("void"));
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "class UMyDependency;\n\nclass UMyActor\n{\npublic:\n    UMyDependency* Value;\n};\n",
+            Some("C:/Project/Source/Game/Public/MyActor.h".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP004"));
     }
 
     #[test]
