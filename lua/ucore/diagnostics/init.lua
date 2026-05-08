@@ -179,6 +179,12 @@ local function show_cursor_float(bufnr)
 		return
 	end
 
+	local assist_ok, assist = pcall(require, "ucore.assist")
+	if assist_ok and assist and type(assist.has_active_float) == "function" and assist.has_active_float() then
+		close_cursor_float()
+		return
+	end
+
 	if not vim.api.nvim_buf_is_valid(bufnr) or vim.api.nvim_get_current_buf() ~= bufnr then
 		return
 	end
@@ -1140,6 +1146,11 @@ function M.reset()
 	close_cursor_float()
 	pcall(vim.api.nvim_del_augroup_by_name, group_name)
 	vim.diagnostic.reset(ns)
+end
+
+function M.close_cursor_float()
+	float_sequence = float_sequence + 1
+	close_cursor_float()
 end
 
 return M

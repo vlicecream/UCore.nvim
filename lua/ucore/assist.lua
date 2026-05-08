@@ -290,6 +290,10 @@ local function open_float(lines, opts)
 		return
 	end
 
+	pcall(function()
+		require("ucore.diagnostics").close_cursor_float()
+	end)
+
 	close_float()
 
 	local buf = vim.api.nvim_create_buf(false, true)
@@ -727,6 +731,10 @@ end
 
 function M.close_float()
 	close_float()
+end
+
+function M.has_active_float()
+	return float_state.win ~= nil and vim.api.nvim_win_is_valid(float_state.win)
 end
 
 local function auto_hover_enabled()
