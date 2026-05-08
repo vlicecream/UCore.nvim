@@ -73,6 +73,7 @@ pub fn process_diagnostics(
     items.extend(unreal_rule_diagnostics(content, file_path.as_deref())?);
     items.extend(unreal_include_diagnostics(conn, content, file_path.as_deref())?);
     items.extend(missing_return_diagnostics(content, file_path.as_deref())?);
+    items.extend(override_diagnostics(conn, engine_conn, content, file_path.as_deref())?);
     items.extend(missing_visible_type_diagnostics(
         conn,
         engine_conn,
@@ -223,6 +224,40 @@ fn missing_return_diagnostics(
 
     let mut items = Vec::new();
     collect_missing_return_items(tree.root_node(), content, file_path, &mut items);
+    Ok(items)
+}
+
+fn override_diagnostics(
+    conn: &Connection,
+    engine_conn: Option<&Connection>,
+    content: &str,
+    file_path: Option<&str>,
+) -> Result<Vec<DiagnosticItem>> {
+    let Some(file_path) = file_path else {
+        return Ok(Vec::new());
+    };
+
+    if !is_cpp_source_or_header(file_path) {
+        return Ok(Vec::new());
+    }
+
+    let mut parser = Parser::new();
+    let language: tree_sitter::Language = tree_sitter_unreal_cpp::LANGUAGE.into();
+    parser.set_language(&language)?;
+
+    let Some(tree) = parser.parse(content, None) else {
+        return Ok(Vec::new());
+    };
+
+    let mut items = Vec::new();
+    collect_override_items(
+        conn,
+        engine_conn,
+        tree.root_node(),
+        content,
+        file_path,
+        &mut items,
+    )?;
     Ok(items)
 }
 
@@ -680,6 +715,52 @@ fn incomplete_member_declaration_item(
     )
 }
 
+fn collect_override_items(
+    conn: &Connection,
+    engine_conn: Option<&Connection>,
+    node: tree_sitter::Node,
+    content: &str,
+    file_path: &str,
+    items: &mut Vec<DiagnosticItem>,
+) -> Result<()> {
+    if let Some(decl) = member_function_declaration(node, content, file_path) {
+        if contains_token(&decl.full_text, "override") {
+            let has_project_match =
+                has_base_member_named(conn, &decl.class_name, &decl.name)?;
+            let has_engine_match = if let Some(engine_conn) = engine_conn {
+                has_base_member_named(engine_conn, &decl.class_name, &decl.name)?
+            } else {
+                false
+            };
+
+            if !has_project_match && !has_engine_match {
+                items.push(
+                    DiagnosticItem::new(
+                        decl.file_path.as_deref(),
+                        decl.line,
+                        decl.character,
+                        DiagnosticSeverity::Error,
+                        "UCore",
+                        "UECPP007",
+                        format!(
+                            "Function {}::{} is marked override but no base member with the same name was found.",
+                            decl.class_name, decl.name
+                        ),
+                    )
+                    .with_end(decl.end_line, decl.end_character),
+                );
+            }
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_override_items(conn, engine_conn, child, content, file_path, items)?;
+    }
+
+    Ok(())
+}
+
 fn collect_missing_impl_items(
     conn: &Connection,
     node: tree_sitter::Node,
@@ -745,6 +826,98 @@ fn collect_missing_impl_items(
     }
 
     Ok(())
+}
+
+fn has_base_member_named(conn: &Connection, class_name: &str, member_name: &str) -> Result<bool> {
+    let mut queue = VecDeque::from(class_ids_by_name(conn, class_name)?);
+    let mut visited = HashSet::new();
+
+    while let Some(class_id) = queue.pop_front() {
+        if !visited.insert(class_id) {
+            continue;
+        }
+
+        for (parent_id, parent_name) in parent_classes(conn, class_id)? {
+            let short_name = strip_namespace(&parent_name);
+            if member_exists_on_class_name(conn, &short_name, member_name)? {
+                return Ok(true);
+            }
+
+            if let Some(parent_id) = parent_id {
+                queue.push_back(parent_id);
+            }
+
+            for id in class_ids_by_name(conn, &short_name)? {
+                if !visited.contains(&id) {
+                    queue.push_back(id);
+                }
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+fn class_ids_by_name(conn: &Connection, class_name: &str) -> Result<Vec<i64>> {
+    let short = strip_namespace(class_name);
+    if short.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT c.id FROM classes c JOIN strings s ON c.name_id = s.id WHERE s.text = ? ORDER BY c.line_number",
+    )?;
+
+    let rows = stmt.query_map([short], |row| row.get::<_, i64>(0))?;
+    Ok(rows.filter_map(|row| row.ok()).collect())
+}
+
+fn parent_classes(conn: &Connection, class_id: i64) -> Result<Vec<(Option<i64>, String)>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT i.parent_class_id, si.text
+        FROM inheritance i
+        JOIN strings si ON i.parent_name_id = si.id
+        WHERE i.child_id = ?
+        "#,
+    )?;
+
+    let rows = stmt.query_map([class_id], |row| {
+        Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, String>(1)?))
+    })?;
+
+    Ok(rows.filter_map(|row| row.ok()).collect())
+}
+
+fn member_exists_on_class_name(
+    conn: &Connection,
+    class_name: &str,
+    member_name: &str,
+) -> Result<bool> {
+    let short = strip_namespace(class_name);
+    if short.is_empty() {
+        return Ok(false);
+    }
+
+    let sql = r#"
+        SELECT 1
+        FROM members m
+        JOIN classes c ON m.class_id = c.id
+        JOIN strings sc ON c.name_id = sc.id
+        JOIN strings sm ON m.name_id = sm.id
+        WHERE sc.text = ?1
+          AND sm.text = ?2
+          AND (m.access IS NULL OR m.access != 'impl')
+        LIMIT 1
+    "#;
+
+    Ok(conn
+        .query_row(sql, params![short, member_name], |_row| Ok(()))
+        .is_ok())
+}
+
+fn strip_namespace(name: &str) -> String {
+    name.rsplit("::").next().unwrap_or(name).trim().to_string()
 }
 
 fn type_references_for_node(node: tree_sitter::Node, content: &str) -> Vec<TypeReference> {
@@ -2123,9 +2296,12 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn insert_string(conn: &Connection, text: &str) -> i64 {
-        conn.execute("INSERT INTO strings (text) VALUES (?)", [text])
+        conn.execute("INSERT OR IGNORE INTO strings (text) VALUES (?)", [text])
             .unwrap();
-        conn.last_insert_rowid()
+        conn.query_row("SELECT id FROM strings WHERE text = ?", [text], |row| {
+            row.get(0)
+        })
+        .unwrap()
     }
 
     fn insert_class(conn: &Connection, name: &str) -> i64 {
@@ -2152,6 +2328,25 @@ mod tests {
             "INSERT INTO members
              (class_id, name_id, type_id, access, detail, return_type_id, line_number)
              VALUES (?, ?, ?, 'impl', ?, ?, 1)",
+            rusqlite::params![class_id, name_id, type_id, params_text, return_type_id],
+        )
+        .unwrap();
+    }
+
+    fn insert_decl_member(
+        conn: &Connection,
+        class_id: i64,
+        name: &str,
+        params_text: &str,
+        return_type: Option<&str>,
+    ) {
+        let name_id = insert_string(conn, name);
+        let type_id = insert_string(conn, "function");
+        let return_type_id = return_type.map(|text| insert_string(conn, text));
+        conn.execute(
+            "INSERT INTO members
+             (class_id, name_id, type_id, access, detail, return_type_id, line_number)
+             VALUES (?, ?, ?, 'public', ?, ?, 1)",
             rusqlite::params![class_id, name_id, type_id, params_text, return_type_id],
         )
         .unwrap();
@@ -2373,6 +2568,64 @@ mod tests {
         assert!(!items.iter().any(|item| item["code"] == "UECPP006"));
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn does_not_warn_for_valid_override_name() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let base_id = insert_class(&conn, "UBaseAbility");
+        insert_decl_member(&conn, base_id, "EndAbility", "()", Some("void"));
+
+        let child_id = insert_class(&conn, "UMyAbility");
+        let parent_name_id = insert_string(&conn, "UBaseAbility");
+        conn.execute(
+            "INSERT INTO inheritance (child_id, parent_name_id, parent_class_id) VALUES (?, ?, ?)",
+            rusqlite::params![child_id, parent_name_id, base_id],
+        )
+        .unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "class UMyAbility : public UBaseAbility\n{\npublic:\n    virtual void EndAbility() override;\n};\n",
+            Some("C:/Project/Source/Game/Public/MyAbility.h".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP007"));
+    }
+
+    #[test]
+    fn warns_when_override_has_no_base_member_name() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let base_id = insert_class(&conn, "UBaseAbility");
+        insert_decl_member(&conn, base_id, "EndAbility", "()", Some("void"));
+
+        let child_id = insert_class(&conn, "UMyAbility");
+        let parent_name_id = insert_string(&conn, "UBaseAbility");
+        conn.execute(
+            "INSERT INTO inheritance (child_id, parent_name_id, parent_class_id) VALUES (?, ?, ?)",
+            rusqlite::params![child_id, parent_name_id, base_id],
+        )
+        .unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "class UMyAbility : public UBaseAbility\n{\npublic:\n    virtual void StopAbility() override;\n};\n",
+            Some("C:/Project/Source/Game/Public/MyAbility.h".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| item["code"] == "UECPP007"));
     }
 
     #[test]
