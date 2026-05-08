@@ -63,7 +63,12 @@ impl UAssetParser {
         let mut reader = BufReader::new(file);
 
         let summary = PackageSummary::read(&mut reader, file_size)?;
-        self.asset_name = summary.asset_name.clone();
+        self.asset_name = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| summary.asset_name.clone());
 
         self.read_name_map(&mut reader, &summary)?;
         self.read_import_map(&mut reader, &summary)?;
@@ -129,11 +134,9 @@ impl UAssetParser {
             let outer_index = reader.read_i32::<LittleEndian>()?;
             let object_name_index = reader.read_i64::<LittleEndian>()? as i32;
 
-            if !summary.has_unversioned_properties {
-                let _optional_package_name = reader.read_i64::<LittleEndian>()?;
-            }
+            let _optional_package_name = reader.read_i64::<LittleEndian>()?;
 
-            if summary.ue5_version >= 12 {
+            if summary.ue5_version > 0 {
                 let _import_optional_flags = reader.read_u32::<LittleEndian>()?;
             }
 
@@ -357,7 +360,6 @@ struct PackageSummary {
     _legacy_version: i32,
     ue4_version: i32,
     ue5_version: i32,
-    has_unversioned_properties: bool,
     asset_name: String,
     name_count: i32,
     name_offset: i32,
@@ -416,18 +418,12 @@ impl PackageSummary {
         let asset_name = package_name.rsplit('/').next().unwrap_or("").to_string();
 
         let package_flags = reader.read_u32::<LittleEndian>()?;
-        let has_unversioned_properties = (package_flags & 0x8000_0000) != 0;
+        let _has_unversioned_properties = (package_flags & 0x8000_0000) != 0;
 
         let name_count = reader.read_i32::<LittleEndian>()?;
         let name_offset = reader.read_i32::<LittleEndian>()?;
 
-        if ue5_version >= 4 {
-            skip_bytes(reader, 8)?;
-        }
-
-        if !has_unversioned_properties {
-            let _localization_id = read_unreal_string(reader);
-        }
+        let _localization_id = read_unreal_string(reader)?;
 
         skip_bytes(reader, 8)?;
 
@@ -461,7 +457,6 @@ impl PackageSummary {
             _legacy_version: legacy_version,
             ue4_version,
             ue5_version,
-            has_unversioned_properties,
             asset_name,
             name_count,
             name_offset,
@@ -610,4 +605,125 @@ where
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn push_i32(buf: &mut Vec<u8>, value: i32) {
+        buf.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_u32(buf: &mut Vec<u8>, value: u32) {
+        buf.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_i64(buf: &mut Vec<u8>, value: i64) {
+        buf.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_fstring(buf: &mut Vec<u8>, value: &str) {
+        push_i32(buf, value.len() as i32 + 1);
+        buf.extend_from_slice(value.as_bytes());
+        buf.push(0);
+    }
+
+    #[test]
+    fn package_summary_reads_localization_id_without_ue5_preskip() {
+        let mut bytes = Vec::new();
+        push_u32(&mut bytes, PACKAGE_TAG);
+        push_i32(&mut bytes, -8);
+        push_i32(&mut bytes, 0);
+        push_i32(&mut bytes, 522);
+        push_i32(&mut bytes, 1002);
+        push_i32(&mut bytes, 0);
+        push_i32(&mut bytes, 0);
+        push_i32(&mut bytes, 512);
+        push_fstring(&mut bytes, "None");
+        push_u32(&mut bytes, 0);
+        push_i32(&mut bytes, 3);
+        push_i32(&mut bytes, 128);
+        push_fstring(&mut bytes, "ABC123");
+        push_i32(&mut bytes, 0);
+        push_i32(&mut bytes, 0);
+        push_i32(&mut bytes, 4);
+        push_i32(&mut bytes, 256);
+        push_i32(&mut bytes, 5);
+        push_i32(&mut bytes, 320);
+        push_i32(&mut bytes, 0);
+        push_i32(&mut bytes, 0);
+        push_i32(&mut bytes, 0);
+        push_i32(&mut bytes, 0);
+        push_i32(&mut bytes, 0);
+        push_i32(&mut bytes, 0);
+        push_i32(&mut bytes, 0);
+        push_i32(&mut bytes, 0);
+
+        bytes.resize(640, 0);
+
+        let mut cursor = Cursor::new(bytes);
+        let summary = PackageSummary::read(&mut cursor, 640).expect("summary should parse");
+
+        assert_eq!(summary.ue4_version, 522);
+        assert_eq!(summary.ue5_version, 1002);
+        assert_eq!(summary.name_count, 3);
+        assert_eq!(summary.name_offset, 128);
+        assert_eq!(summary.export_count, 4);
+        assert_eq!(summary.export_offset, 256);
+        assert_eq!(summary.import_count, 5);
+        assert_eq!(summary.import_offset, 320);
+    }
+
+    #[test]
+    fn import_map_reads_optional_package_name_for_multiple_entries() {
+        let mut parser = UAssetParser::new();
+        parser.name_map = vec![
+            "/Script/Engine".to_string(),
+            "Actor".to_string(),
+            "Default__Actor".to_string(),
+            "None".to_string(),
+            "Blueprint".to_string(),
+            "StandardMacros".to_string(),
+        ];
+
+        let summary = PackageSummary {
+            file_size: 1024,
+            _legacy_version: -8,
+            ue4_version: 521,
+            ue5_version: 0,
+            asset_name: String::new(),
+            name_count: parser.name_map.len() as i32,
+            name_offset: 0,
+            import_count: 2,
+            import_offset: 64,
+            export_count: 0,
+            export_offset: 0,
+        };
+
+        let mut bytes = vec![0u8; 64];
+        push_i64(&mut bytes, 0);
+        push_i64(&mut bytes, 1);
+        push_i32(&mut bytes, -1);
+        push_i64(&mut bytes, 2);
+        push_i64(&mut bytes, 3);
+
+        push_i64(&mut bytes, 0);
+        push_i64(&mut bytes, 4);
+        push_i32(&mut bytes, -2);
+        push_i64(&mut bytes, 5);
+        push_i64(&mut bytes, 3);
+
+        let mut cursor = Cursor::new(bytes);
+        parser
+            .read_import_map(&mut cursor, &summary)
+            .expect("import map should parse");
+
+        assert_eq!(parser.import_map.len(), 2);
+        assert_eq!(parser.import_map[0].class_name, "Actor");
+        assert_eq!(parser.import_map[0].object_name, "Default__Actor");
+        assert_eq!(parser.import_map[1].class_name, "Blueprint");
+        assert_eq!(parser.import_map[1].object_name, "StandardMacros");
+    }
 }
