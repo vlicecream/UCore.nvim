@@ -679,6 +679,168 @@ local function normalize_cursor_info(value)
 	return {}
 end
 
+local function split_top_level_params(params_text)
+	local inner = vim.trim(tostring(params_text or ""))
+	inner = inner:gsub("^%(", ""):gsub("%)$", "")
+	if inner == "" or inner == "void" then
+		return {}
+	end
+
+	local parts = {}
+	local start_at = 1
+	local angle = 0
+	local paren = 0
+	local bracket = 0
+	local brace = 0
+
+	for index = 1, #inner do
+		local ch = inner:sub(index, index)
+		if ch == "<" then
+			angle = angle + 1
+		elseif ch == ">" then
+			angle = math.max(0, angle - 1)
+		elseif ch == "(" then
+			paren = paren + 1
+		elseif ch == ")" then
+			paren = math.max(0, paren - 1)
+		elseif ch == "[" then
+			bracket = bracket + 1
+		elseif ch == "]" then
+			bracket = math.max(0, bracket - 1)
+		elseif ch == "{" then
+			brace = brace + 1
+		elseif ch == "}" then
+			brace = math.max(0, brace - 1)
+		elseif ch == "," and angle == 0 and paren == 0 and bracket == 0 and brace == 0 then
+			table.insert(parts, vim.trim(inner:sub(start_at, index - 1)))
+			start_at = index + 1
+		end
+	end
+
+	table.insert(parts, vim.trim(inner:sub(start_at)))
+	return parts
+end
+
+local function parameter_argument_name(param_text)
+	local text = vim.trim(tostring(param_text or ""))
+	if text == "" or text == "void" then
+		return nil
+	end
+
+	text = vim.trim(text:gsub("%s*=%s*.+$", ""))
+	if text == "..." then
+		return "..."
+	end
+
+	local function pick_identifier(source)
+		local last
+		for token in source:gmatch("[A-Za-z_][A-Za-z0-9_]*") do
+			last = token
+		end
+		return last
+	end
+
+	local pointer_name = text:match("%(%s*[*&]%s*([A-Za-z_][A-Za-z0-9_]*)%s*%)")
+	if pointer_name and pointer_name ~= "" then
+		return pointer_name
+	end
+
+	local array_name = text:match("([A-Za-z_][A-Za-z0-9_]*)%s*%[")
+	if array_name and array_name ~= "" then
+		return array_name
+	end
+
+	local name = pick_identifier(text)
+	if not name then
+		return nil
+	end
+
+	local keywords = {
+		["const"] = true,
+		["volatile"] = true,
+		["class"] = true,
+		["struct"] = true,
+		["enum"] = true,
+		["typename"] = true,
+		["signed"] = true,
+		["unsigned"] = true,
+		["short"] = true,
+		["long"] = true,
+		["int"] = true,
+		["float"] = true,
+		["double"] = true,
+		["bool"] = true,
+		["void"] = true,
+		["char"] = true,
+		["wchar_t"] = true,
+		["auto"] = true,
+		["virtual"] = true,
+		["static"] = true,
+		["inline"] = true,
+		["friend"] = true,
+		["mutable"] = true,
+	}
+
+	if keywords[name] then
+		return nil
+	end
+
+	return name
+end
+
+local function parameter_argument_names(params_text)
+	local args = {}
+	for _, part in ipairs(split_top_level_params(params_text)) do
+		local name = parameter_argument_name(part)
+		if name and name ~= "" then
+			table.insert(args, name)
+		end
+	end
+	return args
+end
+
+local function is_void_return_type(return_type)
+	return vim.trim(tostring(return_type or "")) == "void"
+end
+
+local function should_generate_super_call(cursor_info, target, target_return_type)
+	cursor_info = normalize_cursor_info(cursor_info)
+	target = target or {}
+
+	if cursor_info.is_override ~= true then
+		return false
+	end
+
+	if cursor_info.is_static == true then
+		return false
+	end
+
+	local target_name = tostring(target.name or "")
+	if target_name == "" or target_name:sub(1, 1) == "~" then
+		return false
+	end
+
+	if vim.trim(tostring(target_return_type or "")) == "" then
+		return false
+	end
+
+	return true
+end
+
+local function build_super_call_line(cursor_info, target, target_return_type)
+	if not should_generate_super_call(cursor_info, target, target_return_type) then
+		return nil
+	end
+
+	local args = table.concat(parameter_argument_names(cursor_info.parameters), ", ")
+	local call = string.format("Super::%s(%s);", tostring(target.name or ""), args)
+	if is_void_return_type(target_return_type) then
+		return "\t" .. call
+	end
+
+	return "\treturn " .. call
+end
+
 local function build_definition_specs(cursor_info)
 	cursor_info = normalize_cursor_info(cursor_info)
 	local kind = tostring(cursor_info.kind or "")
@@ -727,6 +889,11 @@ local function build_definition_specs(cursor_info)
 		end
 
 		signature = signature .. suffix
+		local body_line = target.kind == "validation" and "\treturn true;" or "\t"
+		local super_call = build_super_call_line(cursor_info, target, target_return_type)
+		if super_call then
+			body_line = super_call
+		end
 		table.insert(specs, {
 			name = target.name,
 			kind = target.kind,
@@ -734,7 +901,7 @@ local function build_definition_specs(cursor_info)
 			lines = {
 				signature,
 				"{",
-				target.kind == "validation" and "\treturn true;" or "\t",
+				body_line,
 				"}",
 			},
 		})

@@ -272,6 +272,7 @@ fn declaration_node_to_json(node: Node, content: &str) -> Value {
         "return_type": return_type,
         "parameters": parameters,
         "is_virtual": contains_token(text, "virtual"),
+        "is_override": contains_token(text, "override"),
         "is_static": contains_token(text, "static"),
         "is_const": is_const_member_function(node, content),
         "full_text": text,
