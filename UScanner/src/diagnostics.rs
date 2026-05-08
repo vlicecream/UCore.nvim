@@ -287,6 +287,9 @@ fn missing_visible_type_diagnostics(
     let local_types = collect_local_type_visibility(root, content);
     let include_paths = collect_include_paths(content);
     let project_visible_file_ids = reachable_file_ids(conn, file_path);
+    let engine_visible_file_ids = engine_conn
+        .map(|engine_conn| reachable_engine_file_ids(engine_conn, &include_paths))
+        .unwrap_or_default();
     let mut seen = HashSet::new();
     let mut items = Vec::new();
 
@@ -299,6 +302,7 @@ fn missing_visible_type_diagnostics(
         &local_types,
         &include_paths,
         &project_visible_file_ids,
+        &engine_visible_file_ids,
         &mut seen,
         &mut items,
     )?;
@@ -315,6 +319,7 @@ fn collect_missing_visible_type_items(
     local_types: &LocalTypeVisibility,
     include_paths: &HashSet<String>,
     project_visible_file_ids: &HashSet<i64>,
+    engine_visible_file_ids: &HashSet<i64>,
     seen: &mut HashSet<(u32, u32, String)>,
     items: &mut Vec<DiagnosticItem>,
 ) -> Result<()> {
@@ -369,7 +374,12 @@ fn collect_missing_visible_type_items(
         }
 
         let engine_match = if let Some(engine_conn) = engine_conn {
-            lookup_type_visibility(engine_conn, &reference.name, None, Some(include_paths))?
+            lookup_type_visibility(
+                engine_conn,
+                &reference.name,
+                Some(engine_visible_file_ids),
+                Some(include_paths),
+            )?
         } else {
             TypeVisibilityMatch::default()
         };
@@ -408,6 +418,7 @@ fn collect_missing_visible_type_items(
             local_types,
             include_paths,
             project_visible_file_ids,
+            engine_visible_file_ids,
             seen,
             items,
         )?;
@@ -1449,8 +1460,25 @@ fn reachable_file_ids(conn: &Connection, file_path: &str) -> HashSet<i64> {
         return HashSet::new();
     };
 
+    reachable_file_ids_from_roots(conn, vec![root_id])
+}
+
+fn reachable_engine_file_ids(conn: &Connection, include_paths: &HashSet<String>) -> HashSet<i64> {
+    let mut roots = Vec::new();
+    for include_path in include_paths {
+        roots.extend(file_ids_by_include_path(conn, include_path));
+    }
+
+    reachable_file_ids_from_roots(conn, roots)
+}
+
+fn reachable_file_ids_from_roots(conn: &Connection, roots: Vec<i64>) -> HashSet<i64> {
+    if roots.is_empty() {
+        return HashSet::new();
+    }
+
     let mut included = HashSet::new();
-    let mut queue = VecDeque::from([root_id]);
+    let mut queue = VecDeque::from(roots);
 
     while let Some(file_id) = queue.pop_front() {
         if !included.insert(file_id) {
@@ -1491,6 +1519,45 @@ fn get_file_id_by_full_path(conn: &Connection, file_path: &str) -> Option<i64> {
 
     conn.query_row(sql, [&normalized], |row| row.get::<_, i64>(0))
         .ok()
+}
+
+fn file_ids_by_include_path(conn: &Connection, include_path: &str) -> Vec<i64> {
+    let normalized = include_path.replace('\\', "/");
+    let basename = Path::new(&normalized)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .to_string();
+
+    if basename.is_empty() {
+        return Vec::new();
+    }
+
+    let sql = r#"
+        SELECT DISTINCT f.id
+        FROM files f
+        JOIN dir_paths dp ON f.directory_id = dp.id
+        JOIN strings sf ON f.filename_id = sf.id
+        WHERE sf.text = ?1
+           OR (
+                CASE
+                    WHEN dp.full_path = '/' THEN '/' || sf.text
+                    WHEN substr(dp.full_path, -1) = '/' THEN dp.full_path || sf.text
+                    ELSE dp.full_path || '/' || sf.text
+                END LIKE ?2
+              )
+    "#;
+
+    let like_pattern = format!("%/{}", normalized);
+    let mut stmt = match conn.prepare(sql) {
+        Ok(stmt) => stmt,
+        Err(_) => return Vec::new(),
+    };
+
+    match stmt.query_map(params![basename, like_pattern], |row| row.get::<_, i64>(0)) {
+        Ok(rows) => rows.filter_map(|row| row.ok()).collect(),
+        Err(_) => Vec::new(),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2358,6 +2425,56 @@ mod tests {
         .unwrap();
     }
 
+    fn insert_header_file(conn: &Connection, subdir: &str, filename: &str) -> i64 {
+        let drive = insert_string(conn, "C:");
+        let engine_name = insert_string(conn, "Engine");
+        let source_name = insert_string(conn, "Source");
+        let runtime_name = insert_string(conn, "Runtime");
+        let subdir_name = insert_string(conn, subdir);
+        let filename_id = insert_string(conn, filename);
+
+        let c_dir = get_or_create_dir(conn, None, drive);
+        let engine_dir = get_or_create_dir(conn, Some(c_dir), engine_name);
+        let source_dir = get_or_create_dir(conn, Some(engine_dir), source_name);
+        let runtime_dir = get_or_create_dir(conn, Some(source_dir), runtime_name);
+        let subdir_dir = get_or_create_dir(conn, Some(runtime_dir), subdir_name);
+
+        conn.execute(
+            "INSERT INTO files (directory_id, filename_id, extension, is_header) VALUES (?, ?, 'h', 1)",
+            rusqlite::params![subdir_dir, filename_id],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn get_or_create_dir(conn: &Connection, parent_id: Option<i64>, name_id: i64) -> i64 {
+        conn.execute(
+            "INSERT OR IGNORE INTO directories (parent_id, name_id) VALUES (?, ?)",
+            rusqlite::params![parent_id, name_id],
+        )
+        .unwrap();
+        conn.query_row(
+            "SELECT id FROM directories WHERE parent_id IS ?1 AND name_id = ?2",
+            rusqlite::params![parent_id, name_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn insert_include_edge(conn: &Connection, file_id: i64, include_path: &str, resolved_file_id: i64) {
+        let include_path_id = insert_string(conn, include_path);
+        let base_filename = Path::new(include_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(include_path);
+        let base_filename_id = insert_string(conn, base_filename);
+        conn.execute(
+            "INSERT INTO file_includes (file_id, include_path_id, base_filename_id, resolved_file_id) VALUES (?, ?, ?, ?)",
+            rusqlite::params![file_id, include_path_id, base_filename_id, resolved_file_id],
+        )
+        .unwrap();
+    }
+
     fn temp_project_path(name: &str) -> std::path::PathBuf {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2449,6 +2566,38 @@ mod tests {
 
         let items = value["items"].as_array().unwrap();
         assert!(items.iter().any(|item| item["code"] == "UECPP004"));
+    }
+
+    #[test]
+    fn does_not_warn_when_engine_type_is_visible_via_transitive_include() {
+        let project_conn = Connection::open_in_memory().unwrap();
+        let engine_conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&project_conn).unwrap();
+        crate::db::init_db(&engine_conn).unwrap();
+
+        let texture_file_id = insert_header_file(&engine_conn, "Engine", "Texture2D.h");
+        let owner_file_id = insert_header_file(&engine_conn, "Engine", "TextureOwner.h");
+        insert_include_edge(&engine_conn, owner_file_id, "Engine/Texture2D.h", texture_file_id);
+
+        let texture_class_id = insert_class(&engine_conn, "UTexture2D");
+        engine_conn
+            .execute(
+                "UPDATE classes SET file_id = ? WHERE id = ?",
+                rusqlite::params![texture_file_id, texture_class_id],
+            )
+            .unwrap();
+
+        let value = process_diagnostics(
+            &project_conn,
+            Some(&engine_conn),
+            "#include \"Engine/TextureOwner.h\"\n\nclass UMyActor\n{\npublic:\n    UTexture2D* Texture;\n};\n",
+            Some("C:/Project/Source/Game/Public/MyActor.h".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP004"));
     }
 
     #[test]
