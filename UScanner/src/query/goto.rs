@@ -1054,6 +1054,15 @@ fn resolve_lookup_class(ctx: &CursorCtx, content: &str, cursor_line: u32) -> Opt
     ctx.enclosing_class.clone()
 }
 
+fn has_explicit_qualifier(ctx: &CursorCtx) -> bool {
+    matches!(ctx.qualifier_op.as_deref(), Some("::") | Some(".") | Some("->"))
+        && ctx
+            .qualifier
+            .as_ref()
+            .map(|text| !text.trim().is_empty())
+            .unwrap_or(false)
+}
+
 fn is_simple_identifier(text: &str) -> bool {
     let trimmed = text.trim();
     !trimmed.is_empty()
@@ -2128,6 +2137,14 @@ fn goto_definition_inner(
             );
             return Ok(result);
         }
+
+        tracing::debug!(
+            "goto_{}: no member '{}' found via qualifier class '{}'",
+            mode,
+            ctx.symbol,
+            resolved_class
+        );
+        return Ok(Value::Null);
     }
 
     // 2. Try member lookup from the enclosing class.
@@ -2159,13 +2176,15 @@ fn goto_definition_inner(
 
     // 4. Final fallback: member search across the whole project.
     // 4. 最终兜底：全工程成员名搜索。
-    if let Some(result) = find_member_anywhere(conn, &ctx.symbol, false)? {
-        tracing::debug!(
-            "goto_{}: resolved '{}' via global member fallback",
-            mode,
-            ctx.symbol
-        );
-        return Ok(result);
+    if !has_explicit_qualifier(&ctx) {
+        if let Some(result) = find_member_anywhere(conn, &ctx.symbol, false)? {
+            tracing::debug!(
+                "goto_{}: resolved '{}' via global member fallback",
+                mode,
+                ctx.symbol
+            );
+            return Ok(result);
+        }
     }
 
     tracing::debug!("goto_{}: no result for '{}'", mode, ctx.symbol);
@@ -2501,7 +2520,7 @@ fn tokens(text: &str) -> Vec<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{find_local_declaration, infer_var_type};
+    use super::{find_local_declaration, has_explicit_qualifier, infer_var_type, CursorCtx};
 
     const SAMPLE: &str = r#"
 void StartDeath()
@@ -2567,5 +2586,17 @@ void ActivateAbility()
             .expect("expected local declaration");
 
         assert_eq!(decl.row + 1, 16);
+    }
+
+    #[test]
+    fn explicit_qualifier_disables_global_member_fallback() {
+        let ctx = CursorCtx {
+            symbol: "CancelAllAbilities".to_string(),
+            qualifier: Some("ASC".to_string()),
+            qualifier_op: Some("->".to_string()),
+            enclosing_class: Some("USGameplayAbility_Death".to_string()),
+        };
+
+        assert!(has_explicit_qualifier(&ctx));
     }
 }
