@@ -181,8 +181,13 @@ local function show_cursor_float(bufnr)
 
 	local assist_ok, assist = pcall(require, "ucore.assist")
 	if assist_ok and assist and type(assist.has_active_float) == "function" and assist.has_active_float() then
-		close_cursor_float()
-		return
+		local active_kind = type(assist.active_float_kind) == "function" and assist.active_float_kind() or nil
+		if active_kind == "hover" and type(assist.close_float) == "function" then
+			assist.close_float()
+		else
+			close_cursor_float()
+			return
+		end
 	end
 
 	if not vim.api.nvim_buf_is_valid(bufnr) or vim.api.nvim_get_current_buf() ~= bufnr then
@@ -1151,6 +1156,25 @@ end
 function M.close_cursor_float()
 	float_sequence = float_sequence + 1
 	close_cursor_float()
+end
+
+function M.has_active_float()
+	return float_winid ~= nil and vim.api.nvim_win_is_valid(float_winid)
+end
+
+function M.has_cursor_diagnostic(bufnr)
+	bufnr = bufnr or vim.api.nvim_get_current_buf()
+	if not vim.api.nvim_buf_is_valid(bufnr) then
+		return false
+	end
+
+	local cursor = vim.api.nvim_win_get_cursor(0)
+	local row = cursor[1] - 1
+	local diagnostics = vim.diagnostic.get(bufnr, {
+		lnum = row,
+	})
+
+	return not vim.tbl_isempty(diagnostics)
 end
 
 function M.resume_cursor_float(bufnr)

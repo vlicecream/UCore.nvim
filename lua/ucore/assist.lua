@@ -95,6 +95,23 @@ local function close_float()
 	end
 end
 
+local function hover_blocked_by_diagnostics(bufnr)
+	local ok, diagnostics = pcall(require, "ucore.diagnostics")
+	if not ok or not diagnostics then
+		return false
+	end
+
+	if type(diagnostics.has_active_float) == "function" and diagnostics.has_active_float() then
+		return true
+	end
+
+	if type(diagnostics.has_cursor_diagnostic) == "function" then
+		return diagnostics.has_cursor_diagnostic(bufnr)
+	end
+
+	return false
+end
+
 local function display_path(path)
 	return select_ui.relative_unreal_path(normalize_path(path))
 end
@@ -299,9 +316,15 @@ local function open_float(lines, opts)
 		return
 	end
 
-	pcall(function()
-		require("ucore.diagnostics").close_cursor_float()
-	end)
+	if opts.kind == "hover" and opts.auto == true and hover_blocked_by_diagnostics(vim.api.nvim_get_current_buf()) then
+		return
+	end
+
+	if opts.kind ~= "hover" then
+		pcall(function()
+			require("ucore.diagnostics").close_cursor_float()
+		end)
+	end
 
 	close_float()
 
@@ -391,6 +414,10 @@ function M.hover_auto(opts)
 		silent = opts.auto == true,
 	})
 	if not ctx then
+		return
+	end
+
+	if opts.auto == true and hover_blocked_by_diagnostics(ctx.bufnr) then
 		return
 	end
 
@@ -744,6 +771,14 @@ end
 
 function M.has_active_float()
 	return float_state.win ~= nil and vim.api.nvim_win_is_valid(float_state.win)
+end
+
+function M.active_float_kind()
+	if not M.has_active_float() then
+		return nil
+	end
+
+	return float_state.kind
 end
 
 local function auto_hover_enabled()
