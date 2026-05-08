@@ -115,8 +115,6 @@ pub async fn handle_setup(state: Arc<AppState>, params: &Value) -> Result<Value>
 
     let _ = state.save_registry();
 
-    spawn_asset_scan_if_needed(state.clone(), root_key.clone(), req.project_root.clone());
-
     Ok(json!({
         "status": "ok",
         "needs_full_refresh": needs_full_refresh,
@@ -203,8 +201,6 @@ pub async fn handle_query(
     if is_refreshing(&state, &root_key) {
         return Ok(json!([]));
     }
-
-    ensure_asset_scan_started(&state, &root_key, &req.project_root);
 
     let project = get_project_context(&state, &root_key)?;
     let db_path_native = normalize_to_native(&project.db_path);
@@ -401,6 +397,7 @@ fn handle_state_query(
         }
 
         QueryRequest::GetAssetUsages { asset_path } => {
+            ensure_asset_scan_started(&state, root_key, project_root);
             Ok(Some(get_asset_usages(&state, root_key, &asset_path)))
         }
 
@@ -409,6 +406,7 @@ fn handle_state_query(
         }
 
         QueryRequest::FindDerivedClasses { base_class } => {
+            ensure_asset_scan_started(&state, root_key, project_root);
             let mut db_results = query::process_query(
                 conn,
                 QueryRequest::FindDerivedClasses {
@@ -424,7 +422,10 @@ fn handle_state_query(
             Ok(Some(json!(db_results)))
         }
 
-        QueryRequest::GetAssets => Ok(Some(get_assets_from_graph(&state, root_key))),
+        QueryRequest::GetAssets => {
+            ensure_asset_scan_started(&state, root_key, project_root);
+            Ok(Some(get_assets_from_graph(&state, root_key)))
+        }
 
         QueryRequest::GetConfigData { engine_root } => {
             let data =
@@ -1649,22 +1650,6 @@ fn ensure_asset_scan_started(state: &Arc<AppState>, root_key: &str, project_root
 
     tokio::spawn(async move {
         handle_asset_scan(state_clone, project_root).await;
-    });
-}
-
-/// Setup path also starts asset scanning after project registration.
-/// setup 成功注册工程后也启动资产扫描。
-fn spawn_asset_scan_if_needed(state: Arc<AppState>, root_key: String, project_root: String) {
-    let mut active = state.active_asset_scans.lock();
-
-    if !active.insert(root_key) {
-        return;
-    }
-
-    drop(active);
-
-    tokio::spawn(async move {
-        handle_asset_scan(state, project_root).await;
     });
 }
 
