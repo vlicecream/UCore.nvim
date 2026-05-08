@@ -14,7 +14,6 @@ local FALLBACK_PARENT_CLASSES = {
 }
 
 local PARENT_CLASS_CACHE = nil
-
 local SEARCH_PARENT_SENTINEL = "__ucore_search_parent__"
 
 local DIRECTORY_CHOICES = {
@@ -76,10 +75,137 @@ local function search_parent_classes(root, pattern, callback)
   end, 200)
 end
 
+local function has_module(name)
+  local ok = pcall(require, name)
+  return ok
+end
+
+local function pick_parent_class_live(root, common_items, default_parent, callback)
+  local pickers = require("telescope.pickers")
+  local finders = require("telescope.finders")
+  local actions = require("telescope.actions")
+  local action_state = require("telescope.actions.state")
+  local sorters = require("telescope.sorters")
+
+  local state = {
+    query = "",
+    common_items = common_items or {},
+    remote_items = {},
+    request_id = 0,
+    input_seq = 0,
+  }
+
+  local picker_ref
+
+  local function combined_items()
+    local items = {}
+    local seen = {}
+
+    for _, item in ipairs(state.remote_items or {}) do
+      if not seen[item] then
+        seen[item] = true
+        table.insert(items, item)
+      end
+    end
+
+    for _, item in ipairs(state.common_items or {}) do
+      if not seen[item] then
+        seen[item] = true
+        table.insert(items, item)
+      end
+    end
+
+    return items
+  end
+
+  local function make_finder()
+    return finders.new_table({
+      results = combined_items(),
+      entry_maker = function(item)
+        return {
+          value = item,
+          display = item == default_parent and (item .. "  (default)") or item,
+          ordinal = item,
+        }
+      end,
+    })
+  end
+
+  local function refresh_picker()
+    if picker_ref then
+      pcall(function()
+        picker_ref:refresh(make_finder(), { reset_prompt = false })
+      end)
+    end
+  end
+
+  local function request_remote(query)
+    query = vim.trim(query or "")
+    state.request_id = state.request_id + 1
+    local request_id = state.request_id
+
+    if query == "" then
+      state.remote_items = {}
+      refresh_picker()
+      return
+    end
+
+    search_parent_classes(root, query, function(items)
+      vim.schedule(function()
+        if request_id ~= state.request_id then
+          return
+        end
+        state.remote_items = items or {}
+        refresh_picker()
+      end)
+    end)
+  end
+
+  picker_ref = pickers.new({}, {
+    prompt_title = "Select parent class",
+    default_text = default_parent or nil,
+    sorting_strategy = "ascending",
+    selection_strategy = "row",
+    finder = make_finder(),
+    sorter = sorters.get_generic_fuzzy_sorter(),
+    on_input_filter_cb = function(prompt)
+      prompt = tostring(prompt or "")
+      if prompt == state.query then
+        return
+      end
+
+      state.query = prompt
+      state.input_seq = state.input_seq + 1
+      local input_seq = state.input_seq
+
+      vim.defer_fn(function()
+        if input_seq == state.input_seq then
+          request_remote(state.query)
+          refresh_picker()
+        end
+      end, 150)
+    end,
+    attach_mappings = function(prompt_bufnr, map)
+      actions.select_default:replace(function()
+        local selection = action_state.get_selected_entry()
+        actions.close(prompt_bufnr)
+        callback(selection and selection.value or nil)
+      end)
+
+      map("i", "<Esc>", function()
+        actions.close(prompt_bufnr)
+        callback(nil)
+      end)
+      return true
+    end,
+  })
+
+  picker_ref:find()
+end
+
 local function choose_parent_class(root, default_parent, callback)
   ensure_parent_classes(root, function(common_items)
     local items = vim.list_extend({ SEARCH_PARENT_SENTINEL }, vim.deepcopy(common_items))
-
     vim.ui.select(items, {
       prompt = "Select parent class:",
       format_item = function(item)
@@ -102,11 +228,16 @@ local function choose_parent_class(root, default_parent, callback)
         return
       end
 
+      if has_module("telescope.pickers") then
+        return pick_parent_class_live(root, common_items, default_parent, callback)
+      end
+
       vim.ui.input({
         prompt = "Search parent class: ",
         default = default_parent or "",
       }, function(input)
-        if not input or vim.trim(input) == "" then
+        input = vim.trim(input or "")
+        if input == "" then
           callback(nil)
           return
         end
