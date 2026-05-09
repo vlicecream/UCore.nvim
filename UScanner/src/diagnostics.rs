@@ -1251,7 +1251,9 @@ fn collect_local_type_definitions(
 }
 
 fn collect_forward_declared_types(content: &str, visible: &mut HashSet<String>) {
-    let Some(regex) = Regex::new(r"\b(?:class|struct|enum\s+class|enum)\s+([A-Za-z_][A-Za-z0-9_]*)\s*;").ok()
+    let Some(regex) = Regex::new(
+        r"\b(?:class|struct|enum\s+class|enum)\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s*:\s*[A-Za-z_][A-Za-z0-9_:<>]*)?\s*;"
+    ).ok()
     else {
         return;
     };
@@ -3055,6 +3057,24 @@ mod tests {
             &conn,
             None,
             "class UMyDependency;\n\nclass UMyActor\n{\npublic:\n    UMyDependency* Value;\n};\n",
+            Some("C:/Project/Source/Game/Public/MyActor.h".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP004"));
+    }
+
+    #[test]
+    fn does_not_warn_when_enum_class_with_underlying_type_is_forward_declared() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "enum class ERShot_Type : uint8;\n\nclass UMyActor\n{\npublic:\n    ERShot_Type Value;\n};\n",
             Some("C:/Project/Source/Game/Public/MyActor.h".to_string()),
             &[],
         )
