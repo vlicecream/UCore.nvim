@@ -39,6 +39,11 @@ local function is_cpp_like_path(path)
 		or path:match("%.cpp$") or path:match("%.cc$") or path:match("%.cxx$")
 end
 
+local function is_header_like_path(path)
+	path = normalize_path(path or "")
+	return path:match("%.h$") or path:match("%.hh$") or path:match("%.hpp$")
+end
+
 local function open_file_overlays(project_root, primary_bufnr)
 	local overlays = {}
 	local seen = {}
@@ -1454,6 +1459,29 @@ local function schedule_refresh(args)
 			M.refresh(bufnr, { silent = true, force = true })
 		end
 	end, delay)
+
+	if not is_header_like_path(file_path) then
+		return
+	end
+
+	local normalized_root = normalize_path(root)
+	for _, other_bufnr in ipairs(vim.api.nvim_list_bufs()) do
+		if other_bufnr ~= bufnr and vim.api.nvim_buf_is_valid(other_bufnr) then
+			local other_path = vim.api.nvim_buf_get_name(other_bufnr)
+			if other_path ~= "" and is_cpp_like_path(other_path) then
+				local other_root = project.find_project_root(other_path)
+				if other_root and normalize_path(other_root) == normalized_root then
+					refresh_sequences[other_bufnr] = (refresh_sequences[other_bufnr] or 0) + 1
+					local other_sequence = refresh_sequences[other_bufnr]
+					vim.defer_fn(function()
+						if other_sequence == refresh_sequences[other_bufnr] and vim.api.nvim_buf_is_valid(other_bufnr) then
+							M.refresh(other_bufnr, { silent = true, force = true })
+						end
+					end, delay)
+				end
+			end
+		end
+	end
 end
 
 function M.setup()
