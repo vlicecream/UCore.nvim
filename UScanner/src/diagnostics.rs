@@ -293,6 +293,8 @@ fn missing_visible_type_diagnostics(
         .map(|engine_conn| reachable_engine_file_ids(engine_conn, &engine_seed_include_paths))
         .unwrap_or_default();
     let mut seen = HashSet::new();
+    let mut project_text_visibility_cache = HashMap::new();
+    let mut engine_text_visibility_cache = HashMap::new();
     let mut items = Vec::new();
 
     collect_missing_visible_type_items(
@@ -306,6 +308,8 @@ fn missing_visible_type_diagnostics(
         &engine_seed_include_paths,
         &project_visible_file_ids,
         &engine_visible_file_ids,
+        &mut project_text_visibility_cache,
+        &mut engine_text_visibility_cache,
         &mut seen,
         &mut items,
     )?;
@@ -324,6 +328,8 @@ fn collect_missing_visible_type_items(
     engine_seed_include_paths: &HashSet<String>,
     project_visible_file_ids: &HashSet<i64>,
     engine_visible_file_ids: &HashSet<i64>,
+    project_text_visibility_cache: &mut HashMap<String, bool>,
+    engine_text_visibility_cache: &mut HashMap<String, bool>,
     seen: &mut HashSet<(u32, u32, String)>,
     items: &mut Vec<DiagnosticItem>,
 ) -> Result<()> {
@@ -373,7 +379,16 @@ fn collect_missing_visible_type_items(
             Some(include_paths),
         )?;
 
-        if project_match.visible {
+        let project_visible = project_match.visible
+            || (project_match.exists
+                && visible_type_declared_in_files(
+                    conn,
+                    &reference.name,
+                    project_visible_file_ids,
+                    project_text_visibility_cache,
+                )?);
+
+        if project_visible {
             continue;
         }
 
@@ -388,7 +403,20 @@ fn collect_missing_visible_type_items(
             TypeVisibilityMatch::default()
         };
 
-        if engine_match.visible {
+        let engine_visible = if let Some(engine_conn) = engine_conn {
+            engine_match.visible
+                || (engine_match.exists
+                    && visible_type_declared_in_files(
+                        engine_conn,
+                        &reference.name,
+                        engine_visible_file_ids,
+                        engine_text_visibility_cache,
+                    )?)
+        } else {
+            false
+        };
+
+        if engine_visible {
             continue;
         }
 
@@ -424,6 +452,8 @@ fn collect_missing_visible_type_items(
             engine_seed_include_paths,
             project_visible_file_ids,
             engine_visible_file_ids,
+            project_text_visibility_cache,
+            engine_text_visibility_cache,
             seen,
             items,
         )?;
@@ -1553,6 +1583,71 @@ fn reachable_engine_file_ids(conn: &Connection, include_paths: &HashSet<String>)
     reachable_file_ids_from_roots(conn, roots)
 }
 
+fn visible_type_declared_in_files(
+    conn: &Connection,
+    type_name: &str,
+    visible_file_ids: &HashSet<i64>,
+    cache: &mut HashMap<String, bool>,
+) -> Result<bool> {
+    if let Some(cached) = cache.get(type_name) {
+        return Ok(*cached);
+    }
+
+    let declared = type_declared_in_file_set(conn, type_name, visible_file_ids)?;
+    cache.insert(type_name.to_string(), declared);
+    Ok(declared)
+}
+
+fn type_declared_in_file_set(
+    conn: &Connection,
+    type_name: &str,
+    visible_file_ids: &HashSet<i64>,
+) -> Result<bool> {
+    if visible_file_ids.is_empty() || type_name.trim().is_empty() {
+        return Ok(false);
+    }
+
+    let declaration_pattern = Regex::new(&format!(
+        r"\b(?:class|struct|enum(?:\s+class)?)\s+(?:[A-Za-z_][A-Za-z0-9_]*\s+)*{}\b",
+        regex::escape(type_name)
+    ))?;
+
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT
+            CASE
+                WHEN dp.full_path IS NULL OR sf.text IS NULL THEN ''
+                ELSE dp.full_path || '/' || sf.text
+            END
+        FROM files f
+        LEFT JOIN dir_paths dp ON f.directory_id = dp.id
+        LEFT JOIN strings sf ON f.filename_id = sf.id
+        WHERE f.id = ?1
+        "#,
+    )?;
+
+    for file_id in visible_file_ids {
+        let full_path: String = match stmt.query_row([file_id], |row| row.get(0)) {
+            Ok(path) => path,
+            Err(_) => continue,
+        };
+
+        if full_path.is_empty() {
+            continue;
+        }
+
+        let Ok(text) = fs::read_to_string(&full_path) else {
+            continue;
+        };
+
+        if declaration_pattern.is_match(&text) {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
 fn reachable_file_ids_from_roots(conn: &Connection, roots: Vec<i64>) -> HashSet<i64> {
     if roots.is_empty() {
         return HashSet::new();
@@ -2619,6 +2714,33 @@ mod tests {
         conn.last_insert_rowid()
     }
 
+    fn insert_file_at_path(conn: &Connection, path: &Path, is_header: bool) -> i64 {
+        let normalized = path.to_string_lossy().replace('\\', "/");
+        let parts = normalized.split('/').filter(|part| !part.is_empty()).collect::<Vec<_>>();
+        assert!(!parts.is_empty(), "path must contain a filename");
+
+        let filename = parts.last().copied().unwrap();
+        let filename_id = insert_string(conn, filename);
+        let extension = Path::new(filename)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or_default()
+            .to_string();
+
+        let mut parent_id = None;
+        for part in &parts[..parts.len() - 1] {
+            let name_id = insert_string(conn, part);
+            parent_id = Some(get_or_create_dir(conn, parent_id, name_id));
+        }
+
+        conn.execute(
+            "INSERT INTO files (directory_id, filename_id, extension, is_header) VALUES (?, ?, ?, ?)",
+            rusqlite::params![parent_id, filename_id, extension, if is_header { 1 } else { 0 }],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
     fn get_or_create_dir(conn: &Connection, parent_id: Option<i64>, name_id: i64) -> i64 {
         conn.execute(
             "INSERT OR IGNORE INTO directories (parent_id, name_id) VALUES (?, ?)",
@@ -2838,6 +2960,66 @@ mod tests {
 
         let items = value["items"].as_array().unwrap();
         assert!(!items.iter().any(|item| item["code"] == "UECPP004"));
+    }
+
+    #[test]
+    fn does_not_warn_when_visible_engine_header_text_declares_type_but_class_record_points_to_cpp() {
+        let project_conn = Connection::open_in_memory().unwrap();
+        let engine_conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&project_conn).unwrap();
+        crate::db::init_db(&engine_conn).unwrap();
+
+        let root = temp_project_path("visible_text_declares_type");
+        let blueprint_dir = root.join("Engine/Source/Runtime/UMG/Public/Blueprint");
+        let components_dir = root.join("Engine/Source/Runtime/UMG/Public/Components");
+        let private_dir = root.join("Engine/Source/Runtime/UMG/Private/Components");
+        std::fs::create_dir_all(&blueprint_dir).unwrap();
+        std::fs::create_dir_all(&components_dir).unwrap();
+        std::fs::create_dir_all(&private_dir).unwrap();
+
+        let user_widget_path = blueprint_dir.join("UserWidget.h");
+        let widget_header_path = components_dir.join("Widget.h");
+        let widget_cpp_path = private_dir.join("Widget.cpp");
+
+        std::fs::write(
+            &user_widget_path,
+            "#pragma once\n#include \"Components/Widget.h\"\nclass UUserWidget : public UWidget {};\n",
+        )
+        .unwrap();
+        std::fs::write(&widget_header_path, "#pragma once\nclass UWidget {};\n").unwrap();
+        std::fs::write(&widget_cpp_path, "// impl\n").unwrap();
+
+        let user_widget_file_id = insert_file_at_path(&engine_conn, &user_widget_path, true);
+        let widget_header_file_id = insert_file_at_path(&engine_conn, &widget_header_path, true);
+        let widget_cpp_file_id = insert_file_at_path(&engine_conn, &widget_cpp_path, false);
+        insert_include_edge(
+            &engine_conn,
+            user_widget_file_id,
+            "Components/Widget.h",
+            widget_header_file_id,
+        );
+
+        let widget_class_id = insert_class_in_file(&engine_conn, "UWidget", widget_cpp_file_id);
+        engine_conn
+            .execute(
+                "UPDATE classes SET file_id = ? WHERE id = ?",
+                rusqlite::params![widget_cpp_file_id, widget_class_id],
+            )
+            .unwrap();
+
+        let value = process_diagnostics(
+            &project_conn,
+            Some(&engine_conn),
+            "#include \"Blueprint/UserWidget.h\"\n\nclass UMyActor\n{\npublic:\n    UWidget* Widget;\n};\n",
+            Some("C:/Project/Source/Game/Public/MyActor.h".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP004"));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
