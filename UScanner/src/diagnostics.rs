@@ -953,7 +953,6 @@ fn member_exists_on_class_name(
         JOIN strings sm ON m.name_id = sm.id
         WHERE sc.text = ?1
           AND sm.text = ?2
-          AND (m.access IS NULL OR m.access != 'impl')
         LIMIT 1
     "#;
 
@@ -3059,6 +3058,38 @@ mod tests {
             &project_conn,
             Some(&engine_conn),
             "class UWeaponForgeMain : public UBaseWidget\n{\npublic:\n    virtual void NativeGetDesiredFocusTarget() const override;\n};\n",
+            Some("C:/Project/Source/Game/Public/WeaponForgeMain.h".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP007"));
+    }
+
+    #[test]
+    fn does_not_warn_for_engine_override_name_when_only_impl_is_indexed() {
+        let project_conn = Connection::open_in_memory().unwrap();
+        let engine_conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&project_conn).unwrap();
+        crate::db::init_db(&engine_conn).unwrap();
+
+        let child_id = insert_class(&project_conn, "UWeaponForgeMain");
+        insert_inheritance(&project_conn, child_id, "UCommonActivatableWidget", None);
+
+        let base_id = insert_class(&engine_conn, "UCommonActivatableWidget");
+        insert_impl_member(
+            &engine_conn,
+            base_id,
+            "NativeGetDesiredFocusTarget",
+            "() const",
+            Some("UWidget"),
+        );
+
+        let value = process_diagnostics(
+            &project_conn,
+            Some(&engine_conn),
+            "class UWeaponForgeMain : public UCommonActivatableWidget\n{\npublic:\n    virtual UWidget* NativeGetDesiredFocusTarget() const override;\n};\n",
             Some("C:/Project/Source/Game/Public/WeaponForgeMain.h".to_string()),
             &[],
         )
