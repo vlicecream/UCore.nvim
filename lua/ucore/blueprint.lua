@@ -149,24 +149,14 @@ local function push_unique_asset(items, seen, asset_path, category, target)
 end
 
 local function class_hint_text(derived_count, reference_count)
-	local chunks = {}
-	if derived_count > 0 then
-		table.insert(chunks, "Derived " .. derived_count)
-	end
-	if reference_count > 0 then
-		table.insert(chunks, "Refs " .. reference_count)
-	end
-	if vim.tbl_isempty(chunks) then
-		return nil
-	end
-	return "Blueprint " .. table.concat(chunks, "  ")
+	derived_count = tonumber(derived_count or 0) or 0
+	reference_count = tonumber(reference_count or 0) or 0
+	return string.format("Blueprint Derived %d  Refs %d", derived_count, reference_count)
 end
 
 local function member_hint_text(reference_count)
-	if reference_count <= 0 then
-		return nil
-	end
-	return "Blueprint " .. reference_count
+	reference_count = tonumber(reference_count or 0) or 0
+	return string.format("Blueprint %d", reference_count)
 end
 
 local function member_is_blueprint_candidate(member)
