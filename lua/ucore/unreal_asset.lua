@@ -201,7 +201,7 @@ function M.open(asset_path, opts)
 
 	local link_status = install.asset_link_status(project_root)
 	if not link_status.ready then
-		return false, "NeovimLink is not installed in this project or engine. Run :UCore install assetlink"
+		return false, "NeovimLink is not installed in this project or engine. Run :UCore install plugin NeovimLink"
 	end
 
 	local metadata, err = current_project_metadata(project_root)
