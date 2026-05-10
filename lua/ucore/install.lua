@@ -107,7 +107,34 @@ local function copy_file(src, dst)
 	return false, err
 end
 
-local function copy_tree(src, dst)
+local function collect_tree_files(src, files, total_bytes)
+	src = normalize(src)
+	files = files or {}
+	total_bytes = total_bytes or 0
+
+	for _, item in ipairs(scandir(src)) do
+		local from = path_join(src, item.name)
+		if item.kind == "directory" then
+			files, total_bytes = collect_tree_files(from, files, total_bytes)
+		else
+			local info = stat(from) or {}
+			local size = tonumber(info.size or 0) or 0
+			table.insert(files, {
+				path = from,
+				size = size,
+			})
+			total_bytes = total_bytes + size
+		end
+	end
+
+	return files, total_bytes
+end
+
+local function format_mb(bytes)
+	return string.format("%.1f MB", (tonumber(bytes or 0) or 0) / 1024 / 1024)
+end
+
+local function copy_tree(src, dst, progress)
 	src = normalize(src)
 	dst = normalize(dst)
 
@@ -117,24 +144,36 @@ local function copy_tree(src, dst)
 
 	mkdirp(dst)
 
-	for _, item in ipairs(scandir(src)) do
-		local from = path_join(src, item.name)
-		local to = path_join(dst, item.name)
+	local files, total_bytes = collect_tree_files(src)
+	local copied_bytes = 0
 
-		if item.kind == "directory" then
-			local ok, err = copy_tree(from, to)
-			if not ok then
-				return false, err
-			end
-		else
-			local ok, err = copy_file(from, to)
-			if not ok then
-				return false, string.format("copy failed: %s -> %s (%s)", from, to, tostring(err))
-			end
+	if type(progress) == "function" then
+		progress({
+			current_bytes = 0,
+			total_bytes = total_bytes,
+			current_file = nil,
+		})
+	end
+
+	for _, item in ipairs(files) do
+		local relative = item.path:sub(#src + 2)
+		local target = path_join(dst, relative)
+		local ok, err = copy_file(item.path, target)
+		if not ok then
+			return false, string.format("copy failed: %s -> %s (%s)", item.path, target, tostring(err))
+		end
+
+		copied_bytes = copied_bytes + item.size
+		if type(progress) == "function" then
+			progress({
+				current_bytes = copied_bytes,
+				total_bytes = total_bytes,
+				current_file = target,
+			})
 		end
 	end
 
-	return true
+	return true, dst
 end
 
 local function run_system(cmd, opts)
@@ -220,7 +259,7 @@ local function resolve_install_root(scope)
 	return engine.engine_root, engine_plugin_target(engine.engine_root), nil
 end
 
-local function install_plugin(scope)
+local function install_plugin(scope, progress)
 	if not repo_plugin_exists() then
 		return false, "NvimSourceCodeAccess source is missing under UCore.nvim"
 	end
@@ -238,7 +277,7 @@ local function install_plugin(scope)
 	rm_rf(target_dir)
 	mkdirp(vim.fn.fnamemodify(target_dir, ":h"):gsub("\\", "/"))
 
-	local copied, copy_err = copy_tree(plugin_source_dir, target_dir)
+	local copied, copy_err = copy_tree(plugin_source_dir, target_dir, progress)
 	if not copied then
 		return false, copy_err
 	end
@@ -271,6 +310,69 @@ local function install_nvr()
 	return false, table.concat(errors, "\n")
 end
 
+local function make_progress_notifier(title)
+	local handle
+
+	local function notify(lines, level, done)
+		local text = type(lines) == "table" and table.concat(lines, "\n") or tostring(lines or "")
+		local ok, new_handle = pcall(vim.notify, text, level or vim.log.levels.INFO, {
+			title = title,
+			replace = handle,
+			timeout = done and 3000 or false,
+		})
+		if ok and new_handle then
+			handle = new_handle
+		end
+	end
+
+	return {
+		update = function(lines, level)
+			notify(lines, level, false)
+		end,
+		finish = function(lines, level)
+			notify(lines, level, true)
+		end,
+	}
+end
+
+local function unit_to_mb(value, unit)
+	value = tonumber(value or 0) or 0
+	unit = tostring(unit or "MB"):lower()
+	if unit == "gb" then
+		return value * 1024
+	end
+	if unit == "kb" then
+		return value / 1024
+	end
+	if unit == "b" then
+		return value / 1024 / 1024
+	end
+	return value
+end
+
+local function parse_download_progress(line, state)
+	line = tostring(line or ""):gsub("\r", "")
+	if line == "" then
+		return false
+	end
+
+	local total_value, total_unit = line:match("%(([%d%.]+)%s*([kKmMgGbB][bB]?)%)")
+	if total_value and total_unit and line:lower():find("download", 1, true) then
+		state.total_mb = unit_to_mb(total_value, total_unit)
+		state.current_mb = state.current_mb or 0
+		return true
+	end
+
+	local current_value, progress_total_value, progress_unit = line:match("([%d%.]+)%s*/%s*([%d%.]+)%s*([kKmMgGbB][bB]?)")
+	if current_value and progress_total_value and progress_unit then
+		state.current_mb = unit_to_mb(current_value, progress_unit)
+		state.total_mb = unit_to_mb(progress_total_value, progress_unit)
+		return true
+	end
+
+	return false
+end
+
 nvr_install_attempts = function()
 	local attempts = {}
 
@@ -283,14 +385,14 @@ nvr_install_attempts = function()
 
 	if command_exists("py") then
 		table.insert(attempts, {
-			cmd = { "py", "-m", "pip", "install", "--user", "neovim-remote" },
+			cmd = { "py", "-m", "pip", "install", "--progress-bar", "on", "--user", "neovim-remote" },
 			label = "py -m pip install --user neovim-remote",
 		})
 	end
 
 	if command_exists("python") then
 		table.insert(attempts, {
-			cmd = { "python", "-m", "pip", "install", "--user", "neovim-remote" },
+			cmd = { "python", "-m", "pip", "install", "--progress-bar", "on", "--user", "neovim-remote" },
 			label = "python -m pip install --user neovim-remote",
 		})
 	end
@@ -352,16 +454,17 @@ function M.plugin_status(project_root)
 	return status
 end
 
-function M.install_plugin(scope)
-	return install_plugin(scope)
+function M.install_plugin(scope, progress)
+	return install_plugin(scope, progress)
 end
 
 function M.install_nvr()
 	return install_nvr()
 end
 
-function M.install_nvr_async(callback)
+function M.install_nvr_async(callback, opts)
 	callback = callback or function() end
+	opts = opts or {}
 
 	if command_exists("nvr") then
 		return callback(true, "nvr already available")
@@ -382,18 +485,67 @@ function M.install_nvr_async(callback)
 			return callback(false, table.concat(errors, "\n"))
 		end
 
-		vim.system(attempt.cmd, { text = true }, function(result)
-			if result.code == 0 then
-				return callback(true, attempt.label)
+		local output = {}
+		local state = {
+			current_mb = 0,
+			total_mb = nil,
+		}
+
+		local function handle_line(line)
+			line = tostring(line or ""):gsub("\r", "")
+			if line == "" then
+				return
 			end
 
-			local stderr = vim.trim((result.stderr or "") ~= "" and result.stderr or (result.stdout or ""))
-			table.insert(
-				errors,
-				string.format("%s -> %s", attempt.label, stderr ~= "" and stderr or ("exit " .. tostring(result.code)))
-			)
+			table.insert(output, line)
+			if parse_download_progress(line, state) and type(opts.on_progress) == "function" then
+				opts.on_progress({
+					attempt = attempt.label,
+					current_mb = state.current_mb or 0,
+					total_mb = state.total_mb,
+					line = line,
+				})
+			elseif type(opts.on_output) == "function" then
+				opts.on_output({
+					attempt = attempt.label,
+					line = line,
+				})
+			end
+		end
+
+		local job_id = vim.fn.jobstart(attempt.cmd, {
+			stdout_buffered = false,
+			stderr_buffered = false,
+			on_stdout = function(_, data)
+				for _, line in ipairs(data or {}) do
+					handle_line(line)
+				end
+			end,
+			on_stderr = function(_, data)
+				for _, line in ipairs(data or {}) do
+					handle_line(line)
+				end
+			end,
+			on_exit = function(_, code)
+				vim.schedule(function()
+					if code == 0 then
+						return callback(true, attempt.label)
+					end
+
+					local merged = vim.trim(table.concat(output, "\n"))
+					table.insert(
+						errors,
+						string.format("%s -> %s", attempt.label, merged ~= "" and merged or ("exit " .. tostring(code)))
+					)
+					run_next()
+				end)
+			end,
+		})
+
+		if job_id <= 0 then
+			table.insert(errors, string.format("%s -> failed to start process", attempt.label))
 			run_next()
-		end)
+		end
 	end
 
 	run_next()
@@ -443,37 +595,93 @@ UCore install:
 		return
 	end
 
-	local lines = {}
 	local overall_ok = true
+	local notifier = make_progress_notifier("UCore install")
+	local plugin_line = nil
+	local nvr_line = nil
+	local handled = false
+
+	local function render(level, done)
+		local out = {}
+		if plugin_line then
+			table.insert(out, plugin_line)
+		end
+		if nvr_line then
+			table.insert(out, nvr_line)
+		end
+		if done then
+			notifier.finish(out, level)
+		else
+			notifier.update(out, level)
+		end
+	end
 
 	if mode == "all" or mode == "plugin" then
-		local ok, result = install_plugin(scope)
+		handled = true
+		plugin_line = "Plugin install 0.0 MB / 0.0 MB"
+		render()
+		local ok, result = install_plugin(scope, function(progress)
+			plugin_line = string.format(
+				"Plugin install %s / %s",
+				format_mb(progress.current_bytes),
+				format_mb(progress.total_bytes)
+			)
+			render()
+		end)
 		if ok then
-			table.insert(lines, "Plugin installed: " .. tostring(result))
+			plugin_line = "Plugin installed: " .. tostring(result)
 		else
 			overall_ok = false
-			table.insert(lines, "Plugin install failed: " .. tostring(result))
+			plugin_line = "Plugin install failed: " .. tostring(result)
 		end
+		if mode == "plugin" then
+			return render(ok and vim.log.levels.INFO or vim.log.levels.WARN, true)
+		end
+		render(ok and vim.log.levels.INFO or vim.log.levels.WARN, false)
 	end
 
 	if mode == "all" or mode == "nvr" then
-		local ok, result = install_nvr()
-		if ok then
-			table.insert(lines, "nvr ready: " .. tostring(result))
-		else
-			overall_ok = false
-			table.insert(lines, "nvr install failed: " .. tostring(result))
-		end
+		handled = true
+		nvr_line = "nvr install preparing..."
+		render()
+		return M.install_nvr_async(function(ok, result)
+			if ok then
+				nvr_line = "nvr ready: " .. tostring(result)
+			else
+				overall_ok = false
+				nvr_line = "nvr install failed: " .. tostring(result)
+			end
+			render(ok and vim.log.levels.INFO or vim.log.levels.WARN, true)
+		end, {
+			on_progress = function(progress)
+				if progress.total_mb then
+					nvr_line = string.format(
+						"nvr download %.1f MB / %.1f MB",
+						progress.current_mb or 0,
+						progress.total_mb
+					)
+				else
+					nvr_line = string.format("nvr download %.1f MB / ...", progress.current_mb or 0)
+				end
+				render()
+			end,
+			on_output = function(progress)
+				if not nvr_line or nvr_line == "nvr install preparing..." then
+					nvr_line = "nvr install running..."
+					render()
+				end
+			end,
+		})
 	end
 
-	if #lines == 0 then
-		return notify_result({
+	if not handled then
+		return notifier.finish({
 			"Unknown install target: " .. tostring(mode),
 			"Use :UCore install help",
 		}, vim.log.levels.WARN)
 	end
 
-	notify_result(lines, overall_ok and vim.log.levels.INFO or vim.log.levels.WARN)
+	render(overall_ok and vim.log.levels.INFO or vim.log.levels.WARN, true)
 end
 
 return M
