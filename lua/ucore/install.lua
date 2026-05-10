@@ -2,6 +2,7 @@ local project = require("ucore.project")
 local status = require("ucore.status")
 
 local M = {}
+local split_args
 
 local uv = vim.uv or vim.loop
 local remote_repo_url = vim.env.UCORE_INSTALL_REPO or "https://github.com/vlicecream/UCore.nvim.git"
@@ -489,6 +490,41 @@ function M.resolve_plugin(name)
 	return vim.deepcopy(spec)
 end
 
+function M.completion_items(tail, arglead)
+	local raw = tostring(tail or "")
+	local args = split_args(vim.trim(raw))
+	local lead = tostring(arglead or "")
+	local first = args[1] and args[1]:lower() or ""
+	local second = args[2] or ""
+
+	if vim.trim(raw) == "" then
+		return { "all", "plugin", "help" }
+	end
+
+	if #args == 1 and first ~= "plugin" and not raw:match("%s$") then
+		return vim.tbl_filter(function(item)
+			return item:lower():find(first, 1, true) == 1
+		end, { "all", "plugin", "help" })
+	end
+
+	if first == "plugin" then
+		local items = {}
+		for _, key in ipairs(plugin_order) do
+			local spec = plugin_specs[key]
+			table.insert(items, spec.display_name)
+		end
+		if second == "" then
+			return items
+		end
+		local needle = lead ~= "" and lead:lower() or second:lower()
+		return vim.tbl_filter(function(item)
+			return item:lower():find(needle, 1, true) == 1
+		end, items)
+	end
+
+	return {}
+end
+
 function M.install_named(name, scope, progress)
 	local spec = plugin_spec(name)
 	if not spec then
@@ -523,7 +559,7 @@ local function install_status_done(ok, message, detail)
 	end
 end
 
-local function split_args(tail)
+split_args = function(tail)
 	local items = {}
 	for token in tostring(tail or ""):gmatch("%S+") do
 		table.insert(items, token)

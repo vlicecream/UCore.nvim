@@ -1,4 +1,5 @@
 local actions = require("ucore.commands.actions")
+local install = require("ucore.install")
 local ucore_new = require("ucore.unreal.new")
 
 local M = {}
@@ -25,7 +26,7 @@ function M.dispatch(args)
 			actions.find(tail)
 		end,
 		["goto"] = function()
-			actions.goto(tail)
+			actions["goto"](tail)
 		end,
 		signature = actions.signature_help,
 		blueprint = actions.blueprint,
@@ -80,13 +81,18 @@ function M.register()
 			local line = cmdline or ""
 			local before_cursor = line:sub(1, (cursorpos or (#line + 1)) - 1)
 			local tail = before_cursor:match("^%s*UCore%s*(.-)%s*$") or ""
+			local raw_tail = before_cursor:match("^%s*UCore%s*(.*)$") or ""
 			local first = tail:match("^(%S+)")
 			local first_lower = first and first:lower() or nil
 			local in_goto = first_lower == "goto"
+			local in_install = first_lower == "install"
 
 			local items
 			if in_goto then
 				items = goto_items
+			elseif in_install then
+				local install_tail = raw_tail:match("^install(.*)$") or ""
+				items = install.completion_items(install_tail, arglead)
 			else
 				items = user_items
 			end
@@ -98,7 +104,7 @@ function M.register()
 			end
 
 			return vim.tbl_filter(function(item)
-				return item:find(needle, 1, true) == 1
+				return item:lower():find(needle, 1, true) == 1
 			end, items)
 		end,
 	})
