@@ -49,18 +49,21 @@ local function schedule_boot(project_root)
 			return
 		end
 
-		unreal_init.run(project_root, function()
-			bootstrap.boot(function(ok, err)
+		bootstrap.boot(function(ok, err)
+			if ok then
+				booted_projects[project_root] = true
+				vim.defer_fn(function()
+					prewarm_find(project_root, { force = true })
+				end, 500)
+			end
+		end, {
+			project_root = project_root,
+			after_finish = function(ok)
 				if ok then
-					booted_projects[project_root] = true
-					vim.defer_fn(function()
-						prewarm_find(project_root, { force = true })
-					end, 500)
+					unreal_init.run(project_root)
 				end
-			end, {
-				project_root = project_root,
-			})
-		end)
+			end,
+		})
 	end, config.values.auto_boot_delay_ms)
 end
 
@@ -100,8 +103,6 @@ local function try_auto_boot(args)
 			end
 			if config.values.auto_boot then
 				schedule_boot(root)
-			else
-				unreal_init.run(root)
 			end
 			return
 		end

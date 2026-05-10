@@ -189,14 +189,20 @@ end
 
 -- Refresh the shared Engine index after the project is already usable.
 -- 在项目已经可用后，后台刷新共享 Engine 索引。
-local function run_engine_refresh_in_background(payload)
+local function run_engine_refresh_in_background(payload, after_finish)
 	run_engine_refresh_if_needed(payload, function(ok, err)
 		if ok then
 			status.finish("UCore Ready - Initialization Complete")
+			if type(after_finish) == "function" then
+				after_finish(true)
+			end
 			return
 		end
 
 		status.fail("UCore Engine Index Failed", tostring(err))
+		if type(after_finish) == "function" then
+			after_finish(false, err)
+		end
 	end)
 end
 
@@ -303,7 +309,7 @@ function M.boot(callback, opts)
 						booting = false
 						other_progress(100)
 						callback(true)
-						run_engine_refresh_in_background(payload)
+						run_engine_refresh_in_background(payload, opts.after_finish)
 					end)
 				end)
 			end)
