@@ -17,6 +17,7 @@ local plugin_specs = {
 	nvimsourcecodeaccess = {
 		id = "nvimsourcecodeaccess",
 		display_name = "NvimSourceCodeAccess",
+		description = "Unreal SourceCodeAccess provider for opening C++ in Neovim",
 		folder_name = "NvimSourceCodeAccess",
 		manifest_name = "NvimSourceCodeAccess.uplugin",
 		repo_subdir = "unreal-plugins/NvimSourceCodeAccess",
@@ -29,6 +30,7 @@ local plugin_specs = {
 	neovimlink = {
 		id = "neovimlink",
 		display_name = "NeovimLink",
+		description = "Open Unreal Blueprint and asset paths from UCore in the editor",
 		folder_name = "NeovimLink",
 		manifest_name = "NeovimLink.uplugin",
 		repo_subdir = "unreal-plugins/NeovimLink",
@@ -477,6 +479,22 @@ end
 
 function M.install_asset_link_plugin(scope, progress)
 	return install_spec(plugin_specs.neovimlink, scope, progress)
+end
+
+function M.resolve_plugin(name)
+	local spec = plugin_spec(name)
+	if not spec then
+		return nil
+	end
+	return vim.deepcopy(spec)
+end
+
+function M.install_named(name, scope, progress)
+	local spec = plugin_spec(name)
+	if not spec then
+		return false, "unknown plugin: " .. tostring(name)
+	end
+	return install_spec(spec, scope, progress)
 end
 
 local function notify_result(lines, level)
