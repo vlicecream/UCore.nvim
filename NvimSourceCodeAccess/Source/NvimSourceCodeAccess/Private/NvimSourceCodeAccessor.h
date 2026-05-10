@@ -47,20 +47,12 @@ private:
 
 	struct FRemoteLocation
 	{
-		enum class EClientKind : uint8
-		{
-			Unknown,
-			Nvr,
-			Nvim,
-		};
-
 		FString ClientPath;
 		FString ServerName;
-		EClientKind ClientKind = EClientKind::Unknown;
 
 		bool IsValid() const
 		{
-			return !ClientPath.IsEmpty() && !ServerName.IsEmpty() && ClientKind != EClientKind::Unknown;
+			return !ClientPath.IsEmpty() && !ServerName.IsEmpty();
 		}
 	};
 

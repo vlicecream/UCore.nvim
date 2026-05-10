@@ -812,7 +812,7 @@ UCore commands:
   :UCore signature    Show signature help for current call
   :UCore blueprint    Show related Blueprint assets for symbol under cursor
   :UCore rename       Rename symbol under cursor
-  :UCore install      Install Unreal source access plugin / nvr
+  :UCore install      Install Unreal source access plugin
   :UCore help         Show this help
 ]])
 end

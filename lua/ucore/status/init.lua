@@ -36,7 +36,6 @@ end
 local panels = {
 	unreal_init = make_panel("UCore Unreal Init", "ucore.status.unreal_init", {
 		"boot",
-		"task:nvr",
 		"task:plugin",
 		"task:asset_bridge",
 	}),

@@ -188,10 +188,6 @@ local function run_system(cmd, opts)
 	return result
 end
 
-local function command_exists(cmd)
-	return vim.fn.executable(cmd) == 1
-end
-
 local function repo_plugin_exists()
 	return is_dir(plugin_source_dir) and is_file(plugin_source_dir .. "/NvimSourceCodeAccess.uplugin")
 end
@@ -208,8 +204,6 @@ end
 local function plugin_installed(dir)
 	return is_file(plugin_manifest_path(dir))
 end
-
-local nvr_install_attempts
 
 local function project_plugin_target(project_root)
 	return path_join(project_root, "Plugins", "Developer", "NvimSourceCodeAccess")
@@ -286,99 +280,6 @@ local function install_plugin(scope, progress)
 	return true, target_dir
 end
 
-local function install_nvr()
-	if command_exists("nvr") then
-		return true, "nvr already available"
-	end
-
-	local attempts = nvr_install_attempts()
-
-	if #attempts == 0 then
-		return false, "no pipx/python launcher found for installing nvr"
-	end
-
-	local errors = {}
-	for _, attempt in ipairs(attempts) do
-		local result = run_system(attempt.cmd)
-		if result.code == 0 then
-			return true, attempt.label
-		end
-
-		local stderr = vim.trim((result.stderr or "") ~= "" and result.stderr or (result.stdout or ""))
-		table.insert(errors, string.format("%s -> %s", attempt.label, stderr ~= "" and stderr or ("exit " .. tostring(result.code))))
-	end
-
-	return false, table.concat(errors, "\n")
-end
-
-local function unit_to_mb(value, unit)
-	value = tonumber(value or 0) or 0
-	unit = tostring(unit or "MB"):lower()
-	if unit == "gb" then
-		return value * 1024
-	end
-	if unit == "kb" then
-		return value / 1024
-	end
-	if unit == "b" then
-		return value / 1024 / 1024
-	end
-	return value
-end
-
-local function parse_download_progress(line, state)
-	line = tostring(line or ""):gsub("\r", "")
-	if line == "" then
-		return false
-	end
-
-	local total_value, total_unit = line:match("%(([%d%.]+)%s*([kKmMgGbB][bB]?)%)")
-	if total_value and total_unit and line:lower():find("download", 1, true) then
-		state.total_mb = unit_to_mb(total_value, total_unit)
-		state.current_mb = state.current_mb or 0
-		return true
-	end
-
-	local current_value, progress_total_value, progress_unit = line:match("([%d%.]+)%s*/%s*([%d%.]+)%s*([kKmMgGbB][bB]?)")
-	if current_value and progress_total_value and progress_unit then
-		state.current_mb = unit_to_mb(current_value, progress_unit)
-		state.total_mb = unit_to_mb(progress_total_value, progress_unit)
-		return true
-	end
-
-	return false
-end
-
-nvr_install_attempts = function()
-	local attempts = {}
-
-	if command_exists("pipx") then
-		table.insert(attempts, {
-			cmd = { "pipx", "install", "neovim-remote" },
-			label = "pipx install neovim-remote",
-		})
-	end
-
-	if command_exists("py") then
-		table.insert(attempts, {
-			cmd = { "py", "-m", "pip", "install", "--progress-bar", "on", "--user", "neovim-remote" },
-			label = "py -m pip install --user neovim-remote",
-		})
-	end
-
-	if command_exists("python") then
-		table.insert(attempts, {
-			cmd = { "python", "-m", "pip", "install", "--progress-bar", "on", "--user", "neovim-remote" },
-			label = "python -m pip install --user neovim-remote",
-		})
-	end
-
-	return attempts
-end
-
-function M.has_nvr()
-	return command_exists("nvr")
-end
 
 function M.plugin_status(project_root)
 	project_root = normalize(project_root)
@@ -432,99 +333,6 @@ end
 
 function M.install_plugin(scope, progress)
 	return install_plugin(scope, progress)
-end
-
-function M.install_nvr()
-	return install_nvr()
-end
-
-function M.install_nvr_async(callback, opts)
-	callback = callback or function() end
-	opts = opts or {}
-
-	if command_exists("nvr") then
-		return callback(true, "nvr already available")
-	end
-
-	local attempts = nvr_install_attempts()
-	if #attempts == 0 then
-		return callback(false, "no pipx/python launcher found for installing nvr")
-	end
-
-	local errors = {}
-	local index = 0
-
-	local function run_next()
-		index = index + 1
-		local attempt = attempts[index]
-		if not attempt then
-			return callback(false, table.concat(errors, "\n"))
-		end
-
-		local output = {}
-		local state = {
-			current_mb = 0,
-			total_mb = nil,
-		}
-
-		local function handle_line(line)
-			line = tostring(line or ""):gsub("\r", "")
-			if line == "" then
-				return
-			end
-
-			table.insert(output, line)
-			if parse_download_progress(line, state) and type(opts.on_progress) == "function" then
-				opts.on_progress({
-					attempt = attempt.label,
-					current_mb = state.current_mb or 0,
-					total_mb = state.total_mb,
-					line = line,
-				})
-			elseif type(opts.on_output) == "function" then
-				opts.on_output({
-					attempt = attempt.label,
-					line = line,
-				})
-			end
-		end
-
-		local job_id = vim.fn.jobstart(attempt.cmd, {
-			stdout_buffered = false,
-			stderr_buffered = false,
-			on_stdout = function(_, data)
-				for _, line in ipairs(data or {}) do
-					handle_line(line)
-				end
-			end,
-			on_stderr = function(_, data)
-				for _, line in ipairs(data or {}) do
-					handle_line(line)
-				end
-			end,
-			on_exit = function(_, code)
-				vim.schedule(function()
-					if code == 0 then
-						return callback(true, attempt.label)
-					end
-
-					local merged = vim.trim(table.concat(output, "\n"))
-					table.insert(
-						errors,
-						string.format("%s -> %s", attempt.label, merged ~= "" and merged or ("exit " .. tostring(code)))
-					)
-					run_next()
-				end)
-			end,
-		})
-
-		if job_id <= 0 then
-			table.insert(errors, string.format("%s -> failed to start process", attempt.label))
-			run_next()
-		end
-	end
-
-	run_next()
 end
 
 local function notify_result(lines, level)
@@ -582,18 +390,15 @@ function M.run(tail)
 	if mode == "help" then
 		print([[
 UCore install:
-  :UCore install                 Install NvimSourceCodeAccess to current project and install nvr
+  :UCore install                 Install NvimSourceCodeAccess to current project
   :UCore install plugin          Install NvimSourceCodeAccess to current project
   :UCore install plugin engine   Install NvimSourceCodeAccess to current Engine
-  :UCore install nvr             Install neovim-remote (nvr)
   :UCore install help            Show this help
 ]])
 		return
 	end
 
-	local overall_ok = true
 	local handled = false
-	local failure_messages = {}
 
 	if mode == "all" or mode == "plugin" then
 		handled = true
@@ -609,52 +414,12 @@ UCore install:
 		if ok then
 			install_status_finish("task:plugin", "Plugin installed: " .. tostring(result))
 		else
-			overall_ok = false
-			table.insert(failure_messages, tostring(result))
 			install_status_finish("task:plugin", "Plugin install failed: " .. tostring(result))
 		end
 		if mode == "plugin" then
 			return install_status_done(ok, ok and "UCore Install Complete" or "UCore Install Failed", tostring(result))
 		end
-	end
-
-	if mode == "all" or mode == "nvr" then
-		handled = true
-		if mode == "nvr" then
-			install_status_start("Installing Unreal editor integration...")
-		end
-		install_status_progress("task:nvr", "nvr install preparing...")
-		return M.install_nvr_async(function(ok, result)
-			if ok then
-				install_status_finish("task:nvr", "nvr ready: " .. tostring(result))
-			else
-				overall_ok = false
-				table.insert(failure_messages, tostring(result))
-				install_status_finish("task:nvr", "nvr install failed: " .. tostring(result))
-			end
-			install_status_done(
-				overall_ok,
-				overall_ok and "UCore Install Complete" or "UCore Install Failed",
-				#failure_messages > 0 and table.concat(failure_messages, " | ") or nil
-			)
-		end, {
-			on_progress = function(progress)
-				if progress.total_mb then
-					install_status_progress("task:nvr", string.format(
-						"nvr download %.1f MB / %.1f MB",
-						progress.current_mb or 0,
-						progress.total_mb
-					))
-				else
-					install_status_progress("task:nvr", string.format("nvr download %.1f MB / ...", progress.current_mb or 0))
-				end
-			end,
-			on_output = function(progress)
-				if tostring(progress.line or "") ~= "" then
-					install_status_progress("task:nvr", "nvr install running...")
-				end
-			end,
-		})
+		return install_status_done(ok, ok and "UCore Install Complete" or "UCore Install Failed", tostring(result))
 	end
 
 	if not handled then

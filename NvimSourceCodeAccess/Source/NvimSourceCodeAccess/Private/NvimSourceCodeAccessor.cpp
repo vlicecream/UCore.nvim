@@ -486,14 +486,6 @@ bool FNvimSourceCodeAccessor::ResolveRemoteLocation(FRemoteLocation& OutLocation
 	}
 
 	FExecutableLocation ClientLocation;
-	if (ResolvePathExecutable(TEXT("nvr.exe"), false, ClientLocation))
-	{
-		OutLocation.ClientPath = ClientLocation.Path;
-		OutLocation.ServerName = ServerName;
-		OutLocation.ClientKind = FRemoteLocation::EClientKind::Nvr;
-		return true;
-	}
-
 	if (!ResolvePathExecutable(TEXT("nvim.exe"), false, ClientLocation))
 	{
 		return false;
@@ -501,7 +493,6 @@ bool FNvimSourceCodeAccessor::ResolveRemoteLocation(FRemoteLocation& OutLocation
 
 	OutLocation.ClientPath = ClientLocation.Path;
 	OutLocation.ServerName = ServerName;
-	OutLocation.ClientKind = FRemoteLocation::EClientKind::Nvim;
 	return true;
 }
 
@@ -608,14 +599,6 @@ bool FNvimSourceCodeAccessor::ResolveBridgeRemoteLocation(const FString& Project
 	}
 
 	FExecutableLocation ClientLocation;
-	if (ResolvePathExecutable(TEXT("nvr.exe"), false, ClientLocation))
-	{
-		OutLocation.ClientPath = ClientLocation.Path;
-		OutLocation.ServerName = ServerName;
-		OutLocation.ClientKind = FRemoteLocation::EClientKind::Nvr;
-		return true;
-	}
-
 	if (!ResolvePathExecutable(TEXT("nvim.exe"), false, ClientLocation))
 	{
 		return false;
@@ -623,7 +606,6 @@ bool FNvimSourceCodeAccessor::ResolveBridgeRemoteLocation(const FString& Project
 
 	OutLocation.ClientPath = ClientLocation.Path;
 	OutLocation.ServerName = ServerName;
-	OutLocation.ClientKind = FRemoteLocation::EClientKind::Nvim;
 	return true;
 }
 
@@ -675,7 +657,7 @@ bool FNvimSourceCodeAccessor::LaunchBridgeRequest(const TSharedRef<FJsonObject>&
 	);
 
 	TArray<FString> RemoteArgs;
-	RemoteArgs.Add(BridgeRemote.ClientKind == FRemoteLocation::EClientKind::Nvim ? TEXT("--server") : TEXT("--servername"));
+	RemoteArgs.Add(TEXT("--server"));
 	RemoteArgs.Add(BridgeRemote.ServerName);
 	RemoteArgs.Add(TEXT("--remote-expr"));
 	RemoteArgs.Add(Expression);
@@ -701,7 +683,9 @@ bool FNvimSourceCodeAccessor::LaunchBridgeRequest(const TSharedRef<FJsonObject>&
 		&StdErr
 	);
 
-	if (ReturnCode == 0 && StdOut.TrimStartAndEnd().Equals(TEXT("ok"), ESearchCase::IgnoreCase))
+	const bool bStdoutOk = StdOut.TrimStartAndEnd().Equals(TEXT("ok"), ESearchCase::IgnoreCase);
+	const bool bRequestConsumed = IFileManager::Get().FileSize(*RequestPath) == INDEX_NONE;
+	if (ReturnCode == 0 && (bStdoutOk || bRequestConsumed))
 	{
 		return true;
 	}
@@ -718,7 +702,7 @@ bool FNvimSourceCodeAccessor::LaunchRemote(const TArray<FString>& Args, bool bDi
 	}
 
 	TArray<FString> RemoteArgs;
-	RemoteArgs.Add(Remote.ClientKind == FRemoteLocation::EClientKind::Nvim ? TEXT("--server") : TEXT("--servername"));
+	RemoteArgs.Add(TEXT("--server"));
 	RemoteArgs.Add(Remote.ServerName);
 
 	if (bDirectoryTarget)
