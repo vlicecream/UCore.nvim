@@ -19,6 +19,7 @@ local plugin_specs = {
 		display_name = "NvimSourceCodeAccess",
 		folder_name = "NvimSourceCodeAccess",
 		manifest_name = "NvimSourceCodeAccess.uplugin",
+		repo_subdir = "unreal-plugins/NvimSourceCodeAccess",
 		task_key = "task:plugin",
 		aliases = {
 			"nvimsourcecodeaccess",
@@ -30,6 +31,7 @@ local plugin_specs = {
 		display_name = "NeovimLink",
 		folder_name = "NeovimLink",
 		manifest_name = "NeovimLink.uplugin",
+		repo_subdir = "unreal-plugins/NeovimLink",
 		task_key = "task:asset_bridge",
 		aliases = {
 			"neovimlink",
@@ -352,14 +354,14 @@ local function fetch_remote_plugin(spec, progress)
 		repo_dir,
 		"sparse-checkout",
 		"set",
-		spec.folder_name,
+		spec.repo_subdir or spec.folder_name,
 	})
 	if sparse_result.code ~= 0 then
 		rm_rf(temp_dir)
 		return false, command_error(sparse_result, "git sparse-checkout failed")
 	end
 
-	local source_dir = path_join(repo_dir, spec.folder_name)
+	local source_dir = path_join(repo_dir, spec.repo_subdir or spec.folder_name)
 	if not plugin_installed(spec, source_dir) then
 		rm_rf(temp_dir)
 		return false, spec.display_name .. " is missing from remote repository"
