@@ -169,6 +169,8 @@ local function plugin_installed(dir)
 	return is_file(plugin_manifest_path(dir))
 end
 
+local nvr_install_attempts
+
 local function project_plugin_target(project_root)
 	return path_join(project_root, "Plugins", "Developer", "NvimSourceCodeAccess")
 end
@@ -249,6 +251,27 @@ local function install_nvr()
 		return true, "nvr already available"
 	end
 
+	local attempts = nvr_install_attempts()
+
+	if #attempts == 0 then
+		return false, "no pipx/python launcher found for installing nvr"
+	end
+
+	local errors = {}
+	for _, attempt in ipairs(attempts) do
+		local result = run_system(attempt.cmd)
+		if result.code == 0 then
+			return true, attempt.label
+		end
+
+		local stderr = vim.trim((result.stderr or "") ~= "" and result.stderr or (result.stdout or ""))
+		table.insert(errors, string.format("%s -> %s", attempt.label, stderr ~= "" and stderr or ("exit " .. tostring(result.code))))
+	end
+
+	return false, table.concat(errors, "\n")
+end
+
+nvr_install_attempts = function()
 	local attempts = {}
 
 	if command_exists("pipx") then
@@ -272,22 +295,7 @@ local function install_nvr()
 		})
 	end
 
-	if #attempts == 0 then
-		return false, "no pipx/python launcher found for installing nvr"
-	end
-
-	local errors = {}
-	for _, attempt in ipairs(attempts) do
-		local result = run_system(attempt.cmd)
-		if result.code == 0 then
-			return true, attempt.label
-		end
-
-		local stderr = vim.trim((result.stderr or "") ~= "" and result.stderr or (result.stdout or ""))
-		table.insert(errors, string.format("%s -> %s", attempt.label, stderr ~= "" and stderr or ("exit " .. tostring(result.code))))
-	end
-
-	return false, table.concat(errors, "\n")
+	return attempts
 end
 
 function M.has_nvr()
@@ -350,6 +358,45 @@ end
 
 function M.install_nvr()
 	return install_nvr()
+end
+
+function M.install_nvr_async(callback)
+	callback = callback or function() end
+
+	if command_exists("nvr") then
+		return callback(true, "nvr already available")
+	end
+
+	local attempts = nvr_install_attempts()
+	if #attempts == 0 then
+		return callback(false, "no pipx/python launcher found for installing nvr")
+	end
+
+	local errors = {}
+	local index = 0
+
+	local function run_next()
+		index = index + 1
+		local attempt = attempts[index]
+		if not attempt then
+			return callback(false, table.concat(errors, "\n"))
+		end
+
+		vim.system(attempt.cmd, { text = true }, function(result)
+			if result.code == 0 then
+				return callback(true, attempt.label)
+			end
+
+			local stderr = vim.trim((result.stderr or "") ~= "" and result.stderr or (result.stdout or ""))
+			table.insert(
+				errors,
+				string.format("%s -> %s", attempt.label, stderr ~= "" and stderr or ("exit " .. tostring(result.code)))
+			)
+			run_next()
+		end)
+	end
+
+	run_next()
 end
 
 local function notify_result(lines, level)

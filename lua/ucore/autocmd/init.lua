@@ -1,7 +1,7 @@
 local bootstrap = require("ucore.bootstrap")
 local config = require("ucore.config")
-local init_popup = require("ucore.init_popup")
 local project = require("ucore.project")
+local unreal_init = require("ucore.unreal_init")
 
 local M = {}
 
@@ -49,16 +49,18 @@ local function schedule_boot(project_root)
 			return
 		end
 
-		bootstrap.boot(function(ok, err)
-			if ok then
-				booted_projects[project_root] = true
-				vim.defer_fn(function()
-					prewarm_find(project_root, { force = true })
-				end, 500)
-			end
-		end, {
-			project_root = project_root,
-		})
+		unreal_init.run(project_root, function()
+			bootstrap.boot(function(ok, err)
+				if ok then
+					booted_projects[project_root] = true
+					vim.defer_fn(function()
+						prewarm_find(project_root, { force = true })
+					end, 500)
+				end
+			end, {
+				project_root = project_root,
+			})
+		end)
 	end, config.values.auto_boot_delay_ms)
 end
 
@@ -89,10 +91,6 @@ local function try_auto_boot(args)
 		local root = project.find_project_root(buffer_path)
 		if root then
 			attempts_scheduled = false
-			init_popup.maybe_open(root)
-			if not config.values.auto_boot then
-				return
-			end
 			require("ucore.explorer").auto_open_for_project(root)
 			if not find_warm_requested[root] then
 				find_warm_requested[root] = true
@@ -100,7 +98,11 @@ local function try_auto_boot(args)
 					prewarm_find(root)
 				end, 1000)
 			end
-			schedule_boot(root)
+			if config.values.auto_boot then
+				schedule_boot(root)
+			else
+				unreal_init.run(root)
+			end
 			return
 		end
 

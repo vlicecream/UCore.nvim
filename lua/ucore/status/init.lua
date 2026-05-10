@@ -34,6 +34,12 @@ local function make_panel(title, notify_id, ordered_keys)
 end
 
 local panels = {
+	unreal_init = make_panel("UCore Unreal Init", "ucore.status.unreal_init", {
+		"boot",
+		"task:nvr",
+		"task:plugin",
+		"task:asset_bridge",
+	}),
 	init = make_panel("UCore Workspace Init", "ucore.status.init", {
 		"boot",
 		"progress:UCore Other Initialization",
@@ -47,6 +53,14 @@ local function panel_for_key(key)
 	return panels.init
 end
 
+local function panel_storage_key(panel)
+	if panel == panels.unreal_init then
+		return "unreal_init"
+	end
+
+	return "init"
+end
+
 local function panel_has_spinner_items(panel)
 	for key, active in pairs(panel.spinner_active_keys) do
 		if active and panel.items[key] then
@@ -58,7 +72,7 @@ local function panel_has_spinner_items(panel)
 end
 
 local function any_spinner_items()
-	return panel_has_spinner_items(panels.init)
+	return panel_has_spinner_items(panels.unreal_init) or panel_has_spinner_items(panels.init)
 end
 
 local function spinner_frame()
@@ -221,12 +235,20 @@ end
 
 local function render_now()
 	if uses_builtin_notify() then
-		render_float_panel("init", panels.init, 1)
+		local row = 1
+		local unreal_height = render_float_panel("unreal_init", panels.unreal_init, row)
+		if unreal_height > 0 then
+			row = row + unreal_height + 1
+		end
+		render_float_panel("init", panels.init, row)
+		panels.unreal_init.notify_handle = nil
 		panels.init.notify_handle = nil
 		return
 	end
 
+	close_float("unreal_init")
 	close_float("init")
+	render_notify_panel(panels.unreal_init)
 	render_notify_panel(panels.init)
 end
 
@@ -248,7 +270,7 @@ end
 
 local function dismiss_panel(panel)
 	if uses_builtin_notify() then
-		close_float("init")
+		close_float(panel_storage_key(panel))
 		panel.notify_handle = nil
 		return
 	end
@@ -328,11 +350,9 @@ local function schedule_panel_dismiss(panel, delay_ms)
 			return
 		end
 
-		if panel == panels.init then
-			if panel.state == "complete" and not panel.boot_active and not panel_has_spinner_items(panel) then
-				clear_panel_contents(panel)
-				dismiss_panel(panel)
-			end
+		if panel.state == "complete" and not panel.boot_active and not panel_has_spinner_items(panel) then
+			clear_panel_contents(panel)
+			dismiss_panel(panel)
 		end
 	end, delay_ms or 5000)
 end
@@ -364,6 +384,7 @@ local function reset_panel(panel)
 end
 
 local function reset_all()
+	reset_panel(panels.unreal_init)
 	reset_panel(panels.init)
 	render()
 end
@@ -448,6 +469,82 @@ function M.progress_finish(title, message)
 	if panel == panels.init then
 		apply_pending_init_finish()
 	end
+end
+
+function M.unreal_start(message)
+	reset_panel(panels.unreal_init)
+	panels.unreal_init.boot_active = true
+	panels.unreal_init.state = "running"
+	panels.unreal_init.spinner_active_keys.boot = true
+	panels.unreal_init.items.boot = message or "Preparing Unreal editor integration..."
+	render()
+	schedule_spinner()
+end
+
+function M.unreal_finish(message)
+	local panel = panels.unreal_init
+	panel.boot_active = false
+	panel.spinner_active_keys.boot = nil
+	panel.pending_finish_message = message or "UCore Unreal Init Complete"
+	bump_dismiss_version(panel)
+	if not panel_has_spinner_items(panel) then
+		local text = panel.pending_finish_message
+		panel.pending_finish_message = nil
+		panel.state = "complete"
+		panel.items.boot = text
+		render()
+		schedule_panel_dismiss(panel, 5000)
+	end
+end
+
+function M.unreal_fail(message, detail)
+	local panel = panels.unreal_init
+	panel.boot_active = false
+	panel.state = "failed"
+	panel.pending_finish_message = nil
+	panel.spinner_active_keys.boot = nil
+	local text = message or "UCore Unreal Init Failed"
+	if detail and detail ~= "" then
+		text = text .. " | " .. tostring(detail)
+	end
+	panel.items.boot = text
+	bump_dismiss_version(panel)
+	render()
+end
+
+function M.unreal_step(key, message)
+	local panel = panels.unreal_init
+	panel.spinner_active_keys[key] = true
+	panel.items[key] = message
+	panel.state = "running"
+	bump_dismiss_version(panel)
+	render()
+	schedule_spinner()
+end
+
+function M.unreal_step_finish(key, message)
+	local panel = panels.unreal_init
+	panel.spinner_active_keys[key] = nil
+	panel.items[key] = message
+	bump_dismiss_version(panel)
+	if panel.pending_finish_message and not panel.boot_active and not panel_has_spinner_items(panel) then
+		local text = panel.pending_finish_message
+		panel.pending_finish_message = nil
+		panel.state = "complete"
+		panel.items.boot = text
+		render()
+		schedule_panel_dismiss(panel, 5000)
+		return
+	end
+	render()
+end
+
+function M.unreal_clear(key)
+	local panel = panels.unreal_init
+	panel.spinner_active_keys[key] = nil
+	panel.items[key] = nil
+	bump_dismiss_version(panel)
+	render()
 end
 
 function M.progress_fail(title, message)
