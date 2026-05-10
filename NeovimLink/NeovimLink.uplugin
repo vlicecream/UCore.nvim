@@ -1,0 +1,24 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "NeovimLink",
+	"Description": "Receives asset-open requests from UCore and opens Unreal assets in the editor.",
+	"Category": "Other",
+	"CreatedBy": "Ting",
+	"CreatedByURL": "vlicecream.github.io",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"CanContainContent": false,
+	"IsBetaVersion": true,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "NeovimLink",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		}
+	]
+}

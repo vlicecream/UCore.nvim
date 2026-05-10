@@ -10,8 +10,13 @@ local function finish_step(key, message)
 	status.unreal_step_finish(key, message)
 end
 
-local function finish_panel()
-	finish_step("task:asset_bridge", "Asset Jump Bridge Planned")
+local function finish_panel(project_root)
+	local asset_link = install.asset_link_status(project_root)
+	if asset_link.ready then
+		finish_step("task:asset_bridge", "NeovimLink Ready")
+	else
+		finish_step("task:asset_bridge", "NeovimLink Missing")
+	end
 	status.unreal_finish("UCore Unreal Init Complete")
 end
 
@@ -71,7 +76,7 @@ function M.run(project_root, callback)
 	run_plugin_step(project_root, function()
 		running[project_root] = nil
 		completed[project_root] = true
-		finish_panel()
+		finish_panel(project_root)
 		callback()
 	end)
 end

@@ -725,8 +725,7 @@ end
 local function open_source_item(item)
 	if item.type == "asset" or item.asset_path then
 		local asset_path = tostring(item.asset_path or item.path or "")
-		vim.fn.setreg("+", asset_path)
-		vim.notify("Copied asset path: " .. asset_path)
+		require("ucore.unreal_asset").open_or_notify(asset_path)
 		return
 	end
 
@@ -768,7 +767,7 @@ local function preview_find_item(entry, bufnr)
 			"",
 			tostring(item.asset_path),
 			"",
-			"Press <CR> to copy the asset path.",
+			"Press <CR> to open the asset in Unreal Editor.",
 		}
 	elseif item.type == "config" then
 		lines = {
@@ -1350,15 +1349,13 @@ function M.modules(modules)
 	end)
 end
 
--- Pick an asset path and copy it to the clipboard.
--- 选择一个资产路径，并复制到剪贴板。
+-- Pick an asset path and open it in Unreal Editor.
+-- 选择一个资产路径，并在 Unreal Editor 中打开它。
 function M.assets(assets)
 	pick("UCore assets", assets, function(item)
 		return tostring(item)
 	end, function(item)
-		local asset_path = tostring(item)
-		vim.fn.setreg("+", asset_path)
-		vim.notify("Copied asset path: " .. asset_path)
+		require("ucore.unreal_asset").open_or_notify(tostring(item))
 	end)
 end
 
