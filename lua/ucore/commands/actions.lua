@@ -5,6 +5,7 @@ local ui = require("ucore.ui")
 local bootstrap = require("ucore.bootstrap")
 local navigation = require("ucore.navigation")
 local explorer = require("ucore.explorer")
+local install = require("ucore.install")
 
 local M = {}
 local FIND_PAGE_SIZE = 50
@@ -467,6 +468,10 @@ function M.rename(tail)
 	require("ucore.assist").rename(new_name)
 end
 
+function M.install(tail)
+	install.run(tail)
+end
+
 -- Pick and open a registered Unreal project.
 -- 选择并打开一个已注册 Unreal 项目。
 function M.open_project()
@@ -812,6 +817,7 @@ UCore commands:
   :UCore signature    Show signature help for current call
   :UCore blueprint    Show related Blueprint assets for symbol under cursor
   :UCore rename       Rename symbol under cursor
+  :UCore install      Install Unreal source access plugin / nvr
   :UCore help         Show this help
 ]])
 end

@@ -33,6 +33,9 @@ function M.dispatch(args)
 		rename = function()
 			actions.rename(tail)
 		end,
+		install = function()
+			actions.install(tail)
+		end,
 		new = function()
 			ucore_new.create(tail)
 		end,
@@ -63,6 +66,7 @@ function M.register()
 				"signature",
 				"blueprint",
 				"rename",
+				"install",
 				"new",
 				"help",
 			}

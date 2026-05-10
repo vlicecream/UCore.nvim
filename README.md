@@ -204,6 +204,7 @@ When companion plugins emit runtime output into UCore, a bottom tabbed workspace
 :UCore explorer        " toggle the explorer
 :UCore find [pattern]
 :UCore goto <definition|declaration|implementation|references|source>
+:UCore install
 :UCore help
 :checkhealth ucore
 ```
@@ -502,6 +503,7 @@ UCore 自己主要负责：
 :UCore explorer        " 切换 explorer
 :UCore find [pattern]
 :UCore goto <definition|declaration|implementation|references|source>
+:UCore install
 :UCore help
 :checkhealth ucore
 ```

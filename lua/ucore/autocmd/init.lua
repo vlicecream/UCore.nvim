@@ -1,5 +1,6 @@
 local bootstrap = require("ucore.bootstrap")
 local config = require("ucore.config")
+local init_popup = require("ucore.init_popup")
 local project = require("ucore.project")
 
 local M = {}
@@ -64,10 +65,6 @@ end
 -- Try to auto boot from context. Retries up to 3 times with delays.
 -- 从上下文尝试自动启动。最多重试 3 次，静默跳过。
 local function try_auto_boot(args)
-	if not config.values.auto_boot then
-		return
-	end
-
 	local bufnr = args and args.buf or vim.api.nvim_get_current_buf()
 	if not buffer_allows_auto_boot(bufnr) then
 		return
@@ -92,6 +89,10 @@ local function try_auto_boot(args)
 		local root = project.find_project_root(buffer_path)
 		if root then
 			attempts_scheduled = false
+			init_popup.maybe_open(root)
+			if not config.values.auto_boot then
+				return
+			end
 			require("ucore.explorer").auto_open_for_project(root)
 			if not find_warm_requested[root] then
 				find_warm_requested[root] = true
