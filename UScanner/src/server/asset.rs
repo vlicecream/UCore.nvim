@@ -1,10 +1,12 @@
 use anyhow::Result;
 use rayon::prelude::*;
+use regex::Regex;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use tracing::{debug, info, warn};
 
 use crate::server::state::{AppState, AssetGraph};
@@ -14,7 +16,22 @@ use crate::uasset::UAssetParser;
 
 const DISCOVERY_MAX_DEPTH: usize = 4;
 const LOG_EVERY: usize = 1000;
-const ASSET_INDEX_VERSION: i32 = 2;
+const ASSET_INDEX_VERSION: i32 = 3;
+
+fn script_path_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"/Script/[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+").unwrap())
+}
+
+fn game_path_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"/Game/[A-Za-z0-9_/]+(?:[.:][A-Za-z0-9_]+)?").unwrap())
+}
+
+fn ident_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"[A-Za-z_][A-Za-z0-9_]{2,}").unwrap())
+}
 
 /// Run a targeted asset scan for one Unreal project root.
 /// 对一个 Unreal 工程根目录执行定向资产扫描。
@@ -432,15 +449,16 @@ fn collect_candidate_assets(content_dirs: &[PathBuf]) -> Vec<PathBuf> {
 /// 把单个资产文件解析成 AssetRecord。
 pub fn parse_asset_record(path: &Path) -> Result<AssetRecord> {
     let path = path.to_path_buf();
+    let parse_path = path.clone();
 
     let parse_result = std::panic::catch_unwind(move || {
         let mut parser = UAssetParser::new();
         parser
-            .parse(&path)
+            .parse(&parse_path)
             .map(|_| AssetRecord {
-                asset_path: to_asset_path(&path),
-                source_path: normalize_path(&path),
-                mtime: file_mtime(&path),
+                asset_path: to_asset_path(&parse_path),
+                source_path: normalize_path(&parse_path),
+                mtime: file_mtime(&parse_path),
                 parent_class: parser.parent_class,
                 imports: parser.imports,
                 functions: parser.functions,
@@ -448,9 +466,66 @@ pub fn parse_asset_record(path: &Path) -> Result<AssetRecord> {
     });
 
     match parse_result {
-        Ok(result) => result,
-        Err(_) => Err(anyhow::anyhow!("panic while parsing asset")),
+        Ok(Ok(record)) => Ok(record),
+        Ok(Err(err)) => fallback_parse_asset_record(&path).or(Err(err)),
+        Err(_) => fallback_parse_asset_record(&path).or_else(|_| Err(anyhow::anyhow!("panic while parsing asset"))),
     }
+}
+
+fn fallback_parse_asset_record(path: &Path) -> Result<AssetRecord> {
+    let bytes = std::fs::read(path)?;
+    let strings = extract_ascii_strings(&bytes, 4);
+    let parent_class = detect_parent_class_from_strings(&strings);
+    let asset_path = to_asset_path(path);
+    let mut imports = HashSet::new();
+    let mut functions = HashSet::new();
+
+    for text in &strings {
+        for capture in script_path_re().find_iter(text) {
+            let value = capture.as_str();
+            if should_index_import_path(value, &asset_path) {
+                imports.insert(value.to_string());
+            }
+        }
+
+        for capture in game_path_re().find_iter(text) {
+            let value = capture.as_str();
+            if should_index_import_path(value, &asset_path) {
+                imports.insert(value.to_string());
+            }
+        }
+
+        for capture in ident_re().find_iter(text) {
+            let token = capture.as_str();
+            if looks_like_unreal_type_token(token) {
+                imports.insert(token.to_string());
+            }
+            if looks_like_blueprint_function_token(token) {
+                functions.insert(token.to_string());
+            }
+        }
+    }
+
+    if imports.is_empty() && functions.is_empty() && parent_class.is_none() {
+        return Err(anyhow::anyhow!("asset fallback found no indexable symbols"));
+    }
+
+    let mut imports = imports.into_iter().collect::<Vec<_>>();
+    imports.sort();
+    imports.dedup();
+
+    let mut functions = functions.into_iter().collect::<Vec<_>>();
+    functions.sort();
+    functions.dedup();
+
+    Ok(AssetRecord {
+        asset_path,
+        source_path: normalize_path(path),
+        mtime: file_mtime(path),
+        parent_class,
+        imports,
+        functions,
+    })
 }
 
 // -----------------------------------------------------------------------------
@@ -744,6 +819,145 @@ fn collect_asset_rows<P: rusqlite::Params>(
     Ok(())
 }
 
+fn extract_ascii_strings(bytes: &[u8], min_len: usize) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut current = Vec::new();
+
+    for byte in bytes {
+        if (32..=126).contains(byte) {
+            current.push(*byte);
+            continue;
+        }
+
+        if current.len() >= min_len {
+            values.push(String::from_utf8_lossy(&current).to_string());
+        }
+        current.clear();
+    }
+
+    if current.len() >= min_len {
+        values.push(String::from_utf8_lossy(&current).to_string());
+    }
+
+    values
+}
+
+fn detect_parent_class_from_strings(strings: &[String]) -> Option<String> {
+    let mut best: Option<(i32, String)> = None;
+
+    for text in strings {
+        for capture in script_path_re().find_iter(text) {
+            let candidate = capture.as_str();
+            if !looks_like_parent_class_candidate(candidate) {
+                continue;
+            }
+
+            let score = parent_class_score(candidate);
+            let replace = best
+                .as_ref()
+                .map(|(best_score, _)| score > *best_score)
+                .unwrap_or(true);
+
+            if replace {
+                best = Some((score, candidate.to_string()));
+            }
+        }
+    }
+
+    best.map(|(_, value)| value)
+}
+
+fn looks_like_parent_class_candidate(candidate: &str) -> bool {
+    if !candidate.starts_with("/Script/") || !candidate.contains('.') {
+        return false;
+    }
+
+    let class_name = candidate.rsplit('.').next().unwrap_or(candidate);
+    !matches!(
+        class_name,
+        "Class" | "Package" | "MetaData" | "BlueprintGeneratedClass" | "Default__Object"
+    )
+}
+
+fn parent_class_score(candidate: &str) -> i32 {
+    let module = candidate
+        .strip_prefix("/Script/")
+        .and_then(|value| value.split('.').next())
+        .unwrap_or("");
+
+    if !matches!(module, "CoreUObject" | "Engine" | "UnrealEd") {
+        return 100;
+    }
+
+    if module == "Engine" {
+        return 20;
+    }
+
+    10
+}
+
+fn should_index_import_path(value: &str, asset_path: &str) -> bool {
+    if value.eq_ignore_ascii_case(asset_path) {
+        return false;
+    }
+
+    !value.ends_with(".Class")
+}
+
+fn looks_like_blueprint_function_token(token: &str) -> bool {
+    if token.len() < 3 || token.len() > 80 {
+        return false;
+    }
+
+    if token.ends_with("_C")
+        || token.ends_with("_GEN_VARIABLE")
+        || token.starts_with("Default__")
+        || token.starts_with("ExecuteUbergraph_")
+        || token.starts_with("K2Node_")
+        || token.starts_with("SKEL_")
+        || token.starts_with("REINST_")
+    {
+        return false;
+    }
+
+    if token.contains("__") {
+        return false;
+    }
+
+    let has_upper = token.chars().any(|ch| ch.is_ascii_uppercase());
+    let has_lower = token.chars().any(|ch| ch.is_ascii_lowercase());
+    has_upper && has_lower
+}
+
+fn looks_like_unreal_type_token(token: &str) -> bool {
+    if token.len() < 3 || token.len() > 100 {
+        return false;
+    }
+
+    if token.ends_with("_C")
+        || token.ends_with("_GEN_VARIABLE")
+        || token.starts_with("Default__")
+        || token.starts_with("SKEL_")
+        || token.starts_with("REINST_")
+    {
+        return false;
+    }
+
+    let mut chars = token.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    let Some(second) = chars.next() else {
+        return false;
+    };
+
+    if !matches!(first, 'A' | 'U' | 'F' | 'S' | 'E' | 'T' | 'I') || !second.is_ascii_uppercase() {
+        return false;
+    }
+
+    token.chars().any(|ch| ch.is_ascii_lowercase())
+}
+
 fn make_asset_lookup_names(input: &str) -> Vec<String> {
     let class_name = if input.starts_with("/Script/") {
         input.rsplit('.').next().unwrap_or(input)
@@ -789,7 +1003,11 @@ fn normalize_path(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::make_asset_lookup_names;
+    use super::{
+        detect_parent_class_from_strings, extract_ascii_strings, looks_like_blueprint_function_token,
+        looks_like_unreal_type_token,
+        make_asset_lookup_names,
+    };
 
     #[test]
     fn lookup_names_include_prefixed_and_unprefixed_class_names() {
@@ -801,5 +1019,38 @@ mod tests {
     fn lookup_names_handle_script_paths() {
         let names = make_asset_lookup_names("/Script/SimpleBeta.SHero");
         assert_eq!(names, vec!["hero", "shero"]);
+    }
+
+    #[test]
+    fn fallback_parent_class_prefers_project_script_class() {
+        let strings = vec![
+            "/Script/Engine.BlueprintGeneratedClass".to_string(),
+            "/Script/CoreUObject.Class".to_string(),
+            "/Script/SimpleBeta.SHero".to_string(),
+        ];
+        assert_eq!(
+            detect_parent_class_from_strings(&strings),
+            Some("/Script/SimpleBeta.SHero".to_string())
+        );
+    }
+
+    #[test]
+    fn fallback_ascii_string_extraction_keeps_printable_sequences() {
+        let strings = extract_ascii_strings(b"\0/Game/Test/BP_Hero\0SHero\0", 4);
+        assert_eq!(strings, vec!["/Game/Test/BP_Hero", "SHero"]);
+    }
+
+    #[test]
+    fn fallback_function_token_filters_noise() {
+        assert!(looks_like_blueprint_function_token("RefreshCurrency"));
+        assert!(!looks_like_blueprint_function_token("ExecuteUbergraph_BP_Hero"));
+        assert!(!looks_like_blueprint_function_token("BP_Hero_C"));
+    }
+
+    #[test]
+    fn fallback_type_token_accepts_unreal_style_class_names() {
+        assert!(looks_like_unreal_type_token("SInventoryManagerComponent"));
+        assert!(looks_like_unreal_type_token("UWeaponForgeMain"));
+        assert!(!looks_like_unreal_type_token("RefreshCurrency"));
     }
 }
