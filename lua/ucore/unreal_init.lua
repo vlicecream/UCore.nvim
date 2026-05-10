@@ -145,28 +145,18 @@ local function install_missing(project_root, missing, scope, callback)
 		local task_key = plugin_task_key(id)
 		status.unreal_step(task_key, "Preparing " .. spec.display_name .. "...")
 
-		local ok, result = install.install_named(id, scope, function(progress)
-			if progress.message then
-				status.unreal_step(task_key, progress.message)
-				return
+		install.install_named_async(id, scope, function(progress)
+			status.unreal_step(task_key, install.progress_message(id, progress))
+		end, function(ok, result)
+			if ok then
+				finish_step(task_key, spec.display_name .. " Installed")
+			else
+				finish_step(task_key, spec.display_name .. " Install Failed")
+				vim.notify("UCore Unreal Init: plugin install failed\n" .. tostring(result), vim.log.levels.WARN)
 			end
 
-			status.unreal_step(task_key, string.format(
-				"%s %.1f MB / %.1f MB",
-				spec.display_name,
-				(tonumber(progress.current_bytes or 0) or 0) / 1024 / 1024,
-				(tonumber(progress.total_bytes or 0) or 0) / 1024 / 1024
-			))
+			step()
 		end)
-
-		if ok then
-			finish_step(task_key, spec.display_name .. " Installed")
-		else
-			finish_step(task_key, spec.display_name .. " Install Failed")
-			vim.notify("UCore Unreal Init: plugin install failed\n" .. tostring(result), vim.log.levels.WARN)
-		end
-
-		step()
 	end
 
 	step()

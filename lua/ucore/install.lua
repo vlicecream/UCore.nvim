@@ -218,6 +218,54 @@ local function copy_tree(src, dst, progress)
 	return true, dst
 end
 
+local function copy_tree_async(src, dst, progress, callback)
+	src = normalize(src)
+	dst = normalize(dst)
+
+	if not is_dir(src) then
+		return callback(false, "source directory missing: " .. tostring(src))
+	end
+
+	mkdirp(dst)
+
+	local files, total_bytes = collect_tree_files(src)
+	local copied_bytes = 0
+	local index = 0
+
+	local function report()
+		if type(progress) == "function" then
+			progress({
+				phase = "copy",
+				current_bytes = copied_bytes,
+				total_bytes = total_bytes,
+			})
+		end
+	end
+
+	report()
+
+	local function step()
+		index = index + 1
+		if index > #files then
+			return callback(true, dst)
+		end
+
+		local item = files[index]
+		local relative = item.path:sub(#src + 2)
+		local target = path_join(dst, relative)
+		local ok, err = copy_file(item.path, target)
+		if not ok then
+			return callback(false, string.format("copy failed: %s -> %s (%s)", item.path, target, tostring(err)))
+		end
+
+		copied_bytes = copied_bytes + item.size
+		report()
+		vim.schedule(step)
+	end
+
+	vim.schedule(step)
+end
+
 local function run_system(cmd, opts)
 	opts = opts or {}
 	return vim.system(cmd, {
@@ -225,6 +273,19 @@ local function run_system(cmd, opts)
 		cwd = opts.cwd,
 		env = opts.env,
 	}):wait()
+end
+
+local function run_system_async(cmd, opts, callback)
+	opts = opts or {}
+	vim.system(cmd, {
+		text = true,
+		cwd = opts.cwd,
+		env = opts.env,
+	}, function(result)
+		vim.schedule(function()
+			callback(result)
+		end)
+	end)
 end
 
 local function command_error(result, fallback)
@@ -376,6 +437,79 @@ local function fetch_remote_plugin(spec, progress)
 	}
 end
 
+local function fetch_remote_plugin_async(spec, progress, callback)
+	local temp_dir = temp_install_dir(spec)
+	local repo_dir = path_join(temp_dir, "repo")
+
+	rm_rf(temp_dir)
+	mkdirp(temp_dir)
+
+	if type(progress) == "function" then
+		progress({
+			phase = "download",
+			percent = 5,
+			text = string.format("%s 5%% Preparing download", spec.display_name),
+		})
+	end
+
+	run_system_async({
+		"git",
+		"clone",
+		"--depth",
+		"1",
+		"--filter=blob:none",
+		"--sparse",
+		remote_repo_url,
+		repo_dir,
+	}, nil, function(clone_result)
+		if clone_result.code ~= 0 then
+			rm_rf(temp_dir)
+			return callback(false, command_error(clone_result, "git clone failed"))
+		end
+
+		if type(progress) == "function" then
+			progress({
+				phase = "download",
+				percent = 55,
+				text = string.format("%s 55%% Repository downloaded", spec.display_name),
+			})
+		end
+
+		run_system_async({
+			"git",
+			"-C",
+			repo_dir,
+			"sparse-checkout",
+			"set",
+			spec.repo_subdir or spec.folder_name,
+		}, nil, function(sparse_result)
+			if sparse_result.code ~= 0 then
+				rm_rf(temp_dir)
+				return callback(false, command_error(sparse_result, "git sparse-checkout failed"))
+			end
+
+			local source_dir = path_join(repo_dir, spec.repo_subdir or spec.folder_name)
+			if not plugin_installed(spec, source_dir) then
+				rm_rf(temp_dir)
+				return callback(false, spec.display_name .. " is missing from remote repository")
+			end
+
+			if type(progress) == "function" then
+				progress({
+					phase = "download",
+					percent = 70,
+					text = string.format("%s 70%% Package ready", spec.display_name),
+				})
+			end
+
+			callback(true, {
+				temp_dir = temp_dir,
+				source_dir = source_dir,
+			})
+		end)
+	end)
+end
+
 local function install_spec(spec, scope, progress)
 	local root, _, err = resolve_install_root(scope)
 	if not root then
@@ -414,6 +548,46 @@ local function install_spec(spec, scope, progress)
 	end
 
 	return true, target_dir
+end
+
+local function install_spec_async(spec, scope, progress, callback)
+	local root, _, err = resolve_install_root(scope)
+	if not root then
+		return callback(false, err)
+	end
+
+	local target_dir = plugin_target(spec, scope, root)
+	local ok, safe_err = ensure_safe_target(spec, scope, root, target_dir)
+	if not ok then
+		return callback(false, safe_err)
+	end
+
+	fetch_remote_plugin_async(spec, progress, function(fetched, fetched_result)
+		if not fetched then
+			return callback(false, fetched_result)
+		end
+
+		local payload = fetched_result
+		rm_rf(target_dir)
+		mkdirp(vim.fn.fnamemodify(target_dir, ":h"):gsub("\\", "/"))
+
+		if type(progress) == "function" then
+			progress({
+				phase = "copy",
+				current_bytes = 0,
+				total_bytes = 0,
+				text = string.format("%s 72%% Installing files", spec.display_name),
+			})
+		end
+
+		copy_tree_async(payload.source_dir, target_dir, progress, function(copied, copy_result)
+			rm_rf(payload.temp_dir)
+			if not copied then
+				return callback(false, copy_result)
+			end
+			callback(true, target_dir)
+		end)
+	end)
 end
 
 local function status_for_spec(spec, project_root)
@@ -490,6 +664,30 @@ function M.resolve_plugin(name)
 	return vim.deepcopy(spec)
 end
 
+function M.progress_message(name, progress)
+	local spec = type(name) == "table" and name or plugin_spec(name)
+	local display_name = spec and spec.display_name or tostring(name or "Plugin")
+	progress = progress or {}
+
+	if progress.text and progress.text ~= "" then
+		return tostring(progress.text)
+	end
+
+	if progress.phase == "copy" then
+		local total = tonumber(progress.total_bytes or 0) or 0
+		local current = tonumber(progress.current_bytes or 0) or 0
+		local percent = total > 0 and math.floor(72 + ((current / total) * 23)) or 72
+		return string.format("%s %d%% %s / %s", display_name, percent, format_mb(current), format_mb(total))
+	end
+
+	if progress.phase == "download" then
+		local percent = tonumber(progress.percent or 0) or 0
+		return string.format("%s %d%% Downloading", display_name, percent)
+	end
+
+	return display_name .. " Working..."
+end
+
 function M.completion_items(tail, arglead)
 	local raw = tostring(tail or "")
 	local args = split_args(vim.trim(raw))
@@ -531,6 +729,14 @@ function M.install_named(name, scope, progress)
 		return false, "unknown plugin: " .. tostring(name)
 	end
 	return install_spec(spec, scope, progress)
+end
+
+function M.install_named_async(name, scope, progress, callback)
+	local spec = plugin_spec(name)
+	if not spec then
+		return callback(false, "unknown plugin: " .. tostring(name))
+	end
+	return install_spec_async(spec, scope, progress, callback)
 end
 
 local function notify_result(lines, level)
@@ -610,30 +816,42 @@ local function prompt_plugin(callback)
 end
 
 local function run_install(spec, scope)
-	install_status_start("Installing Unreal editor integration...")
-	install_status_progress(spec.task_key, "Preparing " .. spec.display_name .. "...")
+	local function run_install_many(specs, install_scope)
+		install_status_start("Installing Unreal editor integration...")
+		local index = 0
+		local all_ok = true
+		local details = {}
 
-	local ok, result = install_spec(spec, scope, function(progress)
-		if progress.message then
-			install_status_progress(spec.task_key, progress.message)
-			return
+		local function step()
+			index = index + 1
+			if index > #specs then
+				return install_status_done(
+					all_ok,
+					all_ok and "UCore Install Complete" or "UCore Install Failed",
+					table.concat(details, "\n")
+				)
+			end
+
+			local current = specs[index]
+			install_status_progress(current.task_key, "Preparing " .. current.display_name .. "...")
+			install_spec_async(current, install_scope, function(progress)
+				install_status_progress(current.task_key, M.progress_message(current, progress))
+			end, function(ok, result)
+				if ok then
+					install_status_finish(current.task_key, current.display_name .. " installed: " .. tostring(result))
+				else
+					install_status_finish(current.task_key, current.display_name .. " install failed")
+				end
+				all_ok = all_ok and ok
+				table.insert(details, current.display_name .. ": " .. tostring(result))
+				step()
+			end)
 		end
 
-		install_status_progress(spec.task_key, string.format(
-			"%s %s / %s",
-			spec.display_name,
-			format_mb(progress.current_bytes),
-			format_mb(progress.total_bytes)
-		))
-	end)
-
-	if ok then
-		install_status_finish(spec.task_key, spec.display_name .. " installed: " .. tostring(result))
-	else
-		install_status_finish(spec.task_key, spec.display_name .. " install failed")
+		step()
 	end
 
-	return install_status_done(ok, ok and "UCore Install Complete" or "UCore Install Failed", tostring(result))
+	return run_install_many({ spec }, scope)
 end
 
 function M.run(tail)
@@ -673,6 +891,52 @@ function M.run(tail)
 			end
 
 			run_install(spec, scope)
+		end)
+	end
+
+	if command == "all" then
+		local specs = {}
+		for _, key in ipairs(plugin_order) do
+			table.insert(specs, plugin_specs[key])
+		end
+
+		return prompt_scope(function(scope)
+			if not scope then
+				return
+			end
+
+			install_status_start("Installing Unreal editor integration...")
+			local index = 0
+			local all_ok = true
+			local details = {}
+
+			local function step()
+				index = index + 1
+				if index > #specs then
+					return install_status_done(
+						all_ok,
+						all_ok and "UCore Install Complete" or "UCore Install Failed",
+						table.concat(details, "\n")
+					)
+				end
+
+				local spec = specs[index]
+				install_status_progress(spec.task_key, "Preparing " .. spec.display_name .. "...")
+				install_spec_async(spec, scope, function(progress)
+					install_status_progress(spec.task_key, M.progress_message(spec, progress))
+				end, function(ok, result)
+					if ok then
+						install_status_finish(spec.task_key, spec.display_name .. " installed: " .. tostring(result))
+					else
+						install_status_finish(spec.task_key, spec.display_name .. " install failed")
+					end
+					all_ok = all_ok and ok
+					table.insert(details, spec.display_name .. ": " .. tostring(result))
+					step()
+				end)
+			end
+
+			step()
 		end)
 	end
 
