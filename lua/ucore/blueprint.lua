@@ -395,7 +395,7 @@ local function show_target_picker(target, items)
 	end
 
 	ui.select.find(items, {
-		default_text = target.name,
+		default_text = "",
 	})
 end
 
