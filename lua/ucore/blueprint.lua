@@ -105,10 +105,7 @@ end
 
 local function relation_label(target_kind, category)
 	if target_kind == "class" then
-		if category == "derived" then
-			return "Derived Blueprint"
-		end
-		return "Blueprint Reference"
+		return "Derived Blueprint"
 	end
 
 	if category == "derived" then
@@ -148,10 +145,9 @@ local function push_unique_asset(items, seen, asset_path, category, target)
 	table.insert(items, asset_item(asset_path, category, target))
 end
 
-local function class_hint_text(derived_count, reference_count)
+local function class_hint_text(derived_count)
 	derived_count = tonumber(derived_count or 0) or 0
-	reference_count = tonumber(reference_count or 0) or 0
-	return string.format("Blueprint Derived %d  Refs %d", derived_count, reference_count)
+	return string.format("Blueprint Derived %d", derived_count)
 end
 
 local function member_hint_text(reference_count)
@@ -465,10 +461,6 @@ local function collect_class_assets(ctx, target)
 		local items = {}
 		local seen = {}
 
-		for _, asset_path in ipairs(list_value(references and references.references)) do
-			push_unique_asset(items, seen, asset_path, "references", target)
-		end
-
 		for _, asset_path in ipairs(list_value(references and references.derived)) do
 			push_unique_asset(items, seen, asset_path, "derived", target)
 		end
@@ -480,11 +472,9 @@ end
 local function fetch_class_hint(root, target, callback)
 	get_asset_usages_cached(root, target.name, function(usage_result)
 		local derived_count = type(usage_result) == "table" and #list_value(usage_result.derived) or 0
-		local reference_count = type(usage_result) == "table" and #list_value(usage_result.references) or 0
 		callback(vim.tbl_extend("force", target, {
 			derived_count = derived_count,
-			reference_count = reference_count,
-			hint_text = class_hint_text(derived_count, reference_count),
+			hint_text = class_hint_text(derived_count),
 		}))
 	end)
 end
