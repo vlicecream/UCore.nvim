@@ -359,6 +359,36 @@ local function resolve_target_from_parse(ctx, parse_result)
 	return nil
 end
 
+local function resolve_class_target_from_symbols(ctx, parse_result)
+	local symbols = type(parse_result) == "table" and parse_result.symbols or {}
+	local current_line = (tonumber(ctx.line or 0) or 0) + 1
+	local cword = text_value(ctx.cword)
+
+	for _, symbol in ipairs(list_value(symbols)) do
+		local symbol_name = text_value(symbol.name)
+		local symbol_line = tonumber(symbol.line or 0) or 0
+		local symbol_end_line = tonumber(symbol.end_line or symbol_line) or symbol_line
+		local symbol_kind = text_value(symbol.kind)
+
+		if symbol_name ~= ""
+			and is_class_like_symbol(symbol_kind)
+			and current_line >= symbol_line
+			and current_line <= symbol_end_line
+			and (cword == "" or class_names_match(symbol_name, cword))
+		then
+			return {
+				kind = "class",
+				name = symbol_name,
+				line = symbol_line,
+				path = text_value(symbol.file_path),
+				class_item = symbol,
+			}
+		end
+	end
+
+	return nil
+end
+
 local function resolve_target(ctx, callback)
 	remote.parse_buffer(ctx.root, {
 		content = ctx.content,
@@ -367,9 +397,19 @@ local function resolve_target(ctx, callback)
 		character = ctx.character,
 	}, function(parse_result, parse_err)
 		local parsed_target = not parse_err and resolve_target_from_parse(ctx, parse_result) or nil
+		local parsed_class_target = not parse_err and resolve_class_target_from_symbols(ctx, parse_result) or nil
+
+		if parsed_class_target then
+			return callback(parsed_class_target, nil)
+		end
+
+		if parsed_target then
+			return callback(parsed_target, parse_err)
+		end
+
 		local cword = ctx.cword
 		if cword == "" then
-			return callback(parsed_target, parse_err)
+			return callback(nil, parse_err)
 		end
 
 		remote.search_class_symbols(ctx.root, cword, function(search_result, _)
