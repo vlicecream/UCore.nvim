@@ -17,7 +17,7 @@ private:
 	void ProcessRequestFile(const FString& FilePath);
 	void OpenAssetPath(const FString& AssetPath);
 
-	FDelegateHandle TickerHandle;
+	FTSTicker::FDelegateHandle TickerHandle;
 	FString RequestDirectory;
 	FString SessionDirectory;
 	FString SessionFilePath;

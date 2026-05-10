@@ -146,7 +146,7 @@ void FNeovimLinkModule::WriteSessionHeartbeat(bool bForce)
 	NeovimLink::WriteJsonFile(SessionFilePath, Object);
 }
 
-	void FNeovimLinkModule::ProcessRequests()
+void FNeovimLinkModule::ProcessRequests()
 {
 	TArray<FString> Names;
 	IFileManager::Get().FindFiles(Names, *FPaths::Combine(RequestDirectory, TEXT("*.json")), true, false);
