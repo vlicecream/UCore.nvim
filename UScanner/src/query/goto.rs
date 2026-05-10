@@ -218,6 +218,10 @@ fn strip_namespace(name: &str) -> String {
     name.rsplit("::").next().unwrap_or(name).trim().to_string()
 }
 
+fn is_current_class_alias(name: &str) -> bool {
+    matches!(name.trim(), "ThisClass" | "Super")
+}
+
 // -----------------------------------------------------------------------------
 // Cursor context extraction
 // -----------------------------------------------------------------------------
@@ -1002,7 +1006,7 @@ fn member_order_by_clause(prefer_impl: bool) -> String {
 fn resolve_impl_class(ctx: &CursorCtx, content: &str, cursor_line: u32) -> Option<String> {
     if let Some(ref qualifier) = ctx.qualifier {
         if ctx.qualifier_op.as_deref() == Some("::") {
-            if qualifier == "Super" {
+            if is_current_class_alias(qualifier) {
                 return ctx.enclosing_class.clone();
             }
             return Some(qualifier.clone());
@@ -1021,7 +1025,7 @@ fn resolve_lookup_class(ctx: &CursorCtx, content: &str, cursor_line: u32) -> Opt
     if let Some(ref qualifier) = ctx.qualifier {
         return match ctx.qualifier_op.as_deref() {
             Some("::") => {
-                if qualifier == "Super" {
+                if is_current_class_alias(qualifier) {
                     ctx.enclosing_class.clone()
                 } else {
                     Some(clean_type(qualifier))
@@ -1532,7 +1536,7 @@ fn resolve_signature_class(
     if let Some(ref qualifier) = ctx.qualifier {
         return match ctx.qualifier_op.as_deref() {
             Some("::") => {
-                if qualifier == "Super" {
+                if is_current_class_alias(qualifier) {
                     ctx.enclosing_class.clone()
                 } else {
                     Some(clean_type(qualifier))
@@ -2168,7 +2172,7 @@ fn goto_definition_inner(
     if let Some(ref qualifier) = ctx.qualifier {
         let resolved_class = match ctx.qualifier_op.as_deref() {
             Some("::") => {
-                if qualifier == "Super" {
+                if is_current_class_alias(qualifier) {
                     ctx.enclosing_class.clone().unwrap_or_else(|| qualifier.clone())
                 } else {
                     qualifier.clone()
@@ -2581,7 +2585,7 @@ fn tokens(text: &str) -> Vec<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{find_local_declaration, infer_var_type};
+    use super::{extract_cursor_context, find_local_declaration, infer_var_type, resolve_impl_class};
 
     const SAMPLE: &str = r#"
 void StartDeath()
@@ -2601,6 +2605,19 @@ void ActivateAbility()
     UAbilitySystemComponent* ASC = GetAbilitySystemComponentFromActorInfo();
     ASC->CancelAllAbilities();
 }
+"#;
+
+    const THIS_CLASS_SAMPLE: &str = r#"
+class ULyraGameplayAbility_RangedWeapon
+{
+public:
+    void ActivateAbility()
+    {
+        OnTargetDataReadyCallbackDelegateHandle =
+            MyAbilityComponent->AbilityTargetDataSetDelegate(CurrentSpecHandle, CurrentActivationInfo.GetActivationPredictionKey())
+                .AddUObject(this, &ThisClass::OnTargetDataReadyCallback);
+    }
+};
 "#;
 
     fn line_and_col(content: &str, needle: &str, occurrence: usize) -> (u32, u32) {
@@ -2647,5 +2664,32 @@ void ActivateAbility()
             .expect("expected local declaration");
 
         assert_eq!(decl.row + 1, 16);
+    }
+
+    #[test]
+    fn extract_cursor_context_keeps_thisclass_qualifier() {
+        let (line, col) = line_and_col(THIS_CLASS_SAMPLE, "&ThisClass::OnTargetDataReadyCallback", 0);
+        let col = col + "&ThisClass::".len() as u32;
+        let ctx = extract_cursor_context(THIS_CLASS_SAMPLE, line, col).expect("expected cursor context");
+
+        assert_eq!(ctx.symbol, "OnTargetDataReadyCallback");
+        assert_eq!(ctx.qualifier.as_deref(), Some("ThisClass"));
+        assert_eq!(ctx.qualifier_op.as_deref(), Some("::"));
+        assert_eq!(
+            ctx.enclosing_class.as_deref(),
+            Some("ULyraGameplayAbility_RangedWeapon")
+        );
+    }
+
+    #[test]
+    fn resolve_impl_class_maps_thisclass_to_enclosing_class() {
+        let (line, col) = line_and_col(THIS_CLASS_SAMPLE, "&ThisClass::OnTargetDataReadyCallback", 0);
+        let col = col + "&ThisClass::".len() as u32;
+        let ctx = extract_cursor_context(THIS_CLASS_SAMPLE, line, col).expect("expected cursor context");
+
+        assert_eq!(
+            resolve_impl_class(&ctx, THIS_CLASS_SAMPLE, line),
+            Some("ULyraGameplayAbility_RangedWeapon".to_string())
+        );
     }
 }
