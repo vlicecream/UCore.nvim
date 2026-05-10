@@ -511,13 +511,9 @@ bool FNvimSourceCodeAccessor::ResolveBridgeRemoteLocation(const FString& Project
 	}
 
 	const FString NormalizedProjectRoot = NormalizeComparablePath(ProjectRoot);
-	if (NormalizedProjectRoot.IsEmpty())
-	{
-		return false;
-	}
-
 	const TSharedPtr<FJsonObject>* ProjectObject = nullptr;
-	if (!(*ProjectsObject)->TryGetObjectField(ProjectRoot, ProjectObject) || !ProjectObject || !ProjectObject->IsValid())
+	if (!NormalizedProjectRoot.IsEmpty()
+		&& (!(*ProjectsObject)->TryGetObjectField(ProjectRoot, ProjectObject) || !ProjectObject || !ProjectObject->IsValid()))
 	{
 		for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : (*ProjectsObject)->Values)
 		{
@@ -534,13 +530,57 @@ bool FNvimSourceCodeAccessor::ResolveBridgeRemoteLocation(const FString& Project
 		}
 	}
 
-	if (!ProjectObject || !ProjectObject->IsValid())
+	FString ServerName;
+	if (ProjectObject && ProjectObject->IsValid())
 	{
-		return false;
+		(*ProjectObject)->TryGetStringField(TEXT("server"), ServerName);
 	}
 
-	FString ServerName;
-	if (!(*ProjectObject)->TryGetStringField(TEXT("server"), ServerName) || ServerName.IsEmpty())
+	if (ServerName.IsEmpty())
+	{
+		const TSharedPtr<FJsonObject>* SessionsObject = nullptr;
+		if (!RootObject->TryGetObjectField(TEXT("sessions"), SessionsObject) || !SessionsObject || !SessionsObject->IsValid())
+		{
+			return false;
+		}
+
+		int64 LatestSeen = -1;
+		for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : (*SessionsObject)->Values)
+		{
+			if (!Pair.Value.IsValid() || Pair.Value->Type != EJson::Object)
+			{
+				continue;
+			}
+
+			const TSharedPtr<FJsonObject> SessionObject = Pair.Value->AsObject();
+			if (!SessionObject.IsValid())
+			{
+				continue;
+			}
+
+			FString CandidateServerName;
+			if (!SessionObject->TryGetStringField(TEXT("server"), CandidateServerName) || CandidateServerName.IsEmpty())
+			{
+				CandidateServerName = Pair.Key;
+			}
+
+			if (CandidateServerName.IsEmpty())
+			{
+				continue;
+			}
+
+			double CandidateLastSeenValue = 0.0;
+			SessionObject->TryGetNumberField(TEXT("last_seen"), CandidateLastSeenValue);
+			const int64 CandidateLastSeen = static_cast<int64>(CandidateLastSeenValue);
+			if (ServerName.IsEmpty() || CandidateLastSeen >= LatestSeen)
+			{
+				ServerName = CandidateServerName;
+				LatestSeen = CandidateLastSeen;
+			}
+		}
+	}
+
+	if (ServerName.IsEmpty())
 	{
 		return false;
 	}
