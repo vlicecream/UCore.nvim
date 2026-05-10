@@ -212,6 +212,27 @@ function M.search_class_symbols(project_root, pattern, callback, opts)
 	}, callback)
 end
 
+function M.find_derived_classes(project_root, base_class, callback)
+	M.query(project_root, {
+		kind = "FindDerivedClasses",
+		base_class = base_class,
+	}, callback)
+end
+
+function M.get_asset_usages(project_root, asset_path, callback)
+	M.query(project_root, {
+		kind = "GetAssetUsages",
+		asset_path = asset_path,
+	}, callback)
+end
+
+function M.get_asset_dependencies(project_root, asset_path, callback)
+	M.query(project_root, {
+		kind = "GetAssetDependencies",
+		asset_path = asset_path,
+	}, callback)
+end
+
 function M.fast_find(project_root, pattern, callback, opts)
 	if type(opts) == "number" then
 		opts = { limit = opts }

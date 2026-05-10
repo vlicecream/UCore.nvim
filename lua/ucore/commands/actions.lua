@@ -455,6 +455,10 @@ function M.signature_help()
 	require("ucore.assist").signature_help()
 end
 
+function M.blueprint()
+	require("ucore.blueprint").show_related()
+end
+
 function M.rename(tail)
 	local new_name = vim.trim(tostring(tail or ""))
 	if new_name == "" then
@@ -806,6 +810,7 @@ UCore commands:
   :UCore goto         Navigation subcommands (see :UCore goto help)
   :UCore hover        Show symbol hover under cursor
   :UCore signature    Show signature help for current call
+  :UCore blueprint    Show related Blueprint assets for symbol under cursor
   :UCore rename       Rename symbol under cursor
   :UCore help         Show this help
 ]])

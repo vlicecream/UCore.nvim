@@ -1,6 +1,7 @@
 local project = require("ucore.project")
 local remote = require("ucore.remote")
 local ui = require("ucore.ui")
+local editor = require("ucore.editor")
 
 local M = {}
 local current_content
@@ -37,24 +38,6 @@ end
 
 local function cursor_cword()
 	return tostring(vim.fn.expand("<cword>") or "")
-end
-
-local function refresh_opened_buffer_filetype(path, bufnr)
-	bufnr = bufnr or vim.api.nvim_get_current_buf()
-	if not vim.api.nvim_buf_is_valid(bufnr) then
-		return
-	end
-
-	local ok_utreesitter, utreesitter_filetype = pcall(require, "utreesitter.filetype")
-	if ok_utreesitter and utreesitter_filetype and type(utreesitter_filetype.apply_to_buffer) == "function" then
-		pcall(utreesitter_filetype.apply_to_buffer, bufnr)
-		return
-	end
-
-	local detected = vim.filetype.match({ buf = bufnr, filename = path }) or vim.filetype.match({ filename = path })
-	if detected and detected ~= "" and vim.bo[bufnr].filetype ~= detected then
-		vim.bo[bufnr].filetype = detected
-	end
 end
 
 local function find_buffer_for_path(path)
@@ -315,11 +298,7 @@ local function open_path_at(path, line, col)
 		return false
 	end
 
-	return open_result({
-		file_path = path,
-		line_number = line,
-		col = col,
-	}, { silent = true })
+	return editor.open_location(path, line, col, { silent = true })
 end
 
 local function query_parse_buffer(root, file_path, line, character, callback)
@@ -461,20 +440,7 @@ open_result = function(result, opts)
 		return false
 	end
 
-	vim.cmd.edit(vim.fn.fnameescape(path))
-	refresh_opened_buffer_filetype(path)
-
-	local last_line = math.max(1, vim.api.nvim_buf_line_count(0))
-	line = line or 1
-
-	-- Rust DB stores line numbers as 1-based in most tables.
-	-- Rust DB 大多数表里的行号是 1-based。
-	line = math.max(1, math.min(line, last_line))
-	local line_text = vim.api.nvim_buf_get_lines(0, line - 1, line, false)[1] or ""
-	col = math.max(0, math.min(col, #line_text))
-
-	vim.api.nvim_win_set_cursor(0, { line, col })
-	vim.cmd("normal! zz")
+	editor.open_location(path, line, col, { silent = true })
 
 	if source ~= "" then
 		vim.notify("UCore goto" .. source .. ": " .. tostring(path) .. ":" .. tostring(line), vim.log.levels.INFO)
@@ -629,8 +595,7 @@ function M.toggle_source()
 
 	local alt = find_alternate_source(path)
 	if alt and vim.fn.filereadable(alt) == 1 then
-		vim.cmd.edit(vim.fn.fnameescape(alt))
-		refresh_opened_buffer_filetype(alt)
+		editor.open_location(alt, 1, 0, { silent = true })
 	else
 		vim.notify("UCore: no matching source/header file found", vim.log.levels.INFO)
 	end

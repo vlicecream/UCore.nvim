@@ -29,6 +29,7 @@ function M.dispatch(args)
 		end,
 		hover = actions.hover,
 		signature = actions.signature_help,
+		blueprint = actions.blueprint,
 		rename = function()
 			actions.rename(tail)
 		end,
@@ -60,6 +61,7 @@ function M.register()
 				"goto",
 				"hover",
 				"signature",
+				"blueprint",
 				"rename",
 				"new",
 				"help",

@@ -271,6 +271,7 @@ local function default_values()
 				declaration = false,
 				references = "gr",
 				implementation = "gi",
+				blueprint = "gb",
 				source_toggle = "gs",
 				global_find = "gf",
 				hover = "K",
@@ -346,6 +347,11 @@ local function default_values()
 		semantic = {
 			enable = true,
 			debounce_ms = 120,
+		},
+
+		blueprint = {
+			enable = true,
+			debounce_ms = 300,
 		},
 
 		-- Backend executable commands resolved at setup time.
