@@ -117,7 +117,7 @@ fn mark_config_cache_dirty(state: &AppState, root_key: &str) {
 /// Handle .uasset or .umap change.
 /// 处理 .uasset 或 .umap 资产变化。
 async fn handle_asset_change(state: Arc<AppState>, root_key: String, path: PathBuf, ext: &str) {
-    if !is_important_asset(&path, ext) {
+    if !is_indexed_asset(ext) {
         return;
     }
 
@@ -153,7 +153,7 @@ async fn handle_asset_change(state: Arc<AppState>, root_key: String, path: PathB
 }
 
 async fn handle_asset_delete(state: Arc<AppState>, project: MatchedProject, path: PathBuf) {
-    if !is_important_asset(&path, &file_extension(&path)) {
+    if !is_indexed_asset(&file_extension(&path)) {
         return;
     }
 
@@ -177,21 +177,10 @@ async fn handle_asset_delete(state: Arc<AppState>, project: MatchedProject, path
     });
 }
 
-/// Return true if the asset is useful for navigation/search indexes.
-/// 判断资产是否值得进入导航/搜索索引。
-fn is_important_asset(path: &Path, ext: &str) -> bool {
-    if ext == "umap" {
-        return true;
-    }
-
-    let filename = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
-
-    filename.starts_with("BP_")
-        || filename.starts_with("ABP_")
-        || filename.starts_with("WBP_")
-        || filename.starts_with("AM_")
-        || filename.starts_with("DA_")
-        || filename.starts_with("DT_")
+/// Return true if the asset extension participates in the asset index.
+/// 判断这个资产扩展名是否会进入资产索引。
+fn is_indexed_asset(ext: &str) -> bool {
+    ext == "uasset" || ext == "umap"
 }
 
 // -----------------------------------------------------------------------------

@@ -174,6 +174,14 @@ local function member_is_blueprint_candidate(member)
 	return flags:find("UFUNCTION", 1, true) ~= nil or flags:find("UPROPERTY", 1, true) ~= nil
 end
 
+local function is_class_like_symbol(symbol_kind)
+	symbol_kind = text_value(symbol_kind):lower()
+	return symbol_kind == "class"
+		or symbol_kind == "struct"
+		or symbol_kind == "uclass"
+		or symbol_kind == "ustruct"
+end
+
 local function collect_file_targets(symbols, file_path)
 	local current_path = normalize_lower(file_path)
 	local items = {}
@@ -183,7 +191,7 @@ local function collect_file_targets(symbols, file_path)
 		local symbol_name = text_value(symbol.name)
 		local symbol_line = tonumber(symbol.line or 0) or 0
 		local symbol_kind = text_value(symbol.kind):lower()
-		if symbol_name ~= "" and symbol_line > 0 and (symbol_kind == "class" or symbol_kind == "struct") then
+		if symbol_name ~= "" and symbol_line > 0 and is_class_like_symbol(symbol_kind) then
 			local key = string.format("class:%s:%d", symbol_name, symbol_line)
 			if not seen[key] then
 				seen[key] = true
