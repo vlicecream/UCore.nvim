@@ -1310,7 +1310,11 @@ end
 -- 选择一个已注册 Unreal 项目。
 function M.projects(items, on_choice)
 	pick("UCore projects", items, function(item)
-		local engine = item.engine_association and (" [" .. item.engine_association .. "]") or ""
+		local engine_label = tostring(item.engine_association or "")
+		if engine_label == "" then
+			engine_label = tostring(item.engine_id or "")
+		end
+		local engine = engine_label ~= "" and (" [" .. engine_label .. "]") or ""
 		return string.format("%s%s - %s", item.name or item.root, engine, item.root)
 	end, on_choice)
 end

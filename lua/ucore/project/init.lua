@@ -81,6 +81,15 @@ local function is_windows()
 	return package.config:sub(1, 1) == "\\"
 end
 
+local function normalize_association(association)
+	association = tostring(association or "")
+	association = vim.trim(association)
+	if association == "" then
+		return nil
+	end
+	return association
+end
+
 -- Return a readable project cache directory name.
 -- 返回可读性较好的工程缓存目录名。
 local function project_cache_name(project_root)
@@ -409,7 +418,7 @@ function M.read_engine_association(uproject_path)
 		return nil
 	end
 
-	return data.EngineAssociation
+	return normalize_association(data.EngineAssociation)
 end
 
 -- Return display metadata for a project root.
@@ -450,10 +459,23 @@ end
 function M.list_registered_projects()
 	local registry = M.read_registry()
 	local items = {}
+	local dirty = false
 
 	for root, item in pairs(registry.projects or {}) do
 		item.root = item.root or root
+		local association = normalize_association(item.engine_association)
+		local engine_id = tostring(item.engine_id or "")
+		if association == nil or engine_id == "" or engine_id:match("^%-") then
+			local refreshed = M.project_metadata(item.root)
+			item = vim.tbl_deep_extend("force", item, refreshed)
+			registry.projects[root] = item
+			dirty = true
+		end
 		table.insert(items, item)
+	end
+
+	if dirty then
+		M.write_registry(registry)
 	end
 
 	table.sort(items, function(a, b)
@@ -560,6 +582,17 @@ function M.find_engine_root_from_config(association)
 	return nil
 end
 
+local function find_engine_association_from_config(engine_root)
+	engine_root = normalize(engine_root)
+	local roots = config.values.engine_roots or {}
+	for key, root in pairs(roots) do
+		if normalize(root) == engine_root then
+			return tostring(key)
+		end
+	end
+	return nil
+end
+
 -- Find engine root from Epic LauncherInstalled.dat.
 -- 从 Epic LauncherInstalled.dat 查找 engine root。
 function M.find_engine_root_from_launcher(association)
@@ -579,6 +612,24 @@ function M.find_engine_root_from_launcher(association)
 
 		if candidates[app_name] and M.is_engine_root(install_location) then
 			return normalize(install_location)
+		end
+	end
+
+	return nil
+end
+
+local function find_engine_association_from_launcher(engine_root)
+	engine_root = normalize(engine_root)
+	local data = read_json_file("C:/ProgramData/Epic/UnrealEngineLauncher/LauncherInstalled.dat")
+	if type(data) ~= "table" or type(data.InstallationList) ~= "table" then
+		return nil
+	end
+
+	for _, item in ipairs(data.InstallationList) do
+		local app_name = item.AppName
+		local install_location = normalize(item.InstallLocation)
+		if app_name and install_location == engine_root then
+			return tostring(app_name)
 		end
 	end
 
@@ -621,6 +672,45 @@ function M.find_engine_root_from_registry(association)
 	return nil
 end
 
+local function find_engine_association_from_registry(engine_root)
+	if not is_windows() then
+		return nil
+	end
+
+	engine_root = normalize(engine_root)
+	local result = vim.system({
+		"reg",
+		"query",
+		"HKCU\\Software\\Epic Games\\Unreal Engine\\Builds",
+	}, { text = true }):wait()
+
+	if result.code ~= 0 then
+		return nil
+	end
+
+	for line in (result.stdout or ""):gmatch("[^\r\n]+") do
+		line = vim.trim(line)
+		local name, path = line:match("^(%S+)%s+REG_SZ%s+(.+)$")
+		path = path and normalize(vim.trim(path))
+		if name and path and path == engine_root then
+			return tostring(name)
+		end
+	end
+
+	return nil
+end
+
+local function resolve_engine_association_for_root(engine_root)
+	engine_root = normalize(engine_root)
+	if not engine_root or engine_root == "" then
+		return nil
+	end
+
+	return normalize_association(find_engine_association_from_config(engine_root))
+		or normalize_association(find_engine_association_from_launcher(engine_root))
+		or normalize_association(find_engine_association_from_registry(engine_root))
+end
+
 -- Infer engine root by walking upward from a project nested inside a source tree.
 -- 当项目内嵌在源码版引擎目录中时，通过向上查找推断引擎根目录。
 function M.find_engine_root_from_project_path(project_root)
@@ -651,12 +741,12 @@ function M.resolve_engine_root(project_root)
 	project_root = normalize(project_root)
 
 	local uproject_path = M.find_project_file_in_root(project_root)
-	local association = M.read_engine_association(uproject_path)
+	local association = normalize_association(M.read_engine_association(uproject_path))
 
 	if not association or association == "" then
 		local inferred_root = M.find_engine_root_from_project_path(project_root)
 		if inferred_root then
-			return inferred_root, inferred_root
+			return inferred_root, resolve_engine_association_for_root(inferred_root)
 		end
 		return nil, "No EngineAssociation in .uproject"
 	end
@@ -683,7 +773,7 @@ function M.engine_id(engine_root, association)
 		return nil
 	end
 
-	local name = association or basename(engine_root)
+	local name = normalize_association(association) or basename(engine_root)
 	local hash = stable_hash12(normalize(engine_root))
 	return tostring(name):gsub("[^%w_.-]", "_") .. "-" .. hash
 end
@@ -697,8 +787,9 @@ function M.engine_metadata(project_root)
 		return nil, association_or_err
 	end
 
-	local uproject_path = M.find_project_file_in_root(project_root)
-	local association = M.read_engine_association(uproject_path)
+	local association = normalize_association(association_or_err)
+		or resolve_engine_association_for_root(engine_root)
+		or basename(engine_root)
 
 	return {
 		engine_association = association,
