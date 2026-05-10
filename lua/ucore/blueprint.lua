@@ -450,6 +450,9 @@ local function collect_function_or_member_assets(ctx, target)
 		for _, asset_path in ipairs(list_value(result and result.references)) do
 			push_unique_asset(items, seen, asset_path, "references", target)
 		end
+		for _, asset_path in ipairs(list_value(result and result.function_references)) do
+			push_unique_asset(items, seen, asset_path, "references", target)
+		end
 		show_target_picker(target, items)
 	end)
 end
@@ -488,7 +491,10 @@ end
 
 local function fetch_member_hint(root, target, callback)
 	get_asset_usages_cached(root, target.name, function(result)
-		local reference_count = type(result) == "table" and #list_value(result.references) or 0
+		local reference_count = 0
+		if type(result) == "table" then
+			reference_count = #list_value(result.references) + #list_value(result.function_references)
+		end
 		callback(vim.tbl_extend("force", target, {
 			reference_count = reference_count,
 			hint_text = member_hint_text(reference_count),

@@ -606,6 +606,7 @@ pub fn get_assets(conn: &Connection) -> Result<Value> {
 pub fn get_asset_usages(conn: &Connection, asset_path: &str) -> Result<Value> {
     let names = make_asset_lookup_names(asset_path);
     let mut references = HashSet::new();
+    let mut function_references = HashSet::new();
     let mut derived = HashSet::new();
 
     let mut stmt_ref = conn.prepare(
@@ -633,7 +634,7 @@ pub fn get_asset_usages(conn: &Connection, asset_path: &str) -> Result<Value> {
         collect_asset_rows(
             &mut stmt_func,
             params![name, format!("%.{}", name), format!("%:{}", name)],
-            &mut references,
+            &mut function_references,
         )?;
         collect_asset_rows(
             &mut stmt_derived,
@@ -645,6 +646,7 @@ pub fn get_asset_usages(conn: &Connection, asset_path: &str) -> Result<Value> {
     Ok(json!({
         "status": "ready",
         "references": sorted_strings(references),
+        "function_references": sorted_strings(function_references),
         "derived": sorted_strings(derived),
     }))
 }
