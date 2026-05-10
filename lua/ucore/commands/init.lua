@@ -27,7 +27,6 @@ function M.dispatch(args)
 		["goto"] = function()
 			actions.goto(tail)
 		end,
-		hover = actions.hover,
 		signature = actions.signature_help,
 		blueprint = actions.blueprint,
 		rename = function()
@@ -62,7 +61,6 @@ function M.register()
 				"explorer",
 				"find",
 				"goto",
-				"hover",
 				"signature",
 				"blueprint",
 				"rename",

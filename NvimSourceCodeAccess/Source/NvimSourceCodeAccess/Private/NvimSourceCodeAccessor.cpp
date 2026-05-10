@@ -486,13 +486,22 @@ bool FNvimSourceCodeAccessor::ResolveRemoteLocation(FRemoteLocation& OutLocation
 	}
 
 	FExecutableLocation ClientLocation;
-	if (!ResolvePathExecutable(TEXT("nvr.exe"), false, ClientLocation))
+	if (ResolvePathExecutable(TEXT("nvr.exe"), false, ClientLocation))
+	{
+		OutLocation.ClientPath = ClientLocation.Path;
+		OutLocation.ServerName = ServerName;
+		OutLocation.ClientKind = FRemoteLocation::EClientKind::Nvr;
+		return true;
+	}
+
+	if (!ResolvePathExecutable(TEXT("nvim.exe"), false, ClientLocation))
 	{
 		return false;
 	}
 
 	OutLocation.ClientPath = ClientLocation.Path;
 	OutLocation.ServerName = ServerName;
+	OutLocation.ClientKind = FRemoteLocation::EClientKind::Nvim;
 	return true;
 }
 
@@ -599,13 +608,22 @@ bool FNvimSourceCodeAccessor::ResolveBridgeRemoteLocation(const FString& Project
 	}
 
 	FExecutableLocation ClientLocation;
-	if (!ResolvePathExecutable(TEXT("nvr.exe"), false, ClientLocation))
+	if (ResolvePathExecutable(TEXT("nvr.exe"), false, ClientLocation))
+	{
+		OutLocation.ClientPath = ClientLocation.Path;
+		OutLocation.ServerName = ServerName;
+		OutLocation.ClientKind = FRemoteLocation::EClientKind::Nvr;
+		return true;
+	}
+
+	if (!ResolvePathExecutable(TEXT("nvim.exe"), false, ClientLocation))
 	{
 		return false;
 	}
 
 	OutLocation.ClientPath = ClientLocation.Path;
 	OutLocation.ServerName = ServerName;
+	OutLocation.ClientKind = FRemoteLocation::EClientKind::Nvim;
 	return true;
 }
 
@@ -657,7 +675,7 @@ bool FNvimSourceCodeAccessor::LaunchBridgeRequest(const TSharedRef<FJsonObject>&
 	);
 
 	TArray<FString> RemoteArgs;
-	RemoteArgs.Add(TEXT("--servername"));
+	RemoteArgs.Add(BridgeRemote.ClientKind == FRemoteLocation::EClientKind::Nvim ? TEXT("--server") : TEXT("--servername"));
 	RemoteArgs.Add(BridgeRemote.ServerName);
 	RemoteArgs.Add(TEXT("--remote-expr"));
 	RemoteArgs.Add(Expression);
@@ -700,7 +718,7 @@ bool FNvimSourceCodeAccessor::LaunchRemote(const TArray<FString>& Args, bool bDi
 	}
 
 	TArray<FString> RemoteArgs;
-	RemoteArgs.Add(TEXT("--servername"));
+	RemoteArgs.Add(Remote.ClientKind == FRemoteLocation::EClientKind::Nvim ? TEXT("--server") : TEXT("--servername"));
 	RemoteArgs.Add(Remote.ServerName);
 
 	if (bDirectoryTarget)

@@ -2,6 +2,7 @@ local project = require("ucore.project")
 local remote = require("ucore.remote")
 local select_ui = require("ucore.ui.select")
 local write_access = require("ucore.write_access")
+local config = require("ucore.config")
 
 local M = {}
 
@@ -68,6 +69,20 @@ local function current_context()
 		line = cursor[1] - 1,
 		character = cursor[2],
 	}, nil
+end
+
+local function hover_config()
+	local assist = config.values.assist
+	if type(assist) ~= "table" then
+		return {}
+	end
+
+	local hover = assist.hover
+	if type(hover) ~= "table" then
+		return {}
+	end
+
+	return hover
 end
 
 local function close_float()
@@ -474,11 +489,22 @@ local function ensure_project_context(opts)
 end
 
 function M.hover()
+	if hover_config().enable == false then
+		return
+	end
 	return M.hover_auto({ auto = false })
 end
 
 function M.hover_auto(opts)
 	opts = opts or {}
+	local hover = hover_config()
+	if hover.enable == false then
+		return
+	end
+	if opts.auto == true and hover.auto == false then
+		return
+	end
+
 	local ctx = ensure_project_context({
 		silent = opts.auto == true,
 	})
@@ -861,6 +887,11 @@ function M.cancel_auto_hover()
 end
 
 local function auto_hover_enabled()
+	local hover = hover_config()
+	if hover.enable == false or hover.auto == false then
+		return false
+	end
+
 	local mode = vim.api.nvim_get_mode().mode
 	return mode == "n"
 end
@@ -886,7 +917,7 @@ local function schedule_auto_hover()
 			auto = true,
 			sequence = sequence,
 		})
-	end, 80)
+	end, tonumber(hover_config().delay_ms or 80) or 80)
 end
 
 local function schedule_auto_signature()

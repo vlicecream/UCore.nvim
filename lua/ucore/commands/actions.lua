@@ -448,10 +448,6 @@ function M.references()
 	navigation.references()
 end
 
-function M.hover()
-	require("ucore.assist").hover()
-end
-
 function M.signature_help()
 	require("ucore.assist").signature_help()
 end
@@ -813,7 +809,6 @@ UCore commands:
   :UCore explorer     Toggle the left-side Project/Source/Config tree
   :UCore find         Find indexed symbols, modules, assets, config
   :UCore goto         Navigation subcommands (see :UCore goto help)
-  :UCore hover        Show symbol hover under cursor
   :UCore signature    Show signature help for current call
   :UCore blueprint    Show related Blueprint assets for symbol under cursor
   :UCore rename       Rename symbol under cursor

@@ -274,9 +274,16 @@ local function default_values()
 				blueprint = "gb",
 				source_toggle = "gs",
 				global_find = "gf",
-				hover = "K",
 				signature = "<C-k>",
 				rename = "<leader>rn",
+			},
+		},
+
+		assist = {
+			hover = {
+				enable = true,
+				auto = true,
+				delay_ms = 80,
 			},
 		},
 
