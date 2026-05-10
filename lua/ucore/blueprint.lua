@@ -12,7 +12,7 @@ local query_cache = {}
 local query_waiters = {}
 
 local function normalize_path(path)
-	return tostring(path or ""):gsub("\\", "/")
+	return tostring(path or ""):gsub("\\", "/"):gsub("/+", "/")
 end
 
 local function normalize_lower(path)
