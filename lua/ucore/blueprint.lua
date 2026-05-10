@@ -8,6 +8,8 @@ local ns = vim.api.nvim_create_namespace("ucore_blueprint")
 local group_name = "UCoreBlueprint"
 local pending = {}
 local refresh_seq = {}
+local query_cache = {}
+local query_waiters = {}
 
 local function normalize_path(path)
 	return tostring(path or ""):gsub("\\", "/")
@@ -65,6 +67,16 @@ local function trim_unreal_suffix(name)
 	return name
 end
 
+local function trim_unreal_prefix(name)
+	name = tostring(name or "")
+	local first = name:sub(1, 1)
+	local second = name:sub(2, 2)
+	if first ~= "" and second:match("%u") and first:match("[AUFETS]") then
+		return name:sub(2)
+	end
+	return name
+end
+
 local function blueprint_config()
 	local value = config.values.blueprint
 	return type(value) == "table" and value or {}
@@ -76,6 +88,14 @@ end
 
 local function debounce_ms()
 	return tonumber(blueprint_config().debounce_ms or 300) or 300
+end
+
+local function cache_ttl_ms()
+	return tonumber(blueprint_config().cache_ttl_ms or 10000) or 10000
+end
+
+local function member_hint_limit()
+	return tonumber(blueprint_config().member_hint_limit or 8) or 8
 end
 
 local function is_function_cursor(cursor_info)
@@ -236,14 +256,89 @@ local function apply_hints(bufnr, items)
 	end
 end
 
+local function class_names_match(left, right)
+	left = text_value(left)
+	right = text_value(right)
+	if left == "" or right == "" then
+		return false
+	end
+	if left == right then
+		return true
+	end
+	return trim_unreal_prefix(left) == trim_unreal_prefix(right)
+end
+
 local function exact_class_match(items, name)
-	name = text_value(name)
 	for _, item in ipairs(list_value(items)) do
-		if text_value(item.name) == name then
+		if class_names_match(item.name, name) then
 			return item
 		end
 	end
 	return nil
+end
+
+local function query_cache_key(kind, root, name)
+	return table.concat({
+		kind or "",
+		normalize_lower(root),
+		text_value(name):lower(),
+	}, "::")
+end
+
+local function get_cached_query(kind, root, name)
+	local key = query_cache_key(kind, root, name)
+	local entry = query_cache[key]
+	if not entry then
+		return nil
+	end
+	if (vim.loop.now() - entry.time) > cache_ttl_ms() then
+		query_cache[key] = nil
+		return nil
+	end
+	return entry.value
+end
+
+local function store_cached_query(kind, root, name, value)
+	query_cache[query_cache_key(kind, root, name)] = {
+		time = vim.loop.now(),
+		value = value,
+	}
+end
+
+local function push_query_waiter(kind, root, name, callback)
+	local key = query_cache_key(kind, root, name)
+	local waiters = query_waiters[key]
+	if waiters then
+		table.insert(waiters, callback)
+		return true
+	end
+	query_waiters[key] = { callback }
+	return false
+end
+
+local function flush_query_waiters(kind, root, name, result, err)
+	local key = query_cache_key(kind, root, name)
+	local waiters = query_waiters[key] or {}
+	query_waiters[key] = nil
+	for _, callback in ipairs(waiters) do
+		callback(result, err)
+	end
+end
+
+local function get_asset_usages_cached(root, name, callback)
+	local cached = get_cached_query("asset_usages", root, name)
+	if cached ~= nil then
+		return callback(cached, nil)
+	end
+	if push_query_waiter("asset_usages", root, name, callback) then
+		return
+	end
+	remote.get_asset_usages(root, name, function(result, err)
+		if not err then
+			store_cached_query("asset_usages", root, name, result)
+		end
+		flush_query_waiters("asset_usages", root, name, result, err)
+	end)
 end
 
 local function resolve_target_from_parse(ctx, parse_result)
@@ -307,7 +402,7 @@ local function show_target_picker(target, items)
 end
 
 local function collect_function_or_member_assets(ctx, target)
-	remote.get_asset_usages(ctx.root, target.name, function(result, err)
+	get_asset_usages_cached(ctx.root, target.name, function(result, err)
 		if err then
 			return vim.notify("UCore blueprint failed:\n" .. tostring(err), vim.log.levels.ERROR)
 		end
@@ -322,27 +417,12 @@ local function collect_function_or_member_assets(ctx, target)
 end
 
 local function collect_class_assets(ctx, target)
-	local pending_count = 2
-	local references = nil
-	local derived = nil
-	local first_err = nil
-
-	local function finish()
-		pending_count = pending_count - 1
-		if pending_count > 0 then
-			return
+	get_asset_usages_cached(ctx.root, target.name, function(references, err)
+		if err then
+			return vim.notify("UCore blueprint failed:\n" .. tostring(err), vim.log.levels.ERROR)
 		end
-
-		if first_err and references == nil and derived == nil then
-			return vim.notify("UCore blueprint failed:\n" .. tostring(first_err), vim.log.levels.ERROR)
-		end
-
 		local items = {}
 		local seen = {}
-
-		for _, item in ipairs(list_value(derived)) do
-			push_unique_asset(items, seen, item.asset_path or item.path or item.name, "derived", target)
-		end
 
 		for _, asset_path in ipairs(list_value(references and references.references)) do
 			push_unique_asset(items, seen, asset_path, "references", target)
@@ -353,65 +433,23 @@ local function collect_class_assets(ctx, target)
 		end
 
 		show_target_picker(target, items)
-	end
-
-	remote.find_derived_classes(ctx.root, target.name, function(result, err)
-		if err and not first_err then
-			first_err = err
-		end
-		derived = result
-		finish()
-	end)
-
-	remote.get_asset_usages(ctx.root, target.name, function(result, err)
-		if err and not first_err then
-			first_err = err
-		end
-		references = result
-		finish()
 	end)
 end
 
 local function fetch_class_hint(root, target, callback)
-	local pending_count = 2
-	local derived_result = nil
-	local usage_result = nil
-
-	local function finish()
-		pending_count = pending_count - 1
-		if pending_count > 0 then
-			return
-		end
-
-		local derived_count = #list_value(derived_result)
-		if type(usage_result) == "table" then
-			local extra_derived = #list_value(usage_result.derived)
-			if extra_derived > derived_count then
-				derived_count = extra_derived
-			end
-		end
+	get_asset_usages_cached(root, target.name, function(usage_result)
+		local derived_count = type(usage_result) == "table" and #list_value(usage_result.derived) or 0
 		local reference_count = type(usage_result) == "table" and #list_value(usage_result.references) or 0
-
 		callback(vim.tbl_extend("force", target, {
 			derived_count = derived_count,
 			reference_count = reference_count,
 			hint_text = class_hint_text(derived_count, reference_count),
 		}))
-	end
-
-	remote.find_derived_classes(root, target.name, function(result)
-		derived_result = result
-		finish()
-	end)
-
-	remote.get_asset_usages(root, target.name, function(result)
-		usage_result = result
-		finish()
 	end)
 end
 
 local function fetch_member_hint(root, target, callback)
-	remote.get_asset_usages(root, target.name, function(result)
+	get_asset_usages_cached(root, target.name, function(result)
 		local reference_count = type(result) == "table" and #list_value(result.references) or 0
 		callback(vim.tbl_extend("force", target, {
 			reference_count = reference_count,
@@ -467,6 +505,7 @@ local function refresh_buffer(bufnr)
 
 		local remaining = #targets
 		local resolved = {}
+		local member_hints = 0
 
 		local function on_item_done(item)
 			if refresh_seq[bufnr] ~= seq or not vim.api.nvim_buf_is_valid(bufnr) then
@@ -487,8 +526,11 @@ local function refresh_buffer(bufnr)
 		for _, target in ipairs(targets) do
 			if target.kind == "class" then
 				fetch_class_hint(root, target, on_item_done)
-			else
+			elseif member_hints < member_hint_limit() then
+				member_hints = member_hints + 1
 				fetch_member_hint(root, target, on_item_done)
+			else
+				on_item_done(target)
 			end
 		end
 	end)
@@ -544,7 +586,6 @@ function M.setup()
 		"BufReadPost",
 		"BufEnter",
 		"BufWritePost",
-		"TextChanged",
 		"InsertLeave",
 	}, {
 		group = group,
@@ -577,6 +618,8 @@ function M.reset()
 	end
 
 	refresh_seq = {}
+	query_cache = {}
+	query_waiters = {}
 	pcall(vim.api.nvim_del_augroup_by_name, group_name)
 
 	for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do

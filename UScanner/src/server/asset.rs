@@ -14,6 +14,7 @@ use crate::uasset::UAssetParser;
 
 const DISCOVERY_MAX_DEPTH: usize = 4;
 const LOG_EVERY: usize = 1000;
+const ASSET_INDEX_VERSION: i32 = 2;
 
 /// Run a targeted asset scan for one Unreal project root.
 /// 对一个 Unreal 工程根目录执行定向资产扫描。
@@ -115,7 +116,7 @@ impl Drop for ActiveAssetScanGuard {
 /// Return true when the persistent asset index has been initialized at least once.
 /// 判断持久化资产索引是否至少初始化过一次。
 pub fn asset_index_initialized(conn: &Connection) -> Result<bool> {
-    let value = conn
+    let initialized = conn
         .query_row(
             "SELECT value FROM project_meta WHERE key = 'asset_index_initialized'",
             [],
@@ -123,7 +124,20 @@ pub fn asset_index_initialized(conn: &Connection) -> Result<bool> {
         )
         .optional()?;
 
-    Ok(matches!(value.as_deref(), Some("1")))
+    if !matches!(initialized.as_deref(), Some("1")) {
+        return Ok(false);
+    }
+
+    let version = conn
+        .query_row(
+            "SELECT value FROM project_meta WHERE key = 'asset_index_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .and_then(|value| value.parse::<i32>().ok());
+
+    Ok(version == Some(ASSET_INDEX_VERSION))
 }
 
 /// Scan project assets and persist the result into the project DB.
@@ -379,8 +393,8 @@ fn discover_content_dirs(project_root: &Path) -> Vec<PathBuf> {
     dirs
 }
 
-/// Collect important .uasset/.umap files from Content directories.
-/// 从 Content 目录收集重要的 .uasset/.umap 文件。
+/// Collect .uasset/.umap files from Content directories.
+/// 从 Content 目录收集 .uasset/.umap 文件。
 fn collect_candidate_assets(content_dirs: &[PathBuf]) -> Vec<PathBuf> {
     let mut files = Vec::new();
     let mut seen = HashSet::new();
@@ -401,10 +415,6 @@ fn collect_candidate_assets(content_dirs: &[PathBuf]) -> Vec<PathBuf> {
             }
 
             if !is_unreal_asset_file(path) {
-                continue;
-            }
-
-            if !is_important_asset(path) {
                 continue;
             }
 
@@ -626,29 +636,6 @@ fn is_unreal_asset_file(path: &Path) -> bool {
     )
 }
 
-/// Return true for assets that are worth parsing for navigation/search.
-/// 判断资产是否值得解析，用于导航和搜索。
-fn is_important_asset(path: &Path) -> bool {
-    let ext = path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-
-    if ext == "umap" {
-        return true;
-    }
-
-    let filename = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
-
-    filename.starts_with("BP_")
-        || filename.starts_with("ABP_")
-        || filename.starts_with("WBP_")
-        || filename.starts_with("AM_")
-        || filename.starts_with("DA_")
-        || filename.starts_with("DT_")
-}
-
 /// Convert a filesystem path to Unreal asset path.
 /// 把文件系统路径转换成 Unreal 资产路径。
 pub fn to_asset_path(path: &Path) -> String {
@@ -737,6 +724,11 @@ fn write_asset_index_initialized(tx: &rusqlite::Transaction) -> Result<()> {
          VALUES ('asset_index_initialized', '1')",
         [],
     )?;
+    tx.execute(
+        "INSERT OR REPLACE INTO project_meta (key, value)
+         VALUES ('asset_index_version', ?1)",
+        [ASSET_INDEX_VERSION.to_string()],
+    )?;
     Ok(())
 }
 
@@ -793,4 +785,21 @@ fn file_mtime(path: &Path) -> i64 {
 /// 把路径统一成斜杠分隔字符串。
 fn normalize_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/").replace("//", "/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::make_asset_lookup_names;
+
+    #[test]
+    fn lookup_names_include_prefixed_and_unprefixed_class_names() {
+        let names = make_asset_lookup_names("USInventoryManagerComponent");
+        assert_eq!(names, vec!["sinventorymanagercomponent", "usinventorymanagercomponent"]);
+    }
+
+    #[test]
+    fn lookup_names_handle_script_paths() {
+        let names = make_asset_lookup_names("/Script/SimpleBeta.SHero");
+        assert_eq!(names, vec!["hero", "shero"]);
+    }
 }

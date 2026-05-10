@@ -359,6 +359,8 @@ local function default_values()
 		blueprint = {
 			enable = true,
 			debounce_ms = 300,
+			cache_ttl_ms = 10000,
+			member_hint_limit = 8,
 		},
 
 		-- Backend executable commands resolved at setup time.
