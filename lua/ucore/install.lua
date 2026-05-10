@@ -1,4 +1,5 @@
 local project = require("ucore.project")
+local status = require("ucore.status")
 
 local M = {}
 
@@ -310,31 +311,6 @@ local function install_nvr()
 	return false, table.concat(errors, "\n")
 end
 
-local function make_progress_notifier(title)
-	local handle
-
-	local function notify(lines, level, done)
-		local text = type(lines) == "table" and table.concat(lines, "\n") or tostring(lines or "")
-		local ok, new_handle = pcall(vim.notify, text, level or vim.log.levels.INFO, {
-			title = title,
-			replace = handle,
-			timeout = done and 3000 or false,
-		})
-		if ok and new_handle then
-			handle = new_handle
-		end
-	end
-
-	return {
-		update = function(lines, level)
-			notify(lines, level, false)
-		end,
-		finish = function(lines, level)
-			notify(lines, level, true)
-		end,
-	}
-end
-
 local function unit_to_mb(value, unit)
 	value = tonumber(value or 0) or 0
 	unit = tostring(unit or "MB"):lower()
@@ -557,6 +533,26 @@ local function notify_result(lines, level)
 	})
 end
 
+local function install_status_start(message)
+	status.unreal_start(message or "Installing Unreal editor integration...")
+end
+
+local function install_status_progress(key, message)
+	status.unreal_step(key, message)
+end
+
+local function install_status_finish(key, message)
+	status.unreal_step_finish(key, message)
+end
+
+local function install_status_done(ok, message, detail)
+	if ok then
+		status.unreal_finish(message or "UCore Install Complete")
+	else
+		status.unreal_fail(message or "UCore Install Failed", detail)
+	end
+end
+
 local function split_args(tail)
 	local items = {}
 	for token in tostring(tail or ""):gmatch("%S+") do
@@ -596,92 +592,77 @@ UCore install:
 	end
 
 	local overall_ok = true
-	local notifier = make_progress_notifier("UCore install")
-	local plugin_line = nil
-	local nvr_line = nil
 	local handled = false
-
-	local function render(level, done)
-		local out = {}
-		if plugin_line then
-			table.insert(out, plugin_line)
-		end
-		if nvr_line then
-			table.insert(out, nvr_line)
-		end
-		if done then
-			notifier.finish(out, level)
-		else
-			notifier.update(out, level)
-		end
-	end
+	local failure_messages = {}
 
 	if mode == "all" or mode == "plugin" then
 		handled = true
-		plugin_line = "Plugin install 0.0 MB / 0.0 MB"
-		render()
+		install_status_start("Installing Unreal editor integration...")
+		install_status_progress("task:plugin", "Plugin install 0.0 MB / 0.0 MB")
 		local ok, result = install_plugin(scope, function(progress)
-			plugin_line = string.format(
+			install_status_progress("task:plugin", string.format(
 				"Plugin install %s / %s",
 				format_mb(progress.current_bytes),
 				format_mb(progress.total_bytes)
-			)
-			render()
+			))
 		end)
 		if ok then
-			plugin_line = "Plugin installed: " .. tostring(result)
+			install_status_finish("task:plugin", "Plugin installed: " .. tostring(result))
 		else
 			overall_ok = false
-			plugin_line = "Plugin install failed: " .. tostring(result)
+			table.insert(failure_messages, tostring(result))
+			install_status_finish("task:plugin", "Plugin install failed: " .. tostring(result))
 		end
 		if mode == "plugin" then
-			return render(ok and vim.log.levels.INFO or vim.log.levels.WARN, true)
+			return install_status_done(ok, ok and "UCore Install Complete" or "UCore Install Failed", tostring(result))
 		end
-		render(ok and vim.log.levels.INFO or vim.log.levels.WARN, false)
 	end
 
 	if mode == "all" or mode == "nvr" then
 		handled = true
-		nvr_line = "nvr install preparing..."
-		render()
+		if mode == "nvr" then
+			install_status_start("Installing Unreal editor integration...")
+		end
+		install_status_progress("task:nvr", "nvr install preparing...")
 		return M.install_nvr_async(function(ok, result)
 			if ok then
-				nvr_line = "nvr ready: " .. tostring(result)
+				install_status_finish("task:nvr", "nvr ready: " .. tostring(result))
 			else
 				overall_ok = false
-				nvr_line = "nvr install failed: " .. tostring(result)
+				table.insert(failure_messages, tostring(result))
+				install_status_finish("task:nvr", "nvr install failed: " .. tostring(result))
 			end
-			render(ok and vim.log.levels.INFO or vim.log.levels.WARN, true)
+			install_status_done(
+				overall_ok,
+				overall_ok and "UCore Install Complete" or "UCore Install Failed",
+				#failure_messages > 0 and table.concat(failure_messages, " | ") or nil
+			)
 		end, {
 			on_progress = function(progress)
 				if progress.total_mb then
-					nvr_line = string.format(
+					install_status_progress("task:nvr", string.format(
 						"nvr download %.1f MB / %.1f MB",
 						progress.current_mb or 0,
 						progress.total_mb
-					)
+					))
 				else
-					nvr_line = string.format("nvr download %.1f MB / ...", progress.current_mb or 0)
+					install_status_progress("task:nvr", string.format("nvr download %.1f MB / ...", progress.current_mb or 0))
 				end
-				render()
 			end,
 			on_output = function(progress)
-				if not nvr_line or nvr_line == "nvr install preparing..." then
-					nvr_line = "nvr install running..."
-					render()
+				if tostring(progress.line or "") ~= "" then
+					install_status_progress("task:nvr", "nvr install running...")
 				end
 			end,
 		})
 	end
 
 	if not handled then
-		return notifier.finish({
+		return notify_result({
 			"Unknown install target: " .. tostring(mode),
 			"Use :UCore install help",
 		}, vim.log.levels.WARN)
 	end
-
-	render(overall_ok and vim.log.levels.INFO or vim.log.levels.WARN, true)
 end
 
 return M
