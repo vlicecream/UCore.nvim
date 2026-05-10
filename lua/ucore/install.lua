@@ -514,7 +514,7 @@ end
 local function print_help()
 	print([[
 UCore install:
-  :UCore install                                  Pick plugin, then choose Project / Engine
+  :UCore install all                              Pick plugin, then choose Project / Engine
   :UCore install plugin NeovimLink                Install NeovimLink from GitHub
   :UCore install plugin NvimSourceCodeAccess      Install NvimSourceCodeAccess from GitHub
   :UCore install help                             Show this help
@@ -589,7 +589,7 @@ function M.run(tail)
 	end
 
 	local requested_spec
-	if command == "" then
+	if command == "all" then
 		requested_spec = nil
 	elseif command == "plugin" then
 		requested_spec = plugin_spec(args[2])
@@ -601,7 +601,7 @@ function M.run(tail)
 		end
 	else
 		return notify_result({
-			"Unknown install command: " .. tostring(command),
+			"Unknown install command: " .. tostring(command == "" and "install" or command),
 			"Use :UCore install help",
 		}, vim.log.levels.WARN)
 	end
