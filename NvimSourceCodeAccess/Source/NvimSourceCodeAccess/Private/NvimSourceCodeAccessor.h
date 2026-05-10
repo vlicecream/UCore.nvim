@@ -72,6 +72,7 @@ private:
 	static FString ResolveServerName();
 	static bool ResolveEnvironmentOverride(const TCHAR* VariableName, FExecutableLocation& OutLocation);
 	static bool ResolvePathExecutable(const TCHAR* ExecutableName, bool bTerminal, FExecutableLocation& OutLocation);
+	static bool ResolvePreferredShellLocation(FExecutableLocation& OutLocation);
 	static bool ResolveExecutableLocation(FExecutableLocation& OutLocation);
 	static bool ResolveRemoteLocation(FRemoteLocation& OutLocation);
 	static bool ResolveBridgeRemoteLocation(const FString& ProjectRoot, FRemoteLocation& OutLocation);

@@ -433,6 +433,13 @@ bool FNvimSourceCodeAccessor::ResolvePathExecutable(const TCHAR* ExecutableName,
 	return false;
 }
 
+bool FNvimSourceCodeAccessor::ResolvePreferredShellLocation(FExecutableLocation& OutLocation)
+{
+	return ResolveEnvironmentOverride(TEXT("UE_POWERSHELL"), OutLocation)
+		|| ResolvePathExecutable(TEXT("pwsh.exe"), false, OutLocation)
+		|| ResolvePathExecutable(TEXT("powershell.exe"), false, OutLocation);
+}
+
 bool FNvimSourceCodeAccessor::ResolveExecutableLocation(FExecutableLocation& OutLocation)
 {
 	if (ResolveEnvironmentOverride(TEXT("UE_NVIM"), OutLocation)
@@ -441,6 +448,14 @@ bool FNvimSourceCodeAccessor::ResolveExecutableLocation(FExecutableLocation& Out
 		|| ResolveEnvironmentOverride(TEXT("NEOVIDE_BIN"), OutLocation)
 		|| ResolveEnvironmentOverride(TEXT("NVIM_BIN"), OutLocation))
 	{
+		if (OutLocation.bIsTerminal && OutLocation.ShellPath.IsEmpty())
+		{
+			FExecutableLocation ShellLocation;
+			if (ResolvePreferredShellLocation(ShellLocation))
+			{
+				OutLocation.ShellPath = ShellLocation.Path;
+			}
+		}
 		return true;
 	}
 
@@ -451,9 +466,7 @@ bool FNvimSourceCodeAccessor::ResolveExecutableLocation(FExecutableLocation& Out
 		if (OutLocation.bIsTerminal)
 		{
 			FExecutableLocation ShellLocation;
-			if (ResolveEnvironmentOverride(TEXT("UE_POWERSHELL"), ShellLocation)
-				|| ResolvePathExecutable(TEXT("pwsh.exe"), false, ShellLocation)
-				|| ResolvePathExecutable(TEXT("powershell.exe"), false, ShellLocation))
+			if (ResolvePreferredShellLocation(ShellLocation))
 			{
 				OutLocation.ShellPath = ShellLocation.Path;
 			}
@@ -740,7 +753,17 @@ bool FNvimSourceCodeAccessor::Launch(const TArray<FString>& Args) const
 		return false;
 	}
 
-	if (Location.bIsTerminal && !Location.ShellPath.IsEmpty())
+	FString ShellPath = Location.ShellPath;
+	if (Location.bIsTerminal && ShellPath.IsEmpty())
+	{
+		FExecutableLocation ShellLocation;
+		if (ResolvePreferredShellLocation(ShellLocation))
+		{
+			ShellPath = ShellLocation.Path;
+		}
+	}
+
+	if (Location.bIsTerminal && !ShellPath.IsEmpty())
 	{
 		FString Command = FString::Printf(TEXT("& %s"), *QuotePowerShellLiteral(Location.Path));
 		for (const FString& Arg : Args)
@@ -756,7 +779,7 @@ bool FNvimSourceCodeAccessor::Launch(const TArray<FString>& Args) const
 
 		uint32 ShellProcessId = 0;
 		FProcHandle ShellProc = FPlatformProcess::CreateProc(
-			*Location.ShellPath,
+			*ShellPath,
 			*ShellArgs,
 			false,
 			false,
