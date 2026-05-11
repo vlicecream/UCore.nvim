@@ -73,7 +73,7 @@ end
 local function wait_ready(attempt, callback)
 	attempt = attempt or 1
 
-	client.rpc.request("status", {}, function(result, err)
+	client.status(function(result, err)
 		if not err and result and result.status == "running" then
 			return callback(true, result)
 		end
