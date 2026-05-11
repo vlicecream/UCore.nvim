@@ -3,8 +3,10 @@
 #include "NvimSourceCodeAccessor.h"
 
 #include "HAL/FileManager.h"
+#include "ISourceCodeAccessModule.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
+#include "Modules/ModuleManager.h"
 #include "UObject/Class.h"
 #include "UObject/Field.h"
 #include "UObject/UnrealType.h"
@@ -16,12 +18,22 @@ FNvimSourceCodeNavigationHandler::FNvimSourceCodeNavigationHandler(FNvimSourceCo
 
 bool FNvimSourceCodeNavigationHandler::CanNavigateToClass(const UClass* InClass)
 {
+	if (!IsActiveAccessor())
+	{
+		return false;
+	}
+
 	FString HeaderPath;
 	return InClass != nullptr && InClass->HasAllClassFlags(CLASS_Native) && ResolveHeaderPath(InClass, HeaderPath);
 }
 
 bool FNvimSourceCodeNavigationHandler::NavigateToClass(const UClass* InClass)
 {
+	if (!IsActiveAccessor())
+	{
+		return false;
+	}
+
 	if (!CanNavigateToClass(InClass))
 	{
 		return false;
@@ -39,16 +51,31 @@ bool FNvimSourceCodeNavigationHandler::NavigateToClass(const UClass* InClass)
 
 bool FNvimSourceCodeNavigationHandler::CanNavigateToStruct(const UScriptStruct* InStruct)
 {
+	if (!IsActiveAccessor())
+	{
+		return false;
+	}
+
 	return CanNavigateToStruct(static_cast<const UStruct*>(InStruct));
 }
 
 bool FNvimSourceCodeNavigationHandler::NavigateToStruct(const UScriptStruct* InStruct)
 {
+	if (!IsActiveAccessor())
+	{
+		return false;
+	}
+
 	return NavigateToStruct(static_cast<const UStruct*>(InStruct));
 }
 
 bool FNvimSourceCodeNavigationHandler::CanNavigateToFunction(const UFunction* InFunction)
 {
+	if (!IsActiveAccessor())
+	{
+		return false;
+	}
+
 	if (!InFunction)
 	{
 		return false;
@@ -72,6 +99,11 @@ bool FNvimSourceCodeNavigationHandler::CanNavigateToFunction(const UFunction* In
 
 bool FNvimSourceCodeNavigationHandler::NavigateToFunction(const UFunction* InFunction)
 {
+	if (!IsActiveAccessor())
+	{
+		return false;
+	}
+
 	if (!CanNavigateToFunction(InFunction))
 	{
 		return false;
@@ -104,6 +136,11 @@ bool FNvimSourceCodeNavigationHandler::NavigateToFunction(const UFunction* InFun
 
 bool FNvimSourceCodeNavigationHandler::CanNavigateToProperty(const FProperty* InProperty)
 {
+	if (!IsActiveAccessor())
+	{
+		return false;
+	}
+
 	if (!InProperty || !InProperty->IsNative())
 	{
 		return false;
@@ -115,6 +152,11 @@ bool FNvimSourceCodeNavigationHandler::CanNavigateToProperty(const FProperty* In
 
 bool FNvimSourceCodeNavigationHandler::NavigateToProperty(const FProperty* InProperty)
 {
+	if (!IsActiveAccessor())
+	{
+		return false;
+	}
+
 	if (!CanNavigateToProperty(InProperty))
 	{
 		return false;
@@ -133,6 +175,11 @@ bool FNvimSourceCodeNavigationHandler::NavigateToProperty(const FProperty* InPro
 
 bool FNvimSourceCodeNavigationHandler::CanNavigateToStruct(const UStruct* InStruct)
 {
+	if (!IsActiveAccessor())
+	{
+		return false;
+	}
+
 	if (!InStruct || !InStruct->IsNative())
 	{
 		return false;
@@ -144,6 +191,11 @@ bool FNvimSourceCodeNavigationHandler::CanNavigateToStruct(const UStruct* InStru
 
 bool FNvimSourceCodeNavigationHandler::NavigateToStruct(const UStruct* InStruct)
 {
+	if (!IsActiveAccessor())
+	{
+		return false;
+	}
+
 	return NavigateToStructInternal(InStruct);
 }
 
@@ -295,6 +347,18 @@ const UField* FNvimSourceCodeNavigationHandler::ResolveOwningField(const UField*
 	}
 
 	return InField;
+}
+
+bool FNvimSourceCodeNavigationHandler::IsActiveAccessor() const
+{
+	ISourceCodeAccessModule* SourceCodeAccessModule =
+		FModuleManager::GetModulePtr<ISourceCodeAccessModule>(TEXT("SourceCodeAccess"));
+	if (!SourceCodeAccessModule)
+	{
+		return false;
+	}
+
+	return SourceCodeAccessModule->GetAccessor().GetFName() == Accessor.GetFName();
 }
 
 bool FNvimSourceCodeNavigationHandler::OpenAtLine(const FString& FilePath, int32 LineNumber) const

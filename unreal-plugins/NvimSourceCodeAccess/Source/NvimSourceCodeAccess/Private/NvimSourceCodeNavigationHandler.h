@@ -45,6 +45,7 @@ private:
 	static FString GetCppTypeName(const UStruct* InStruct);
 	static const UField* ResolveOwningField(const UField* InField);
 
+	bool IsActiveAccessor() const;
 	bool OpenAtLine(const FString& FilePath, int32 LineNumber) const;
 	bool NavigateToStructInternal(const UStruct* InStruct);
 };
