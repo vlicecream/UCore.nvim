@@ -7,16 +7,20 @@ local M = {}
 -- 当 Rust 阶段计划还没到时使用的默认整体进度权重。
 local default_phase_order = {
 	"discovery",
-	"db_sync",
+	"db_prepare",
 	"analysis",
+	"db_write",
+	"asset_index",
 	"finalizing",
 }
 
 local default_phases = {
 	discovery = { label = "Discovery", weight = 0.05 },
-	db_sync = { label = "DB Sync", weight = 0.15 },
-	analysis = { label = "Analysis", weight = 0.65 },
-	finalizing = { label = "Finalizing", weight = 0.15 },
+	db_prepare = { label = "DB Prepare", weight = 0.05 },
+	analysis = { label = "Analysis", weight = 0.45 },
+	db_write = { label = "DB Write", weight = 0.25 },
+	asset_index = { label = "Asset Index", weight = 0.10 },
+	finalizing = { label = "Finalizing", weight = 0.10 },
 }
 
 local phases = {}
@@ -25,15 +29,6 @@ local last_percent = -1
 local active = false
 local title = "UCore refresh"
 local visible = true
-local last_event_ms = 0
-
-local function now_ms()
-	local uv = vim.uv or vim.loop
-	if uv and uv.now then
-		return uv.now()
-	end
-	return math.floor(vim.fn.reltimefloat(vim.fn.reltime()) * 1000)
-end
 
 -- Load the built-in overall progress plan.
 -- 加载内置的整体进度计划。
@@ -48,7 +43,6 @@ local function reset()
 	load_default_plan()
 	last_percent = -1
 	active = true
-	last_event_ms = now_ms()
 end
 
 -- Start a new visible progress run with a user-facing title.
@@ -72,7 +66,6 @@ function M.finish(message)
 
 	active = false
 	last_percent = 100
-	last_event_ms = now_ms()
 	if visible then
 		status.progress_finish(title, message or string.format("%s 100%%", title))
 	end
@@ -82,7 +75,6 @@ end
 -- 标记当前进度展示失败。
 function M.fail(message)
 	active = false
-	last_event_ms = now_ms()
 	if visible then
 		status.progress_fail(title, message or string.format("%s failed", title))
 	end
@@ -169,8 +161,6 @@ function M.handle_plan(plan)
 	if vim.tbl_isempty(phases) then
 		load_default_plan()
 	end
-
-	last_event_ms = now_ms()
 end
 
 -- Convert phase-local progress into an overall percentage.
@@ -232,7 +222,6 @@ function M.handle_progress(event)
 	end
 
 	last_percent = overall
-	last_event_ms = now_ms()
 
 	local message = string.format("%s %d%%", title, overall)
 	if is_complete then
@@ -242,16 +231,6 @@ function M.handle_progress(event)
 	if visible then
 		status.progress(title, message)
 	end
-end
-
-function M.snapshot()
-	return {
-		active = active,
-		title = title,
-		last_percent = last_percent,
-		last_event_ms = last_event_ms,
-		visible = visible,
-	}
 end
 
 return M

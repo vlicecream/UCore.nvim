@@ -45,7 +45,7 @@ pub fn run_refresh(req: RefreshRequest, reporter: Arc<dyn ProgressReporter>) -> 
     reporter.report("discovery", 70, 100, "Resolving module dependencies...");
     let resolved_modules = resolve_modules(discovery.modules);
 
-    reporter.report("db_sync", 0, 100, "Preparing database...");
+    reporter.report("db_prepare", 0, 100, "Preparing database...");
     let mut conn = open_refresh_db(&ctx.db_path_native)?;
     write_engine_version(&conn, ue_version)?;
 
@@ -203,14 +203,19 @@ fn report_plan(reporter: &dyn ProgressReporter) {
             weight: 0.05,
         },
         PhaseInfo {
-            name: "db_sync".to_string(),
-            label: "DB Sync".to_string(),
-            weight: 0.15,
+            name: "db_prepare".to_string(),
+            label: "DB Prepare".to_string(),
+            weight: 0.05,
         },
         PhaseInfo {
             name: "analysis".to_string(),
             label: "Analysis".to_string(),
-            weight: 0.55,
+            weight: 0.45,
+        },
+        PhaseInfo {
+            name: "db_write".to_string(),
+            label: "DB Write".to_string(),
+            weight: 0.25,
         },
         PhaseInfo {
             name: "asset_index".to_string(),
@@ -220,7 +225,7 @@ fn report_plan(reporter: &dyn ProgressReporter) {
         PhaseInfo {
             name: "finalizing".to_string(),
             label: "Finalizing".to_string(),
-            weight: 0.15,
+            weight: 0.10,
         },
     ]);
 }

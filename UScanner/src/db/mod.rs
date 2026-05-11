@@ -446,11 +446,11 @@ pub fn save_to_db(
     init_db(conn)?;
 
     prepare_bulk_write(conn)?;
-    reporter.report("db_sync", 0, 100, "Dropping indices for faster insertion...");
+    reporter.report("db_write", 0, 100, "Dropping indices for faster insertion...");
     drop_indices(conn)?;
 
     let total = results.len();
-    reporter.report("db_sync", 0, total, &format!("Saving results (0/{})", total));
+    reporter.report("db_write", 0, total, &format!("Saving results (0/{})", total));
 
     let tx = conn.transaction()?;
     let mut string_cache: HashMap<String, i64> = HashMap::new();
@@ -512,7 +512,7 @@ pub fn save_to_db(
             if current == total || percent > last_reported_percent {
                 last_reported_percent = percent;
                 reporter.report(
-                    "db_sync",
+                    "db_write",
                     current,
                     total,
                     &format!("Saving results ({}/{})", current, total),

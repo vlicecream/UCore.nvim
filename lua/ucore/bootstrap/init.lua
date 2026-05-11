@@ -2,7 +2,6 @@ local backend = require("ucore.backend")
 local client = require("ucore.client")
 local config = require("ucore.config")
 local protocol = require("ucore.protocol")
-local progress = require("ucore.progress")
 local project = require("ucore.project")
 local server = require("ucore.server")
 local status = require("ucore.status")
@@ -176,34 +175,6 @@ local function run_engine_refresh_if_needed(payload, callback)
 		callback(ok, err)
 	end
 
-	local function monitor_stall()
-		if settled then
-			return
-		end
-
-		local snapshot = progress.snapshot()
-		local timeout_ms = tonumber((config.values.progress or {}).stall_timeout_ms) or 120000
-		local uv = vim.uv or vim.loop
-		local now = uv and uv.now and uv.now() or 0
-
-		if snapshot.active and snapshot.title == title and snapshot.last_event_ms > 0 then
-			if now - snapshot.last_event_ms >= timeout_ms then
-				progress.fail(string.format(
-					"%s stalled at %d%%",
-					title,
-					math.max(0, tonumber(snapshot.last_percent or 0) or 0)
-				))
-				return finish_once(false, string.format(
-					"%s stalled at %d%%",
-					title,
-					math.max(0, tonumber(snapshot.last_percent or 0) or 0)
-				))
-			end
-		end
-
-		vim.defer_fn(monitor_stall, 1000)
-	end
-
 	client.refresh({
 		type = "refresh",
 		project_root = engine.engine_root,
@@ -223,8 +194,6 @@ local function run_engine_refresh_if_needed(payload, callback)
 	end, {
 		label = title,
 	})
-
-	monitor_stall()
 end
 
 -- Refresh the shared Engine index after the project is already usable.
