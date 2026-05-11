@@ -248,6 +248,7 @@ local function default_values()
 		-- refresh 进度通知配置。
 		progress = {
 			enable = true,
+			stall_timeout_ms = 120000,
 		},
 
 		-- UI integration options.

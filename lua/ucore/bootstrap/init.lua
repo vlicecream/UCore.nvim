@@ -2,6 +2,7 @@ local backend = require("ucore.backend")
 local client = require("ucore.client")
 local config = require("ucore.config")
 local protocol = require("ucore.protocol")
+local progress = require("ucore.progress")
 local project = require("ucore.project")
 local server = require("ucore.server")
 local status = require("ucore.status")
@@ -163,6 +164,46 @@ local function run_engine_refresh_if_needed(payload, callback)
 	end
 
 	engine_refreshing[engine.engine_id] = true
+	local settled = false
+	local title = "UCore Engine Index"
+
+	local function finish_once(ok, err)
+		if settled then
+			return
+		end
+		settled = true
+		engine_refreshing[engine.engine_id] = nil
+		callback(ok, err)
+	end
+
+	local function monitor_stall()
+		if settled then
+			return
+		end
+
+		local snapshot = progress.snapshot()
+		local timeout_ms = tonumber((config.values.progress or {}).stall_timeout_ms) or 120000
+		local uv = vim.uv or vim.loop
+		local now = uv and uv.now and uv.now() or 0
+
+		if snapshot.active and snapshot.title == title and snapshot.last_event_ms > 0 then
+			if now - snapshot.last_event_ms >= timeout_ms then
+				progress.fail(string.format(
+					"%s stalled at %d%%",
+					title,
+					math.max(0, tonumber(snapshot.last_percent or 0) or 0)
+				))
+				return finish_once(false, string.format(
+					"%s stalled at %d%%",
+					title,
+					math.max(0, tonumber(snapshot.last_percent or 0) or 0)
+				))
+			end
+		end
+
+		vim.defer_fn(monitor_stall, 1000)
+	end
+
 	client.refresh({
 		type = "refresh",
 		project_root = engine.engine_root,
@@ -173,18 +214,17 @@ local function run_engine_refresh_if_needed(payload, callback)
 		scope = "Game",
 		vcs_hash = nil,
 	}, function(_, err)
-		engine_refreshing[engine.engine_id] = nil
-
 		if err then
-			return callback(false, err)
+			return finish_once(false, err)
 		end
 
 		project.write_engine_index_metadata(engine)
-		callback(true)
+		finish_once(true)
 	end, {
-		silent = true,
-		label = "UCore Engine Index",
+		label = title,
 	})
+
+	monitor_stall()
 end
 
 -- Refresh the shared Engine index after the project is already usable.
@@ -192,15 +232,14 @@ end
 local function run_engine_refresh_in_background(payload, after_finish)
 	run_engine_refresh_if_needed(payload, function(ok, err)
 		if ok then
+			status.finish("UCore Ready - Initialization Complete")
 			if type(after_finish) == "function" then
 				after_finish(true)
 			end
 			return
 		end
 
-		vim.schedule(function()
-			vim.notify("UCore Engine Index Failed:\n" .. tostring(err), vim.log.levels.WARN)
-		end)
+		status.fail("UCore Engine Index Failed", tostring(err))
 		if type(after_finish) == "function" then
 			after_finish(false, err)
 		end
@@ -309,7 +348,6 @@ function M.boot(callback, opts)
 						other_progress(80)
 						booting = false
 						other_progress(100)
-						status.finish("UCore Ready - Initialization Complete")
 						callback(true)
 						run_engine_refresh_in_background(payload, opts.after_finish)
 					end)
