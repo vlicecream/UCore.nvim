@@ -84,12 +84,20 @@ local function handle_frame(frame)
 		return
 	end
 
-	local msg_type = msg[1]
+	local function decode_integer(value)
+		local numeric = tonumber(value)
+		if numeric ~= nil then
+			return numeric
+		end
+		return value
+	end
+
+	local msg_type = decode_integer(msg[1])
 
 	-- Response: [1, msgid, error, result]
 	-- 响应帧：[1, msgid, error, result]
 	if msg_type == 1 then
-		local msgid = msg[2]
+		local msgid = decode_integer(msg[2])
 		local err = msg[3]
 		local result = msg[4]
 		local pending_entry = pending[msgid]
