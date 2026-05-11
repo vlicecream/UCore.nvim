@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rusqlite::{Connection, ToSql};
+use rusqlite::{Connection, OptionalExtension, ToSql};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::io::BufRead;
@@ -441,6 +441,10 @@ fn collect_unresolved_candidate_files(
     symbol_name: &str,
     current_file: Option<&str>,
 ) -> Result<CandidateFiles> {
+    if is_type_like_symbol(conn, symbol_name)? {
+        return collect_type_candidate_files(conn, symbol_name, current_file);
+    }
+
     let mut candidate_ids = HashSet::new();
     let mut found_definition = false;
 
@@ -485,6 +489,112 @@ fn collect_unresolved_candidate_files(
         file_paths,
         found_definition,
     })
+}
+
+fn collect_type_candidate_files(
+    conn: &Connection,
+    symbol_name: &str,
+    current_file: Option<&str>,
+) -> Result<CandidateFiles> {
+    let mut candidate_ids = HashSet::new();
+    let mut found_definition = false;
+
+    for id in find_symbol_definition_file_ids(conn, symbol_name)? {
+        found_definition = true;
+        candidate_ids.insert(id);
+    }
+
+    for id in find_type_reference_file_ids(conn, symbol_name)? {
+        candidate_ids.insert(id);
+    }
+
+    if let Some(current) = current_file {
+        if let Some(id) = find_file_id(conn, current)? {
+            candidate_ids.insert(id);
+        }
+    }
+
+    let mut ids = candidate_ids.into_iter().collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.truncate(MAX_FILES);
+
+    let mut file_paths = get_file_paths_by_ids(conn, &ids)?;
+    file_paths.sort();
+    file_paths.dedup();
+
+    Ok(CandidateFiles {
+        file_paths,
+        found_definition,
+    })
+}
+
+fn is_type_like_symbol(conn: &Connection, symbol_name: &str) -> Result<bool> {
+    let exists = conn
+        .query_row(
+            r#"
+            SELECT 1
+            FROM classes c
+            JOIN strings s ON c.name_id = s.id
+            WHERE s.text = ?
+            LIMIT 1
+            "#,
+            [symbol_name],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+
+    Ok(exists)
+}
+
+fn find_type_reference_file_ids(conn: &Connection, symbol_name: &str) -> Result<Vec<i64>> {
+    let mut ids = Vec::new();
+    let mut seen = HashSet::new();
+    let detail_pattern = format!("%{}%", symbol_name);
+
+    collect_ids(
+        conn,
+        r#"
+        SELECT DISTINCT m.file_id
+        FROM members m
+        JOIN strings st ON m.type_id = st.id
+        WHERE st.text = ?
+          AND m.file_id IS NOT NULL
+        "#,
+        &[symbol_name],
+        &mut seen,
+        &mut ids,
+    )?;
+
+    collect_ids(
+        conn,
+        r#"
+        SELECT DISTINCT m.file_id
+        FROM members m
+        JOIN strings srt ON m.return_type_id = srt.id
+        WHERE srt.text = ?
+          AND m.file_id IS NOT NULL
+        "#,
+        &[symbol_name],
+        &mut seen,
+        &mut ids,
+    )?;
+
+    collect_ids(
+        conn,
+        r#"
+        SELECT DISTINCT COALESCE(m.file_id, c.file_id)
+        FROM members m
+        JOIN classes c ON m.class_id = c.id
+        WHERE m.detail LIKE ?
+          AND COALESCE(m.file_id, c.file_id) IS NOT NULL
+        "#,
+        &[detail_pattern.as_str()],
+        &mut seen,
+        &mut ids,
+    )?;
+
+    Ok(ids)
 }
 
 /// Find definition file ids for a member owned by a specific class.

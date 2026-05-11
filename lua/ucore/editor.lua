@@ -34,8 +34,13 @@ local function ensure_buffer_open(path)
 		return existing
 	end
 
-	vim.cmd.edit(vim.fn.fnameescape(path))
-	return vim.api.nvim_get_current_buf()
+	local bufnr = vim.fn.bufadd(path)
+	if not bufnr or bufnr <= 0 then
+		error("failed to add buffer for path: " .. tostring(path))
+	end
+	pcall(vim.fn.bufload, bufnr)
+	vim.api.nvim_set_current_buf(bufnr)
+	return bufnr
 end
 
 function M.refresh_filetype(path, bufnr)

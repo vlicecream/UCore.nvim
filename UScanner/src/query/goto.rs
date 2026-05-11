@@ -2366,6 +2366,14 @@ fn goto_definition_inner(
                 return Ok(result);
             }
         }
+        if let Some(result) = find_type_definition(conn, &ctx.symbol)? {
+            tracing::debug!(
+                "goto_{}: fell back to type definition for '{}'",
+                mode,
+                ctx.symbol
+            );
+            return Ok(result);
+        }
         tracing::debug!("goto_{}: no result for '{}'", mode, ctx.symbol);
         return Ok(Value::Null);
     }
