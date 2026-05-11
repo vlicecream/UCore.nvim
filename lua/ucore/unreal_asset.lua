@@ -11,6 +11,11 @@ local function normalize(path)
 	return path and path:gsub("\\", "/"):gsub("/+$", "") or nil
 end
 
+local function normalize_lower(path)
+	path = normalize(path)
+	return path and path:lower() or nil
+end
+
 local function dirname(path)
 	path = normalize(path or "")
 	if path == "" then
@@ -116,12 +121,12 @@ local function current_project_metadata(project_root)
 end
 
 local function session_alive(project_root)
-	project_root = normalize(project_root)
+	project_root = normalize_lower(project_root)
 	local now = os.time()
 
 	for _, path in ipairs(scandir_json(session_dir())) do
 		local item = read_json(path)
-		if type(item) == "table" and normalize(item.project_root) == project_root then
+		if type(item) == "table" and normalize_lower(item.project_root) == project_root then
 			local last_seen = tonumber(item.last_seen or 0) or 0
 			if now - last_seen <= session_ttl_seconds then
 				return true
@@ -215,7 +220,11 @@ function M.open(asset_path, opts)
 		return true
 	end
 
-	return launch_editor(metadata)
+	local launched, launch_err = launch_editor(metadata)
+	if launched then
+		vim.notify("UCore asset: launching Unreal Editor...", vim.log.levels.INFO)
+	end
+	return launched, launch_err
 end
 
 function M.open_or_notify(asset_path, opts)

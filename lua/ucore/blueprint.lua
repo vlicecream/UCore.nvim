@@ -430,8 +430,8 @@ local function show_target_picker(target, items)
 		return
 	end
 
-	ui.select.find(items, {
-		default_text = "",
+	ui.select.blueprint_assets(items, {
+		title = relation_label(target.kind, items[1] and items[1].blueprint_category or ""),
 	})
 end
 

@@ -15,7 +15,8 @@ private:
 	void WriteSessionHeartbeat(bool bForce);
 	void ProcessRequests();
 	void ProcessRequestFile(const FString& FilePath);
-	void OpenAssetPath(const FString& AssetPath);
+	bool CanOpenAssets() const;
+	bool OpenAssetPath(const FString& AssetPath);
 
 	FTSTicker::FDelegateHandle TickerHandle;
 	FString RequestDirectory;

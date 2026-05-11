@@ -3,6 +3,7 @@
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "Dom/JsonObject.h"
 #include "Editor.h"
+#include "Framework/Application/SlateApplication.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformMisc.h"
 #include "HAL/PlatformProcess.h"
@@ -89,6 +90,24 @@ namespace NeovimLink
 
 		return FFileHelper::SaveStringToFile(Text, *FilePath);
 	}
+
+	static bool IsExpiredRequest(const TSharedPtr<FJsonObject>& Object)
+	{
+		if (!Object.IsValid())
+		{
+			return true;
+		}
+
+		double Timestamp = 0.0;
+		Object->TryGetNumberField(TEXT("timestamp"), Timestamp);
+		if (Timestamp <= 0.0)
+		{
+			return false;
+		}
+
+		const int64 AgeSeconds = FDateTime::UtcNow().ToUnixTimestamp() - static_cast<int64>(Timestamp);
+		return AgeSeconds > 300;
+	}
 }
 
 void FNeovimLinkModule::StartupModule()
@@ -170,8 +189,14 @@ void FNeovimLinkModule::ProcessRequestFile(const FString& FilePath)
 	FString RequestProjectRoot;
 	Object->TryGetStringField(TEXT("project_root"), RequestProjectRoot);
 	RequestProjectRoot = NeovimLink::NormalizePath(RequestProjectRoot);
-	if (!RequestProjectRoot.IsEmpty() && RequestProjectRoot != CurrentProjectRoot)
+	if (!RequestProjectRoot.IsEmpty() && !RequestProjectRoot.Equals(CurrentProjectRoot, ESearchCase::IgnoreCase))
 	{
+		return;
+	}
+
+	if (NeovimLink::IsExpiredRequest(Object))
+	{
+		IFileManager::Get().Delete(*FilePath, false, true, true);
 		return;
 	}
 
@@ -182,18 +207,37 @@ void FNeovimLinkModule::ProcessRequestFile(const FString& FilePath)
 		FString AssetPath;
 		if (Object->TryGetStringField(TEXT("asset_path"), AssetPath))
 		{
-			OpenAssetPath(AssetPath);
+			if (!OpenAssetPath(AssetPath))
+			{
+				return;
+			}
 		}
 	}
 
 	IFileManager::Get().Delete(*FilePath, false, true, true);
 }
 
-void FNeovimLinkModule::OpenAssetPath(const FString& AssetPath)
+bool FNeovimLinkModule::CanOpenAssets() const
 {
-	if (AssetPath.IsEmpty() || GEditor == nullptr)
+	if (GEditor == nullptr || !FSlateApplication::IsInitialized())
 	{
-		return;
+		return false;
+	}
+
+	const FAssetRegistryModule* AssetRegistryModule = FModuleManager::GetModulePtr<FAssetRegistryModule>(TEXT("AssetRegistry"));
+	if (AssetRegistryModule == nullptr)
+	{
+		return false;
+	}
+
+	return !AssetRegistryModule->Get().IsLoadingAssets();
+}
+
+bool FNeovimLinkModule::OpenAssetPath(const FString& AssetPath)
+{
+	if (AssetPath.IsEmpty() || !CanOpenAssets())
+	{
+		return false;
 	}
 
 	FAssetRegistryModule& AssetRegistryModule =
@@ -219,13 +263,21 @@ void FNeovimLinkModule::OpenAssetPath(const FString& AssetPath)
 
 	if (AssetObject == nullptr)
 	{
-		return;
+		return false;
 	}
 
 	if (UAssetEditorSubsystem* AssetEditorSubsystem = GEditor->GetEditorSubsystem<UAssetEditorSubsystem>())
 	{
-		AssetEditorSubsystem->OpenEditorForAsset(AssetObject);
+		if (!AssetEditorSubsystem->OpenEditorForAsset(AssetObject))
+		{
+			return false;
+		}
+
+		AssetEditorSubsystem->FindEditorForAsset(AssetObject, true);
+		return true;
 	}
+
+	return false;
 }
 
 IMPLEMENT_MODULE(FNeovimLinkModule, NeovimLink)

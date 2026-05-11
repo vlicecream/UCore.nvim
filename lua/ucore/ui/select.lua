@@ -945,6 +945,98 @@ local function pick_telescope_references(references, opts)
 		:find()
 end
 
+local function close_window(winid)
+	if winid and vim.api.nvim_win_is_valid(winid) then
+		vim.api.nvim_win_close(winid, true)
+	end
+end
+
+local function open_blueprint_assets_window(items, opts)
+	opts = opts or {}
+	if type(items) ~= "table" or vim.tbl_isempty(items) then
+		vim.notify((opts.title or "UCore blueprint") .. ": no results", vim.log.levels.WARN)
+		return
+	end
+
+	local columns = vim.o.columns
+	local lines = vim.o.lines
+	local width = math.max(80, math.min(math.floor(columns * 0.82), 180))
+	local height = math.max(12, math.min(#items + 2, math.floor(lines * 0.75)))
+	local row = math.max(1, math.floor((lines - height) / 2) - 1)
+	local col = math.max(0, math.floor((columns - width) / 2))
+
+	local bufnr = vim.api.nvim_create_buf(false, true)
+	local winid = vim.api.nvim_open_win(bufnr, true, {
+		relative = "editor",
+		row = row,
+		col = col,
+		width = width,
+		height = height,
+		style = "minimal",
+		border = "rounded",
+		title = opts.title or "UCore Blueprint",
+		title_pos = "center",
+	})
+
+	vim.bo[bufnr].buftype = "nofile"
+	vim.bo[bufnr].bufhidden = "wipe"
+	vim.bo[bufnr].swapfile = false
+	vim.bo[bufnr].modifiable = true
+	vim.bo[bufnr].filetype = "ucore_blueprint_assets"
+
+	local name_width = 24
+	for _, item in ipairs(items) do
+		name_width = math.min(48, math.max(name_width, vim.fn.strdisplaywidth(tostring(item.name or "")) + 2))
+	end
+
+	local lines_out = {}
+	for _, item in ipairs(items) do
+		local name = tostring(item.name or "<asset>")
+		local path = tostring(item.asset_path or item.path or "")
+		local line = string.format("%s %s", pad_right(name, name_width), path)
+		table.insert(lines_out, line)
+	end
+
+	vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines_out)
+	vim.bo[bufnr].modifiable = false
+
+	for index, item in ipairs(items) do
+		local name = tostring(item.name or "<asset>")
+		local path = tostring(item.asset_path or item.path or "")
+		local line = index - 1
+		local name_end = #name
+		local path_start = #pad_right(name, name_width) + 1
+		vim.api.nvim_buf_add_highlight(bufnr, -1, "Identifier", line, 0, name_end)
+		if path ~= "" then
+			vim.api.nvim_buf_add_highlight(bufnr, -1, "Comment", line, path_start, -1)
+		end
+	end
+
+	local function choose_current()
+		local cursor = vim.api.nvim_win_get_cursor(winid)
+		local item = items[cursor[1]]
+		close_window(winid)
+		if item then
+			require("ucore.unreal_asset").open_or_notify(tostring(item.asset_path or item.path or ""))
+		end
+	end
+
+	local function close_current()
+		close_window(winid)
+	end
+
+	local map = function(lhs, rhs)
+		vim.keymap.set("n", lhs, rhs, { buffer = bufnr, nowait = true, silent = true })
+	end
+
+	map("<CR>", choose_current)
+	map("q", close_current)
+	map("<Esc>", close_current)
+
+	vim.api.nvim_win_set_option(winid, "cursorline", true)
+	vim.api.nvim_win_set_cursor(winid, { 1, 0 })
+end
+
 -- Open project-wide find using a Telescope grep-style file preview.
 -- 使用 Telescope grep 风格预览打开项目全局查找。
 local function pick_telescope_find(items, default_text)
@@ -1357,6 +1449,10 @@ function M.assets(assets)
 	end, function(item)
 		require("ucore.unreal_asset").open_or_notify(tostring(item))
 	end)
+end
+
+function M.blueprint_assets(items, opts)
+	return open_blueprint_assets_window(items, opts)
 end
 
 -- Pick a symbol and open its source file when possible.
