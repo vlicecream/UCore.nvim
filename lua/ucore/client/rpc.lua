@@ -57,11 +57,13 @@ local function ensure_heartbeat()
 
 	if not heartbeat_autocmd_registered then
 		heartbeat_autocmd_registered = true
-		vim.api.nvim_create_autocmd("VimLeavePre", {
-			callback = function()
-				stop_heartbeat()
-			end,
-		})
+		vim.schedule(function()
+			vim.api.nvim_create_autocmd("VimLeavePre", {
+				callback = function()
+					stop_heartbeat()
+				end,
+			})
+		end)
 	end
 end
 
