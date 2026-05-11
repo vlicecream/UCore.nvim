@@ -157,15 +157,43 @@ local function editor_executable(engine_root)
 	return nil
 end
 
+local function powershell_quote(value)
+	value = tostring(value or "")
+	return "'" .. value:gsub("'", "''") .. "'"
+end
+
 local function launch_editor(metadata)
 	local editor_path = editor_executable(metadata.engine_root)
 	if not editor_path then
 		return false, "Could not find UnrealEditor.exe"
 	end
 
-	local job = vim.fn.jobstart({ editor_path, metadata.uproject_path }, {
-		detach = true,
-	})
+	local job
+	if vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1 then
+		local shell = vim.fn.executable("pwsh") == 1 and "pwsh" or "powershell"
+		local working_dir = dirname(editor_path) or metadata.engine_root or metadata.project_root or ""
+		local command = table.concat({
+			"Start-Process",
+			"-FilePath", powershell_quote(editor_path),
+			"-ArgumentList", powershell_quote(metadata.uproject_path),
+			"-WorkingDirectory", powershell_quote(working_dir),
+			"-WindowStyle Normal",
+		}, " ")
+		job = vim.fn.jobstart({
+			shell,
+			"-NoProfile",
+			"-NonInteractive",
+			"-ExecutionPolicy", "Bypass",
+			"-Command", command,
+		}, {
+			detach = true,
+		})
+	else
+		job = vim.fn.jobstart({ editor_path, metadata.uproject_path }, {
+			detach = true,
+		})
+	end
+
 	if tonumber(job or 0) <= 0 then
 		return false, "Failed to launch Unreal Editor"
 	end
