@@ -24,6 +24,8 @@ struct CleanRegexes {
 /// Lazily initialized regex cache.
 /// 懒加载的正则缓存。
 static CLEAN_REGEXES: OnceLock<CleanRegexes> = OnceLock::new();
+static GAMEPLAY_TAG_DEFINE_RE: OnceLock<Regex> = OnceLock::new();
+static GAMEPLAY_TAG_DECLARE_RE: OnceLock<Regex> = OnceLock::new();
 
 fn get_clean_regexes() -> &'static CleanRegexes {
     CLEAN_REGEXES.get_or_init(|| {
@@ -61,6 +63,35 @@ fn get_clean_regexes() -> &'static CleanRegexes {
 
             whitespace: Regex::new(r"\s+").unwrap(),
         }
+    })
+}
+
+fn gameplay_tag_define_re() -> &'static Regex {
+    GAMEPLAY_TAG_DEFINE_RE.get_or_init(|| {
+        Regex::new(
+            r#"(?x)
+            \b(?:UE_DEFINE_GAMEPLAY_TAG(?:_COMMENT|_STATIC)?|DEFINE_GAMEPLAY_TAG(?:_COMMENT)?)\s*
+            \(\s*
+            (?P<identifier>[A-Za-z_][A-Za-z0-9_]*)\s*,\s*
+            (?:TEXT\s*\(\s*)?
+            " (?P<tag>[^"]+) "
+            "#,
+        )
+        .unwrap()
+    })
+}
+
+fn gameplay_tag_declare_re() -> &'static Regex {
+    GAMEPLAY_TAG_DECLARE_RE.get_or_init(|| {
+        Regex::new(
+            r#"(?x)
+            \bUE_DECLARE_GAMEPLAY_TAG_EXTERN\s*
+            \(\s*
+            (?P<identifier>[A-Za-z_][A-Za-z0-9_]*)
+            \s*\)
+            "#,
+        )
+        .unwrap()
     })
 }
 
@@ -237,6 +268,7 @@ pub fn process_file(
                 classes: Vec::new(),
                 calls: Vec::new(),
                 includes: Vec::new(),
+                gameplay_tags: Vec::new(),
                 parser: "fast-skip".to_string(),
                 new_hash,
             }),
@@ -246,6 +278,7 @@ pub fn process_file(
 
     let (classes, calls, includes) =
         parse_content_mmap(content_bytes, &input.path, language, query, include_query)?;
+    let gameplay_tags = collect_gameplay_tags(content_bytes);
 
     Ok(ParseResult {
         path: input.path.clone(),
@@ -255,6 +288,7 @@ pub fn process_file(
             classes,
             calls,
             includes,
+            gameplay_tags,
             parser: "treesitter".to_string(),
             new_hash,
         }),
@@ -349,6 +383,61 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
         .any(|window| window == needle)
+}
+
+/// Collect GameplayTag declarations and definitions with lightweight regexes.
+/// 使用轻量正则收集 GameplayTag 的声明和定义。
+fn collect_gameplay_tags(content_bytes: &[u8]) -> Vec<crate::types::GameplayTagInfo> {
+    let Ok(content) = std::str::from_utf8(content_bytes) else {
+        return Vec::new();
+    };
+
+    let mut items = Vec::new();
+
+    for caps in gameplay_tag_define_re().captures_iter(content) {
+        let (Some(full), Some(identifier), Some(tag)) =
+            (caps.get(0), caps.name("identifier"), caps.name("tag"))
+        else {
+            continue;
+        };
+
+        items.push(crate::types::GameplayTagInfo {
+            identifier: identifier.as_str().to_string(),
+            tag_path: Some(tag.as_str().to_string()),
+            kind: "define".to_string(),
+            line: line_number_for_offset(content, full.start()),
+        });
+    }
+
+    for caps in gameplay_tag_declare_re().captures_iter(content) {
+        let (Some(full), Some(identifier)) = (caps.get(0), caps.name("identifier")) else {
+            continue;
+        };
+
+        if items
+            .iter()
+            .any(|item| item.identifier == identifier.as_str() && item.kind == "define")
+        {
+            continue;
+        }
+
+        items.push(crate::types::GameplayTagInfo {
+            identifier: identifier.as_str().to_string(),
+            tag_path: None,
+            kind: "declare".to_string(),
+            line: line_number_for_offset(content, full.start()),
+        });
+    }
+
+    items
+}
+
+fn line_number_for_offset(content: &str, offset: usize) -> usize {
+    content[..offset.min(content.len())]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1
 }
 
 /// Collect include paths.
@@ -915,4 +1004,26 @@ fn clean_type_string(raw: &str) -> String {
         .last()
         .unwrap_or("")
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::collect_gameplay_tags;
+
+    #[test]
+    fn collect_gameplay_tag_definitions_and_declarations() {
+        let content = br#"
+UE_DECLARE_GAMEPLAY_TAG_EXTERN(TAG_Weapon_Fire);
+UE_DEFINE_GAMEPLAY_TAG(TAG_Weapon_Fire, "Weapon.Fire");
+UE_DEFINE_GAMEPLAY_TAG_COMMENT(TAG_Status_Death, "Status.Death", "desc");
+"#;
+
+        let tags = collect_gameplay_tags(content);
+        assert_eq!(tags.len(), 2);
+        assert_eq!(tags[0].identifier, "TAG_Weapon_Fire");
+        assert_eq!(tags[0].tag_path.as_deref(), Some("Weapon.Fire"));
+        assert_eq!(tags[0].kind, "define");
+        assert_eq!(tags[1].identifier, "TAG_Status_Death");
+        assert_eq!(tags[1].tag_path.as_deref(), Some("Status.Death"));
+    }
 }

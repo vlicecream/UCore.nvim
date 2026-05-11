@@ -16,7 +16,7 @@ use crate::types::{ParseResult, ProgressReporter};
 ///
 /// Increment this when table structures, indexes, or stored data semantics change.
 /// 当表结构、索引或存储语义变化时递增。
-pub const DB_VERSION: i32 = 20;
+pub const DB_VERSION: i32 = 21;
 
 /// Completion cache version.
 /// 补全缓存版本。
@@ -272,6 +272,16 @@ fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
             function_key TEXT NOT NULL,
             FOREIGN KEY(asset_path) REFERENCES assets(asset_path) ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS gameplay_tags (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            identifier TEXT NOT NULL,
+            tag_path TEXT,
+            kind TEXT NOT NULL,
+            line_number INTEGER,
+            file_id INTEGER NOT NULL,
+            FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+        );
         "#,
     )?;
 
@@ -360,6 +370,9 @@ fn create_indices(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_asset_references_reference_key ON asset_references(reference_key);
         CREATE INDEX IF NOT EXISTS idx_asset_functions_asset_path ON asset_functions(asset_path);
         CREATE INDEX IF NOT EXISTS idx_asset_functions_function_key ON asset_functions(function_key);
+        CREATE INDEX IF NOT EXISTS idx_gameplay_tags_identifier ON gameplay_tags(identifier);
+        CREATE INDEX IF NOT EXISTS idx_gameplay_tags_tag_path ON gameplay_tags(tag_path);
+        CREATE INDEX IF NOT EXISTS idx_gameplay_tags_file_id ON gameplay_tags(file_id);
         "#,
     )?;
 
@@ -393,6 +406,9 @@ fn drop_indices(conn: &Connection) -> rusqlite::Result<()> {
         "idx_asset_references_reference_key",
         "idx_asset_functions_asset_path",
         "idx_asset_functions_function_key",
+        "idx_gameplay_tags_identifier",
+        "idx_gameplay_tags_tag_path",
+        "idx_gameplay_tags_file_id",
     ];
 
     for index_name in indices {
@@ -503,6 +519,11 @@ pub fn save_to_db(
              VALUES (?1, ?2, ?3)",
         )?;
 
+        let mut stmt_tag = tx.prepare(
+            "INSERT INTO gameplay_tags (identifier, tag_path, kind, line_number, file_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+
         let mut last_reported_percent = 0usize;
 
         for (index, result) in results.iter().enumerate() {
@@ -588,6 +609,8 @@ pub fn save_to_db(
                 file_id,
                 &data.includes,
             )?;
+
+            save_gameplay_tags(&mut stmt_tag, file_id, &data.gameplay_tags)?;
         }
     }
 
@@ -805,6 +828,24 @@ fn save_includes(
             file_id,
             include_path_id,
             base_filename_id,
+        ])?;
+    }
+
+    Ok(())
+}
+
+fn save_gameplay_tags(
+    stmt_tag: &mut rusqlite::Statement,
+    file_id: i64,
+    tags: &[crate::types::GameplayTagInfo],
+) -> anyhow::Result<()> {
+    for tag in tags {
+        stmt_tag.execute(params![
+            tag.identifier,
+            tag.tag_path,
+            tag.kind,
+            tag.line as i64,
+            file_id,
         ])?;
     }
 

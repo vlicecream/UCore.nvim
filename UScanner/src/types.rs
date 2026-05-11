@@ -158,6 +158,7 @@ pub struct ParseData {
     pub classes: Vec<ClassInfo>,
     pub calls: Vec<CallInfo>,
     pub includes: Vec<String>,
+    pub gameplay_tags: Vec<GameplayTagInfo>,
     pub parser: String,
     pub new_hash: String,
 }
@@ -167,6 +168,19 @@ pub struct ParseData {
 #[derive(Debug, Clone, Serialize)]
 pub struct CallInfo {
     pub name: String,
+    pub line: usize,
+}
+
+/// One indexed GameplayTag declaration or definition.
+/// 一条被索引的 GameplayTag 声明或定义。
+#[derive(Debug, Clone, Serialize)]
+pub struct GameplayTagInfo {
+    pub identifier: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag_path: Option<String>,
+
+    pub kind: String,
     pub line: usize,
 }
 

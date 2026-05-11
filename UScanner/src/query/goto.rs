@@ -258,6 +258,39 @@ pub fn extract_cursor_context(content: &str, line: u32, character: u32) -> Optio
     })
 }
 
+fn string_literal_under_cursor(content: &str, line: u32, character: u32) -> Option<String> {
+    let line_text = content.lines().nth(line as usize)?;
+    let bytes = line_text.as_bytes();
+    let col = (character as usize).min(bytes.len());
+    let mut quote_start = None;
+    let mut index = 0usize;
+
+    while index < bytes.len() {
+        if bytes[index] == b'"' && (index == 0 || bytes[index - 1] != b'\\') {
+            if let Some(start) = quote_start {
+                if col >= start && col <= index {
+                    return line_text.get(start + 1..index).map(|text| text.to_string());
+                }
+                quote_start = None;
+            } else {
+                quote_start = Some(index);
+            }
+        }
+
+        index += 1;
+    }
+
+    None
+}
+
+fn looks_like_gameplay_tag_path(text: &str) -> bool {
+    !text.is_empty()
+        && text.contains('.')
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.'))
+}
+
 /// Find the node under Neovim's 0-based cursor column.
 /// 根据 Neovim 传来的 0-based 光标列查找当前节点。
 fn cursor_node_at(root: Node, row: usize, col: usize) -> Option<Node> {
@@ -1225,6 +1258,104 @@ fn find_member_hover_in_class(
     Ok(result)
 }
 
+fn gameplay_tag_order_by_clause() -> &'static str {
+    r#"
+    ORDER BY
+        CASE WHEN gt.kind = 'define' THEN 0 ELSE 1 END,
+        CASE
+            WHEN sf.text LIKE '%.cpp' THEN 0
+            WHEN sf.text LIKE '%.cc' THEN 1
+            WHEN sf.text LIKE '%.cxx' THEN 2
+            WHEN sf.text LIKE '%.h' THEN 3
+            WHEN sf.text LIKE '%.hpp' THEN 4
+            ELSE 5
+        END,
+        gt.line_number
+    "#
+}
+
+fn find_gameplay_tag_by_identifier(conn: &Connection, identifier: &str) -> Result<Option<Value>> {
+    let sql = format!(
+        r#"
+        {}
+        SELECT gt.identifier,
+               gt.tag_path,
+               gt.line_number,
+               dp.full_path || '/' || sf.text,
+               gt.kind
+        FROM gameplay_tags gt
+        JOIN files f ON gt.file_id = f.id
+        JOIN dir_paths dp ON f.directory_id = dp.id
+        JOIN strings sf ON f.filename_id = sf.id
+        WHERE gt.identifier = ?
+        {}
+        LIMIT 1
+        "#,
+        PATH_CTE,
+        gameplay_tag_order_by_clause(),
+    );
+
+    let mut result = conn
+        .query_row(&sql, [identifier], |row| {
+            Ok(json!({
+                "symbol_name": row.get::<_, String>(0)?,
+                "tag_path": row.get::<_, Option<String>>(1)?,
+                "line_number": row.get::<_, i64>(2)?,
+                "file_path": normalize_path(&row.get::<_, String>(3)?),
+                "kind": "gameplay_tag",
+                "tag_kind": row.get::<_, String>(4)?,
+            }))
+        })
+        .optional()?;
+
+    if let Some(value) = result.as_mut() {
+        fix_symbol_location(value, identifier);
+    }
+
+    Ok(result)
+}
+
+fn find_gameplay_tag_by_path(conn: &Connection, tag_path: &str) -> Result<Option<Value>> {
+    let sql = format!(
+        r#"
+        {}
+        SELECT gt.identifier,
+               gt.tag_path,
+               gt.line_number,
+               dp.full_path || '/' || sf.text,
+               gt.kind
+        FROM gameplay_tags gt
+        JOIN files f ON gt.file_id = f.id
+        JOIN dir_paths dp ON f.directory_id = dp.id
+        JOIN strings sf ON f.filename_id = sf.id
+        WHERE gt.tag_path = ?
+        {}
+        LIMIT 1
+        "#,
+        PATH_CTE,
+        gameplay_tag_order_by_clause(),
+    );
+
+    let mut result = conn
+        .query_row(&sql, [tag_path], |row| {
+            Ok(json!({
+                "symbol_name": row.get::<_, String>(0)?,
+                "tag_path": row.get::<_, Option<String>>(1)?,
+                "line_number": row.get::<_, i64>(2)?,
+                "file_path": normalize_path(&row.get::<_, String>(3)?),
+                "kind": "gameplay_tag",
+                "tag_kind": row.get::<_, String>(4)?,
+            }))
+        })
+        .optional()?;
+
+    if let Some(value) = result.as_mut() {
+        fix_text_location(value, tag_path);
+    }
+
+    Ok(result)
+}
+
 fn find_member_hover_in_inheritance_chain(
     conn: &Connection,
     class_name: &str,
@@ -2087,9 +2218,21 @@ fn goto_definition_inner(
     file_path: Option<String>,
     prefer_impl: bool,
 ) -> Result<Value> {
+    if let Some(tag_path) = string_literal_under_cursor(&content, line, character) {
+        if looks_like_gameplay_tag_path(&tag_path) {
+            if let Some(result) = find_gameplay_tag_by_path(conn, &tag_path)? {
+                return Ok(result);
+            }
+        }
+    }
+
     let Some(ctx) = extract_cursor_context(&content, line, character) else {
         return Ok(Value::Null);
     };
+
+    if let Some(result) = find_gameplay_tag_by_identifier(conn, &ctx.symbol)? {
+        return Ok(result);
+    }
 
     if !prefer_impl
         && file_path
@@ -2163,6 +2306,16 @@ fn goto_definition_inner(
                 return Ok(result);
             }
         }
+        if matches!(ctx.qualifier_op.as_deref(), Some("::")) || ctx.enclosing_class.is_none() {
+            if let Some(result) = find_member_anywhere(conn, &ctx.symbol, false)? {
+                tracing::debug!(
+                    "goto_{}: resolved '{}' via global static/member fallback",
+                    mode,
+                    ctx.symbol
+                );
+                return Ok(result);
+            }
+        }
         tracing::debug!("goto_{}: no result for '{}'", mode, ctx.symbol);
         return Ok(Value::Null);
     }
@@ -2209,7 +2362,10 @@ fn goto_definition_inner(
             ctx.symbol,
             resolved_class
         );
-        return Ok(Value::Null);
+
+        if !matches!(ctx.qualifier_op.as_deref(), Some("::")) {
+            return Ok(Value::Null);
+        }
     }
 
     // 2. Try member lookup from the enclosing class.
@@ -2324,6 +2480,23 @@ fn fix_symbol_location(value: &mut Value, symbol_name: &str) {
     }
 }
 
+fn fix_text_location(value: &mut Value, text: &str) {
+    let Some(file_path) = value.get("file_path").and_then(Value::as_str) else {
+        return;
+    };
+
+    let start_line = value
+        .get("line_number")
+        .and_then(Value::as_i64)
+        .unwrap_or(1)
+        .max(1) as usize;
+
+    if let Some((line, col)) = find_text_location_near(file_path, text, start_line) {
+        value["line_number"] = json!(line as i64);
+        value["col"] = json!(col as i64);
+    }
+}
+
 fn find_symbol_location_near(
     file_path: &str,
     symbol_name: &str,
@@ -2341,6 +2514,30 @@ fn find_symbol_location_near(
 
     for (index, line) in lines.iter().enumerate().take(end + 1).skip(start) {
         if let Some(col) = find_identifier_in_line(line, symbol_name) {
+            return Some((index + 1, col));
+        }
+    }
+
+    None
+}
+
+fn find_text_location_near(
+    file_path: &str,
+    text: &str,
+    start_line: usize,
+) -> Option<(usize, usize)> {
+    let content = fs::read_to_string(file_path).ok()?;
+    let lines = content.lines().collect::<Vec<_>>();
+
+    if lines.is_empty() {
+        return None;
+    }
+
+    let start = start_line.saturating_sub(1).min(lines.len() - 1);
+    let end = (start + 8).min(lines.len() - 1);
+
+    for (index, line) in lines.iter().enumerate().take(end + 1).skip(start) {
+        if let Some(col) = line.find(text) {
             return Some((index + 1, col));
         }
     }
@@ -2585,7 +2782,10 @@ fn tokens(text: &str) -> Vec<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_cursor_context, find_local_declaration, infer_var_type, resolve_impl_class};
+    use super::{
+        extract_cursor_context, find_local_declaration, infer_var_type, resolve_impl_class,
+        string_literal_under_cursor,
+    };
 
     const SAMPLE: &str = r#"
 void StartDeath()
@@ -2690,6 +2890,17 @@ public:
         assert_eq!(
             resolve_impl_class(&ctx, THIS_CLASS_SAMPLE, line),
             Some("ULyraGameplayAbility_RangedWeapon".to_string())
+        );
+    }
+
+    #[test]
+    fn string_literal_under_cursor_extracts_gameplay_tag_path() {
+        let sample = r#"auto Tag = FGameplayTag::RequestGameplayTag(TEXT("Status.Death"));"#;
+        let (line, col) = line_and_col(sample, "Status.Death", 0);
+
+        assert_eq!(
+            string_literal_under_cursor(sample, line, col),
+            Some("Status.Death".to_string())
         );
     }
 }
