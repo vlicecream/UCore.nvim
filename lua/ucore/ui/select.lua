@@ -1153,7 +1153,7 @@ local function pick_telescope_find(items, default_text)
 	local previewers = require("telescope.previewers")
 	local actions = require("telescope.actions")
 	local action_state = require("telescope.actions.state")
-	local conf = require("telescope.config").values
+	local sorters = require("telescope.sorters")
 
 	items = prepare_find_items(items)
 
@@ -1187,7 +1187,7 @@ local function pick_telescope_find(items, default_text)
 					end
 				end,
 			}),
-			sorter = conf.generic_sorter({}),
+			sorter = sorters.empty(),
 			attach_mappings = function(prompt_bufnr)
 				map_telescope_escape(prompt_bufnr, function(mode, lhs, rhs)
 					vim.keymap.set(mode, lhs, rhs, { buffer = prompt_bufnr, nowait = true, silent = true })
