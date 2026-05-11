@@ -171,7 +171,7 @@ pub async fn handle_setup(state: Arc<AppState>, params: &Value) -> Result<Value>
     }
 
     if !needs_full_refresh {
-        ensure_asset_index_ready(&db_path_native, &req.project_root).await?;
+        schedule_asset_index_ready(state.clone(), db_path_native.clone(), req.project_root.clone());
     }
 
     let _ = state.save_registry();
@@ -1783,6 +1783,38 @@ async fn ensure_asset_index_ready(db_path_native: &str, project_root: &str) -> R
         asset::refresh_asset_index(&mut conn, Path::new(&project_root), reporter)
     })
     .await?
+}
+
+/// Schedule persistent asset index initialization in the background.
+/// 后台调度持久化资产索引初始化，不阻塞 setup 返回。
+fn schedule_asset_index_ready(state: Arc<AppState>, db_path_native: String, project_root: String) {
+    let root_key = normalize_path_key(&project_root);
+
+    {
+        let mut active = state.active_asset_scans.lock();
+        if active.contains(&root_key) {
+            return;
+        }
+        active.insert(root_key.clone());
+    }
+
+    tokio::spawn(async move {
+        let result = ensure_asset_index_ready(&db_path_native, &project_root).await;
+
+        {
+            let mut active = state.active_asset_scans.lock();
+            active.remove(&root_key);
+        }
+
+        match result {
+            Ok(()) => {
+                info!("Background asset index ready: {}", project_root);
+            }
+            Err(err) => {
+                warn!("Background asset index failed for {}: {}", project_root, err);
+            }
+        }
+    });
 }
 
 /// Ensure SQLite database exists, version matches, and has required data.
