@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rusqlite::{Connection, OptionalExtension, ToSql};
+use rusqlite::{Connection, ToSql};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::io::BufRead;
@@ -441,21 +441,6 @@ fn collect_unresolved_candidate_files(
     symbol_name: &str,
     current_file: Option<&str>,
 ) -> Result<CandidateFiles> {
-    if is_delegate_symbol(conn, symbol_name)? {
-        let mut file_paths = collect_all_file_ids(conn)
-            .and_then(|ids| get_file_paths_by_ids(conn, &ids.into_iter().take(MAX_FILES).collect::<Vec<_>>()))?;
-        file_paths.sort();
-        file_paths.dedup();
-
-        return Ok(CandidateFiles {
-            file_paths,
-            found_definition: find_symbol_definition_file_ids(conn, symbol_name)?
-                .into_iter()
-                .next()
-                .is_some(),
-        });
-    }
-
     let mut candidate_ids = HashSet::new();
     let mut found_definition = false;
 
@@ -500,32 +485,6 @@ fn collect_unresolved_candidate_files(
         file_paths,
         found_definition,
     })
-}
-
-fn is_delegate_symbol(conn: &Connection, symbol_name: &str) -> Result<bool> {
-    let exists = conn
-        .query_row(
-            r#"
-            SELECT 1
-            FROM classes c
-            JOIN strings s ON c.name_id = s.id
-            WHERE s.text = ?
-              AND c.symbol_type IN (
-                'delegate',
-                'multicast_delegate',
-                'dynamic_delegate',
-                'dynamic_multicast_delegate',
-                'event'
-              )
-            LIMIT 1
-            "#,
-            [symbol_name],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some();
-
-    Ok(exists)
 }
 
 /// Find definition file ids for a member owned by a specific class.
