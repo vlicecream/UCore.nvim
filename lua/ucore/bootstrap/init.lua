@@ -151,17 +151,14 @@ local function run_engine_refresh_if_needed(payload, callback)
 	local engine_paths = payload._engine_paths
 
 	if not engine or not engine_paths then
-		status.progress_finish("UCore Engine Index", "UCore Engine Index 100%")
 		return callback(true)
 	end
 
 	if not project.engine_needs_refresh(engine) then
-		status.progress_finish("UCore Engine Index", "UCore Engine Index 100%")
 		return callback(true)
 	end
 
 	if engine_refreshing[engine.engine_id] then
-		status.progress_finish("UCore Engine Index", "UCore Engine Index 100%")
 		return callback(true)
 	end
 
@@ -184,7 +181,10 @@ local function run_engine_refresh_if_needed(payload, callback)
 
 		project.write_engine_index_metadata(engine)
 		callback(true)
-	end)
+	end, {
+		silent = true,
+		label = "UCore Engine Index",
+	})
 end
 
 -- Refresh the shared Engine index after the project is already usable.
@@ -192,14 +192,15 @@ end
 local function run_engine_refresh_in_background(payload, after_finish)
 	run_engine_refresh_if_needed(payload, function(ok, err)
 		if ok then
-			status.finish("UCore Ready - Initialization Complete")
 			if type(after_finish) == "function" then
 				after_finish(true)
 			end
 			return
 		end
 
-		status.fail("UCore Engine Index Failed", tostring(err))
+		vim.schedule(function()
+			vim.notify("UCore Engine Index Failed:\n" .. tostring(err), vim.log.levels.WARN)
+		end)
 		if type(after_finish) == "function" then
 			after_finish(false, err)
 		end
@@ -308,6 +309,7 @@ function M.boot(callback, opts)
 						other_progress(80)
 						booting = false
 						other_progress(100)
+						status.finish("UCore Ready - Initialization Complete")
 						callback(true)
 						run_engine_refresh_in_background(payload, opts.after_finish)
 					end)

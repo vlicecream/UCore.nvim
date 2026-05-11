@@ -29,7 +29,7 @@ local function refresh_progress_title(payload, opts)
 end
 
 function M.refresh(payload, callback, opts)
-	progress.start(refresh_progress_title(payload, opts))
+	progress.start(refresh_progress_title(payload, opts), opts)
 
 	rpc.request("refresh", payload, function(result, err)
 		if not err then

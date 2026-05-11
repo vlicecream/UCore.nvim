@@ -24,6 +24,7 @@ local phase_order = {}
 local last_percent = -1
 local active = false
 local title = "UCore refresh"
+local visible = true
 
 -- Load the built-in overall progress plan.
 -- 加载内置的整体进度计划。
@@ -42,10 +43,14 @@ end
 
 -- Start a new visible progress run with a user-facing title.
 -- 使用面向用户的标题开始一次新的进度展示。
-function M.start(next_title)
+function M.start(next_title, opts)
+	opts = opts or {}
 	title = next_title or "UCore refresh"
+	visible = opts.silent ~= true
 	reset()
-	status.progress(title, string.format("%s 0%%", title))
+	if visible then
+		status.progress(title, string.format("%s 0%%", title))
+	end
 end
 
 -- Finish the visible progress run and let it disappear shortly after.
@@ -57,14 +62,18 @@ function M.finish(message)
 
 	active = false
 	last_percent = 100
-	status.progress_finish(title, message or string.format("%s 100%%", title))
+	if visible then
+		status.progress_finish(title, message or string.format("%s 100%%", title))
+	end
 end
 
 -- Mark the current progress run as failed.
 -- 标记当前进度展示失败。
 function M.fail(message)
 	active = false
-	status.progress_fail(title, message or string.format("%s failed", title))
+	if visible then
+		status.progress_fail(title, message or string.format("%s failed", title))
+	end
 end
 
 -- Clamp one numeric value into a safe range.
@@ -215,7 +224,9 @@ function M.handle_progress(event)
 		return M.finish(string.format("%s 100%%", title))
 	end
 
-	status.progress(title, message)
+	if visible then
+		status.progress(title, message)
+	end
 end
 
 return M
