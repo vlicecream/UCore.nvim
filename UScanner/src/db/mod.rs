@@ -16,7 +16,7 @@ use crate::types::{ParseResult, ProgressReporter};
 ///
 /// Increment this when table structures, indexes, or stored data semantics change.
 /// 当表结构、索引或存储语义变化时递增。
-pub const DB_VERSION: i32 = 22;
+pub const DB_VERSION: i32 = 23;
 
 /// Completion cache version.
 /// 补全缓存版本。

@@ -27,6 +27,7 @@ static CLEAN_REGEXES: OnceLock<CleanRegexes> = OnceLock::new();
 static GAMEPLAY_TAG_DEFINE_RE: OnceLock<Regex> = OnceLock::new();
 static GAMEPLAY_TAG_DECLARE_RE: OnceLock<Regex> = OnceLock::new();
 static MACRO_DEFINE_RE: OnceLock<Regex> = OnceLock::new();
+static DELEGATE_MACRO_START_RE: OnceLock<Regex> = OnceLock::new();
 
 fn get_clean_regexes() -> &'static CleanRegexes {
     CLEAN_REGEXES.get_or_init(|| {
@@ -102,6 +103,12 @@ fn macro_define_re() -> &'static Regex {
             r#"(?m)^[ \t]*#[ \t]*define[ \t]+(?P<identifier>[A-Za-z_][A-Za-z0-9_]*)\b"#,
         )
         .unwrap()
+    })
+}
+
+fn delegate_macro_start_re() -> &'static Regex {
+    DELEGATE_MACRO_START_RE.get_or_init(|| {
+        Regex::new(r"\b(?P<macro>DECLARE_[A-Za-z0-9_]+)\s*\(").unwrap()
     })
 }
 
@@ -287,8 +294,9 @@ pub fn process_file(
         });
     }
 
-    let (classes, calls, includes) =
+    let (mut classes, calls, includes) =
         parse_content_mmap(content_bytes, &input.path, language, query, include_query)?;
+    classes.extend(collect_delegate_definitions(content_bytes));
     let gameplay_tags = collect_gameplay_tags(content_bytes);
     let macro_definitions = collect_macro_definitions(content_bytes);
 
@@ -467,6 +475,207 @@ fn collect_macro_definitions(content_bytes: &[u8]) -> Vec<crate::types::MacroDef
     }
 
     items
+}
+
+/// Collect Unreal delegate declarations produced by DECLARE_* macros.
+/// 收集由 DECLARE_* 宏生成的 Unreal delegate 声明。
+fn collect_delegate_definitions(content_bytes: &[u8]) -> Vec<ClassInfo> {
+    let Ok(content) = std::str::from_utf8(content_bytes) else {
+        return Vec::new();
+    };
+
+    let mut items = Vec::new();
+
+    for caps in delegate_macro_start_re().captures_iter(content) {
+        let Some(macro_match) = caps.name("macro") else {
+            continue;
+        };
+
+        let macro_name = macro_match.as_str();
+        if !looks_like_delegate_macro(macro_name) {
+            continue;
+        }
+
+        let Some(open_paren) = content[macro_match.end()..]
+            .find('(')
+            .map(|offset| macro_match.end() + offset)
+        else {
+            continue;
+        };
+
+        let Some(close_paren) = find_matching_paren(content, open_paren) else {
+            continue;
+        };
+
+        let args = &content[open_paren + 1..close_paren];
+        let Some(delegate_name) = extract_delegate_name(macro_name, args) else {
+            continue;
+        };
+
+        let line = line_number_for_offset(content, macro_match.start());
+        let end_line = line_number_for_offset(content, close_paren);
+
+        items.push(ClassInfo {
+            class_name: delegate_name,
+            namespace: None,
+            base_classes: Vec::new(),
+            symbol_type: delegate_symbol_type(macro_name).to_string(),
+            line,
+            end_line,
+            range_start: macro_match.start(),
+            range_end: close_paren + 1,
+            members: Vec::new(),
+            is_final: false,
+            is_interface: false,
+        });
+    }
+
+    dedupe_delegate_classes(items)
+}
+
+fn looks_like_delegate_macro(macro_name: &str) -> bool {
+    let macro_upper = macro_name.to_ascii_uppercase();
+    macro_upper.contains("DELEGATE") || macro_upper.starts_with("DECLARE_EVENT")
+}
+
+fn delegate_symbol_type(macro_name: &str) -> &'static str {
+    let macro_upper = macro_name.to_ascii_uppercase();
+
+    if macro_upper.starts_with("DECLARE_EVENT") {
+        "event"
+    } else if macro_upper.contains("DYNAMIC") && macro_upper.contains("MULTICAST") {
+        "dynamic_multicast_delegate"
+    } else if macro_upper.contains("DYNAMIC") {
+        "dynamic_delegate"
+    } else if macro_upper.contains("MULTICAST") {
+        "multicast_delegate"
+    } else {
+        "delegate"
+    }
+}
+
+fn find_matching_paren(content: &str, open_paren: usize) -> Option<usize> {
+    let bytes = content.as_bytes();
+    let mut depth = 0usize;
+    let mut index = open_paren;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'(' => depth += 1,
+            b')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+
+        index += 1;
+    }
+
+    None
+}
+
+fn split_top_level_args(text: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut paren_depth = 0i32;
+    let mut angle_depth = 0i32;
+    let mut bracket_depth = 0i32;
+    let mut brace_depth = 0i32;
+
+    for ch in text.chars() {
+        match ch {
+            '(' => {
+                paren_depth += 1;
+                current.push(ch);
+            }
+            ')' => {
+                paren_depth -= 1;
+                current.push(ch);
+            }
+            '<' => {
+                angle_depth += 1;
+                current.push(ch);
+            }
+            '>' => {
+                angle_depth -= 1;
+                current.push(ch);
+            }
+            '[' => {
+                bracket_depth += 1;
+                current.push(ch);
+            }
+            ']' => {
+                bracket_depth -= 1;
+                current.push(ch);
+            }
+            '{' => {
+                brace_depth += 1;
+                current.push(ch);
+            }
+            '}' => {
+                brace_depth -= 1;
+                current.push(ch);
+            }
+            ',' if paren_depth == 0 && angle_depth == 0 && bracket_depth == 0 && brace_depth == 0 => {
+                let arg = current.trim();
+                if !arg.is_empty() {
+                    args.push(arg.to_string());
+                }
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    let arg = current.trim();
+    if !arg.is_empty() {
+        args.push(arg.to_string());
+    }
+
+    args
+}
+
+fn extract_delegate_name(macro_name: &str, args: &str) -> Option<String> {
+    let args = split_top_level_args(args);
+    if args.is_empty() {
+        return None;
+    }
+
+    let macro_upper = macro_name.to_ascii_uppercase();
+    let name_index = if macro_upper.starts_with("DECLARE_EVENT") || macro_upper.contains("RETVAL") {
+        1
+    } else {
+        0
+    };
+    let raw_name = args.get(name_index)?.trim();
+    let identifier = Regex::new(r"[A-Za-z_][A-Za-z0-9_:]*")
+        .ok()?
+        .find(raw_name)?
+        .as_str();
+    let name = identifier.rsplit("::").next()?.trim();
+
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+fn dedupe_delegate_classes(items: Vec<ClassInfo>) -> Vec<ClassInfo> {
+    let mut seen = std::collections::HashSet::new();
+    let mut result = Vec::new();
+
+    for item in items {
+        let key = format!("{}:{}:{}", item.class_name, item.symbol_type, item.line);
+        if seen.insert(key) {
+            result.push(item);
+        }
+    }
+
+    result
 }
 
 fn line_number_for_offset(content: &str, offset: usize) -> usize {
@@ -1045,7 +1254,9 @@ fn clean_type_string(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_gameplay_tags, collect_macro_definitions};
+    use super::{
+        collect_delegate_definitions, collect_gameplay_tags, collect_macro_definitions,
+    };
 
     #[test]
     fn collect_gameplay_tag_definitions_and_declarations() {
@@ -1075,5 +1286,23 @@ UE_DEFINE_GAMEPLAY_TAG_COMMENT(TAG_Status_Death, "Status.Death", "desc");
         assert_eq!(macros.len(), 2);
         assert_eq!(macros[0].name, "SIMPLE_MACRO");
         assert_eq!(macros[1].name, "FUNCTION_LIKE");
+    }
+
+    #[test]
+    fn collect_unreal_delegate_definitions() {
+        let content = br#"
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnDamageTaken, float, Damage);
+DECLARE_EVENT_OneParam(UMyWidget, FOnWidgetReady, UObject*);
+DECLARE_DELEGATE_RetVal(bool, FCanOpenMenu);
+"#;
+
+        let delegates = collect_delegate_definitions(content);
+        assert_eq!(delegates.len(), 3);
+        assert_eq!(delegates[0].class_name, "FOnDamageTaken");
+        assert_eq!(delegates[0].symbol_type, "dynamic_multicast_delegate");
+        assert_eq!(delegates[1].class_name, "FOnWidgetReady");
+        assert_eq!(delegates[1].symbol_type, "event");
+        assert_eq!(delegates[2].class_name, "FCanOpenMenu");
+        assert_eq!(delegates[2].symbol_type, "delegate");
     }
 }
