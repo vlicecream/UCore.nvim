@@ -1225,13 +1225,68 @@ local function rank_forward_decl_candidate(item, symbol_info, current_path, head
 	}
 end
 
+local function is_include_directive(line)
+	line = tostring(line or "")
+	return line:match("^%s*#%s*include%s+[<\"]") ~= nil
+end
+
+local function is_generated_include_line(line)
+	line = tostring(line or "")
+	return line:match('^%s*#%s*include%s+"[^"]+%.generated%.h"%s*$') ~= nil
+end
+
+local function resolve_include_insert_line(lines, bufnr, target_line)
+	lines = lines or {}
+	target_line = math.max(tonumber(target_line) or 1, 1)
+	local file_path = normalize(vim.api.nvim_buf_get_name(bufnr))
+
+	if is_header_file(file_path) then
+		local generated_row
+		for index, line in ipairs(lines) do
+			if is_generated_include_line(line) then
+				generated_row = index
+				break
+			end
+		end
+
+		if generated_row then
+			local last_regular_include
+			for index = 1, generated_row - 1 do
+				if is_include_directive(lines[index]) then
+					last_regular_include = index
+				end
+			end
+
+			if last_regular_include then
+				return last_regular_include + 1
+			end
+
+			return generated_row
+		end
+	end
+
+	local last_include
+	for index, line in ipairs(lines) do
+		if is_include_directive(line) then
+			last_include = index
+		end
+	end
+
+	if last_include then
+		return last_include + 1
+	end
+
+	return target_line
+end
+
 local function insert_include_line(bufnr, include_path, target_line)
 	local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
 	if line_contains_include(lines, include_path) then
 		return false, "already_included"
 	end
 
-	local row = math.max((tonumber(target_line) or 1) - 1, 0)
+	local insert_line = resolve_include_insert_line(lines, bufnr, target_line)
+	local row = math.max(insert_line - 1, 0)
 	local insert = string.format('#include "%s"', include_path)
 	vim.api.nvim_buf_set_lines(bufnr, row, row, false, { insert })
 	return true
@@ -1260,7 +1315,54 @@ local function insert_forward_declaration(bufnr, keyword, symbol, target_line)
 	return true
 end
 
-local function choose_and_insert_dependency(bufnr, metadata, candidates)
+local function choose_dependency_candidate(candidates, opts)
+	opts = opts or {}
+	if vim.tbl_isempty(candidates) then
+		return nil
+	end
+
+	local prefer_action = tostring(opts.prefer_action or "")
+	local best = candidates[1]
+	if prefer_action ~= "" then
+		for _, candidate in ipairs(candidates) do
+			if candidate.action == prefer_action then
+				if best.action ~= prefer_action or candidate.score > best.score then
+					best = candidate
+				end
+			end
+		end
+	end
+
+	if opts.auto == true then
+		return best
+	end
+
+	if #candidates == 1 then
+		return candidates[1]
+	end
+
+	if candidates[1].score > candidates[2].score then
+		return candidates[1]
+	end
+
+	if prefer_action ~= "" and best.action == prefer_action then
+		local best_preferred = best.score
+		local competitor_score = -math.huge
+		for _, candidate in ipairs(candidates) do
+			if candidate.action ~= prefer_action and candidate.score > competitor_score then
+				competitor_score = candidate.score
+			end
+		end
+		if best_preferred >= competitor_score then
+			return best
+		end
+	end
+
+	return nil
+end
+
+local function choose_and_insert_dependency(bufnr, metadata, candidates, opts)
+	opts = opts or {}
 	if vim.tbl_isempty(candidates) then
 		return vim.notify("No indexed symbol found for the current symbol", vim.log.levels.INFO)
 	end
@@ -1305,8 +1407,9 @@ local function choose_and_insert_dependency(bufnr, metadata, candidates)
 		vim.notify("Failed to insert dependency", vim.log.levels.ERROR)
 	end
 
-	if #candidates == 1 or candidates[1].score > candidates[2].score then
-		return apply(candidates[1])
+	local auto_choice = choose_dependency_candidate(candidates, opts)
+	if auto_choice then
+		return apply(auto_choice)
 	end
 
 	vim.ui.select(candidates, {
@@ -1324,7 +1427,18 @@ local function choose_and_insert_dependency(bufnr, metadata, candidates)
 	end)
 end
 
-try_include_symbol = function(bufnr)
+local function diagnostic_missing_type_symbol(diagnostic)
+	diagnostic = diagnostic or {}
+	local message = tostring(diagnostic.message or "")
+	local symbol = message:match("Type%s*([A-Za-z_][A-Za-z0-9_:]*)%s*is%s*not%s*visible")
+	if symbol and symbol ~= "" then
+		return symbol:match("([^:]+)$") or symbol
+	end
+	return nil
+end
+
+try_include_symbol = function(bufnr, opts)
+	opts = opts or {}
 	local root = project.find_project_root(vim.api.nvim_buf_get_name(bufnr))
 	if not root then
 		return
@@ -1332,6 +1446,19 @@ try_include_symbol = function(bufnr)
 
 	local file_path = normalize(vim.api.nvim_buf_get_name(bufnr))
 	local symbol_info = current_symbol(bufnr)
+	local override_symbol = tostring(opts.symbol or "")
+	if (not symbol_info or symbol_info.symbol == "") and override_symbol ~= "" then
+		symbol_info = {
+			symbol = override_symbol,
+			row = vim.api.nvim_win_get_cursor(0)[1] - 1,
+			col = vim.api.nvim_win_get_cursor(0)[2],
+			start_col = 0,
+			end_col = 0,
+			line = line_text(bufnr, vim.api.nvim_win_get_cursor(0)[1] - 1),
+			before = "",
+			after = "",
+		}
+	end
 	if not symbol_info then
 		return vim.notify("No symbol under cursor", vim.log.levels.INFO)
 	end
@@ -1342,7 +1469,7 @@ try_include_symbol = function(bufnr)
 		end
 		return vim.notify("No symbol under cursor", vim.log.levels.INFO)
 	end
-	local symbol = symbol_info.symbol
+	local symbol = override_symbol ~= "" and override_symbol or symbol_info.symbol
 
 	remote.query(root, {
 		kind = "ParseBuffer",
@@ -1375,7 +1502,7 @@ try_include_symbol = function(bufnr)
 				end
 			end
 
-			choose_and_insert_dependency(bufnr, metadata, candidates)
+			choose_and_insert_dependency(bufnr, metadata, candidates, opts)
 		end, 24)
 	end)
 end
@@ -1384,6 +1511,14 @@ function M.smart_action()
 	local bufnr = vim.api.nvim_get_current_buf()
 	local diagnostic = current_ucore_diagnostic()
 	if diagnostic then
+		local code = diagnostic.code or (diagnostic.user_data and diagnostic.user_data.code)
+		if code == "UECPPO04" then
+			return try_include_symbol(bufnr, {
+				auto = true,
+				prefer_action = "include",
+				symbol = diagnostic_missing_type_symbol(diagnostic),
+			})
+		end
 		local ok = apply_ucore_fix(bufnr, diagnostic)
 		if ok then
 			return
