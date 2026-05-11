@@ -10,21 +10,28 @@ local read_buffer = ""
 local next_msgid = 1
 local pending = {}
 
+local function same_socket(handle)
+	return handle ~= nil and socket ~= nil and handle == socket
+end
+
 -- Close the current socket without touching pending callbacks.
 -- 关闭当前 socket，但不清理等待中的回调。
-local function close_socket()
-	if socket then
+local function close_socket(handle)
+	local target = handle or socket
+	if target then
 		pcall(function()
-			socket:read_stop()
+			target:read_stop()
 		end)
 		pcall(function()
-			socket:close()
+			target:close()
 		end)
 	end
 
-	socket = nil
-	connected = false
-	read_buffer = ""
+	if not handle or same_socket(handle) then
+		socket = nil
+		connected = false
+		read_buffer = ""
+	end
 end
 
 -- Encode a u32 as big-endian bytes.
@@ -128,10 +135,14 @@ end
 
 -- Start reading frames from the TCP socket.
 -- 开始从 TCP socket 读取响应帧。
-local function start_read_loop()
-	socket:read_start(function(err, chunk)
+local function start_read_loop(handle)
+	if not handle then
+		return
+	end
+
+	handle:read_start(function(err, chunk)
 		if err then
-			close_socket()
+			close_socket(handle)
 			vim.schedule(function()
 				vim.notify("UCore RPC read error: " .. tostring(err), vim.log.levels.ERROR)
 			end)
@@ -139,7 +150,11 @@ local function start_read_loop()
 		end
 
 		if not chunk then
-			close_socket()
+			close_socket(handle)
+			return
+		end
+
+		if not same_socket(handle) then
 			return
 		end
 
@@ -164,19 +179,25 @@ function M.connect(callback)
 		return callback(true, nil)
 	end
 
-	socket = uv.new_tcp()
+	local client = uv.new_tcp()
+	socket = client
 	read_buffer = ""
 
-	socket:connect("127.0.0.1", config.values.port, function(err)
+	client:connect("127.0.0.1", config.values.port, function(err)
+		if not same_socket(client) then
+			close_socket(client)
+			return
+		end
+
 		if err then
-			close_socket()
+			close_socket(client)
 			return vim.schedule(function()
 				callback(false, err)
 			end)
 		end
 
 		connected = true
-		start_read_loop()
+		start_read_loop(client)
 
 		vim.schedule(function()
 			callback(true, nil)
@@ -204,9 +225,18 @@ function M.request(method, params, callback)
 		-- 请求帧：[0, msgid, method, params]
 		local payload = vim.mpack.encode({ 0, msgid, method, params or {} })
 		local frame = make_frame(payload)
-		socket:write(frame, function(write_err)
+		local current_socket = socket
+		if not current_socket then
+			pending[msgid] = nil
+			return callback(nil, "UCore RPC socket is not connected")
+		end
+
+		current_socket:write(frame, function(write_err)
 			if write_err then
 				pending[msgid] = nil
+				if same_socket(current_socket) then
+					close_socket(current_socket)
+				end
 				vim.schedule(function()
 					callback(nil, write_err)
 				end)
