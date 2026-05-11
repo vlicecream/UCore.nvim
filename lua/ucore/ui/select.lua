@@ -118,6 +118,82 @@ local function pad_right(text, width)
 	return text .. string.rep(" ", padding)
 end
 
+local function map_telescope_escape(prompt_bufnr, map)
+	if type(map) ~= "function" then
+		return
+	end
+
+	map("i", "<Esc>", function()
+		require("telescope.actions").close(prompt_bufnr)
+	end)
+end
+
+local function open_input_window(opts)
+	opts = opts or {}
+	local title = tostring(opts.title or opts.prompt or "Input")
+	local default = tostring(opts.default or "")
+	local width = math.max(32, math.min(vim.o.columns - 8, math.max(48, vim.fn.strdisplaywidth(default) + 8)))
+	local row = math.max(1, math.floor(vim.o.lines * 0.3))
+	local col = math.max(0, math.floor((vim.o.columns - width) / 2))
+	local bufnr = vim.api.nvim_create_buf(false, true)
+	local winid = vim.api.nvim_open_win(bufnr, true, {
+		relative = "editor",
+		row = row,
+		col = col,
+		width = width,
+		height = 1,
+		style = "minimal",
+		border = "rounded",
+		title = title,
+		title_pos = "center",
+	})
+
+	vim.bo[bufnr].buftype = "nofile"
+	vim.bo[bufnr].bufhidden = "wipe"
+	vim.bo[bufnr].swapfile = false
+	vim.bo[bufnr].modifiable = true
+	vim.bo[bufnr].filetype = "ucore_input"
+	vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { default })
+
+	local done = false
+	local function finish(value)
+		if done then
+			return
+		end
+		done = true
+		if winid and vim.api.nvim_win_is_valid(winid) then
+			vim.api.nvim_win_close(winid, true)
+		end
+		local callback = opts.on_confirm or opts.callback
+		if type(callback) == "function" then
+			callback(value)
+		end
+	end
+
+	local function submit()
+		local line = (vim.api.nvim_buf_get_lines(bufnr, 0, 1, false)[1] or "")
+		finish(line)
+	end
+
+	local function cancel()
+		finish(nil)
+	end
+
+	local keymap_opts = { buffer = bufnr, nowait = true, silent = true }
+	vim.keymap.set("n", "<CR>", submit, keymap_opts)
+	vim.keymap.set("i", "<CR>", submit, keymap_opts)
+	vim.keymap.set("n", "<Esc>", cancel, keymap_opts)
+	vim.keymap.set("i", "<Esc>", cancel, keymap_opts)
+	vim.keymap.set("n", "q", cancel, keymap_opts)
+
+	vim.api.nvim_win_set_cursor(winid, { 1, #default })
+	vim.schedule(function()
+		if winid and vim.api.nvim_win_is_valid(winid) then
+			vim.cmd("startinsert!")
+		end
+	end)
+end
+
 local function normalize_path(path)
 	return tostring(path or ""):gsub("\\", "/"):lower()
 end
@@ -874,6 +950,9 @@ local function pick_telescope(title, items, format_item, on_choice)
 			}),
 			sorter = conf.generic_sorter({}),
 			attach_mappings = function(prompt_bufnr)
+				map_telescope_escape(prompt_bufnr, function(mode, lhs, rhs)
+					vim.keymap.set(mode, lhs, rhs, { buffer = prompt_bufnr, nowait = true, silent = true })
+				end)
 				actions.select_default:replace(function()
 					local selection = action_state.get_selected_entry()
 					actions.close(prompt_bufnr)
@@ -929,6 +1008,9 @@ local function pick_telescope_references(references, opts)
 			previewer = conf.grep_previewer({}),
 			sorter = conf.generic_sorter({}),
 			attach_mappings = function(prompt_bufnr)
+				map_telescope_escape(prompt_bufnr, function(mode, lhs, rhs)
+					vim.keymap.set(mode, lhs, rhs, { buffer = prompt_bufnr, nowait = true, silent = true })
+				end)
 				actions.select_default:replace(function()
 					local selection = action_state.get_selected_entry()
 					actions.close(prompt_bufnr)
@@ -1107,6 +1189,9 @@ local function pick_telescope_find(items, default_text)
 			}),
 			sorter = conf.generic_sorter({}),
 			attach_mappings = function(prompt_bufnr)
+				map_telescope_escape(prompt_bufnr, function(mode, lhs, rhs)
+					vim.keymap.set(mode, lhs, rhs, { buffer = prompt_bufnr, nowait = true, silent = true })
+				end)
 				actions.select_default:replace(function()
 					local selection = action_state.get_selected_entry()
 					actions.close(prompt_bufnr)
@@ -1350,6 +1435,7 @@ local function pick_telescope_find_live(initial_symbols, opts)
 			end, FIND_DEBOUNCE_MS)
 		end,
 		attach_mappings = function(prompt_bufnr, map)
+			map_telescope_escape(prompt_bufnr, map)
 			actions.select_default:replace(function()
 				local selection = action_state.get_selected_entry()
 				actions.close(prompt_bufnr)
@@ -1489,6 +1575,14 @@ function M.blueprint_assets(items, opts)
 		require("ucore.unreal_asset").open_or_notify(tostring(item.asset_path or item.path or ""))
 	end
 	return open_large_list_window(items, opts)
+end
+
+function M.input(opts, callback)
+	opts = opts or {}
+	if callback ~= nil then
+		opts.callback = callback
+	end
+	return open_input_window(opts)
 end
 
 -- Pick a symbol and open its source file when possible.

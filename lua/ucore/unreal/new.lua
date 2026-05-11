@@ -1,6 +1,7 @@
 local project = require("ucore.project")
 local remote = require("ucore.remote")
 local write_access = require("ucore.write_access")
+local select_ui = require("ucore.ui.select")
 
 local M = {}
 
@@ -228,8 +229,8 @@ local function choose_parent_class(root, default_parent, callback)
         return pick_parent_class_live(root, common_items, default_parent, callback)
       end
 
-      vim.ui.input({
-        prompt = "Search parent class: ",
+      select_ui.input({
+        title = "Search parent class",
         default = "",
       }, function(input)
         input = vim.trim(input or "")

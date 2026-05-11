@@ -4,6 +4,7 @@ local render = require("ucore.explorer.render")
 local search = require("ucore.explorer.search")
 local state = require("ucore.explorer.state")
 local tree = require("ucore.explorer.tree")
+local select_ui = require("ucore.ui.select")
 
 local M = {}
 
@@ -203,11 +204,16 @@ local function collapse()
 end
 
 local function prompt_search()
-	local ok, value = pcall(vim.fn.input, "UCore Explorer search: ", state.search or "")
-	if ok and value ~= nil then
+	select_ui.input({
+		title = "UCore Explorer search",
+		default = state.search or "",
+	}, function(value)
+		if value == nil then
+			return
+		end
 		state.search = value
 		redraw()
-	end
+	end)
 end
 
 local function clear_search()
