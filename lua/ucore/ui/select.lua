@@ -970,9 +970,9 @@ local function open_large_list_window(items, opts)
 
 	local columns = vim.o.columns
 	local lines = vim.o.lines
-	local width = math.max(80, math.min(math.floor(columns * 0.82), 180))
-	local height = math.max(12, math.min(#items + 2, math.floor(lines * 0.75)))
-	local row = math.max(1, math.floor((lines - height) / 2) - 1)
+	local width = math.max(100, math.min(columns - 6, math.floor(columns * 0.92)))
+	local height = math.max(16, math.min(lines - 6, math.max(#items + 2, math.floor(lines * 0.82))))
+	local row = math.max(1, math.floor((lines - height) / 2) - 2)
 	local col = math.max(0, math.floor((columns - width) / 2))
 
 	local bufnr = vim.api.nvim_create_buf(false, true)
