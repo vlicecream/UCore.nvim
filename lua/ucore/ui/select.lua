@@ -951,12 +951,22 @@ local function close_window(winid)
 	end
 end
 
-local function open_blueprint_assets_window(items, opts)
+local function default_large_list_line(item)
+	return {
+		text = tostring(item),
+		highlights = {},
+	}
+end
+
+local function open_large_list_window(items, opts)
 	opts = opts or {}
 	if type(items) ~= "table" or vim.tbl_isempty(items) then
-		vim.notify((opts.title or "UCore blueprint") .. ": no results", vim.log.levels.WARN)
+		vim.notify((opts.title or "UCore list") .. ": no results", vim.log.levels.WARN)
 		return
 	end
+
+	local line_builder = type(opts.line_builder) == "function" and opts.line_builder or default_large_list_line
+	local on_choice = type(opts.on_choice) == "function" and opts.on_choice or function() end
 
 	local columns = vim.o.columns
 	local lines = vim.o.lines
@@ -974,7 +984,7 @@ local function open_blueprint_assets_window(items, opts)
 		height = height,
 		style = "minimal",
 		border = "rounded",
-		title = opts.title or "UCore Blueprint",
+		title = opts.title or "UCore List",
 		title_pos = "center",
 	})
 
@@ -982,33 +992,31 @@ local function open_blueprint_assets_window(items, opts)
 	vim.bo[bufnr].bufhidden = "wipe"
 	vim.bo[bufnr].swapfile = false
 	vim.bo[bufnr].modifiable = true
-	vim.bo[bufnr].filetype = "ucore_blueprint_assets"
-
-	local name_width = 24
-	for _, item in ipairs(items) do
-		name_width = math.min(48, math.max(name_width, vim.fn.strdisplaywidth(tostring(item.name or "")) + 2))
-	end
+	vim.bo[bufnr].filetype = opts.filetype or "ucore_large_list"
 
 	local lines_out = {}
-	for _, item in ipairs(items) do
-		local name = tostring(item.name or "<asset>")
-		local path = tostring(item.asset_path or item.path or "")
-		local line = string.format("%s %s", pad_right(name, name_width), path)
-		table.insert(lines_out, line)
+	local metadata = {}
+	for index, item in ipairs(items) do
+		local rendered = line_builder(item, index, items) or {}
+		local text = tostring(rendered.text or "")
+		table.insert(lines_out, text)
+		metadata[index] = rendered
 	end
 
 	vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines_out)
 	vim.bo[bufnr].modifiable = false
 
-	for index, item in ipairs(items) do
-		local name = tostring(item.name or "<asset>")
-		local path = tostring(item.asset_path or item.path or "")
+	for index, rendered in ipairs(metadata) do
 		local line = index - 1
-		local name_end = #name
-		local path_start = #pad_right(name, name_width) + 1
-		vim.api.nvim_buf_add_highlight(bufnr, -1, "Identifier", line, 0, name_end)
-		if path ~= "" then
-			vim.api.nvim_buf_add_highlight(bufnr, -1, "Comment", line, path_start, -1)
+		for _, highlight in ipairs(rendered.highlights or {}) do
+			vim.api.nvim_buf_add_highlight(
+				bufnr,
+				-1,
+				tostring(highlight.group or "Normal"),
+				line,
+				tonumber(highlight.start_col or 0) or 0,
+				highlight.end_col == nil and -1 or (tonumber(highlight.end_col) or -1)
+			)
 		end
 	end
 
@@ -1017,7 +1025,7 @@ local function open_blueprint_assets_window(items, opts)
 		local item = items[cursor[1]]
 		close_window(winid)
 		if item then
-			require("ucore.unreal_asset").open_or_notify(tostring(item.asset_path or item.path or ""))
+			on_choice(item, cursor[1], items)
 		end
 	end
 
@@ -1035,6 +1043,24 @@ local function open_blueprint_assets_window(items, opts)
 
 	vim.api.nvim_win_set_option(winid, "cursorline", true)
 	vim.api.nvim_win_set_cursor(winid, { 1, 0 })
+end
+
+local function blueprint_asset_line(item, _, items)
+	local name_width = 24
+	for _, value in ipairs(items or {}) do
+		name_width = math.min(48, math.max(name_width, vim.fn.strdisplaywidth(tostring(value.name or "")) + 2))
+	end
+
+	local name = tostring(item.name or "<asset>")
+	local path = tostring(item.asset_path or item.path or "")
+	local padded = pad_right(name, name_width)
+	return {
+		text = string.format("%s %s", padded, path),
+		highlights = {
+			{ group = "Identifier", start_col = 0, end_col = #name },
+			path ~= "" and { group = "Comment", start_col = #padded + 1, end_col = -1 } or nil,
+		},
+	}
 end
 
 -- Open project-wide find using a Telescope grep-style file preview.
@@ -1451,8 +1477,18 @@ function M.assets(assets)
 	end)
 end
 
+function M.large_list(items, opts)
+	return open_large_list_window(items, opts)
+end
+
 function M.blueprint_assets(items, opts)
-	return open_blueprint_assets_window(items, opts)
+	opts = opts or {}
+	opts.filetype = opts.filetype or "ucore_blueprint_assets"
+	opts.line_builder = opts.line_builder or blueprint_asset_line
+	opts.on_choice = opts.on_choice or function(item)
+		require("ucore.unreal_asset").open_or_notify(tostring(item.asset_path or item.path or ""))
+	end
+	return open_large_list_window(items, opts)
 end
 
 -- Pick a symbol and open its source file when possible.
