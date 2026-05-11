@@ -1356,6 +1356,52 @@ fn find_gameplay_tag_by_path(conn: &Connection, tag_path: &str) -> Result<Option
     Ok(result)
 }
 
+fn find_macro_definition(conn: &Connection, macro_name: &str) -> Result<Option<Value>> {
+    let sql = format!(
+        r#"
+        {}
+        SELECT md.name,
+               md.line_number,
+               dp.full_path || '/' || sf.text
+        FROM macro_definitions md
+        JOIN files f ON md.file_id = f.id
+        JOIN dir_paths dp ON f.directory_id = dp.id
+        JOIN strings sf ON f.filename_id = sf.id
+        WHERE md.name = ?
+        ORDER BY
+            CASE
+                WHEN sf.text LIKE '%.h' THEN 0
+                WHEN sf.text LIKE '%.hpp' THEN 1
+                WHEN sf.text LIKE '%.inl' THEN 2
+                WHEN sf.text LIKE '%.cpp' THEN 3
+                WHEN sf.text LIKE '%.cc' THEN 4
+                WHEN sf.text LIKE '%.cxx' THEN 5
+                ELSE 6
+            END,
+            md.line_number
+        LIMIT 1
+        "#,
+        PATH_CTE,
+    );
+
+    let mut result = conn
+        .query_row(&sql, [macro_name], |row| {
+            Ok(json!({
+                "symbol_name": row.get::<_, String>(0)?,
+                "line_number": row.get::<_, i64>(1)?,
+                "file_path": normalize_path(&row.get::<_, String>(2)?),
+                "kind": "macro",
+            }))
+        })
+        .optional()?;
+
+    if let Some(value) = result.as_mut() {
+        fix_symbol_location(value, macro_name);
+    }
+
+    Ok(result)
+}
+
 fn find_member_hover_in_inheritance_chain(
     conn: &Connection,
     class_name: &str,
@@ -2231,6 +2277,10 @@ fn goto_definition_inner(
     };
 
     if let Some(result) = find_gameplay_tag_by_identifier(conn, &ctx.symbol)? {
+        return Ok(result);
+    }
+
+    if let Some(result) = find_macro_definition(conn, &ctx.symbol)? {
         return Ok(result);
     }
 

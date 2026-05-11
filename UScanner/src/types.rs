@@ -159,6 +159,7 @@ pub struct ParseData {
     pub calls: Vec<CallInfo>,
     pub includes: Vec<String>,
     pub gameplay_tags: Vec<GameplayTagInfo>,
+    pub macro_definitions: Vec<MacroDefinitionInfo>,
     pub parser: String,
     pub new_hash: String,
 }
@@ -181,6 +182,14 @@ pub struct GameplayTagInfo {
     pub tag_path: Option<String>,
 
     pub kind: String,
+    pub line: usize,
+}
+
+/// One indexed C/C++ macro definition.
+/// 一条被索引的 C/C++ 宏定义。
+#[derive(Debug, Clone, Serialize)]
+pub struct MacroDefinitionInfo {
+    pub name: String,
     pub line: usize,
 }
 

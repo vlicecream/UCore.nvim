@@ -16,7 +16,7 @@ use crate::types::{ParseResult, ProgressReporter};
 ///
 /// Increment this when table structures, indexes, or stored data semantics change.
 /// 当表结构、索引或存储语义变化时递增。
-pub const DB_VERSION: i32 = 21;
+pub const DB_VERSION: i32 = 22;
 
 /// Completion cache version.
 /// 补全缓存版本。
@@ -282,6 +282,14 @@ fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
             file_id INTEGER NOT NULL,
             FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS macro_definitions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            line_number INTEGER,
+            file_id INTEGER NOT NULL,
+            FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+        );
         "#,
     )?;
 
@@ -373,6 +381,8 @@ fn create_indices(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_gameplay_tags_identifier ON gameplay_tags(identifier);
         CREATE INDEX IF NOT EXISTS idx_gameplay_tags_tag_path ON gameplay_tags(tag_path);
         CREATE INDEX IF NOT EXISTS idx_gameplay_tags_file_id ON gameplay_tags(file_id);
+        CREATE INDEX IF NOT EXISTS idx_macro_definitions_name ON macro_definitions(name);
+        CREATE INDEX IF NOT EXISTS idx_macro_definitions_file_id ON macro_definitions(file_id);
         "#,
     )?;
 
@@ -409,6 +419,8 @@ fn drop_indices(conn: &Connection) -> rusqlite::Result<()> {
         "idx_gameplay_tags_identifier",
         "idx_gameplay_tags_tag_path",
         "idx_gameplay_tags_file_id",
+        "idx_macro_definitions_name",
+        "idx_macro_definitions_file_id",
     ];
 
     for index_name in indices {
@@ -524,6 +536,11 @@ pub fn save_to_db(
              VALUES (?1, ?2, ?3, ?4, ?5)",
         )?;
 
+        let mut stmt_macro = tx.prepare(
+            "INSERT INTO macro_definitions (name, line_number, file_id)
+             VALUES (?1, ?2, ?3)",
+        )?;
+
         let mut last_reported_percent = 0usize;
 
         for (index, result) in results.iter().enumerate() {
@@ -611,6 +628,7 @@ pub fn save_to_db(
             )?;
 
             save_gameplay_tags(&mut stmt_tag, file_id, &data.gameplay_tags)?;
+            save_macro_definitions(&mut stmt_macro, file_id, &data.macro_definitions)?;
         }
     }
 
@@ -845,6 +863,22 @@ fn save_gameplay_tags(
             tag.tag_path,
             tag.kind,
             tag.line as i64,
+            file_id,
+        ])?;
+    }
+
+    Ok(())
+}
+
+fn save_macro_definitions(
+    stmt_macro: &mut rusqlite::Statement,
+    file_id: i64,
+    macros: &[crate::types::MacroDefinitionInfo],
+) -> anyhow::Result<()> {
+    for macro_info in macros {
+        stmt_macro.execute(params![
+            macro_info.name,
+            macro_info.line as i64,
             file_id,
         ])?;
     }

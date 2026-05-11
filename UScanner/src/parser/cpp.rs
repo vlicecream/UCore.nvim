@@ -26,6 +26,7 @@ struct CleanRegexes {
 static CLEAN_REGEXES: OnceLock<CleanRegexes> = OnceLock::new();
 static GAMEPLAY_TAG_DEFINE_RE: OnceLock<Regex> = OnceLock::new();
 static GAMEPLAY_TAG_DECLARE_RE: OnceLock<Regex> = OnceLock::new();
+static MACRO_DEFINE_RE: OnceLock<Regex> = OnceLock::new();
 
 fn get_clean_regexes() -> &'static CleanRegexes {
     CLEAN_REGEXES.get_or_init(|| {
@@ -90,6 +91,15 @@ fn gameplay_tag_declare_re() -> &'static Regex {
             (?P<identifier>[A-Za-z_][A-Za-z0-9_]*)
             \s*\)
             "#,
+        )
+        .unwrap()
+    })
+}
+
+fn macro_define_re() -> &'static Regex {
+    MACRO_DEFINE_RE.get_or_init(|| {
+        Regex::new(
+            r#"(?m)^[ \t]*#[ \t]*define[ \t]+(?P<identifier>[A-Za-z_][A-Za-z0-9_]*)\b"#,
         )
         .unwrap()
     })
@@ -269,6 +279,7 @@ pub fn process_file(
                 calls: Vec::new(),
                 includes: Vec::new(),
                 gameplay_tags: Vec::new(),
+                macro_definitions: Vec::new(),
                 parser: "fast-skip".to_string(),
                 new_hash,
             }),
@@ -279,6 +290,7 @@ pub fn process_file(
     let (classes, calls, includes) =
         parse_content_mmap(content_bytes, &input.path, language, query, include_query)?;
     let gameplay_tags = collect_gameplay_tags(content_bytes);
+    let macro_definitions = collect_macro_definitions(content_bytes);
 
     Ok(ParseResult {
         path: input.path.clone(),
@@ -289,6 +301,7 @@ pub fn process_file(
             calls,
             includes,
             gameplay_tags,
+            macro_definitions,
             parser: "treesitter".to_string(),
             new_hash,
         }),
@@ -368,6 +381,7 @@ pub fn parse_content(
 /// 低成本头文件预过滤。
 fn looks_like_interesting_unreal_header(content: &[u8]) -> bool {
     contains_bytes(content, b"#include")
+        || contains_bytes(content, b"#define")
         || contains_bytes(content, b"UCLASS")
         || contains_bytes(content, b"USTRUCT")
         || contains_bytes(content, b"UENUM")
@@ -425,6 +439,29 @@ fn collect_gameplay_tags(content_bytes: &[u8]) -> Vec<crate::types::GameplayTagI
             identifier: identifier.as_str().to_string(),
             tag_path: None,
             kind: "declare".to_string(),
+            line: line_number_for_offset(content, full.start()),
+        });
+    }
+
+    items
+}
+
+/// Collect generic C/C++ macro definitions.
+/// 收集通用 C/C++ 宏定义。
+fn collect_macro_definitions(content_bytes: &[u8]) -> Vec<crate::types::MacroDefinitionInfo> {
+    let Ok(content) = std::str::from_utf8(content_bytes) else {
+        return Vec::new();
+    };
+
+    let mut items = Vec::new();
+
+    for caps in macro_define_re().captures_iter(content) {
+        let (Some(full), Some(identifier)) = (caps.get(0), caps.name("identifier")) else {
+            continue;
+        };
+
+        items.push(crate::types::MacroDefinitionInfo {
+            name: identifier.as_str().to_string(),
             line: line_number_for_offset(content, full.start()),
         });
     }
@@ -1008,7 +1045,7 @@ fn clean_type_string(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::collect_gameplay_tags;
+    use super::{collect_gameplay_tags, collect_macro_definitions};
 
     #[test]
     fn collect_gameplay_tag_definitions_and_declarations() {
@@ -1025,5 +1062,18 @@ UE_DEFINE_GAMEPLAY_TAG_COMMENT(TAG_Status_Death, "Status.Death", "desc");
         assert_eq!(tags[0].kind, "define");
         assert_eq!(tags[1].identifier, "TAG_Status_Death");
         assert_eq!(tags[1].tag_path.as_deref(), Some("Status.Death"));
+    }
+
+    #[test]
+    fn collect_generic_macro_definitions() {
+        let content = br#"
+#define SIMPLE_MACRO 1
+ # define FUNCTION_LIKE(Value) (Value)
+"#;
+
+        let macros = collect_macro_definitions(content);
+        assert_eq!(macros.len(), 2);
+        assert_eq!(macros[0].name, "SIMPLE_MACRO");
+        assert_eq!(macros[1].name, "FUNCTION_LIKE");
     }
 }
