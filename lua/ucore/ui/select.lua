@@ -1153,7 +1153,7 @@ local function pick_telescope_find(items, default_text)
 	local previewers = require("telescope.previewers")
 	local actions = require("telescope.actions")
 	local action_state = require("telescope.actions.state")
-	local sorters = require("telescope.sorters")
+	local conf = require("telescope.config").values
 
 	items = prepare_find_items(items)
 
@@ -1166,11 +1166,6 @@ local function pick_telescope_find(items, default_text)
 		.new({}, {
 			prompt_title = "UCore find",
 			default_text = default_text,
-			sorting_strategy = "ascending",
-			-- Telescope's default reset strategy can try to restore row 1 while
-			-- the filtered results buffer is temporarily empty, which trips
-			-- `Invalid cursor line: out of range` on first prompt edits.
-			selection_strategy = "row",
 			finder = finders.new_table({
 				results = items,
 				entry_maker = make_find_entry,
@@ -1187,7 +1182,7 @@ local function pick_telescope_find(items, default_text)
 					end
 				end,
 			}),
-			sorter = sorters.empty(),
+			sorter = conf.generic_sorter({}),
 			attach_mappings = function(prompt_bufnr)
 				map_telescope_escape(prompt_bufnr, function(mode, lhs, rhs)
 					vim.keymap.set(mode, lhs, rhs, { buffer = prompt_bufnr, nowait = true, silent = true })
@@ -1401,8 +1396,6 @@ local function pick_telescope_find_live(initial_symbols, opts)
 	picker_ref = pickers.new({}, {
 		prompt_title = "UCore find",
 		default_text = state.query ~= "" and state.query or nil,
-		sorting_strategy = "ascending",
-		selection_strategy = "row",
 		finder = make_finder(),
 		previewer = previewers.new_buffer_previewer({
 			get_buffer_by_name = function(_, entry)
