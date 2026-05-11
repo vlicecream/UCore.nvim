@@ -4,14 +4,65 @@ local progress = require("ucore.progress")
 local uv = vim.uv or vim.loop
 local M = {}
 
+local HEARTBEAT_INTERVAL_MS = 120000
+
 local socket = nil
 local connected = false
 local read_buffer = ""
 local next_msgid = 1
 local pending = {}
+local heartbeat_timer = nil
+local heartbeat_autocmd_registered = false
 
 local function same_socket(handle)
 	return handle ~= nil and socket ~= nil and handle == socket
+end
+
+local function stop_heartbeat()
+	if heartbeat_timer then
+		pcall(function()
+			heartbeat_timer:stop()
+		end)
+		pcall(function()
+			heartbeat_timer:close()
+		end)
+		heartbeat_timer = nil
+	end
+end
+
+local function send_heartbeat()
+	M.request("ping", {
+		pid = vim.fn.getpid(),
+	}, function()
+	end)
+end
+
+local function ensure_heartbeat()
+	if heartbeat_timer and not heartbeat_timer:is_closing() then
+		return
+	end
+
+	heartbeat_timer = uv.new_timer()
+	if not heartbeat_timer then
+		return
+	end
+
+	heartbeat_timer:start(
+		HEARTBEAT_INTERVAL_MS,
+		HEARTBEAT_INTERVAL_MS,
+		vim.schedule_wrap(function()
+			send_heartbeat()
+		end)
+	)
+
+	if not heartbeat_autocmd_registered then
+		heartbeat_autocmd_registered = true
+		vim.api.nvim_create_autocmd("VimLeavePre", {
+			callback = function()
+				stop_heartbeat()
+			end,
+		})
+	end
 end
 
 -- Close the current socket without touching pending callbacks.
@@ -206,6 +257,8 @@ function M.connect(callback)
 
 		connected = true
 		start_read_loop(client)
+		ensure_heartbeat()
+		send_heartbeat()
 
 		vim.schedule(function()
 			callback(true, nil)
@@ -257,6 +310,7 @@ end
 -- 关闭 RPC socket，并清理等待中的回调。
 function M.close()
 	close_socket()
+	stop_heartbeat()
 	pending = {}
 end
 
