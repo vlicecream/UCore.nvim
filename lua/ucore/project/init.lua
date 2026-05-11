@@ -5,10 +5,26 @@ local read_json_file
 
 local uv = vim.uv or vim.loop
 
+local function is_windows()
+	return package.config:sub(1, 1) == "\\"
+end
+
 -- Normalize paths to slash-separated strings for JSON/Rust interop.
 -- 统一路径为斜杠格式，方便 JSON 和 Rust 侧处理。
 local function normalize(path)
 	return path and path:gsub("\\", "/") or nil
+end
+
+local function trim_trailing_slashes(path)
+	path = normalize(path or "")
+	if path == "" then
+		return nil
+	end
+	if path == "/" or path:match("^%a:/$") then
+		return path
+	end
+	path = path:gsub("/+$", "")
+	return path ~= "" and path or nil
 end
 
 local function basename(path)
@@ -35,6 +51,31 @@ end
 local function dirname(path)
 	path = normalize(path or ""):gsub("/+$", "")
 	return path:match("^(.*)/[^/]*$") or ""
+end
+
+local function canonicalize_path(path)
+	path = tostring(path or "")
+	path = vim.trim(path)
+	if path == "" then
+		return nil
+	end
+	path = vim.fn.expand(path)
+
+	local absolute
+	if vim.fs and vim.fs.abspath then
+		absolute = vim.fs.abspath(path)
+	else
+		absolute = vim.fn.fnamemodify(path, ":p")
+	end
+
+	absolute = normalize(absolute)
+	local native = is_windows() and absolute:gsub("/", "\\") or absolute
+	local real = uv.fs_realpath(native) or uv.fs_realpath(absolute)
+	local canonical = trim_trailing_slashes(real or absolute)
+	if canonical and is_windows() then
+		canonical = canonical:lower()
+	end
+	return canonical
 end
 
 local function fs_stat(path)
@@ -77,10 +118,6 @@ local function mkdirp(path)
 	end
 end
 
-local function is_windows()
-	return package.config:sub(1, 1) == "\\"
-end
-
 local function normalize_association(association)
 	association = tostring(association or "")
 	association = vim.trim(association)
@@ -90,10 +127,14 @@ local function normalize_association(association)
 	return association
 end
 
+local function path_key(path)
+	return canonicalize_path(path) or trim_trailing_slashes(path)
+end
+
 -- Return a readable project cache directory name.
 -- 返回可读性较好的工程缓存目录名。
 local function project_cache_name(project_root)
-	local normalized = normalize(project_root)
+	local normalized = path_key(project_root) or normalize(project_root)
 	local name = basename(normalized)
 	local hash = stable_hash12(normalized)
 
@@ -133,7 +174,7 @@ function M.find_project_file(start_path)
 		limit = 1,
 	})[1]
 
-	return found and normalize(found) or nil
+	return found and (path_key(found) or normalize(found)) or nil
 end
 
 -- Return the Unreal project root directory.
@@ -144,7 +185,7 @@ function M.find_project_root(start_path)
 		return nil
 	end
 
-	return dirname(normalize(vim.fs.abspath(project_file)))
+	return path_key(dirname(project_file)) or dirname(normalize(vim.fs.abspath(project_file)))
 end
 
 -- Search for an Unreal project root from multiple context sources.
@@ -210,6 +251,7 @@ end
 -- Build default database paths under Neovim's cache directory.
 -- 在 Neovim cache 目录下构造默认数据库路径。
 function M.build_paths(project_root)
+	project_root = path_key(project_root) or normalize(project_root)
 	local cache_dir = normalize(config.values.cache_dir)
 	local project_cache_dir = cache_dir .. "/projects/" .. project_cache_name(project_root)
 	mkdirp(project_cache_dir)
@@ -228,13 +270,14 @@ end
 -- Build shared database paths for one Unreal Engine install.
 -- 为一个 Unreal Engine 安装构造共享数据库路径。
 function M.build_engine_paths(engine)
+	local engine_root = path_key(engine.engine_root) or normalize(engine.engine_root)
 	local cache_dir = normalize(config.values.cache_dir)
 	local engine_cache_dir = cache_dir .. "/engines/" .. engine.engine_id
 	mkdirp(engine_cache_dir)
 
 	return {
 		engine_id = engine.engine_id,
-		engine_root = engine.engine_root,
+		engine_root = engine_root,
 		cache_dir = engine_cache_dir,
 		db_path = engine_cache_dir .. "/engine.db",
 		cache_db_path = engine_cache_dir .. "/engine-cache.db",
@@ -286,7 +329,9 @@ function M.engine_needs_refresh(engine)
 		return true
 	end
 
-	return metadata.engine_id ~= engine.engine_id or normalize(metadata.engine_root) ~= normalize(engine.engine_root)
+	return metadata.engine_id ~= engine.engine_id
+		or (path_key(metadata.engine_root) or normalize(metadata.engine_root))
+			~= (path_key(engine.engine_root) or normalize(engine.engine_root))
 end
 
 -- Default scanner configuration shared by setup and refresh.
@@ -368,6 +413,56 @@ function M.read_registry()
 
 	data.projects = data.projects or {}
 	data.engines = data.engines or {}
+	local dirty = false
+
+	local normalized_projects = {}
+	for root, item in pairs(data.projects) do
+		if type(item) == "table" then
+			local canonical_root = path_key(item.root or root) or normalize(item.root or root) or normalize(root)
+			if canonical_root then
+				item.root = canonical_root
+				if normalized_projects[canonical_root] then
+					normalized_projects[canonical_root] = vim.tbl_deep_extend("force", normalized_projects[canonical_root], item)
+					dirty = true
+				else
+					normalized_projects[canonical_root] = item
+					if canonical_root ~= root then
+						dirty = true
+					end
+				end
+			else
+				normalized_projects[root] = item
+			end
+		end
+	end
+	data.projects = normalized_projects
+
+	local normalized_engines = {}
+	for engine_id, item in pairs(data.engines) do
+		if type(item) == "table" then
+			local engine_root = path_key(item.engine_root) or normalize(item.engine_root)
+			local association = normalize_association(item.engine_association)
+			local canonical_id = (engine_root and M.engine_id(engine_root, association)) or tostring(item.engine_id or engine_id)
+			if engine_root then
+				item.engine_root = engine_root
+			end
+			item.engine_id = canonical_id
+			if normalized_engines[canonical_id] then
+				normalized_engines[canonical_id] = vim.tbl_deep_extend("force", normalized_engines[canonical_id], item)
+				dirty = true
+			else
+				normalized_engines[canonical_id] = item
+				if canonical_id ~= engine_id then
+					dirty = true
+				end
+			end
+		end
+	end
+	data.engines = normalized_engines
+
+	if dirty then
+		M.write_registry(data)
+	end
 	return data
 end
 
@@ -387,6 +482,7 @@ end
 -- Find the .uproject file directly under a project root.
 -- 在项目根目录下查找 .uproject 文件。
 function M.find_project_file_in_root(project_root)
+	project_root = path_key(project_root) or normalize(project_root)
 	local scan = uv.fs_scandir(project_root)
 	if not scan then
 		return nil
@@ -424,7 +520,7 @@ end
 -- Return display metadata for a project root.
 -- 返回项目根目录对应的展示信息。
 function M.project_metadata(project_root)
-	project_root = normalize(project_root)
+	project_root = path_key(project_root) or normalize(project_root)
 	local uproject_path = M.find_project_file_in_root(project_root)
 	local name = basename(project_root)
 	local engine = M.engine_metadata(project_root)
@@ -444,7 +540,7 @@ end
 -- Register one Unreal project into the global registry.
 -- 将一个 Unreal 项目注册到全局注册表。
 function M.register_project(project_root)
-	project_root = normalize(project_root)
+	project_root = path_key(project_root) or normalize(project_root)
 	local registry = M.read_registry()
 	local metadata = M.project_metadata(project_root)
 
@@ -462,7 +558,7 @@ function M.list_registered_projects()
 	local dirty = false
 
 	for root, item in pairs(registry.projects or {}) do
-		item.root = item.root or root
+		item.root = path_key(item.root or root) or item.root or root
 		local association = normalize_association(item.engine_association)
 		local engine_id = tostring(item.engine_id or "")
 		if association == nil or engine_id == "" or engine_id:match("^%-") then
@@ -488,7 +584,7 @@ end
 -- Return cached engine metadata for a registered project.
 -- 返回已注册项目缓存的 Engine 元信息。
 function M.cached_engine_metadata(project_root)
-	project_root = normalize(project_root)
+	project_root = path_key(project_root) or normalize(project_root)
 
 	local registry = M.read_registry()
 	local item = registry.projects and registry.projects[project_root]
@@ -506,7 +602,7 @@ end
 -- Open a project by changing cwd and editing its .uproject when possible.
 -- 通过切换 cwd 并打开 .uproject 来打开项目。
 function M.open_project(project_root)
-	project_root = normalize(project_root)
+	project_root = path_key(project_root) or normalize(project_root)
 	local metadata = M.register_project(project_root)
 
 	vim.api.nvim_set_current_dir(project_root)
@@ -527,7 +623,7 @@ function M.is_engine_root(path)
 		return false
 	end
 
-	path = normalize(path)
+	path = path_key(path) or normalize(path)
 	return is_dir(path .. "/Engine/Source") or is_file(path .. "/Engine/Build/Build.version")
 end
 
@@ -575,7 +671,7 @@ function M.find_engine_root_from_config(association)
 	for _, key in ipairs(engine_association_candidates(association)) do
 		local root = config.values.engine_roots and config.values.engine_roots[key]
 		if M.is_engine_root(root) then
-			return normalize(root)
+			return path_key(root) or normalize(root)
 		end
 	end
 
@@ -583,10 +679,10 @@ function M.find_engine_root_from_config(association)
 end
 
 local function find_engine_association_from_config(engine_root)
-	engine_root = normalize(engine_root)
+	engine_root = path_key(engine_root) or normalize(engine_root)
 	local roots = config.values.engine_roots or {}
 	for key, root in pairs(roots) do
-		if normalize(root) == engine_root then
+		if (path_key(root) or normalize(root)) == engine_root then
 			return tostring(key)
 		end
 	end
@@ -611,7 +707,7 @@ function M.find_engine_root_from_launcher(association)
 		local install_location = item.InstallLocation
 
 		if candidates[app_name] and M.is_engine_root(install_location) then
-			return normalize(install_location)
+			return path_key(install_location) or normalize(install_location)
 		end
 	end
 
@@ -619,7 +715,7 @@ function M.find_engine_root_from_launcher(association)
 end
 
 local function find_engine_association_from_launcher(engine_root)
-	engine_root = normalize(engine_root)
+	engine_root = path_key(engine_root) or normalize(engine_root)
 	local data = read_json_file("C:/ProgramData/Epic/UnrealEngineLauncher/LauncherInstalled.dat")
 	if type(data) ~= "table" or type(data.InstallationList) ~= "table" then
 		return nil
@@ -627,7 +723,7 @@ local function find_engine_association_from_launcher(engine_root)
 
 	for _, item in ipairs(data.InstallationList) do
 		local app_name = item.AppName
-		local install_location = normalize(item.InstallLocation)
+		local install_location = path_key(item.InstallLocation) or normalize(item.InstallLocation)
 		if app_name and install_location == engine_root then
 			return tostring(app_name)
 		end
@@ -665,7 +761,7 @@ function M.find_engine_root_from_registry(association)
 		path = path and vim.trim(path)
 
 		if name and path and candidates[name] and M.is_engine_root(path) then
-			return normalize(path)
+			return path_key(path) or normalize(path)
 		end
 	end
 
@@ -677,7 +773,7 @@ local function find_engine_association_from_registry(engine_root)
 		return nil
 	end
 
-	engine_root = normalize(engine_root)
+	engine_root = path_key(engine_root) or normalize(engine_root)
 	local result = vim.system({
 		"reg",
 		"query",
@@ -691,7 +787,7 @@ local function find_engine_association_from_registry(engine_root)
 	for line in (result.stdout or ""):gmatch("[^\r\n]+") do
 		line = vim.trim(line)
 		local name, path = line:match("^(%S+)%s+REG_SZ%s+(.+)$")
-		path = path and normalize(vim.trim(path))
+		path = path and (path_key(vim.trim(path)) or normalize(vim.trim(path)))
 		if name and path and path == engine_root then
 			return tostring(name)
 		end
@@ -701,7 +797,7 @@ local function find_engine_association_from_registry(engine_root)
 end
 
 local function resolve_engine_association_for_root(engine_root)
-	engine_root = normalize(engine_root)
+	engine_root = path_key(engine_root) or normalize(engine_root)
 	if not engine_root or engine_root == "" then
 		return nil
 	end
@@ -714,7 +810,7 @@ end
 -- Infer engine root by walking upward from a project nested inside a source tree.
 -- 当项目内嵌在源码版引擎目录中时，通过向上查找推断引擎根目录。
 function M.find_engine_root_from_project_path(project_root)
-	project_root = normalize(project_root)
+	project_root = path_key(project_root) or normalize(project_root)
 	if not project_root or project_root == "" then
 		return nil
 	end
@@ -738,7 +834,7 @@ end
 -- Resolve EngineAssociation to an Unreal Engine root path.
 -- 将 EngineAssociation 解析成 Unreal Engine 根目录。
 function M.resolve_engine_root(project_root)
-	project_root = normalize(project_root)
+	project_root = path_key(project_root) or normalize(project_root)
 
 	local uproject_path = M.find_project_file_in_root(project_root)
 	local association = normalize_association(M.read_engine_association(uproject_path))
@@ -752,7 +848,7 @@ function M.resolve_engine_root(project_root)
 	end
 
 	if M.is_engine_root(association) then
-		return normalize(association), association
+		return path_key(association) or normalize(association), association
 	end
 
 	local root = M.find_engine_root_from_config(association)
@@ -773,8 +869,9 @@ function M.engine_id(engine_root, association)
 		return nil
 	end
 
+	engine_root = path_key(engine_root) or normalize(engine_root)
 	local name = normalize_association(association) or basename(engine_root)
-	local hash = stable_hash12(normalize(engine_root))
+	local hash = stable_hash12(engine_root)
 	return tostring(name):gsub("[^%w_.-]", "_") .. "-" .. hash
 end
 
