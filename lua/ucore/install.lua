@@ -346,6 +346,31 @@ local function plugin_target(spec, scope, root)
 	return path_join(root, "Plugins", "Developer", spec.folder_name)
 end
 
+local function display_target_path(scope, root, target)
+	scope = scope == "engine" and "engine" or "project"
+	root = normalize(root)
+	target = normalize(target)
+	if not target then
+		return nil
+	end
+
+	if scope == "engine" then
+		local prefix = normalize(path_join(root or "", "Engine"))
+		if prefix and target:sub(1, #prefix) == prefix then
+			local suffix = target:sub(#prefix + 1):gsub("^/+", "")
+			return suffix ~= "" and ("Engine/" .. suffix) or "Engine"
+		end
+		return target
+	end
+
+	if root and target:sub(1, #root) == root then
+		local suffix = target:sub(#root + 1):gsub("^/+", "")
+		return suffix ~= "" and ("Project/" .. suffix) or "Project"
+	end
+
+	return target
+end
+
 local function ensure_safe_target(spec, scope, root, target)
 	local expected = normalize(plugin_target(spec, scope, root))
 	target = normalize(target)
@@ -817,6 +842,7 @@ end
 
 local function run_install(spec, scope)
 	local function run_install_many(specs, install_scope)
+		local install_root = resolve_install_root(install_scope)
 		install_status_start("Installing Unreal editor integration...")
 		local index = 0
 		local all_ok = true
@@ -838,12 +864,14 @@ local function run_install(spec, scope)
 				install_status_progress(current.task_key, M.progress_message(current, progress))
 			end, function(ok, result)
 				if ok then
-					install_status_finish(current.task_key, current.display_name .. " installed: " .. tostring(result))
+					local shown = display_target_path(install_scope, install_root, result) or tostring(result)
+					install_status_finish(current.task_key, current.display_name .. " installed: " .. shown)
+					table.insert(details, current.display_name .. ": " .. shown)
 				else
 					install_status_finish(current.task_key, current.display_name .. " install failed")
+					table.insert(details, current.display_name .. ": " .. tostring(result))
 				end
 				all_ok = all_ok and ok
-				table.insert(details, current.display_name .. ": " .. tostring(result))
 				step()
 			end)
 		end
@@ -905,6 +933,7 @@ function M.run(tail)
 				return
 			end
 
+			local install_root = resolve_install_root(scope)
 			install_status_start("Installing Unreal editor integration...")
 			local index = 0
 			local all_ok = true
@@ -926,12 +955,14 @@ function M.run(tail)
 					install_status_progress(spec.task_key, M.progress_message(spec, progress))
 				end, function(ok, result)
 					if ok then
-						install_status_finish(spec.task_key, spec.display_name .. " installed: " .. tostring(result))
+						local shown = display_target_path(scope, install_root, result) or tostring(result)
+						install_status_finish(spec.task_key, spec.display_name .. " installed: " .. shown)
+						table.insert(details, spec.display_name .. ": " .. shown)
 					else
 						install_status_finish(spec.task_key, spec.display_name .. " install failed")
+						table.insert(details, spec.display_name .. ": " .. tostring(result))
 					end
 					all_ok = all_ok and ok
-					table.insert(details, spec.display_name .. ": " .. tostring(result))
 					step()
 				end)
 			end
