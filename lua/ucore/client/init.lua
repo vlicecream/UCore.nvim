@@ -34,7 +34,7 @@ local function refresh_progress_detail(payload, opts)
 	end
 
 	if payload and payload.engine_root == nil then
-		return "Preparing shared engine refresh..."
+		return "Preparing engine refresh..."
 	end
 
 	return "Preparing project refresh..."

@@ -263,9 +263,8 @@ local function format_progress_message(overall, event)
 	local computed_detail = nil
 
 	if total > 0 and event.stage ~= "complete" then
-		local stage_percent = clamp(math.floor((current / math.max(total, 1)) * 100), 0, 100)
 		local prefix = label or tostring(event.stage or "Progress")
-		computed_detail = string.format("%s %d/%d (%d%%)", prefix, current, total, stage_percent)
+		computed_detail = string.format("%s %d/%d", prefix, current, total)
 	end
 
 	if computed_detail and (event.stage == "analysis" or event.stage == "db_write") then

@@ -125,7 +125,7 @@ local function wait_compatible(payload, replaced, callback)
 			return callback(false, protocol.compatibility_error(result))
 		end
 
-		other_progress(30, "Replacing incompatible UCore server...")
+		other_progress(30, "Replacing server...")
 		local function replace_server()
 			server.replace(function(ok, replace_message)
 				if not ok then
@@ -180,7 +180,7 @@ local function run_engine_refresh_if_needed(payload, callback)
 	if not project.engine_needs_refresh(engine) then
 		status.progress_finish(
 			"UCore Engine Index",
-			"UCore Engine Index 100%\n---- Up to date, shared engine index reused."
+			"UCore Engine Index 100%\n---- Shared index reused."
 		)
 		return callback(true)
 	end
@@ -220,7 +220,7 @@ local function run_engine_refresh_if_needed(payload, callback)
 		finish_once(true)
 	end, {
 		label = title,
-		detail = "Scanning shared engine sources...",
+		detail = "Scanning engine...",
 	})
 end
 
@@ -246,10 +246,10 @@ end
 -- Run refresh when setup says the database is stale or missing.
 -- 当 setup 判断数据库缺失或过期时执行 refresh。
 local function run_refresh_if_needed(payload, setup_result, callback)
-	project_progress(0, "Checking whether project refresh is needed...")
+	project_progress(0, "Checking project refresh...")
 
 	if not setup_result.needs_full_refresh then
-		project_progress(90, "Project index is already up to date.")
+		project_progress(90, "Project index is up to date.")
 		return callback(true)
 	end
 
@@ -265,7 +265,7 @@ local function run_refresh_if_needed(payload, setup_result, callback)
 		callback(true)
 	end, {
 		label = "UCore Project Index",
-		detail = "Scanning project sources...",
+		detail = "Scanning project...",
 	})
 end
 
@@ -308,7 +308,7 @@ function M.boot(callback, opts)
 
 	booting = true
 	status.start("UCore Initializing...")
-	other_progress(0, "Starting UCore backend...")
+	other_progress(0, "Starting backend...")
 
 	server.start(function(ok, start_message)
 		if not ok then
@@ -316,7 +316,7 @@ function M.boot(callback, opts)
 			fail(start_message)
 			return callback(false, start_message)
 		end
-		other_progress(25, "Backend started. Waiting for RPC readiness...")
+		other_progress(25, "Waiting for RPC...")
 
 		wait_compatible(payload, false, function(ready, ready_err)
 			if not ready then
@@ -324,7 +324,7 @@ function M.boot(callback, opts)
 				fail(tostring(ready_err), "Log: " .. tostring(server.log_path()))
 				return callback(false, ready_err)
 			end
-			other_progress(40, "RPC ready. Registering project workspace...")
+			other_progress(40, "Registering workspace...")
 
 			run_setup(payload, function(setup_ok, setup_result)
 				if not setup_ok then
@@ -341,7 +341,7 @@ function M.boot(callback, opts)
 						return callback(false, refresh_err)
 					end
 
-					project_progress(95, "Starting filesystem watcher...")
+					project_progress(95, "Starting file watcher...")
 					run_watch(payload, function(watch_ok, watch_err)
 						if not watch_ok then
 							booting = false
