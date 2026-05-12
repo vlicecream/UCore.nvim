@@ -345,8 +345,20 @@ function M.handle_progress(event)
 		reset()
 	end
 
+	if event.stage == "complete" then
+		active = false
+		last_percent = 100
+		last_stage = "complete"
+		last_detail = nil
+		last_tail = normalize_detail(event.message)
+		if auto_finish then
+			return M.finish()
+		end
+		return
+	end
+
 	local overall = overall_percent(event)
-	local is_complete = overall >= 100 or event.stage == "complete"
+	local is_complete = overall >= 100
 	local detail = normalize_detail(event.message)
 	local display_title = display_title_for_event(event, detail)
 	local rendered = format_progress_message(display_title, stage_percent(event))
@@ -378,12 +390,6 @@ function M.handle_progress(event)
 	current_display_title = display_title
 
 	if is_complete then
-		if not auto_finish then
-			active = false
-			last_percent = 100
-			last_stage = "complete"
-			return
-		end
 		return M.finish(string.format("%s 100%%", display_title))
 	end
 
