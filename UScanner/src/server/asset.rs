@@ -606,6 +606,14 @@ fn collect_candidate_assets(content_dirs: &[PathBuf]) -> Vec<PathBuf> {
         }
     }
 
+    // Parse larger assets first so long-running work is distributed earlier
+    // across rayon workers, reducing the 99% long tail.
+    files.sort_unstable_by(|left, right| {
+        let left_size = std::fs::metadata(left).map(|meta| meta.len()).unwrap_or(0);
+        let right_size = std::fs::metadata(right).map(|meta| meta.len()).unwrap_or(0);
+        right_size.cmp(&left_size).then_with(|| left.cmp(right))
+    });
+
     files
 }
 
