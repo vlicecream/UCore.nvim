@@ -168,15 +168,16 @@ local function launch_editor(metadata)
 		return false, "Could not find UnrealEditor.exe"
 	end
 
+	local project_dir = dirname(metadata.uproject_path) or metadata.project_root or metadata.engine_root or ""
+
 	local job
 	if vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1 then
 		local shell = vim.fn.executable("pwsh") == 1 and "pwsh" or "powershell"
-		local working_dir = dirname(editor_path) or metadata.engine_root or metadata.project_root or ""
 		local command = table.concat({
 			"Start-Process",
 			"-FilePath", powershell_quote(editor_path),
 			"-ArgumentList", powershell_quote(metadata.uproject_path),
-			"-WorkingDirectory", powershell_quote(working_dir),
+			"-WorkingDirectory", powershell_quote(project_dir),
 			"-WindowStyle Normal",
 		}, " ")
 		job = vim.fn.jobstart({
@@ -191,6 +192,7 @@ local function launch_editor(metadata)
 	else
 		job = vim.fn.jobstart({ editor_path, metadata.uproject_path }, {
 			detach = true,
+			cwd = project_dir,
 		})
 	end
 
