@@ -105,6 +105,10 @@ local function compact_message(message)
 	return lines[1] or ""
 end
 
+local function is_detail_line(line)
+	return type(line) == "string" and line:find("^%-%-%-%- ", 1, true) ~= nil
+end
+
 local function render_message_lines(panel, key, message)
 	local lines = split_message_lines(message)
 	if #lines == 0 then
@@ -226,6 +230,16 @@ local function init_modal_lines(panel)
 		status_line = string.format("Closing in %ds", math.max(panel.countdown_seconds, 0))
 	end
 
+	local main_items = {}
+	local detail_items = {}
+	for _, line in ipairs(items) do
+		if is_detail_line(line) then
+			table.insert(detail_items, line)
+		else
+			table.insert(main_items, line)
+		end
+	end
+
 	local lines = {
 		panel.title,
 		"",
@@ -233,8 +247,21 @@ local function init_modal_lines(panel)
 		"",
 	}
 
-	for _, line in ipairs(items) do
+	for _, line in ipairs(main_items) do
 		table.insert(lines, line)
+	end
+
+	local min_height = 14
+	local target_without_details = math.max(min_height - #detail_items, #lines)
+	while #lines < target_without_details do
+		table.insert(lines, "")
+	end
+
+	if #detail_items > 0 then
+		table.insert(lines, "")
+		for _, line in ipairs(detail_items) do
+			table.insert(lines, line)
+		end
 	end
 
 	return lines
@@ -242,7 +269,7 @@ end
 
 local function init_modal_width(lines)
 	local content_width = float_text_width(lines)
-	local min_width = 64
+	local min_width = 88
 	local max_width = math.max(vim.o.columns - 8, min_width)
 	return math.min(math.max(content_width, min_width), max_width)
 end
@@ -257,6 +284,16 @@ local function center_text(text, width)
 	return string.rep(" ", padding) .. text
 end
 
+local function right_align_text(text, width)
+	local display_width = vim.fn.strdisplaywidth(text)
+	if display_width >= width then
+		return text
+	end
+
+	local padding = width - display_width
+	return string.rep(" ", padding) .. text
+end
+
 local function apply_init_modal_highlights(buf, lines, width)
 	if #lines >= 1 then
 		pcall(vim.api.nvim_buf_add_highlight, buf, highlight_ns, "Title", 0, 0, -1)
@@ -268,7 +305,7 @@ local function apply_init_modal_highlights(buf, lines, width)
 
 	for index = 5, #lines do
 		local line = lines[index]
-		if line:find("^%-%-%-%- ", 1, true) then
+		if is_detail_line(line) then
 			pcall(vim.api.nvim_buf_add_highlight, buf, highlight_ns, "Comment", index - 1, 0, -1)
 		elseif line:find("100%%", 1, true) then
 			pcall(vim.api.nvim_buf_add_highlight, buf, highlight_ns, "String", index - 1, 0, -1)
@@ -304,6 +341,11 @@ local function render_float_panel(panel_key, panel, row)
 		display_lines = vim.deepcopy(lines)
 		display_lines[1] = center_text(display_lines[1], width)
 		display_lines[3] = center_text(display_lines[3], width)
+		for index = 1, #display_lines do
+			if is_detail_line(display_lines[index]) then
+				display_lines[index] = right_align_text(display_lines[index], width)
+			end
+		end
 	end
 	vim.bo[buf].modifiable = true
 	vim.api.nvim_buf_set_lines(buf, 0, -1, false, display_lines)
