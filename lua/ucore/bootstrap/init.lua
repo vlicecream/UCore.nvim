@@ -159,6 +159,10 @@ local function run_engine_refresh_if_needed(payload, callback)
 	end
 
 	if not project.engine_needs_refresh(engine) then
+		status.progress_finish(
+			"UCore Engine Index",
+			"UCore Engine Index 100%\n---- Up to date, shared engine index reused."
+		)
 		return callback(true)
 	end
 

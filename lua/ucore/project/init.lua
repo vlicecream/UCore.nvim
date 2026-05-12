@@ -272,11 +272,24 @@ end
 function M.build_engine_paths(engine)
 	local engine_root = path_key(engine.engine_root) or normalize(engine.engine_root)
 	local cache_dir = normalize(config.values.cache_dir)
-	local engine_cache_dir = cache_dir .. "/engines/" .. engine.engine_id
+	local registry = M.read_registry()
+	local cache_engine_id = tostring(engine.engine_id or "")
+
+	for registered_id, item in pairs(registry.engines or {}) do
+		if type(item) == "table" then
+			local registered_root = path_key(item.engine_root) or normalize(item.engine_root)
+			if registered_root == engine_root then
+				cache_engine_id = tostring(item.engine_id or registered_id or cache_engine_id)
+				break
+			end
+		end
+	end
+
+	local engine_cache_dir = cache_dir .. "/engines/" .. cache_engine_id
 	mkdirp(engine_cache_dir)
 
 	return {
-		engine_id = engine.engine_id,
+		engine_id = cache_engine_id,
 		engine_root = engine_root,
 		cache_dir = engine_cache_dir,
 		db_path = engine_cache_dir .. "/engine.db",
@@ -297,8 +310,8 @@ end
 function M.write_engine_index_metadata(engine)
 	local paths = M.build_engine_paths(engine)
 	local metadata = {
-		engine_id = engine.engine_id,
-		engine_root = engine.engine_root,
+		engine_id = paths.engine_id,
+		engine_root = paths.engine_root,
 		engine_association = engine.engine_association,
 		indexed_at = os.time(),
 	}
@@ -309,7 +322,10 @@ function M.write_engine_index_metadata(engine)
 	file:close()
 
 	local registry = M.read_registry()
-	registry.engines[engine.engine_id] = vim.tbl_deep_extend("force", registry.engines[engine.engine_id] or {}, metadata)
+	if paths.engine_id ~= engine.engine_id then
+		registry.engines[engine.engine_id] = nil
+	end
+	registry.engines[paths.engine_id] = vim.tbl_deep_extend("force", registry.engines[paths.engine_id] or {}, metadata)
 	M.write_registry(registry)
 
 	return metadata
@@ -329,9 +345,8 @@ function M.engine_needs_refresh(engine)
 		return true
 	end
 
-	return metadata.engine_id ~= engine.engine_id
-		or (path_key(metadata.engine_root) or normalize(metadata.engine_root))
-			~= (path_key(engine.engine_root) or normalize(engine.engine_root))
+	return (path_key(metadata.engine_root) or normalize(metadata.engine_root))
+		~= (path_key(engine.engine_root) or normalize(engine.engine_root))
 end
 
 -- Default scanner configuration shared by setup and refresh.
