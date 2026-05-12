@@ -44,11 +44,7 @@ pub fn run_refresh(req: RefreshRequest, reporter: Arc<dyn ProgressReporter>) -> 
         "discovery",
         0,
         100,
-        &format!(
-            "Scanning {} roots: {}",
-            search_roots.len(),
-            summarize_search_roots(&ctx, &search_roots)
-        ),
+        &format!("Roots {} | {}", search_roots.len(), summarize_search_roots(&ctx, &search_roots)),
     );
 
     let ue_version = ctx.engine_root.as_deref().and_then(read_ue_version);
@@ -58,11 +54,7 @@ pub fn run_refresh(req: RefreshRequest, reporter: Arc<dyn ProgressReporter>) -> 
         "discovery",
         70,
         100,
-        &format!(
-            "Resolving module dependencies ({} modules, {} files discovered)...",
-            discovery.modules.len(),
-            discovery.files.len()
-        ),
+        &format!("Modules {} | Files {}", discovery.modules.len(), discovery.files.len()),
     );
     let resolved_modules = resolve_modules(discovery.modules);
 
@@ -70,11 +62,7 @@ pub fn run_refresh(req: RefreshRequest, reporter: Arc<dyn ProgressReporter>) -> 
         "db_prepare",
         0,
         100,
-        &format!(
-            "Preparing database ({} components, {} modules)...",
-            discovery.components.len(),
-            resolved_modules.len()
-        ),
+        &format!("Components {} | Modules {}", discovery.components.len(), resolved_modules.len()),
     );
     let mut conn = open_refresh_db(&ctx.db_path_native)?;
     write_engine_version(&conn, ue_version)?;
@@ -364,7 +352,7 @@ fn discover_project(ctx: &RefreshContext, reporter: Arc<dyn ProgressReporter>) -
                     "discovery",
                     current,
                     100,
-                    &format!("Scanning {} ({} entries seen)", display_path, count),
+                    &format!("Seen {} | {}", count, display_path),
                 );
             }
 
@@ -800,7 +788,7 @@ fn parse_changed_sources(
         "analysis",
         0,
         files.len(),
-        &format!("Analyzing 0/{} files (0%)", files.len()),
+        &format!("0/{}", files.len()),
     );
 
     let language = tree_sitter_unreal_cpp::LANGUAGE.into();
@@ -839,12 +827,7 @@ fn parse_changed_sources(
                     "analysis",
                     current,
                     total,
-                    &format!(
-                        "Analyzing {}/{} files ({}%)",
-                        current,
-                        total,
-                        percent
-                    ),
+                    &format!("{}/{}", current, total),
                 );
             }
 

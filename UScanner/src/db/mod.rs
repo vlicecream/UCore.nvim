@@ -473,13 +473,13 @@ pub fn save_to_db(
     reporter: Arc<dyn ProgressReporter>,
 ) -> anyhow::Result<()> {
     init_db(conn)?;
+    let total = results.len();
 
     prepare_bulk_write(conn)?;
-    reporter.report("db_write", 0, 100, "Dropping indices for faster insertion...");
+    reporter.report("db_write", 0, total.max(1), "Drop");
     drop_indices(conn)?;
 
-    let total = results.len();
-    reporter.report("db_write", 0, total, &format!("Saving results (0/{})", total));
+    reporter.report("db_write", 0, total, "0");
 
     let tx = conn.transaction()?;
     let mut string_cache: HashMap<String, i64> = HashMap::new();
@@ -554,7 +554,7 @@ pub fn save_to_db(
                     "db_write",
                     current,
                     total,
-                    &format!("Saving results ({}/{})", current, total),
+                    &format!("{}/{}", current, total),
                 );
             }
 
@@ -671,19 +671,19 @@ fn finalize_bulk_write(
         "finalizing",
         70,
         100,
-        "Re-creating indices (this may take a while)...",
+        "Indices",
     );
     create_indices(conn)?;
 
     conn.execute("PRAGMA foreign_keys = ON", [])?;
 
-    reporter.report("finalizing", 80, 100, "Optimizing inheritance graph...");
+    reporter.report("finalizing", 80, 100, "Inheritance");
     resolve_inheritance(conn)?;
 
-    reporter.report("finalizing", 85, 100, "Resolving file includes...");
+    reporter.report("finalizing", 85, 100, "Includes");
     resolve_file_includes_by_path(conn)?;
 
-    reporter.report("finalizing", 95, 100, "Vacuuming and optimizing...");
+    reporter.report("finalizing", 95, 100, "Optimize");
     conn.execute("PRAGMA optimize", [])?;
 
     Ok(())

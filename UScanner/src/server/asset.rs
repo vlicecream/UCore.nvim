@@ -17,6 +17,7 @@ use crate::uasset::UAssetParser;
 const DISCOVERY_MAX_DEPTH: usize = 4;
 const LOG_EVERY: usize = 1000;
 const ASSET_INDEX_VERSION: i32 = 3;
+const ASSET_PROGRESS_EVERY: usize = 100;
 
 fn script_path_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -42,7 +43,7 @@ pub async fn handle_asset_scan(state: Arc<AppState>, project_root: String) {
     info!("Starting asset scan: {}", project_root);
 
     let root = PathBuf::from(project_root.clone());
-    let scan_result = tokio::task::spawn_blocking(move || scan_project_assets(&root)).await;
+    let scan_result = tokio::task::spawn_blocking(move || scan_project_assets(&root, None)).await;
 
     match scan_result {
         Ok(Ok(report)) => {
@@ -164,22 +165,22 @@ pub fn refresh_asset_index(
     project_root: &Path,
     reporter: Arc<dyn ProgressReporter>,
 ) -> Result<()> {
-    reporter.report("asset_index", 0, 100, "Scanning Unreal assets...");
-    let report = scan_project_assets(project_root)?;
+    let report = scan_project_assets(project_root, Some(reporter.as_ref()))?;
 
     reporter.report(
         "asset_index",
-        70,
-        100,
-        &format!(
-            "Persisting asset index ({} assets, {} errors)...",
-            report.parsed.len(),
-            report.errors
-        ),
+        report.total_seen.max(1),
+        report.total_seen.max(1),
+        "Persist",
     );
 
     replace_asset_index(conn, &report.parsed)?;
-    reporter.report("asset_index", 100, 100, "Asset index ready.");
+    reporter.report(
+        "asset_index",
+        report.total_seen.max(1),
+        report.total_seen.max(1),
+        "Ready",
+    );
     Ok(())
 }
 
@@ -295,11 +296,17 @@ pub struct AssetRecord {
 
 /// Scan one Unreal project root and parse selected assets.
 /// 扫描一个 Unreal 工程根目录，并解析筛选后的资产。
-pub fn scan_project_assets(project_root: &Path) -> Result<AssetScanReport> {
+pub fn scan_project_assets(
+    project_root: &Path,
+    reporter: Option<&dyn ProgressReporter>,
+) -> Result<AssetScanReport> {
     let content_dirs = discover_content_dirs(project_root);
     let asset_files = collect_candidate_assets(&content_dirs);
 
     let total_seen = asset_files.len();
+    if let Some(reporter) = reporter {
+        reporter.report("asset_index", 0, total_seen.max(1), "Scan");
+    }
 
     let parsed_results = asset_files
         .par_iter()
@@ -307,6 +314,15 @@ pub fn scan_project_assets(project_root: &Path) -> Result<AssetScanReport> {
         .filter_map(|(index, path)| {
             if index > 0 && index % LOG_EVERY == 0 {
                 debug!("Asset scan progress: {} files visited", index);
+            }
+            if let Some(reporter) = reporter {
+                let current = index + 1;
+                if current == total_seen
+                    || current == 1
+                    || current % ASSET_PROGRESS_EVERY == 0
+                {
+                    reporter.report("asset_index", current, total_seen.max(1), "Scan");
+                }
             }
 
             match parse_asset_record(path) {
