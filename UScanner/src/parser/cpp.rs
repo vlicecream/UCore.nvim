@@ -1225,7 +1225,7 @@ fn find_declarator_node<'a>(node: Node<'a>) -> Option<Node<'a>> {
 
 /// Clean C++ type text down to the meaningful type name.
 /// 把 C++ 类型文本清理成真正有意义的类型名。
-fn clean_type_string(raw: &str) -> String {
+pub(crate) fn clean_type_string(raw: &str) -> String {
     let regexes = get_clean_regexes();
 
     let mut clean = raw.trim().to_string();
