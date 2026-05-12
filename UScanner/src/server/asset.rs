@@ -166,22 +166,59 @@ pub fn refresh_asset_index(
     project_root: &Path,
     reporter: Arc<dyn ProgressReporter>,
 ) -> Result<()> {
-    let report = scan_project_assets(project_root, Some(reporter.as_ref()))?;
+    let initialized = asset_index_initialized(conn)?;
+    let content_dirs = discover_content_dirs(project_root);
+    let asset_files = collect_candidate_assets(&content_dirs);
 
-    reporter.report(
-        "asset_index",
-        0,
-        report.parsed.len().max(1),
-        "Persist",
-    );
+    if !initialized {
+        let report = parse_asset_files(&asset_files, Some(reporter.as_ref()))?;
+        reporter.report(
+            "asset_index",
+            0,
+            report.parsed.len().max(1),
+            "Persist",
+        );
+        replace_asset_index(conn, &report.parsed, Some(reporter.as_ref()))?;
+        reporter.report(
+            "asset_index",
+            report.parsed.len().max(1),
+            report.parsed.len().max(1),
+            "Ready",
+        );
+        return Ok(());
+    }
 
-    replace_asset_index(conn, &report.parsed, Some(reporter.as_ref()))?;
-    reporter.report(
-        "asset_index",
-        report.parsed.len().max(1),
-        report.parsed.len().max(1),
-        "Ready",
-    );
+    let existing = load_existing_asset_mtimes(conn)?;
+    let mut changed_files = Vec::new();
+    let mut on_disk = HashSet::new();
+    let total_seen = asset_files.len().max(1);
+
+    for (index, path) in asset_files.iter().enumerate() {
+        let current = index + 1;
+        if current == asset_files.len() || current == 1 || current % ASSET_PROGRESS_EVERY == 0 {
+            reporter.report("asset_index", current, total_seen, "Scan");
+        }
+
+        let source_path = normalize_path(path);
+        on_disk.insert(source_path.clone());
+        let mtime = file_mtime(path);
+        if existing.get(&source_path).copied() != Some(mtime) {
+            changed_files.push(path.clone());
+        }
+    }
+
+    let deleted_paths = existing
+        .keys()
+        .filter(|path| !on_disk.contains(*path))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let report = parse_asset_files(&changed_files, None)?;
+    let work_total = (deleted_paths.len() + report.parsed.len()).max(1);
+
+    reporter.report("asset_index", 0, work_total, "Persist");
+    apply_asset_index_delta(conn, &report.parsed, &deleted_paths, Some(reporter.as_ref()))?;
+    reporter.report("asset_index", work_total, work_total, "Ready");
     Ok(())
 }
 
@@ -220,6 +257,62 @@ pub fn replace_asset_index(
                 }
             }
 
+            insert_asset_record_db(
+                &mut stmt_asset,
+                &mut stmt_reference,
+                &mut stmt_function,
+                record,
+            )?;
+        }
+    }
+
+    write_asset_index_initialized(&tx)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn apply_asset_index_delta(
+    conn: &mut Connection,
+    records: &[AssetRecord],
+    deleted_paths: &[String],
+    reporter: Option<&dyn ProgressReporter>,
+) -> Result<()> {
+    let tx = conn.transaction()?;
+
+    let total = (deleted_paths.len() + records.len()).max(1);
+    let mut current = 0usize;
+
+    {
+        let mut stmt_asset = tx.prepare(
+            "INSERT INTO assets
+             (asset_path, asset_key, source_path, source_path_key, parent_class, parent_class_key, mtime)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )?;
+        let mut stmt_reference = tx.prepare(
+            "INSERT INTO asset_references (asset_path, reference_key) VALUES (?1, ?2)",
+        )?;
+        let mut stmt_function = tx.prepare(
+            "INSERT INTO asset_functions (asset_path, function_key) VALUES (?1, ?2)",
+        )?;
+
+        for source_path in deleted_paths {
+            current += 1;
+            if let Some(reporter) = reporter {
+                if current == total || current == 1 || current % ASSET_PROGRESS_EVERY == 0 {
+                    reporter.report("asset_index", current, total, "Persist");
+                }
+            }
+            delete_asset_by_source_path_tx(&tx, source_path)?;
+        }
+
+        for record in records {
+            current += 1;
+            if let Some(reporter) = reporter {
+                if current == total || current == 1 || current % ASSET_PROGRESS_EVERY == 0 {
+                    reporter.report("asset_index", current, total, "Persist");
+                }
+            }
+            delete_asset_by_source_path_tx(&tx, &record.source_path)?;
             insert_asset_record_db(
                 &mut stmt_asset,
                 &mut stmt_reference,
@@ -307,6 +400,20 @@ pub struct AssetRecord {
     pub functions: Vec<String>,
 }
 
+fn load_existing_asset_mtimes(conn: &Connection) -> Result<HashMap<String, i64>> {
+    let mut stmt = conn.prepare("SELECT source_path, mtime FROM assets")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+
+    let mut items = HashMap::new();
+    for row in rows {
+        let (path, mtime) = row?;
+        items.insert(path, mtime);
+    }
+    Ok(items)
+}
+
 /// Scan one Unreal project root and parse selected assets.
 /// 扫描一个 Unreal 工程根目录，并解析筛选后的资产。
 pub fn scan_project_assets(
@@ -315,7 +422,13 @@ pub fn scan_project_assets(
 ) -> Result<AssetScanReport> {
     let content_dirs = discover_content_dirs(project_root);
     let asset_files = collect_candidate_assets(&content_dirs);
+    parse_asset_files(&asset_files, reporter)
+}
 
+fn parse_asset_files(
+    asset_files: &[PathBuf],
+    reporter: Option<&dyn ProgressReporter>,
+) -> Result<AssetScanReport> {
     let total_seen = asset_files.len();
     let processed = AtomicUsize::new(0);
     let reported = AtomicUsize::new(0);
@@ -398,8 +511,7 @@ pub fn scan_project_assets(
             .join(" | ");
 
         warn!(
-            "Asset scan parse summary for {}: {} total errors across {} reasons. Top failures: {}",
-            project_root.display(),
+            "Asset scan parse summary: {} total errors across {} reasons. Top failures: {}",
             errors,
             error_summary.len(),
             summary,
