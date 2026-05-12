@@ -143,7 +143,7 @@ struct DiscoveredFile {
 struct RefreshFilePlan {
     sources_to_parse: Vec<InputFile>,
     other_files: Vec<FileUpsert>,
-    deleted: Vec<String>,
+    deleted: Vec<DeletedFileRef>,
 }
 
 /// Non-source file upsert data.
@@ -158,8 +158,15 @@ struct FileUpsert {
 /// Existing file metadata loaded from DB.
 /// 从 DB 读取到的已有文件元数据。
 struct ExistingFileMeta {
+    file_id: i64,
     mtime: i64,
     file_hash: Option<String>,
+}
+
+/// Existing file row scheduled for deletion.
+/// 计划删除的已有文件记录。
+struct DeletedFileRef {
+    file_id: i64,
 }
 
 impl RefreshContext {
@@ -569,7 +576,7 @@ fn load_existing_files(conn: &Connection) -> Result<HashMap<String, ExistingFile
     let mut files = HashMap::new();
 
     let mut stmt = conn.prepare(
-        "SELECT f.directory_id, s.text, f.mtime, f.file_hash
+        "SELECT f.id, f.directory_id, s.text, f.mtime, f.file_hash
          FROM files f
          JOIN strings s ON f.filename_id = s.id",
     )?;
@@ -577,17 +584,22 @@ fn load_existing_files(conn: &Connection) -> Result<HashMap<String, ExistingFile
     let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, i64>(2)?,
-            row.get::<_, Option<String>>(3)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, Option<String>>(4)?,
         ))
     })?;
 
     for row in rows {
-        let (dir_id, filename, mtime, file_hash) = row?;
+        let (file_id, dir_id, filename, mtime, file_hash) = row?;
         files.insert(
             reconstruct_path(&dir_map, dir_id, &filename),
-            ExistingFileMeta { mtime, file_hash },
+            ExistingFileMeta {
+                file_id,
+                mtime,
+                file_hash,
+            },
         );
     }
 
@@ -775,9 +787,12 @@ fn build_file_plan(
     }
 
     let deleted = existing
-        .keys()
-        .filter(|path| !on_disk.contains(*path))
-        .cloned()
+        .into_iter()
+        .filter_map(|(path, meta)| {
+            (!on_disk.contains(&path)).then_some(DeletedFileRef {
+                file_id: meta.file_id,
+            })
+        })
         .collect();
 
     RefreshFilePlan {
@@ -789,33 +804,19 @@ fn build_file_plan(
 
 /// Remove files missing from disk.
 /// 删除磁盘上已经不存在的文件。
-fn remove_deleted_files(conn: &mut Connection, deleted: &[String]) -> Result<()> {
+fn remove_deleted_files(conn: &mut Connection, deleted: &[DeletedFileRef]) -> Result<()> {
     if deleted.is_empty() {
         return Ok(());
     }
 
     let tx = conn.transaction()?;
-    let mut string_cache = HashMap::new();
-    let mut dir_cache = HashMap::new();
+    let mut stmt = tx.prepare("DELETE FROM files WHERE id = ?")?;
 
-    for path in deleted {
-        let p = Path::new(path);
-        let parent = p.parent().unwrap_or_else(|| Path::new(""));
-        let filename = p.file_name().and_then(|name| name.to_str()).unwrap_or("");
-
-        if filename.is_empty() {
-            continue;
-        }
-
-        let dir_id = get_or_create_directory(&tx, &mut string_cache, &mut dir_cache, parent)?;
-        let filename_id = db::get_or_create_string(&tx, &mut string_cache, filename)?;
-
-        tx.execute(
-            "DELETE FROM files WHERE directory_id = ? AND filename_id = ?",
-            params![dir_id, filename_id],
-        )?;
+    for deleted_file in deleted {
+        stmt.execute(params![deleted_file.file_id])?;
     }
 
+    drop(stmt);
     tx.commit()?;
     Ok(())
 }
