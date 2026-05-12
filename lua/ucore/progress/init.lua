@@ -57,7 +57,12 @@ function M.start(next_title, opts)
 	visible = opts.silent ~= true
 	reset()
 	if visible then
-		status.progress(title, string.format("%s 0%%", title))
+		local message = string.format("%s 0%%", title)
+		local detail = vim.trim(tostring(opts.detail or ""))
+		if detail ~= "" then
+			message = message .. "\n---- " .. detail
+		end
+		status.progress(title, message)
 	end
 end
 

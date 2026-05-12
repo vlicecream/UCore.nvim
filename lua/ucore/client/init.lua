@@ -28,7 +28,22 @@ local function refresh_progress_title(payload, opts)
 	return "UCore Project Index"
 end
 
+local function refresh_progress_detail(payload, opts)
+	if opts and opts.detail then
+		return opts.detail
+	end
+
+	if payload and payload.engine_root == nil then
+		return "Preparing shared engine refresh..."
+	end
+
+	return "Preparing project refresh..."
+end
+
 function M.refresh(payload, callback, opts)
+	opts = vim.tbl_extend("force", {
+		detail = refresh_progress_detail(payload, opts),
+	}, opts or {})
 	progress.start(refresh_progress_title(payload, opts), opts)
 
 	rpc.request("refresh", payload, function(result, err)

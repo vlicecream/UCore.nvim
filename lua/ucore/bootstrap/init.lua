@@ -19,9 +19,13 @@ end
 
 -- Update the non-indexing part of boot progress.
 -- 更新非索引部分的初始化进度。
-local function other_progress(percent)
+local function other_progress(percent, detail)
 	local title = "UCore Other Initialization"
 	local message = string.format("UCore Other Initialization %d%%", percent)
+	detail = vim.trim(tostring(detail or ""))
+	if detail ~= "" then
+		message = message .. "\n---- " .. detail
+	end
 	if percent >= 100 then
 		status.progress_finish(title, message)
 		return
@@ -102,7 +106,7 @@ local function wait_compatible(payload, replaced, callback)
 			return callback(false, protocol.compatibility_error(result))
 		end
 
-		other_progress(30)
+		other_progress(30, "Replacing incompatible UCore server...")
 		local function replace_server()
 			server.replace(function(ok, replace_message)
 				if not ok then
@@ -193,6 +197,7 @@ local function run_engine_refresh_if_needed(payload, callback)
 		finish_once(true)
 	end, {
 		label = title,
+		detail = "Scanning shared engine sources...",
 	})
 end
 
@@ -236,7 +241,10 @@ local function run_refresh_if_needed(payload, setup_result, callback)
 		end
 
 		callback(true)
-	end)
+	end, {
+		label = "UCore Project Index",
+		detail = "Scanning project sources...",
+	})
 end
 
 -- Start watcher after setup/refresh.
@@ -278,7 +286,7 @@ function M.boot(callback, opts)
 
 	booting = true
 	status.start("UCore Initializing...")
-	other_progress(0)
+	other_progress(0, "Starting UCore backend...")
 
 	server.start(function(ok, start_message)
 		if not ok then
@@ -286,7 +294,7 @@ function M.boot(callback, opts)
 			fail(start_message)
 			return callback(false, start_message)
 		end
-		other_progress(25)
+		other_progress(25, "Backend started. Waiting for RPC readiness...")
 
 		wait_compatible(payload, false, function(ready, ready_err)
 			if not ready then
@@ -294,7 +302,7 @@ function M.boot(callback, opts)
 				fail(tostring(ready_err), "Log: " .. tostring(server.log_path()))
 				return callback(false, ready_err)
 			end
-			other_progress(40)
+			other_progress(40, "RPC ready. Registering project workspace...")
 
 			run_setup(payload, function(setup_ok, setup_result)
 				if not setup_ok then
@@ -302,7 +310,11 @@ function M.boot(callback, opts)
 					fail(tostring(setup_result))
 					return callback(false, setup_result)
 				end
-				other_progress(60)
+				if setup_result.needs_full_refresh then
+					other_progress(60, "Workspace registered. Running project index refresh...")
+				else
+					other_progress(60, "Workspace registered. Project index already up to date...")
+				end
 
 				run_refresh_if_needed(payload, setup_result, function(refresh_ok, refresh_err)
 					if not refresh_ok then
@@ -311,15 +323,15 @@ function M.boot(callback, opts)
 						return callback(false, refresh_err)
 					end
 
+					other_progress(80, "Project ready. Starting filesystem watcher...")
 					run_watch(payload, function(watch_ok, watch_err)
 						if not watch_ok then
 							booting = false
 							fail(tostring(watch_err))
 							return callback(false, watch_err)
 						end
-						other_progress(80)
 						booting = false
-						other_progress(100)
+						other_progress(100, "Workspace ready. Engine index may continue in background.")
 						callback(true)
 						run_engine_refresh_in_background(payload, opts.after_finish)
 					end)
