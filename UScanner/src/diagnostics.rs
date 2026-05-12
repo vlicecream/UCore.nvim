@@ -1871,7 +1871,8 @@ fn is_macro_invocation_statement(text: &str) -> bool {
 
 fn build_definition_signature(decl: &HeaderFunctionDecl, expected: &ExpectedDefinition) -> String {
     let normalized_parameters = normalize_parameter_signature(&decl.parameters);
-    let mut signature = if expected.return_type.is_empty() {
+    let cleaned_return_type = clean_cpp_type_text(&expected.return_type);
+    let mut signature = if cleaned_return_type.is_empty() {
         format!(
             "{}::{}{}",
             decl.class_name, expected.name, normalized_parameters
@@ -1879,7 +1880,7 @@ fn build_definition_signature(decl: &HeaderFunctionDecl, expected: &ExpectedDefi
     } else {
         format!(
             "{} {}::{}{}",
-            expected.return_type, decl.class_name, expected.name, normalized_parameters
+            cleaned_return_type, decl.class_name, expected.name, normalized_parameters
         )
     };
 
@@ -2060,7 +2061,7 @@ fn has_indexed_definition(
     expected: &ExpectedDefinition,
 ) -> Result<bool> {
     let expected_params = normalize_parameter_signature(&decl.parameters);
-    let expected_return = normalize_space(&expected.return_type);
+    let expected_return = normalize_space(&clean_cpp_type_text(&expected.return_type));
     let mut stmt = conn.prepare(
         r#"
         SELECT
@@ -2097,7 +2098,7 @@ fn has_indexed_definition(
         }
 
         if !expected_return.is_empty() {
-            let actual_return = normalize_space(&return_type);
+            let actual_return = normalize_space(&clean_cpp_type_text(&return_type));
             if !actual_return.is_empty() && actual_return != expected_return {
                 continue;
             }
@@ -2200,6 +2201,32 @@ fn normalize_parameter_signature(params: &str) -> String {
     normalize_space(&out)
         .replace(" )", ")")
         .replace(" ,", ",")
+}
+
+fn clean_cpp_type_text(raw: &str) -> String {
+    let api_re = Regex::new(r"\b[A-Z0-9_]+_API\b").unwrap();
+    let whitespace_re = Regex::new(r"\s+").unwrap();
+
+    let mut clean = raw.trim().to_string();
+
+    for keyword in [
+        "virtual",
+        "static",
+        "inline",
+        "FORCEINLINE",
+        "FORCEINLINE_DEBUGGABLE",
+        "constexpr",
+        "friend",
+    ] {
+        let pattern = format!(r"\b{}\b", regex::escape(keyword));
+        let re = Regex::new(&pattern).unwrap();
+        clean = re.replace_all(&clean, "").to_string();
+    }
+
+    clean = api_re.replace_all(&clean, "").to_string();
+    clean = clean.replace(';', "");
+    clean = whitespace_re.replace_all(&clean, " ").to_string();
+    clean.trim().to_string()
 }
 
 fn is_header_file(path: &str) -> bool {
@@ -3694,6 +3721,37 @@ mod tests {
 
         let items = value["items"].as_array().unwrap();
         assert!(!items.iter().any(|item| item["code"] == "UECPP001"));
+    }
+
+    #[test]
+    fn api_and_virtual_prefixes_do_not_break_cpp_definition_match() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let root = temp_project_path("api_virtual_impl");
+        let header = root.join("Source/Game/Public/LyraCombatSet.h");
+        let source = root.join("Source/Game/Private/LyraCombatSet.cpp");
+        std::fs::create_dir_all(header.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(
+            &source,
+            "#include \"LyraCombatSet.h\"\n\nbool ULyraCombatSet::PreGameplayEffectExecute(FGameplayEffectModCallbackData& Data)\n{\n    return true;\n}\n",
+        )
+        .unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "class ULyraCombatSet\n{\npublic:\n    UE_API virtual bool PreGameplayEffectExecute(FGameplayEffectModCallbackData& Data) override;\n};\n",
+            Some(header.to_string_lossy().replace('\\', "/")),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP001"));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
