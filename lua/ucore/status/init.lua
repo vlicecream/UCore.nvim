@@ -11,10 +11,6 @@ local float_state = {
 	wins = {},
 }
 
-local function panel_is_modal(panel)
-	return panel == panels.init
-end
-
 local function uses_builtin_notify()
 	local info = debug.getinfo(vim.notify, "S")
 	local source = tostring(info and info.source or "")
@@ -51,6 +47,10 @@ local panels = {
 		"progress:UCore Engine Index",
 	}),
 }
+
+local function panel_is_modal(panel)
+	return panel == panels.init
+end
 
 local function panel_for_key(key)
 	return panels.init
