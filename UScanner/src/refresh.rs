@@ -27,6 +27,7 @@ const ENGINE_SCAN_SUBDIRS: &[&str] = &[
     "Engine/Shaders",
 ];
 const DISCOVERY_PROGRESS_EVERY: usize = 250;
+const ITEM_PROGRESS_EVERY: usize = 250;
 
 /// Run a full project refresh.
 /// 执行一次完整工程刷新。
@@ -827,6 +828,8 @@ fn parse_changed_sources(
             let previous = reported_percent.load(Ordering::Relaxed);
 
             if current == total
+                || current == 1
+                || current % ITEM_PROGRESS_EVERY == 0
                 || (percent > previous
                     && reported_percent
                         .compare_exchange(previous, percent, Ordering::Relaxed, Ordering::Relaxed)

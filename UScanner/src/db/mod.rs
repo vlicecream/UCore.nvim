@@ -32,6 +32,7 @@ const DB_BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
 /// SQLite busy timeout for bulk writes.
 /// 批量写入时的 busy timeout。
 const DB_BULK_BUSY_TIMEOUT: Duration = Duration::from_millis(60_000);
+const ITEM_PROGRESS_EVERY: usize = 250;
 
 /// Ensure the on-disk database matches the current schema version.
 /// 确保磁盘数据库版本和当前 schema 版本一致。
@@ -547,7 +548,7 @@ pub fn save_to_db(
             let current = index + 1;
             let percent = progress_percent(current, total);
 
-            if current == total || percent > last_reported_percent {
+            if current == total || current == 1 || current % ITEM_PROGRESS_EVERY == 0 || percent > last_reported_percent {
                 last_reported_percent = percent;
                 reporter.report(
                     "db_write",

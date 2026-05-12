@@ -268,7 +268,9 @@ local function format_progress_message(overall, event)
 		computed_detail = string.format("%s %d/%d (%d%%)", prefix, current, total, stage_percent)
 	end
 
-	if computed_detail and detail ~= "" then
+	if computed_detail and (event.stage == "analysis" or event.stage == "db_write") then
+		detail = computed_detail
+	elseif computed_detail and detail ~= "" then
 		local lower_detail = detail:lower()
 		local lower_prefix = computed_detail:lower()
 		if lower_detail ~= lower_prefix and not lower_detail:find(lower_prefix, 1, true) then
