@@ -224,9 +224,9 @@ local function run_engine_refresh_if_needed(payload, callback)
 	})
 end
 
--- Refresh the shared Engine index after the project is already usable.
--- 在项目已经可用后，后台刷新共享 Engine 索引。
-local function run_engine_refresh_in_background(payload, after_finish)
+-- Refresh the shared Engine index as the final boot step.
+-- 把共享 Engine 索引作为 boot 的最后一步顺序执行。
+local function run_engine_refresh_step(payload, after_finish)
 	run_engine_refresh_if_needed(payload, function(ok, err)
 		if ok then
 			status.finish("UCore Ready - Initialization Complete")
@@ -350,9 +350,14 @@ function M.boot(callback, opts)
 						end
 
 						project_progress(100)
-						booting = false
-						callback(true)
-						run_engine_refresh_in_background(payload, opts.after_finish)
+						run_engine_refresh_step(payload, function(engine_ok, engine_err)
+							booting = false
+							if not engine_ok then
+								return callback(false, engine_err)
+							end
+
+							callback(true)
+						end)
 					end)
 				end)
 			end)
