@@ -11,9 +11,16 @@ local function normalize(path)
 	return path and path:gsub("\\", "/"):gsub("/+$", "") or nil
 end
 
-local function normalize_lower(path)
-	path = normalize(path)
-	return path and path:lower() or nil
+local function same_path(a, b)
+	local left = normalize(a)
+	local right = normalize(b)
+	if not left or not right then
+		return false
+	end
+	if vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1 then
+		return left:lower() == right:lower()
+	end
+	return left == right
 end
 
 local function dirname(path)
@@ -121,12 +128,15 @@ local function current_project_metadata(project_root)
 end
 
 local function session_alive(project_root)
-	project_root = normalize_lower(project_root)
+	project_root = normalize(project_root)
+	if not project_root then
+		return false
+	end
 	local now = os.time()
 
 	for _, path in ipairs(scandir_json(session_dir())) do
 		local item = read_json(path)
-		if type(item) == "table" and normalize_lower(item.project_root) == project_root then
+		if type(item) == "table" and same_path(item.project_root, project_root) then
 			local last_seen = tonumber(item.last_seen or 0) or 0
 			if now - last_seen <= session_ttl_seconds then
 				return true

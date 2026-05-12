@@ -71,11 +71,21 @@ local function canonicalize_path(path)
 	absolute = normalize(absolute)
 	local native = is_windows() and absolute:gsub("/", "\\") or absolute
 	local real = uv.fs_realpath(native) or uv.fs_realpath(absolute)
-	local canonical = trim_trailing_slashes(real or absolute)
+	return trim_trailing_slashes(real or absolute)
+end
+
+local function comparable_path(path)
+	local canonical = canonicalize_path(path) or trim_trailing_slashes(path)
 	if canonical and is_windows() then
-		canonical = canonical:lower()
+		return canonical:lower()
 	end
 	return canonical
+end
+
+local function same_path(a, b)
+	local left = comparable_path(a)
+	local right = comparable_path(b)
+	return left ~= nil and right ~= nil and left == right
 end
 
 local function fs_stat(path)
@@ -278,7 +288,7 @@ function M.build_engine_paths(engine)
 	for registered_id, item in pairs(registry.engines or {}) do
 		if type(item) == "table" then
 			local registered_root = path_key(item.engine_root) or normalize(item.engine_root)
-			if registered_root == engine_root then
+			if same_path(registered_root, engine_root) then
 				cache_engine_id = tostring(item.engine_id or registered_id or cache_engine_id)
 				break
 			end
@@ -345,8 +355,10 @@ function M.engine_needs_refresh(engine)
 		return true
 	end
 
-	return (path_key(metadata.engine_root) or normalize(metadata.engine_root))
-		~= (path_key(engine.engine_root) or normalize(engine.engine_root))
+	return not same_path(
+		path_key(metadata.engine_root) or normalize(metadata.engine_root),
+		path_key(engine.engine_root) or normalize(engine.engine_root)
+	)
 end
 
 -- Default scanner configuration shared by setup and refresh.
@@ -436,8 +448,15 @@ function M.read_registry()
 			local canonical_root = path_key(item.root or root) or normalize(item.root or root) or normalize(root)
 			if canonical_root then
 				item.root = canonical_root
-				if normalized_projects[canonical_root] then
-					normalized_projects[canonical_root] = vim.tbl_deep_extend("force", normalized_projects[canonical_root], item)
+				local existing_key = nil
+				for candidate in pairs(normalized_projects) do
+					if same_path(candidate, canonical_root) then
+						existing_key = candidate
+						break
+					end
+				end
+				if existing_key then
+					normalized_projects[existing_key] = vim.tbl_deep_extend("force", normalized_projects[existing_key], item)
 					dirty = true
 				else
 					normalized_projects[canonical_root] = item
@@ -558,8 +577,18 @@ function M.register_project(project_root)
 	project_root = path_key(project_root) or normalize(project_root)
 	local registry = M.read_registry()
 	local metadata = M.project_metadata(project_root)
+	local existing_key = nil
+	for root in pairs(registry.projects or {}) do
+		if same_path(root, project_root) then
+			existing_key = root
+			break
+		end
+	end
 
-	registry.projects[project_root] = vim.tbl_deep_extend("force", registry.projects[project_root] or {}, metadata)
+	registry.projects[project_root] = vim.tbl_deep_extend("force", registry.projects[existing_key] or registry.projects[project_root] or {}, metadata)
+	if existing_key and existing_key ~= project_root then
+		registry.projects[existing_key] = nil
+	end
 
 	M.write_registry(registry)
 	return metadata
@@ -603,6 +632,14 @@ function M.cached_engine_metadata(project_root)
 
 	local registry = M.read_registry()
 	local item = registry.projects and registry.projects[project_root]
+	if type(item) ~= "table" or not item.engine_id or not item.engine_root then
+		for root, value in pairs(registry.projects or {}) do
+			if same_path(root, project_root) then
+				item = value
+				break
+			end
+		end
+	end
 	if type(item) ~= "table" or not item.engine_id or not item.engine_root then
 		return nil
 	end
@@ -697,7 +734,7 @@ local function find_engine_association_from_config(engine_root)
 	engine_root = path_key(engine_root) or normalize(engine_root)
 	local roots = config.values.engine_roots or {}
 	for key, root in pairs(roots) do
-		if (path_key(root) or normalize(root)) == engine_root then
+		if same_path(path_key(root) or normalize(root), engine_root) then
 			return tostring(key)
 		end
 	end
@@ -739,7 +776,7 @@ local function find_engine_association_from_launcher(engine_root)
 	for _, item in ipairs(data.InstallationList) do
 		local app_name = item.AppName
 		local install_location = path_key(item.InstallLocation) or normalize(item.InstallLocation)
-		if app_name and install_location == engine_root then
+		if app_name and same_path(install_location, engine_root) then
 			return tostring(app_name)
 		end
 	end
@@ -803,7 +840,7 @@ local function find_engine_association_from_registry(engine_root)
 		line = vim.trim(line)
 		local name, path = line:match("^(%S+)%s+REG_SZ%s+(.+)$")
 		path = path and (path_key(vim.trim(path)) or normalize(vim.trim(path)))
-		if name and path and path == engine_root then
+		if name and path and same_path(path, engine_root) then
 			return tostring(name)
 		end
 	end
