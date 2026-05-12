@@ -173,7 +173,12 @@ local function float_display_lines(panel)
 
 	lines[1] = string.format("%s: %s", panel.title, lines[1])
 	for index = 2, #lines do
-		lines[index] = string.format("%s  %s", panel.title, lines[index])
+		local line = lines[index]
+		if line:find("^%-%-%-%- ", 1, true) then
+			lines[index] = string.format("%s      %s", panel.title, line)
+		else
+			lines[index] = string.format("%s  %s", panel.title, line)
+		end
 	end
 	return lines
 end
