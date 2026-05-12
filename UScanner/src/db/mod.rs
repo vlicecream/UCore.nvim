@@ -3,7 +3,7 @@ pub mod project_path;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -474,12 +474,17 @@ pub fn save_to_db(
 ) -> anyhow::Result<()> {
     init_db(conn)?;
     let total = results.len();
+    let started_at = Instant::now();
+
+    info!("DB write start: {} parse results", total);
 
     prepare_bulk_write(conn)?;
+    reporter.report("db_write", 0, total.max(1), "Prepare");
     reporter.report("db_write", 0, total.max(1), "Drop");
     drop_indices(conn)?;
+    info!("DB write drop indices finished in {} ms", started_at.elapsed().as_millis());
 
-    reporter.report("db_write", 0, total, "0");
+    reporter.report("db_write", 0, total.max(1), "Insert");
 
     let tx = conn.transaction()?;
     let mut string_cache: HashMap<String, i64> = HashMap::new();
@@ -633,7 +638,14 @@ pub fn save_to_db(
         }
     }
 
+    reporter.report("db_write", total.max(1), total.max(1), "Commit");
+    let commit_started_at = Instant::now();
     tx.commit()?;
+    info!(
+        "DB write commit finished in {} ms (total {} ms)",
+        commit_started_at.elapsed().as_millis(),
+        started_at.elapsed().as_millis()
+    );
 
     finalize_bulk_write(conn, reporter)?;
     Ok(())
@@ -667,6 +679,8 @@ fn finalize_bulk_write(
     conn: &mut Connection,
     reporter: Arc<dyn ProgressReporter>,
 ) -> anyhow::Result<()> {
+    let started_at = Instant::now();
+    reporter.report("finalizing", 60, 100, "Commit");
     reporter.report(
         "finalizing",
         70,
@@ -685,6 +699,7 @@ fn finalize_bulk_write(
 
     reporter.report("finalizing", 95, 100, "Optimize");
     conn.execute("PRAGMA optimize", [])?;
+    info!("DB finalize finished in {} ms", started_at.elapsed().as_millis());
 
     Ok(())
 }

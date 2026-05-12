@@ -841,6 +841,7 @@ fn parse_changed_sources(
         })
         .collect::<Vec<_>>();
 
+    reporter.report("db_write", 0, total.max(1), "Prepare");
     db::save_to_db(conn, &results, reporter)?;
     Ok(())
 }
