@@ -251,7 +251,7 @@ local function init_modal_sections(panel)
 		table.insert(lines, line)
 	end
 
-	local min_height = 18
+	local min_height = 20
 	local body_target = math.max(min_height, #lines)
 	while #lines < body_target do
 		table.insert(lines, "")
@@ -262,7 +262,7 @@ end
 
 local function init_modal_width(lines)
 	local content_width = float_text_width(lines)
-	local min_width = 104
+	local min_width = 112
 	local max_width = math.max(vim.o.columns - 8, min_width)
 	return math.min(math.max(content_width, min_width), max_width)
 end
@@ -314,7 +314,7 @@ local function render_init_footer(detail_lines, parent_config)
 	end
 
 	local footer_lines = vim.deepcopy(detail_lines)
-	local footer_width = math.min(float_text_width(footer_lines), math.max(parent_config.width - 4, 1))
+	local footer_width = math.max(parent_config.width - 4, 1)
 	for index = 1, #footer_lines do
 		footer_lines[index] = right_align_text(footer_lines[index], footer_width)
 	end
@@ -332,7 +332,7 @@ local function render_init_footer(detail_lines, parent_config)
 	local footer_config = {
 		relative = "editor",
 		row = parent_config.row + parent_config.height - #footer_lines - 1,
-		col = parent_config.col + parent_config.width - footer_width - 1,
+		col = parent_config.col + 2,
 		width = footer_width,
 		height = #footer_lines,
 		style = "minimal",
