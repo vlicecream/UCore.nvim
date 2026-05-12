@@ -1788,6 +1788,7 @@ fn member_function_declaration(
     if text.is_empty()
         || text.contains('{')
         || !text.contains(';')
+        || is_macro_invocation_statement(&text)
         || contains_token(&text, "inline")
         || contains_token(&text, "FORCEINLINE")
         || contains_token(&text, "friend")
@@ -1841,6 +1842,31 @@ fn member_function_declaration(
     decl.expected_definitions = expected_definitions(&decl);
 
     Some(decl)
+}
+
+fn is_macro_invocation_statement(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    let Some(open_paren) = trimmed.find('(') else {
+        return false;
+    };
+
+    let prefix = trimmed[..open_paren].trim_end();
+    if prefix.is_empty() || prefix.contains(' ') || prefix.contains('\t') {
+        return false;
+    }
+
+    let mut chars = prefix.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+
+    if !first.is_ascii_uppercase() {
+        return false;
+    }
+
+    prefix
+        .chars()
+        .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
 }
 
 fn build_definition_signature(decl: &HeaderFunctionDecl, expected: &ExpectedDefinition) -> String {
@@ -3650,6 +3676,24 @@ mod tests {
         assert!(!items.iter().any(|item| item["code"] == "UECPP001"));
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn attribute_accessors_macro_does_not_warn_about_missing_cpp_definition() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "class ULyraCombatSet\n{\npublic:\n    ATTRIBUTE_ACCESSORS(ULyraCombatSet, BaseDamage);\n    ATTRIBUTE_ACCESSORS(ULyraCombatSet, BaseHeal);\n};\n",
+            Some("C:/Project/Source/Game/Public/LyraCombatSet.h".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP001"));
     }
 
     #[test]
