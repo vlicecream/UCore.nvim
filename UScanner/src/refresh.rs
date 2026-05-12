@@ -148,6 +148,13 @@ struct FileUpsert {
     module_id: i64,
 }
 
+/// Existing file metadata loaded from DB.
+/// 从 DB 读取到的已有文件元数据。
+struct ExistingFileMeta {
+    mtime: i64,
+    file_hash: Option<String>,
+}
+
 impl RefreshContext {
     /// Normalize request into refresh context.
     /// 把请求规范化成 refresh 上下文。
@@ -530,7 +537,7 @@ fn write_engine_version(conn: &Connection, version: Option<UeBuildVersion>) -> R
 
 /// Load known files and mtimes from DB.
 /// 从 DB 读取已有文件路径和 mtime。
-fn load_existing_files(conn: &Connection) -> Result<HashMap<String, i64>> {
+fn load_existing_files(conn: &Connection) -> Result<HashMap<String, ExistingFileMeta>> {
     let mut dir_map = HashMap::new();
 
     {
@@ -555,7 +562,9 @@ fn load_existing_files(conn: &Connection) -> Result<HashMap<String, i64>> {
     let mut files = HashMap::new();
 
     let mut stmt = conn.prepare(
-        "SELECT f.directory_id, s.text, f.mtime FROM files f JOIN strings s ON f.filename_id = s.id",
+        "SELECT f.directory_id, s.text, f.mtime, f.file_hash
+         FROM files f
+         JOIN strings s ON f.filename_id = s.id",
     )?;
 
     let rows = stmt.query_map([], |row| {
@@ -563,12 +572,16 @@ fn load_existing_files(conn: &Connection) -> Result<HashMap<String, i64>> {
             row.get::<_, i64>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, i64>(2)?,
+            row.get::<_, Option<String>>(3)?,
         ))
     })?;
 
     for row in rows {
-        let (dir_id, filename, mtime) = row?;
-        files.insert(reconstruct_path(&dir_map, dir_id, &filename), mtime);
+        let (dir_id, filename, mtime, file_hash) = row?;
+        files.insert(
+            reconstruct_path(&dir_map, dir_id, &filename),
+            ExistingFileMeta { mtime, file_hash },
+        );
     }
 
     Ok(files)
@@ -692,7 +705,7 @@ fn insert_global_module(
 /// 构造解析、写入和删除计划。
 fn build_file_plan(
     files: Vec<DiscoveredFile>,
-    existing: HashMap<String, i64>,
+    existing: HashMap<String, ExistingFileMeta>,
     module_map: HashMap<String, i64>,
     project_root: PathBuf,
 ) -> RefreshFilePlan {
@@ -717,13 +730,14 @@ fn build_file_plan(
             .map(|(_, id)| *id)
             .unwrap_or(global_module_id);
 
-        let changed = existing.get(&file.path).copied() != Some(mtime);
+        let existing_meta = existing.get(&file.path);
+        let changed = existing_meta.map(|meta| meta.mtime) != Some(mtime);
 
         if changed && is_source_extension(&file.extension) {
             sources_to_parse.push(InputFile {
                 path: file.path,
                 mtime: mtime as u64,
-                old_hash: None,
+                old_hash: existing_meta.and_then(|meta| meta.file_hash.clone()),
                 module_id: Some(module_id),
                 db_path: None,
             });

@@ -500,6 +500,12 @@ pub fn save_to_db(
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )?;
 
+        let mut stmt_touch_file = tx.prepare(
+            "UPDATE files
+             SET extension = ?3, mtime = ?4, module_id = ?5, is_header = ?6
+             WHERE directory_id = ?1 AND filename_id = ?2",
+        )?;
+
         let mut stmt_class = tx.prepare(
             "INSERT INTO classes
              (name_id, namespace_id, base_class_id, file_id, line_number, symbol_type, end_line_number)
@@ -563,14 +569,6 @@ pub fn save_to_db(
                 );
             }
 
-            if result.status != "parsed" {
-                continue;
-            }
-
-            let Some(data) = &result.data else {
-                continue;
-            };
-
             let path_obj = Path::new(&result.path);
             let parent_dir = path_obj.parent().unwrap_or_else(|| Path::new(""));
             let filename = path_obj
@@ -590,6 +588,26 @@ pub fn save_to_db(
                 parent_dir,
             )?;
             let filename_id = get_or_create_string(&tx, &mut string_cache, filename)?;
+
+            if result.status == "cache_hit" {
+                stmt_touch_file.execute(params![
+                    dir_id,
+                    filename_id,
+                    extension,
+                    result.mtime as i64,
+                    result.module_id,
+                    is_header_extension(&extension) as i32,
+                ])?;
+                continue;
+            }
+
+            if result.status != "parsed" {
+                continue;
+            }
+
+            let Some(data) = &result.data else {
+                continue;
+            };
 
             let _ = stmt_delete_file.execute(params![dir_id, filename_id]);
 
