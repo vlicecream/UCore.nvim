@@ -347,7 +347,7 @@ fn run_scan_locally(input: &str) -> Result<()> {
 
             if let Some(db_path) = db_path {
                 if let Ok(mut conn) = rusqlite::Connection::open(db_path) {
-                    let _ = db::save_to_db(
+                    let _ = db::save_to_db_incremental(
                         &mut conn,
                         &results,
                         Arc::new(StdoutReporter),

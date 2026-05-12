@@ -1519,7 +1519,7 @@ pub async fn handle_scan(state: &AppState, params: &Value) -> Result<Value> {
             .collect::<Vec<_>>();
 
         let mut conn = conn.lock();
-        db::save_to_db(&mut conn, &results, Arc::new(crate::types::StdoutReporter))?;
+        db::save_to_db_incremental(&mut conn, &results, Arc::new(crate::types::StdoutReporter))?;
 
         Ok(json!(results.len()))
     })

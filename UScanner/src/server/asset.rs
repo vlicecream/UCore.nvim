@@ -282,6 +282,10 @@ fn apply_asset_index_delta(
 
     let total = (deleted_paths.len() + records.len()).max(1);
     let mut current = 0usize;
+    let mut delete_keys = deleted_paths
+        .iter()
+        .map(|path| path.to_ascii_lowercase())
+        .collect::<Vec<_>>();
 
     {
         let mut stmt_asset = tx.prepare(
@@ -296,14 +300,13 @@ fn apply_asset_index_delta(
             "INSERT INTO asset_functions (asset_path, function_key) VALUES (?1, ?2)",
         )?;
 
-        for source_path in deleted_paths {
+        for _source_path in deleted_paths {
             current += 1;
             if let Some(reporter) = reporter {
                 if current == total || current == 1 || current % ASSET_PROGRESS_EVERY == 0 {
                     reporter.report("asset_index", current, total, "Persist");
                 }
             }
-            delete_asset_by_source_path_tx(&tx, source_path)?;
         }
 
         for record in records {
@@ -313,7 +316,12 @@ fn apply_asset_index_delta(
                     reporter.report("asset_index", current, total, "Persist");
                 }
             }
-            delete_asset_by_source_path_tx(&tx, &record.source_path)?;
+            delete_keys.push(record.source_path.to_ascii_lowercase());
+        }
+
+        delete_assets_by_source_path_keys_tx(&tx, &delete_keys)?;
+
+        for record in records {
             insert_asset_record_db(
                 &mut stmt_asset,
                 &mut stmt_reference,
@@ -944,25 +952,39 @@ fn insert_asset_record_db(
 
 fn delete_asset_by_source_path_tx(tx: &rusqlite::Transaction, source_path: &str) -> Result<()> {
     let source_path_key = source_path.to_ascii_lowercase();
+    delete_assets_by_source_path_keys_tx(tx, &[source_path_key])
+}
+
+fn delete_assets_by_source_path_keys_tx(
+    tx: &rusqlite::Transaction,
+    source_path_keys: &[String],
+) -> Result<()> {
+    if source_path_keys.is_empty() {
+        return Ok(());
+    }
+
+    tx.execute_batch(
+        "DROP TABLE IF EXISTS temp_ucore_asset_source_keys;
+         CREATE TEMP TABLE temp_ucore_asset_source_keys (source_path_key TEXT PRIMARY KEY);",
+    )?;
+
+    {
+        let mut stmt =
+            tx.prepare("INSERT OR IGNORE INTO temp_ucore_asset_source_keys (source_path_key) VALUES (?1)")?;
+        for key in source_path_keys {
+            stmt.execute([key.as_str()])?;
+        }
+    }
 
     tx.execute(
-        "DELETE FROM asset_references
-         WHERE asset_path IN (
-             SELECT asset_path FROM assets WHERE source_path_key = ?1
+        "DELETE FROM assets
+         WHERE source_path_key IN (
+             SELECT source_path_key FROM temp_ucore_asset_source_keys
          )",
-        [source_path_key.as_str()],
+        [],
     )?;
-    tx.execute(
-        "DELETE FROM asset_functions
-         WHERE asset_path IN (
-             SELECT asset_path FROM assets WHERE source_path_key = ?1
-         )",
-        [source_path_key.as_str()],
-    )?;
-    tx.execute(
-        "DELETE FROM assets WHERE source_path_key = ?1",
-        [source_path_key.as_str()],
-    )?;
+
+    tx.execute_batch("DROP TABLE IF EXISTS temp_ucore_asset_source_keys;")?;
 
     Ok(())
 }

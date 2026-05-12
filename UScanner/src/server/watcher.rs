@@ -274,7 +274,7 @@ async fn handle_source_change(
             })
             .unwrap_or_default();
 
-        if let Err(err) = db::save_to_db(
+        if let Err(err) = db::save_to_db_incremental(
             &mut conn,
             &[parse_result],
             Arc::new(crate::types::StdoutReporter),

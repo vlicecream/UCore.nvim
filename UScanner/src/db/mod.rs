@@ -1,6 +1,6 @@
 pub mod project_path;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -669,6 +669,280 @@ pub fn save_to_db(
     Ok(())
 }
 
+/// Save parser results using incremental writes without global index rebuild.
+/// 使用增量写入方式保存解析结果，避免全局索引重建。
+pub fn save_to_db_incremental(
+    conn: &mut Connection,
+    results: &[ParseResult],
+    reporter: Arc<dyn ProgressReporter>,
+) -> anyhow::Result<()> {
+    init_db(conn)?;
+
+    if results.is_empty() {
+        return Ok(());
+    }
+
+    let total = results.len();
+    let started_at = Instant::now();
+    let tx = conn.transaction()?;
+    let mut string_cache: HashMap<String, i64> = HashMap::new();
+    let mut dir_cache: HashMap<(Option<i64>, i64), i64> = HashMap::new();
+
+    struct PlannedWrite<'a> {
+        result: &'a ParseResult,
+        dir_id: i64,
+        filename_id: i64,
+        extension: String,
+        existing_file_id: Option<i64>,
+    }
+
+    let mut planned = Vec::with_capacity(results.len());
+    let mut stmt_select_file =
+        tx.prepare("SELECT id FROM files WHERE directory_id = ?1 AND filename_id = ?2")?;
+
+    for result in results {
+        let path_obj = Path::new(&result.path);
+        let parent_dir = path_obj.parent().unwrap_or_else(|| Path::new(""));
+        let filename = path_obj
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown");
+        let extension = path_obj
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+
+        let dir_id = project_path::get_or_create_directory(
+            &tx,
+            &mut string_cache,
+            &mut dir_cache,
+            parent_dir,
+        )?;
+        let filename_id = get_or_create_string(&tx, &mut string_cache, filename)?;
+        let existing_file_id = stmt_select_file
+            .query_row(params![dir_id, filename_id], |row| row.get::<_, i64>(0))
+            .optional()?;
+
+        planned.push(PlannedWrite {
+            result,
+            dir_id,
+            filename_id,
+            extension,
+            existing_file_id,
+        });
+    }
+
+    drop(stmt_select_file);
+
+    let replaced_file_ids = planned
+        .iter()
+        .filter_map(|item| {
+            if item.result.status == "parsed" && item.result.data.is_some() {
+                item.existing_file_id
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let mut affected_class_name_ids = collect_class_name_ids_for_files_tx(&tx, &replaced_file_ids)?;
+    let mut affected_filename_ids = collect_filename_ids_for_files_tx(&tx, &replaced_file_ids)?;
+
+    delete_files_by_ids_tx(&tx, &replaced_file_ids)?;
+
+    let mut stmt_insert_file = tx.prepare(
+        "INSERT INTO files
+         (directory_id, filename_id, extension, mtime, file_hash, module_id, is_header)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )?;
+
+    let mut stmt_touch_file = tx.prepare(
+        "UPDATE files
+         SET extension = ?2, mtime = ?3, module_id = ?4, is_header = ?5
+         WHERE id = ?1",
+    )?;
+
+    let mut stmt_class = tx.prepare(
+        "INSERT INTO classes
+         (name_id, namespace_id, base_class_id, file_id, line_number, symbol_type, end_line_number)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )?;
+
+    let mut stmt_inheritance = tx.prepare(
+        "INSERT INTO inheritance (child_id, parent_name_id)
+         VALUES (?1, ?2)",
+    )?;
+
+    let mut stmt_enum = tx.prepare(
+        "INSERT INTO enum_values (enum_id, name_id, line_number, file_id)
+         VALUES (?1, ?2, ?3, ?4)",
+    )?;
+
+    let mut stmt_member = tx.prepare(
+        "INSERT INTO members
+         (class_id, name_id, type_id, flags, access, detail, return_type_id, is_static, line_number, file_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+    )?;
+
+    let mut stmt_call = tx.prepare(
+        "INSERT INTO symbol_calls (file_id, line, name_id)
+         VALUES (?1, ?2, ?3)",
+    )?;
+
+    let mut stmt_fts = tx.prepare(
+        "INSERT INTO symbols_fts (name, type, class_name, rowid_ref)
+         VALUES (?1, ?2, ?3, ?4)",
+    )?;
+
+    let mut stmt_include = tx.prepare(
+        "INSERT INTO file_includes (file_id, include_path_id, base_filename_id)
+         VALUES (?1, ?2, ?3)",
+    )?;
+
+    let mut stmt_tag = tx.prepare(
+        "INSERT INTO gameplay_tags (identifier, tag_path, kind, line_number, file_id)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )?;
+
+    let mut stmt_macro = tx.prepare(
+        "INSERT INTO macro_definitions (name, line_number, file_id)
+         VALUES (?1, ?2, ?3)",
+    )?;
+
+    let mut last_reported_percent = 0usize;
+    let mut written_file_ids = Vec::new();
+
+    for (index, item) in planned.iter().enumerate() {
+        let current = index + 1;
+        let percent = progress_percent(current, total);
+
+        if current == total || current == 1 || current % ITEM_PROGRESS_EVERY == 0 || percent > last_reported_percent {
+            last_reported_percent = percent;
+            reporter.report("db_write", current, total, &format!("{}/{}", current, total));
+        }
+
+        affected_filename_ids.insert(item.filename_id);
+
+        if item.result.status == "cache_hit" {
+            if let Some(existing_file_id) = item.existing_file_id {
+                stmt_touch_file.execute(params![
+                    existing_file_id,
+                    item.extension,
+                    item.result.mtime as i64,
+                    item.result.module_id,
+                    is_header_extension(&item.extension) as i32,
+                ])?;
+            }
+            continue;
+        }
+
+        if item.result.status != "parsed" {
+            continue;
+        }
+
+        let Some(data) = &item.result.data else {
+            continue;
+        };
+
+        for class_info in &data.classes {
+            let class_name_id = get_or_create_string(&tx, &mut string_cache, &class_info.class_name)?;
+            affected_class_name_ids.insert(class_name_id);
+        }
+
+        stmt_insert_file.execute(params![
+            item.dir_id,
+            item.filename_id,
+            item.extension,
+            item.result.mtime as i64,
+            data.new_hash,
+            item.result.module_id,
+            is_header_extension(&item.extension) as i32,
+        ])?;
+
+        let file_id = tx.last_insert_rowid();
+        written_file_ids.push(file_id);
+
+        save_classes(
+            &tx,
+            &mut string_cache,
+            &mut stmt_class,
+            &mut stmt_inheritance,
+            &mut stmt_enum,
+            &mut stmt_member,
+            &mut stmt_fts,
+            file_id,
+            &data.classes,
+        )?;
+
+        save_calls(
+            &tx,
+            &mut string_cache,
+            &mut stmt_call,
+            file_id,
+            &data.calls,
+        )?;
+
+        save_includes(
+            &tx,
+            &mut string_cache,
+            &mut stmt_include,
+            file_id,
+            &data.includes,
+        )?;
+
+        save_gameplay_tags(&mut stmt_tag, file_id, &data.gameplay_tags)?;
+        save_macro_definitions(&mut stmt_macro, file_id, &data.macro_definitions)?;
+    }
+
+    drop(stmt_macro);
+    drop(stmt_tag);
+    drop(stmt_include);
+    drop(stmt_fts);
+    drop(stmt_call);
+    drop(stmt_member);
+    drop(stmt_enum);
+    drop(stmt_inheritance);
+    drop(stmt_class);
+    drop(stmt_touch_file);
+    drop(stmt_insert_file);
+
+    resolve_inheritance_incremental_tx(
+        &tx,
+        &written_file_ids,
+        &affected_class_name_ids.into_iter().collect::<Vec<_>>(),
+    )?;
+    resolve_file_includes_incremental_tx(
+        &tx,
+        &written_file_ids,
+        &affected_filename_ids.into_iter().collect::<Vec<_>>(),
+    )?;
+
+    reporter.report("db_write", total.max(1), total.max(1), "Commit");
+    tx.commit()?;
+    info!(
+        "DB incremental write finished in {} ms ({} results)",
+        started_at.elapsed().as_millis(),
+        total
+    );
+
+    Ok(())
+}
+
+/// Delete file rows and all symbol side tables by file id.
+/// 按 file id 删除文件及其关联的符号数据。
+pub fn delete_files_by_ids(conn: &mut Connection, file_ids: &[i64]) -> anyhow::Result<()> {
+    if file_ids.is_empty() {
+        return Ok(());
+    }
+
+    init_db(conn)?;
+    let tx = conn.transaction()?;
+    delete_files_by_ids_tx(&tx, file_ids)?;
+    tx.commit()?;
+    Ok(())
+}
+
 /// Convert item progress into a 0-100 percentage.
 /// 将条目进度换算成 0-100 百分比。
 fn progress_percent(current: usize, total: usize) -> usize {
@@ -719,6 +993,219 @@ fn finalize_bulk_write(
     conn.execute("PRAGMA optimize", [])?;
     info!("DB finalize finished in {} ms", started_at.elapsed().as_millis());
 
+    Ok(())
+}
+
+fn collect_class_name_ids_for_files_tx(
+    tx: &rusqlite::Transaction,
+    file_ids: &[i64],
+) -> anyhow::Result<HashSet<i64>> {
+    let mut ids = HashSet::new();
+    let mut stmt = tx.prepare("SELECT DISTINCT name_id FROM classes WHERE file_id = ?1")?;
+
+    for file_id in file_ids {
+        let rows = stmt.query_map(params![file_id], |row| row.get::<_, i64>(0))?;
+        for row in rows {
+            ids.insert(row?);
+        }
+    }
+
+    Ok(ids)
+}
+
+fn collect_filename_ids_for_files_tx(
+    tx: &rusqlite::Transaction,
+    file_ids: &[i64],
+) -> anyhow::Result<HashSet<i64>> {
+    let mut ids = HashSet::new();
+    let mut stmt = tx.prepare("SELECT filename_id FROM files WHERE id = ?1")?;
+
+    for file_id in file_ids {
+        if let Some(filename_id) = stmt
+            .query_row(params![file_id], |row| row.get::<_, i64>(0))
+            .optional()?
+        {
+            ids.insert(filename_id);
+        }
+    }
+
+    Ok(ids)
+}
+
+fn populate_temp_ids_table(
+    tx: &rusqlite::Transaction,
+    table_name: &str,
+    ids: &[i64],
+) -> anyhow::Result<()> {
+    tx.execute_batch(&format!(
+        "DROP TABLE IF EXISTS {0}; CREATE TEMP TABLE {0} (id INTEGER PRIMARY KEY);",
+        table_name
+    ))?;
+
+    let mut stmt = tx.prepare(&format!(
+        "INSERT OR IGNORE INTO {} (id) VALUES (?1)",
+        table_name
+    ))?;
+
+    for id in ids {
+        stmt.execute(params![id])?;
+    }
+
+    Ok(())
+}
+
+fn delete_files_by_ids_tx(tx: &rusqlite::Transaction, file_ids: &[i64]) -> anyhow::Result<()> {
+    if file_ids.is_empty() {
+        return Ok(());
+    }
+
+    populate_temp_ids_table(tx, "temp_ucore_deleted_file_ids", file_ids)?;
+
+    tx.execute(
+        r#"
+        DELETE FROM symbols_fts
+        WHERE rowid_ref IN (
+            SELECT c.id
+            FROM classes c
+            JOIN temp_ucore_deleted_file_ids t ON t.id = c.file_id
+        )
+        OR rowid_ref IN (
+            SELECT m.id
+            FROM members m
+            JOIN temp_ucore_deleted_file_ids t ON t.id = m.file_id
+        )
+        "#,
+        [],
+    )?;
+
+    tx.execute(
+        r#"
+        UPDATE inheritance
+        SET parent_class_id = NULL
+        WHERE parent_class_id IN (
+            SELECT c.id
+            FROM classes c
+            JOIN temp_ucore_deleted_file_ids t ON t.id = c.file_id
+        )
+        "#,
+        [],
+    )?;
+
+    tx.execute(
+        "UPDATE file_includes
+         SET resolved_file_id = NULL
+         WHERE resolved_file_id IN (SELECT id FROM temp_ucore_deleted_file_ids)",
+        [],
+    )?;
+
+    for sql in [
+        "DELETE FROM gameplay_tags WHERE file_id IN (SELECT id FROM temp_ucore_deleted_file_ids)",
+        "DELETE FROM macro_definitions WHERE file_id IN (SELECT id FROM temp_ucore_deleted_file_ids)",
+        "DELETE FROM symbol_calls WHERE file_id IN (SELECT id FROM temp_ucore_deleted_file_ids)",
+        "DELETE FROM file_includes WHERE file_id IN (SELECT id FROM temp_ucore_deleted_file_ids)",
+        "DELETE FROM members WHERE file_id IN (SELECT id FROM temp_ucore_deleted_file_ids)",
+        "DELETE FROM enum_values WHERE file_id IN (SELECT id FROM temp_ucore_deleted_file_ids)",
+        "DELETE FROM inheritance WHERE child_id IN (SELECT c.id FROM classes c JOIN temp_ucore_deleted_file_ids t ON t.id = c.file_id)",
+        "DELETE FROM classes WHERE file_id IN (SELECT id FROM temp_ucore_deleted_file_ids)",
+        "DELETE FROM files WHERE id IN (SELECT id FROM temp_ucore_deleted_file_ids)",
+    ] {
+        tx.execute(sql, [])?;
+    }
+
+    tx.execute_batch("DROP TABLE IF EXISTS temp_ucore_deleted_file_ids;")?;
+    Ok(())
+}
+
+fn resolve_inheritance_incremental_tx(
+    tx: &rusqlite::Transaction,
+    changed_file_ids: &[i64],
+    affected_name_ids: &[i64],
+) -> anyhow::Result<()> {
+    if changed_file_ids.is_empty() && affected_name_ids.is_empty() {
+        return Ok(());
+    }
+
+    populate_temp_ids_table(tx, "temp_ucore_changed_file_ids", changed_file_ids)?;
+    populate_temp_ids_table(tx, "temp_ucore_changed_name_ids", affected_name_ids)?;
+
+    tx.execute(
+        r#"
+        UPDATE inheritance
+        SET parent_class_id = (
+            SELECT c.id
+            FROM classes c
+            WHERE c.name_id = inheritance.parent_name_id
+            LIMIT 1
+        )
+        WHERE child_id IN (
+                SELECT c.id
+                FROM classes c
+                JOIN temp_ucore_changed_file_ids t ON t.id = c.file_id
+              )
+           OR parent_name_id IN (
+                SELECT id
+                FROM temp_ucore_changed_name_ids
+              )
+        "#,
+        [],
+    )?;
+
+    tx.execute_batch(
+        "DROP TABLE IF EXISTS temp_ucore_changed_file_ids;
+         DROP TABLE IF EXISTS temp_ucore_changed_name_ids;",
+    )?;
+    Ok(())
+}
+
+fn resolve_file_includes_incremental_tx(
+    tx: &rusqlite::Transaction,
+    changed_file_ids: &[i64],
+    affected_filename_ids: &[i64],
+) -> anyhow::Result<()> {
+    if changed_file_ids.is_empty() && affected_filename_ids.is_empty() {
+        return Ok(());
+    }
+
+    populate_temp_ids_table(tx, "temp_ucore_include_file_ids", changed_file_ids)?;
+    populate_temp_ids_table(tx, "temp_ucore_include_name_ids", affected_filename_ids)?;
+
+    tx.execute(
+        r#"
+        UPDATE file_includes
+        SET resolved_file_id = NULL
+        WHERE file_id IN (SELECT id FROM temp_ucore_include_file_ids)
+           OR resolved_file_id IN (SELECT id FROM temp_ucore_include_file_ids)
+           OR base_filename_id IN (SELECT id FROM temp_ucore_include_name_ids)
+        "#,
+        [],
+    )?;
+
+    tx.execute(
+        r#"
+        UPDATE file_includes
+        SET resolved_file_id = (
+            SELECT f.id
+            FROM files f
+            WHERE f.filename_id = file_includes.base_filename_id
+            LIMIT 1
+        )
+        WHERE (
+                file_id IN (SELECT id FROM temp_ucore_include_file_ids)
+                OR base_filename_id IN (SELECT id FROM temp_ucore_include_name_ids)
+              )
+          AND (
+                SELECT COUNT(*)
+                FROM files f
+                WHERE f.filename_id = file_includes.base_filename_id
+              ) = 1
+        "#,
+        [],
+    )?;
+
+    tx.execute_batch(
+        "DROP TABLE IF EXISTS temp_ucore_include_file_ids;
+         DROP TABLE IF EXISTS temp_ucore_include_name_ids;",
+    )?;
     Ok(())
 }
 

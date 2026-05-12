@@ -95,7 +95,12 @@ pub fn run_refresh(req: RefreshRequest, reporter: Arc<dyn ProgressReporter>) -> 
     remove_deleted_files(&mut conn, &plan.deleted)?;
     reporter.report("db_prepare", 100, 100, "Ready");
 
-    parse_changed_sources(&mut conn, plan.sources_to_parse, reporter.clone())?;
+    parse_changed_sources(
+        &mut conn,
+        plan.sources_to_parse,
+        plan.use_bulk_source_write,
+        reporter.clone(),
+    )?;
     upsert_non_source_files(&mut conn, plan.other_files)?;
 
     if should_index_assets(&ctx) {
@@ -144,6 +149,7 @@ struct RefreshFilePlan {
     sources_to_parse: Vec<InputFile>,
     other_files: Vec<FileUpsert>,
     deleted: Vec<DeletedFileRef>,
+    use_bulk_source_write: bool,
 }
 
 /// Non-source file upsert data.
@@ -729,6 +735,7 @@ fn build_file_plan(
     project_root: PathBuf,
     reporter: Arc<dyn ProgressReporter>,
 ) -> RefreshFilePlan {
+    let existing_count = existing.len();
     let sorted_modules = sorted_module_roots(module_map);
     let global_module_id = sorted_modules
         .iter()
@@ -795,10 +802,15 @@ fn build_file_plan(
         })
         .collect();
 
+    let use_bulk_source_write = existing_count == 0
+        || sources_to_parse.len() >= 4000
+        || sources_to_parse.len().saturating_mul(2) >= total_files;
+
     RefreshFilePlan {
         sources_to_parse,
         other_files,
         deleted,
+        use_bulk_source_write,
     }
 }
 
@@ -809,15 +821,8 @@ fn remove_deleted_files(conn: &mut Connection, deleted: &[DeletedFileRef]) -> Re
         return Ok(());
     }
 
-    let tx = conn.transaction()?;
-    let mut stmt = tx.prepare("DELETE FROM files WHERE id = ?")?;
-
-    for deleted_file in deleted {
-        stmt.execute(params![deleted_file.file_id])?;
-    }
-
-    drop(stmt);
-    tx.commit()?;
+    let file_ids = deleted.iter().map(|item| item.file_id).collect::<Vec<_>>();
+    db::delete_files_by_ids(conn, &file_ids)?;
     Ok(())
 }
 
@@ -826,6 +831,7 @@ fn remove_deleted_files(conn: &mut Connection, deleted: &[DeletedFileRef]) -> Re
 fn parse_changed_sources(
     conn: &mut Connection,
     files: Vec<InputFile>,
+    use_bulk_write: bool,
     reporter: Arc<dyn ProgressReporter>,
 ) -> Result<()> {
     if files.is_empty() {
@@ -944,7 +950,11 @@ fn parse_changed_sources(
         &format!("{}/{}", total, total),
     );
     reporter.report("db_write", 0, total.max(1), "Prepare");
-    db::save_to_db(conn, &results, reporter)?;
+    if use_bulk_write {
+        db::save_to_db(conn, &results, reporter)?;
+    } else {
+        db::save_to_db_incremental(conn, &results, reporter)?;
+    }
     Ok(())
 }
 
