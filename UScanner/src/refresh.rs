@@ -805,7 +805,7 @@ fn parse_changed_sources(
 
     let total = files.len();
     let processed = AtomicUsize::new(0);
-    let reported_percent = AtomicUsize::new(0);
+    let reported_bucket = AtomicUsize::new(0);
 
     let results = files
         .into_par_iter()
@@ -835,17 +835,15 @@ fn parse_changed_sources(
             }
 
             let current = processed.fetch_add(1, Ordering::Relaxed) + 1;
-            let remaining = total.saturating_sub(current);
-            let percent = (current * 100 / total).min(100);
-            let previous = reported_percent.load(Ordering::Relaxed);
+            let bucket = (current * 1000 / total).min(1000);
+            let previous = reported_bucket.load(Ordering::Relaxed);
 
             if current == 1
                 || current % ITEM_PROGRESS_EVERY == 0
-                || (remaining <= ITEM_PROGRESS_EVERY && (remaining == 0 || current % 25 == 0))
-                || (percent > previous
-                    && percent < 100
-                    && reported_percent
-                        .compare_exchange(previous, percent, Ordering::Relaxed, Ordering::Relaxed)
+                || (bucket > previous
+                    && bucket < 1000
+                    && reported_bucket
+                        .compare_exchange(previous, bucket, Ordering::Relaxed, Ordering::Relaxed)
                         .is_ok())
             {
                 reporter.report(
