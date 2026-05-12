@@ -216,6 +216,12 @@ local function normalize_detail(message)
 	return vim.trim(message)
 end
 
+local function event_numbers(event)
+	local current = tonumber(event.current) or 0
+	local total = tonumber(event.total) or 0
+	return current, total
+end
+
 local function stage_label(stage)
 	local phase = phases[stage]
 	if phase and phase.label and phase.label ~= "" then
@@ -240,19 +246,38 @@ end
 
 local function format_progress_message(overall, event)
 	local lines = { string.format("%s %d%%", title, overall) }
+	local label = stage_label(event.stage)
+	local current, total = event_numbers(event)
 	local detail = normalize_detail(event.message)
-	if detail == "" then
-		return table.concat(lines, "\n")
+	local computed_detail = nil
+
+	if total > 0 and event.stage ~= "complete" then
+		local stage_percent = clamp(math.floor((current / math.max(total, 1)) * 100), 0, 100)
+		local prefix = label or tostring(event.stage or "Progress")
+		computed_detail = string.format("%s %d/%d (%d%%)", prefix, current, total, stage_percent)
 	end
 
-	local label = stage_label(event.stage)
-	if label then
+	if computed_detail and detail ~= "" then
+		local lower_detail = detail:lower()
+		local lower_prefix = computed_detail:lower()
+		if lower_detail ~= lower_prefix and not lower_detail:find(lower_prefix, 1, true) then
+			detail = string.format("%s | %s", computed_detail, detail)
+		else
+			detail = computed_detail
+		end
+	elseif computed_detail then
+		detail = computed_detail
+	elseif detail ~= "" and label then
 		local lower_detail = detail:lower()
 		local lower_label = label:lower()
 		local lower_stage = tostring(event.stage or ""):lower()
 		if not lower_detail:find(lower_label, 1, true) and (lower_stage == "" or not lower_detail:find(lower_stage, 1, true)) then
 			detail = string.format("%s: %s", label, detail)
 		end
+	end
+
+	if detail == "" then
+		return table.concat(lines, "\n")
 	end
 
 	table.insert(lines, "---- " .. detail)
@@ -276,7 +301,8 @@ function M.handle_progress(event)
 	local overall = overall_percent(event)
 	local is_complete = overall >= 100 or event.stage == "complete"
 	local detail = normalize_detail(event.message)
-	local same_render = overall == last_percent and event.stage == last_stage and detail == (last_detail or "")
+	local rendered = format_progress_message(overall, event)
+	local same_render = overall == last_percent and event.stage == last_stage and rendered == (last_detail or "")
 
 	-- Rust owns progress throttling; Lua ignores only stale or truly duplicate events.
 	-- Rust 负责节流；Lua 只忽略过期或完全重复的事件。
@@ -286,14 +312,14 @@ function M.handle_progress(event)
 
 	last_percent = overall
 	last_stage = event.stage
-	last_detail = detail
+	last_detail = rendered
 
 	if is_complete then
-		return M.finish(string.format("%s 100%%", title))
+		return M.finish(string.format("%s 100%%\n---- %s", title, detail ~= "" and detail or "Complete."))
 	end
 
 	if visible then
-		status.progress(title, format_progress_message(overall, event))
+		status.progress(title, rendered)
 	end
 end
 
