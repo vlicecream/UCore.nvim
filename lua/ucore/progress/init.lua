@@ -28,6 +28,7 @@ local phase_order = {}
 local last_percent = -1
 local last_stage = nil
 local last_detail = nil
+local last_tail = nil
 local active = false
 local title = "UCore refresh"
 local visible = true
@@ -46,6 +47,7 @@ local function reset()
 	last_percent = -1
 	last_stage = nil
 	last_detail = nil
+	last_tail = nil
 	active = true
 end
 
@@ -76,9 +78,17 @@ function M.finish(message)
 	active = false
 	last_percent = 100
 	last_stage = "complete"
+	local finish_message = message
+	if not finish_message then
+		finish_message = string.format("%s 100%%", title)
+		if last_tail and last_tail ~= "" then
+			finish_message = finish_message .. "\n---- " .. last_tail
+		end
+	end
 	last_detail = nil
+	last_tail = nil
 	if visible then
-		status.progress_finish(title, message or string.format("%s 100%%", title))
+		status.progress_finish(title, finish_message)
 	end
 end
 
@@ -88,6 +98,7 @@ function M.fail(message)
 	active = false
 	last_stage = "failed"
 	last_detail = nil
+	last_tail = nil
 	if visible then
 		status.progress_fail(title, message or string.format("%s failed", title))
 	end
@@ -313,6 +324,7 @@ function M.handle_progress(event)
 	last_percent = overall
 	last_stage = event.stage
 	last_detail = rendered
+	last_tail = rendered:match("\n%-%-%-%- (.+)$") or detail
 
 	if is_complete then
 		return M.finish(string.format("%s 100%%\n---- %s", title, detail ~= "" and detail or "Complete."))

@@ -227,6 +227,11 @@ end
 -- Run refresh when setup says the database is stale or missing.
 -- 当 setup 判断数据库缺失或过期时执行 refresh。
 local function run_refresh_if_needed(payload, setup_result, callback)
+	status.progress(
+		"UCore Project Index",
+		"UCore Project Index 0%\n---- Checking whether project refresh is needed..."
+	)
+
 	if not setup_result.needs_full_refresh then
 		status.progress_finish(
 			"UCore Project Index",
