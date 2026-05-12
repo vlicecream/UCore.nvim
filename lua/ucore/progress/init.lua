@@ -36,6 +36,7 @@ local visible = true
 local stage_progress = {}
 local target_kind = "project"
 local current_display_title = nil
+local auto_finish = true
 
 -- Load the built-in overall progress plan.
 -- 加载内置的整体进度计划。
@@ -55,6 +56,7 @@ local function reset()
 	stage_progress = {}
 	active = true
 	current_display_title = nil
+	auto_finish = true
 end
 
 -- Start a new visible progress run with a user-facing title.
@@ -63,8 +65,10 @@ function M.start(next_title, opts)
 	opts = opts or {}
 	title = next_title or "UCore refresh"
 	target_kind = opts.target_kind or "project"
+	auto_finish = opts.auto_finish ~= false
 	visible = opts.silent ~= true
 	reset()
+	auto_finish = opts.auto_finish ~= false
 	if visible then
 		status.progress(title, string.format("%s 0%%", title))
 	end
@@ -374,6 +378,12 @@ function M.handle_progress(event)
 	current_display_title = display_title
 
 	if is_complete then
+		if not auto_finish then
+			active = false
+			last_percent = 100
+			last_stage = "complete"
+			return
+		end
 		return M.finish(string.format("%s 100%%", display_title))
 	end
 

@@ -79,6 +79,39 @@ local function project_finalize_progress(percent, detail)
 	status.progress(title, message)
 end
 
+local function finish_phase(title)
+	status.progress_finish(title, string.format("%s 100%%", title))
+end
+
+local function finish_phase_list(titles)
+	for _, title in ipairs(titles or {}) do
+		finish_phase(title)
+	end
+end
+
+local function finish_project_skip_phases()
+	finish_phase_list({
+		"UCore Project Discovery",
+		"UCore Project DB Prepare",
+		"UCore Project Analysis",
+		"UCore Project DB Write",
+		"UCore Project Asset Scan",
+		"UCore Project Asset Persist",
+	})
+end
+
+local function finish_engine_skip_phases()
+	finish_phase_list({
+		"UCore Engine Discovery",
+		"UCore Engine DB Prepare",
+		"UCore Engine Analysis",
+		"UCore Engine DB Write",
+		"UCore Engine Finalize",
+		"UCore Engine Asset Scan",
+		"UCore Engine Asset Persist",
+	})
+end
+
 -- Build a setup/refresh/watch payload for the current Unreal project.
 -- 为当前 Unreal 工程构造 setup/refresh/watch 请求体。
 local function current_project_payload(project_root)
@@ -207,6 +240,7 @@ local function run_engine_refresh_if_needed(payload, callback)
 		log.write_progress("boot-engine-skip", {
 			reason = "missing-engine-metadata",
 		})
+		finish_engine_skip_phases()
 		return callback(true)
 	end
 
@@ -215,11 +249,7 @@ local function run_engine_refresh_if_needed(payload, callback)
 			reason = "shared-index-reused",
 			engine_root = engine.engine_root,
 		})
-		status.progress_finish(
-			"UCore Engine Discovery",
-			"UCore Engine Discovery 100%"
-		)
-		status.progress_finish("UCore Engine Asset Persist", "UCore Engine Asset Persist 100%")
+		finish_engine_skip_phases()
 		return callback(true)
 	end
 
@@ -228,6 +258,7 @@ local function run_engine_refresh_if_needed(payload, callback)
 			reason = "refresh-already-running",
 			engine_id = engine.engine_id,
 		})
+		finish_engine_skip_phases()
 		return callback(true)
 	end
 
@@ -308,8 +339,7 @@ local function run_refresh_if_needed(payload, setup_result, callback)
 			reason = "index-up-to-date",
 			project_root = payload.project_root,
 		})
-		project_code_progress(90, "Project index is up to date.")
-		status.progress_finish("UCore Project Asset Persist", "UCore Project Asset Persist 100%")
+		finish_project_skip_phases()
 		return callback(true)
 	end
 
