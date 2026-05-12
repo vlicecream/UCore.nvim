@@ -838,10 +838,10 @@ fn parse_changed_sources(
             let percent = (current * 100 / total).min(100);
             let previous = reported_percent.load(Ordering::Relaxed);
 
-            if current == total
-                || current == 1
+            if current == 1
                 || current % ITEM_PROGRESS_EVERY == 0
                 || (percent > previous
+                    && percent < 100
                     && reported_percent
                         .compare_exchange(previous, percent, Ordering::Relaxed, Ordering::Relaxed)
                         .is_ok())
@@ -858,6 +858,12 @@ fn parse_changed_sources(
         })
         .collect::<Vec<_>>();
 
+    reporter.report(
+        "analysis",
+        total,
+        total,
+        &format!("{}/{}", total, total),
+    );
     reporter.report("db_write", 0, total.max(1), "Prepare");
     db::save_to_db(conn, &results, reporter)?;
     Ok(())
