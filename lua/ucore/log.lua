@@ -1,5 +1,4 @@
 local config = require("ucore.config")
-local server = require("ucore.server")
 
 local M = {}
 local uv = vim.uv or vim.loop
@@ -55,7 +54,8 @@ local function fallback_log_path()
 end
 
 local function active_log_path()
-	local path = server.log_path()
+	local ok, server = pcall(require, "ucore.server")
+	local path = ok and server and server.log_path and server.log_path() or nil
 	if path and path ~= "" then
 		return path
 	end

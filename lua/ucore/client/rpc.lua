@@ -1,4 +1,5 @@
 local config = require("ucore.config")
+local log = require("ucore.log")
 local progress = require("ucore.progress")
 
 local uv = vim.uv or vim.loop
@@ -178,11 +179,20 @@ local function handle_frame(frame)
 
 		vim.schedule(function()
 			if method == "progress_plan" then
+				log.write("rpc-progress-plan", {
+					phase_count = type(params) == "table" and #(params.phases or params[2] or {}) or 0,
+				})
 				progress.handle_plan(params)
 				return
 			end
 
 			if method == "progress" then
+				log.write("rpc-progress", {
+					stage = params and (params.stage or params[2]) or nil,
+					current = params and (params.current or params[3]) or nil,
+					total = params and (params.total or params[4]) or nil,
+					message = params and (params.message or params[5]) or nil,
+				})
 				progress.handle_progress(params)
 				return
 			end

@@ -192,6 +192,13 @@ pub async fn handle_refresh(
     let mut req: RefreshRequest = convert_params(params)?;
     let root_key = normalize_path_key(&req.project_root);
 
+    info!(
+        project_root = %req.project_root,
+        engine_root = ?req.engine_root,
+        scope = ?req.scope,
+        "refresh request received"
+    );
+
     let _guard = RefreshGuard::try_new(state, root_key.clone())?;
 
     let db_path_unix = upsert_refresh_project_context(state, &mut req, &root_key)?;
@@ -212,6 +219,11 @@ pub async fn handle_refresh(
     let reporter = Arc::new(RpcProgressReporter { tx });
 
     tokio::task::spawn_blocking(move || refresh::run_refresh(req, reporter)).await??;
+
+    info!(
+        project_root = %root_key,
+        "refresh request finished"
+    );
 
     clear_completion_cache(state, &root_key);
 

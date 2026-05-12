@@ -1,4 +1,5 @@
 local config = require("ucore.config")
+local log = require("ucore.log")
 local status = require("ucore.status")
 
 local M = {}
@@ -340,6 +341,14 @@ function M.handle_progress(event)
 	last_stage = event.stage
 	last_detail = rendered
 	last_tail = rendered:match("\n%-%-%-%- (.+)$") or detail
+
+	log.write("progress-ui", {
+		stage = event.stage,
+		current = event.current,
+		total = event.total,
+		overall = overall,
+		detail = last_tail,
+	})
 
 	if is_complete then
 		return M.finish(string.format("%s 100%%\n---- %s", title, detail ~= "" and detail or "Complete."))

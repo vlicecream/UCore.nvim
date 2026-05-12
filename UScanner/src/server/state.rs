@@ -34,6 +34,15 @@ impl ProgressReporter for RpcProgressReporter {
     /// Send one progress event.
     /// 发送一个进度事件。
     fn report(&self, stage: &str, current: usize, total: usize, message: &str) {
+        info!(
+            target: "ucore::progress",
+            stage = stage,
+            current = current,
+            total = total,
+            message = message,
+            "refresh progress"
+        );
+
         let progress = Progress {
             msg_type: "progress".to_string(),
             stage: stage.to_string(),
@@ -48,6 +57,12 @@ impl ProgressReporter for RpcProgressReporter {
     /// Send the refresh phase plan.
     /// 发送 refresh 阶段计划。
     fn report_plan(&self, phases: &[PhaseInfo]) {
+        info!(
+            target: "ucore::progress",
+            phase_count = phases.len(),
+            "refresh progress plan"
+        );
+
         let plan = ProgressPlan {
             msg_type: "progress_plan".to_string(),
             phases: phases.to_vec(),
