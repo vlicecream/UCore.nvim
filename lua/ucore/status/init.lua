@@ -219,10 +219,10 @@ local function float_display_lines(panel)
 	return lines
 end
 
-local function init_modal_lines(panel)
+local function init_modal_sections(panel)
 	local items = panel_lines(panel)
 	if #items == 0 then
-		return items
+		return {}, {}
 	end
 
 	local status_line = "Please wait for init"
@@ -252,19 +252,12 @@ local function init_modal_lines(panel)
 	end
 
 	local min_height = 18
-	local target_total = math.max(min_height, #lines + math.max(#detail_items, 1))
-	local body_target = target_total - #detail_items
+	local body_target = math.max(min_height, #lines)
 	while #lines < body_target do
 		table.insert(lines, "")
 	end
 
-	if #detail_items > 0 then
-		for _, line in ipairs(detail_items) do
-			table.insert(lines, line)
-		end
-	end
-
-	return lines
+	return lines, detail_items
 end
 
 local function init_modal_width(lines)
@@ -306,9 +299,7 @@ local function apply_init_modal_highlights(buf, lines, width)
 
 	for index = 5, #lines do
 		local line = lines[index]
-		if is_detail_line(line) then
-			pcall(vim.api.nvim_buf_add_highlight, buf, highlight_ns, "Comment", index - 1, 0, -1)
-		elseif line:find("100%%", 1, true) then
+		if line:find("100%%", 1, true) then
 			pcall(vim.api.nvim_buf_add_highlight, buf, highlight_ns, "String", index - 1, 0, -1)
 		elseif line:find("^Closing in ", 1, true) then
 			pcall(vim.api.nvim_buf_add_highlight, buf, highlight_ns, "Comment", index - 1, 0, -1)
@@ -316,16 +307,66 @@ local function apply_init_modal_highlights(buf, lines, width)
 	end
 end
 
+local function render_init_footer(detail_lines, parent_config)
+	if #detail_lines == 0 then
+		close_float("init_footer")
+		return
+	end
+
+	local footer_lines = vim.deepcopy(detail_lines)
+	local footer_width = math.min(float_text_width(footer_lines), math.max(parent_config.width - 4, 1))
+	for index = 1, #footer_lines do
+		footer_lines[index] = right_align_text(footer_lines[index], footer_width)
+	end
+
+	local footer_buf = ensure_float_buf("init_footer")
+	vim.bo[footer_buf].modifiable = true
+	vim.api.nvim_buf_set_lines(footer_buf, 0, -1, false, footer_lines)
+	vim.api.nvim_buf_clear_namespace(footer_buf, highlight_ns, 0, -1)
+	vim.bo[footer_buf].modifiable = false
+
+	for index = 1, #footer_lines do
+		pcall(vim.api.nvim_buf_add_highlight, footer_buf, highlight_ns, "Comment", index - 1, 0, -1)
+	end
+
+	local footer_config = {
+		relative = "editor",
+		row = parent_config.row + parent_config.height - #footer_lines - 1,
+		col = parent_config.col + parent_config.width - footer_width - 1,
+		width = footer_width,
+		height = #footer_lines,
+		style = "minimal",
+		focusable = false,
+		noautocmd = true,
+		zindex = parent_config.zindex + 1,
+	}
+
+	local footer_win = float_state.wins["init_footer"]
+	if footer_win and vim.api.nvim_win_is_valid(footer_win) then
+		pcall(vim.api.nvim_win_set_config, footer_win, footer_config)
+	else
+		footer_win = vim.api.nvim_open_win(footer_buf, false, footer_config)
+		float_state.wins["init_footer"] = footer_win
+		vim.wo[footer_win].winblend = 0
+		vim.wo[footer_win].wrap = false
+		vim.wo[footer_win].cursorline = false
+	end
+end
+
 local function render_float_panel(panel_key, panel, row)
 	local lines
 	local is_init_modal = panel_is_modal(panel)
+	local detail_lines = {}
 	if is_init_modal then
-		lines = init_modal_lines(panel)
+		lines, detail_lines = init_modal_sections(panel)
 	else
 		lines = float_display_lines(panel)
 	end
 	if #lines == 0 then
 		close_float(panel_key)
+		if is_init_modal then
+			close_float("init_footer")
+		end
 		return 0
 	end
 
@@ -342,11 +383,6 @@ local function render_float_panel(panel_key, panel, row)
 		display_lines = vim.deepcopy(lines)
 		display_lines[1] = center_text(display_lines[1], width)
 		display_lines[3] = center_text(display_lines[3], width)
-		for index = 1, #display_lines do
-			if is_detail_line(display_lines[index]) then
-				display_lines[index] = right_align_text(display_lines[index], width)
-			end
-		end
 	end
 	vim.bo[buf].modifiable = true
 	vim.api.nvim_buf_set_lines(buf, 0, -1, false, display_lines)
@@ -395,6 +431,7 @@ local function render_float_panel(panel_key, panel, row)
 
 	if is_init_modal then
 		bind_modal_keys(panel_key, buf)
+		render_init_footer(detail_lines, config)
 	end
 
 	if is_init_modal then
@@ -476,12 +513,16 @@ end
 dismiss_panel = function(panel)
 	if uses_builtin_notify() then
 		close_float(panel_storage_key(panel))
+		if panel_is_modal(panel) then
+			close_float("init_footer")
+		end
 		panel.notify_handle = nil
 		return
 	end
 
 	if panel_is_modal(panel) then
 		close_float(panel_storage_key(panel))
+		close_float("init_footer")
 		panel.notify_handle = nil
 		return
 	end
