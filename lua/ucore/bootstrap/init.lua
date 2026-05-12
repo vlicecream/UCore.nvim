@@ -343,7 +343,6 @@ function M.boot(callback, opts)
 	opts = opts or {}
 
 	if booting then
-		status.start("UCore Initializing...")
 		return callback(false, "already booting")
 	end
 
