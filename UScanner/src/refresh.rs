@@ -835,11 +835,13 @@ fn parse_changed_sources(
             }
 
             let current = processed.fetch_add(1, Ordering::Relaxed) + 1;
+            let remaining = total.saturating_sub(current);
             let percent = (current * 100 / total).min(100);
             let previous = reported_percent.load(Ordering::Relaxed);
 
             if current == 1
                 || current % ITEM_PROGRESS_EVERY == 0
+                || (remaining <= ITEM_PROGRESS_EVERY && (remaining == 0 || current % 25 == 0))
                 || (percent > previous
                     && percent < 100
                     && reported_percent

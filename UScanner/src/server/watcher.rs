@@ -34,6 +34,14 @@ pub async fn handle_file_change(state: Arc<AppState>, path: PathBuf) {
         return;
     };
 
+    if state.active_refreshes.lock().contains(&project.root_key) {
+        info!(
+            "Watcher change ignored during refresh: {}",
+            normalized_path
+        );
+        return;
+    }
+
     if !path.exists() {
         if ASSET_EXTENSIONS.contains(&ext.as_str()) {
             handle_asset_delete(state, project, path).await;
