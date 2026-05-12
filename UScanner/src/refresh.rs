@@ -68,10 +68,13 @@ pub fn run_refresh(req: RefreshRequest, reporter: Arc<dyn ProgressReporter>) -> 
         100,
         &format!("Components {} | Modules {}", discovery.components.len(), resolved_modules.len()),
     );
+    reporter.report("db_prepare", 10, 100, "Open DB");
     let mut conn = open_refresh_db(&ctx.db_path_native)?;
     write_engine_version(&conn, ue_version)?;
 
+    reporter.report("db_prepare", 25, 100, "Load existing files");
     let existing_files = load_existing_files(&conn)?;
+    reporter.report("db_prepare", 40, 100, "Write components/modules");
     let module_map = write_components_and_modules(
         &mut conn,
         &ctx.project_root,
@@ -79,14 +82,18 @@ pub fn run_refresh(req: RefreshRequest, reporter: Arc<dyn ProgressReporter>) -> 
         &resolved_modules,
     )?;
 
+    reporter.report("db_prepare", 55, 100, "Build file plan");
     let plan = build_file_plan(
         discovery.files,
         existing_files,
         module_map,
         ctx.project_root.clone(),
+        reporter.clone(),
     );
 
+    reporter.report("db_prepare", 96, 100, "Remove deleted files");
     remove_deleted_files(&mut conn, &plan.deleted)?;
+    reporter.report("db_prepare", 100, 100, "Ready");
 
     parse_changed_sources(&mut conn, plan.sources_to_parse, reporter.clone())?;
     upsert_non_source_files(&mut conn, plan.other_files)?;
@@ -708,6 +715,7 @@ fn build_file_plan(
     existing: HashMap<String, ExistingFileMeta>,
     module_map: HashMap<String, i64>,
     project_root: PathBuf,
+    reporter: Arc<dyn ProgressReporter>,
 ) -> RefreshFilePlan {
     let sorted_modules = sorted_module_roots(module_map);
     let global_module_id = sorted_modules
@@ -720,7 +728,20 @@ fn build_file_plan(
     let mut sources_to_parse = Vec::new();
     let mut other_files = Vec::new();
 
-    for file in files {
+    let total_files = files.len().max(1);
+
+    for (index, file) in files.into_iter().enumerate() {
+        let current = index + 1;
+        if current == total_files || current == 1 || current % ITEM_PROGRESS_EVERY == 0 {
+            let scaled = 55 + ((current * 40) / total_files);
+            reporter.report(
+                "db_prepare",
+                scaled.min(95),
+                100,
+                &format!("Build file plan {}/{}", current, total_files),
+            );
+        }
+
         on_disk.insert(file.path.clone());
 
         let mtime = file_mtime(&file.path);
