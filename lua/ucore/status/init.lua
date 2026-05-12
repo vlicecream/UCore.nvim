@@ -30,6 +30,7 @@ local function make_panel(title, notify_id, ordered_keys)
 		state = "running",
 		pending_finish_message = nil,
 		dismiss_version = 0,
+		countdown_seconds = nil,
 	}
 end
 
@@ -219,12 +220,17 @@ local function init_modal_lines(panel)
 	local lines = {
 		panel.title,
 		"",
-		"请等待 init",
+		"Please wait for init",
 		"",
 	}
 
 	for _, line in ipairs(items) do
 		table.insert(lines, line)
+	end
+
+	if panel.state == "complete" and type(panel.countdown_seconds) == "number" then
+		table.insert(lines, "")
+		table.insert(lines, string.format("Closing in %ds", math.max(panel.countdown_seconds, 0)))
 	end
 
 	return lines
@@ -262,6 +268,8 @@ local function apply_init_modal_highlights(buf, lines, width)
 			pcall(vim.api.nvim_buf_add_highlight, buf, highlight_ns, "Comment", index - 1, 0, -1)
 		elseif line:find("100%%", 1, true) then
 			pcall(vim.api.nvim_buf_add_highlight, buf, highlight_ns, "String", index - 1, 0, -1)
+		elseif line:find("^Closing in ", 1, true) then
+			pcall(vim.api.nvim_buf_add_highlight, buf, highlight_ns, "Comment", index - 1, 0, -1)
 		end
 	end
 end
@@ -449,6 +457,7 @@ local function clear_panel_contents(panel)
 	panel.spinner_active_keys = {}
 	panel.boot_active = false
 	panel.pending_finish_message = nil
+	panel.countdown_seconds = nil
 end
 
 local function suppress_panel_keys(panel)
@@ -513,6 +522,29 @@ local function schedule_panel_dismiss(panel, delay_ms)
 	end, delay_ms or 5000)
 end
 
+local function schedule_panel_countdown(panel, seconds)
+	local version = panel.dismiss_version
+	panel.countdown_seconds = seconds
+	render()
+
+	if seconds <= 0 then
+		clear_panel_contents(panel)
+		dismiss_panel(panel)
+		render()
+		return
+	end
+
+	vim.defer_fn(function()
+		if panel.dismiss_version ~= version then
+			return
+		end
+		if panel.state ~= "complete" or panel.boot_active or panel_has_spinner_items(panel) then
+			return
+		end
+		schedule_panel_countdown(panel, seconds - 1)
+	end, 1000)
+end
+
 local function schedule_spinner()
 	if spinner_scheduled or not any_spinner_items() then
 		return
@@ -556,8 +588,7 @@ local function apply_pending_init_finish()
 	panel.state = "complete"
 	panel.items.boot = text
 	bump_dismiss_version(panel)
-	render()
-	schedule_panel_dismiss(panel, 5000)
+	schedule_panel_countdown(panel, 5)
 end
 
 function M.start(message)
