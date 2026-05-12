@@ -219,7 +219,10 @@ end
 -- 当 setup 判断数据库缺失或过期时执行 refresh。
 local function run_refresh_if_needed(payload, setup_result, callback)
 	if not setup_result.needs_full_refresh then
-		status.progress_finish("UCore Project Index", "UCore Project Index 100%")
+		status.progress_finish(
+			"UCore Project Index",
+			"UCore Project Index 100%\n---- Up to date, full refresh not needed."
+		)
 		return callback(true)
 	end
 

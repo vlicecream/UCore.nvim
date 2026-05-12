@@ -799,7 +799,7 @@ fn parse_changed_sources(
         "analysis",
         0,
         files.len(),
-        &format!("Analyzing {} files...", files.len()),
+        &format!("Analyzing 0/{} files (0%)", files.len()),
     );
 
     let language = tree_sitter_unreal_cpp::LANGUAGE.into();
@@ -836,7 +836,12 @@ fn parse_changed_sources(
                     "analysis",
                     current,
                     total,
-                    &format!("Analyzing: {}/{}", current, total),
+                    &format!(
+                        "Analyzing {}/{} files ({}%)",
+                        current,
+                        total,
+                        percent
+                    ),
                 );
             }
 
