@@ -183,33 +183,122 @@ local function float_display_lines(panel)
 	return lines
 end
 
+local function init_modal_lines(panel)
+	local items = panel_lines(panel)
+	if #items == 0 then
+		return items
+	end
+
+	local lines = {
+		panel.title,
+		"",
+		"请等待 init",
+		"",
+	}
+
+	for _, line in ipairs(items) do
+		table.insert(lines, line)
+	end
+
+	return lines
+end
+
+local function init_modal_width(lines)
+	local content_width = float_text_width(lines)
+	local min_width = 64
+	local max_width = math.max(vim.o.columns - 8, min_width)
+	return math.min(math.max(content_width, min_width), max_width)
+end
+
+local function center_text(text, width)
+	local display_width = vim.fn.strdisplaywidth(text)
+	if display_width >= width then
+		return text
+	end
+
+	local padding = math.floor((width - display_width) / 2)
+	return string.rep(" ", padding) .. text
+end
+
+local function apply_init_modal_highlights(buf, lines, width)
+	if #lines >= 1 then
+		pcall(vim.api.nvim_buf_add_highlight, buf, highlight_ns, "Title", 0, 0, -1)
+	end
+
+	if #lines >= 3 then
+		pcall(vim.api.nvim_buf_add_highlight, buf, highlight_ns, "Comment", 2, 0, -1)
+	end
+
+	for index = 5, #lines do
+		local line = lines[index]
+		if line:find("^%-%-%-%- ", 1, true) then
+			pcall(vim.api.nvim_buf_add_highlight, buf, highlight_ns, "Comment", index - 1, 0, -1)
+		elseif line:find("100%%", 1, true) then
+			pcall(vim.api.nvim_buf_add_highlight, buf, highlight_ns, "String", index - 1, 0, -1)
+		end
+	end
+end
+
 local function render_float_panel(panel_key, panel, row)
-	local lines = float_display_lines(panel)
+	local lines
+	local is_init_modal = panel == panels.init
+	if is_init_modal then
+		lines = init_modal_lines(panel)
+	else
+		lines = float_display_lines(panel)
+	end
 	if #lines == 0 then
 		close_float(panel_key)
 		return 0
 	end
 
-	local width = math.min(float_text_width(lines), math.max(vim.o.columns - 4, 1))
+	local width
+	if is_init_modal then
+		width = init_modal_width(lines)
+	else
+		width = math.min(float_text_width(lines), math.max(vim.o.columns - 4, 1))
+	end
 	local height = #lines
 	local buf = ensure_float_buf(panel_key)
+	local display_lines = lines
+	if is_init_modal then
+		display_lines = vim.deepcopy(lines)
+		display_lines[1] = center_text(display_lines[1], width)
+		display_lines[3] = center_text(display_lines[3], width)
+	end
 	vim.bo[buf].modifiable = true
-	vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+	vim.api.nvim_buf_set_lines(buf, 0, -1, false, display_lines)
 	vim.api.nvim_buf_clear_namespace(buf, highlight_ns, 0, -1)
 	vim.bo[buf].modifiable = false
 
-	local config = {
-		relative = "editor",
-		anchor = "NE",
-		row = row,
-		col = vim.o.columns - 1,
-		width = width,
-		height = height,
-		style = "minimal",
-		focusable = false,
-		noautocmd = true,
-		zindex = 250,
-	}
+	local config
+	if is_init_modal then
+		config = {
+			relative = "editor",
+			row = math.max(math.floor((vim.o.lines - height) / 2) - 1, 1),
+			col = math.max(math.floor((vim.o.columns - width) / 2), 1),
+			width = width,
+			height = height,
+			style = "minimal",
+			focusable = false,
+			noautocmd = true,
+			border = "rounded",
+			zindex = 260,
+		}
+	else
+		config = {
+			relative = "editor",
+			anchor = "NE",
+			row = row,
+			col = vim.o.columns - 1,
+			width = width,
+			height = height,
+			style = "minimal",
+			focusable = false,
+			noautocmd = true,
+			zindex = 250,
+		}
+	end
 
 	local win = float_state.wins[panel_key]
 	if win and vim.api.nvim_win_is_valid(win) then
@@ -222,11 +311,15 @@ local function render_float_panel(panel_key, panel, row)
 		vim.wo[win].cursorline = false
 	end
 
-	local highlight = panel.state == "failed" and "DiagnosticError" or "Comment"
-	for index, _ in ipairs(lines) do
-		local prefix = panel.title .. ":"
-		local prefix_len = #prefix
-		pcall(vim.api.nvim_buf_add_highlight, buf, highlight_ns, highlight, index - 1, 0, prefix_len)
+	if is_init_modal then
+		apply_init_modal_highlights(buf, display_lines, width)
+	else
+		local highlight = panel.state == "failed" and "DiagnosticError" or "Comment"
+		for index, _ in ipairs(lines) do
+			local prefix = panel.title .. ":"
+			local prefix_len = #prefix
+			pcall(vim.api.nvim_buf_add_highlight, buf, highlight_ns, highlight, index - 1, 0, prefix_len)
+		end
 	end
 
 	return height
@@ -261,22 +354,21 @@ local function render_notify_panel(panel)
 end
 
 local function render_now()
-	if uses_builtin_notify() then
+	local builtin_notify = uses_builtin_notify()
+	if builtin_notify then
 		local row = 1
 		local unreal_height = render_float_panel("unreal_init", panels.unreal_init, row)
 		if unreal_height > 0 then
 			row = row + unreal_height + 1
 		end
-		render_float_panel("init", panels.init, row)
 		panels.unreal_init.notify_handle = nil
-		panels.init.notify_handle = nil
-		return
+	else
+		close_float("unreal_init")
+		render_notify_panel(panels.unreal_init)
 	end
 
-	close_float("unreal_init")
-	close_float("init")
-	render_notify_panel(panels.unreal_init)
-	render_notify_panel(panels.init)
+	render_float_panel("init", panels.init, 1)
+	panels.init.notify_handle = nil
 end
 
 local function render()
