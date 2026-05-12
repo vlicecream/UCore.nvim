@@ -11,6 +11,10 @@ local float_state = {
 	wins = {},
 }
 
+local function panel_is_modal(panel)
+	return panel == panels.init
+end
+
 local function uses_builtin_notify()
 	local info = debug.getinfo(vim.notify, "S")
 	local source = tostring(info and info.source or "")
@@ -157,6 +161,29 @@ local function ensure_float_buf(panel_key)
 	return buf
 end
 
+local function bind_modal_keys(panel_key, buf)
+	if not vim.api.nvim_buf_is_valid(buf) then
+		return
+	end
+
+	pcall(vim.keymap.del, "n", "<Esc>", { buffer = buf })
+	pcall(vim.keymap.del, "n", "q", { buffer = buf })
+
+	vim.keymap.set("n", "<Esc>", function()
+		local panel = panels[panel_key]
+		if not panel or panel.state == "running" or panel.boot_active then
+			return
+		end
+		clear_panel_contents(panel)
+		dismiss_panel(panel)
+		render()
+	end, {
+		buffer = buf,
+		nowait = true,
+		silent = true,
+	})
+end
+
 local function float_text_width(lines)
 	local width = 0
 	for _, line in ipairs(lines) do
@@ -241,7 +268,7 @@ end
 
 local function render_float_panel(panel_key, panel, row)
 	local lines
-	local is_init_modal = panel == panels.init
+	local is_init_modal = panel_is_modal(panel)
 	if is_init_modal then
 		lines = init_modal_lines(panel)
 	else
@@ -304,11 +331,15 @@ local function render_float_panel(panel_key, panel, row)
 	if win and vim.api.nvim_win_is_valid(win) then
 		pcall(vim.api.nvim_win_set_config, win, config)
 	else
-		win = vim.api.nvim_open_win(buf, false, config)
+		win = vim.api.nvim_open_win(buf, is_init_modal, config)
 		float_state.wins[panel_key] = win
 		vim.wo[win].winblend = 0
 		vim.wo[win].wrap = false
 		vim.wo[win].cursorline = false
+	end
+
+	if is_init_modal then
+		bind_modal_keys(panel_key, buf)
 	end
 
 	if is_init_modal then
@@ -394,6 +425,12 @@ local function dismiss_panel(panel)
 		return
 	end
 
+	if panel_is_modal(panel) then
+		close_float(panel_storage_key(panel))
+		panel.notify_handle = nil
+		return
+	end
+
 	if not panel.notify_handle then
 		return
 	end
@@ -459,7 +496,7 @@ local function should_ignore_suppressed_update(panel, key, message)
 end
 
 local function schedule_panel_dismiss(panel, delay_ms)
-	if not panel.notify_handle then
+	if not panel.notify_handle and not float_state.wins[panel_storage_key(panel)] then
 		return
 	end
 
