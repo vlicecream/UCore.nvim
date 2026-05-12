@@ -733,21 +733,23 @@ fn build_file_plan(
         let existing_meta = existing.get(&file.path);
         let changed = existing_meta.map(|meta| meta.mtime) != Some(mtime);
 
-        if changed && is_source_extension(&file.extension) {
-            sources_to_parse.push(InputFile {
-                path: file.path,
-                mtime: mtime as u64,
-                old_hash: existing_meta.and_then(|meta| meta.file_hash.clone()),
-                module_id: Some(module_id),
-                db_path: None,
-            });
-        } else {
-            other_files.push(FileUpsert {
-                path: file.path,
-                extension: file.extension,
-                mtime,
-                module_id,
-            });
+        if changed {
+            if is_source_extension(&file.extension) {
+                sources_to_parse.push(InputFile {
+                    path: file.path,
+                    mtime: mtime as u64,
+                    old_hash: existing_meta.and_then(|meta| meta.file_hash.clone()),
+                    module_id: Some(module_id),
+                    db_path: None,
+                });
+            } else {
+                other_files.push(FileUpsert {
+                    path: file.path,
+                    extension: file.extension,
+                    mtime,
+                    module_id,
+                });
+            }
         }
     }
 
