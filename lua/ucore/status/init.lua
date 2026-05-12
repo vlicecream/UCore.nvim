@@ -251,14 +251,14 @@ local function init_modal_lines(panel)
 		table.insert(lines, line)
 	end
 
-	local min_height = 14
-	local target_without_details = math.max(min_height - #detail_items, #lines)
-	while #lines < target_without_details do
+	local min_height = 18
+	local target_total = math.max(min_height, #lines + math.max(#detail_items, 1))
+	local body_target = target_total - #detail_items
+	while #lines < body_target do
 		table.insert(lines, "")
 	end
 
 	if #detail_items > 0 then
-		table.insert(lines, "")
 		for _, line in ipairs(detail_items) do
 			table.insert(lines, line)
 		end
@@ -269,7 +269,7 @@ end
 
 local function init_modal_width(lines)
 	local content_width = float_text_width(lines)
-	local min_width = 88
+	local min_width = 104
 	local max_width = math.max(vim.o.columns - 8, min_width)
 	return math.min(math.max(content_width, min_width), max_width)
 end
@@ -285,12 +285,13 @@ local function center_text(text, width)
 end
 
 local function right_align_text(text, width)
+	local content_width = math.max(width - 2, 1)
 	local display_width = vim.fn.strdisplaywidth(text)
-	if display_width >= width then
+	if display_width >= content_width then
 		return text
 	end
 
-	local padding = width - display_width
+	local padding = content_width - display_width
 	return string.rep(" ", padding) .. text
 end
 
