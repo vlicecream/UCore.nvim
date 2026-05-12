@@ -217,20 +217,20 @@ local function init_modal_lines(panel)
 		return items
 	end
 
+	local status_line = "Please wait for init"
+	if panel.state == "complete" and type(panel.countdown_seconds) == "number" then
+		status_line = string.format("Closing in %ds", math.max(panel.countdown_seconds, 0))
+	end
+
 	local lines = {
 		panel.title,
 		"",
-		"Please wait for init",
+		status_line,
 		"",
 	}
 
 	for _, line in ipairs(items) do
 		table.insert(lines, line)
-	end
-
-	if panel.state == "complete" and type(panel.countdown_seconds) == "number" then
-		table.insert(lines, "")
-		table.insert(lines, string.format("Closing in %ds", math.max(panel.countdown_seconds, 0)))
 	end
 
 	return lines
