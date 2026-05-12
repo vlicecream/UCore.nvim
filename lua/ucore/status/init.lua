@@ -11,6 +11,10 @@ local float_state = {
 	wins = {},
 }
 
+local clear_panel_contents
+local dismiss_panel
+local render
+
 local function uses_builtin_notify()
 	local info = debug.getinfo(vim.notify, "S")
 	local source = tostring(info and info.source or "")
@@ -410,7 +414,7 @@ local function render_now()
 	panels.init.notify_handle = nil
 end
 
-local function render()
+render = function()
 	if vim.in_fast_event() then
 		if render_scheduled then
 			return
@@ -426,7 +430,7 @@ local function render()
 	render_now()
 end
 
-local function dismiss_panel(panel)
+dismiss_panel = function(panel)
 	if uses_builtin_notify() then
 		close_float(panel_storage_key(panel))
 		panel.notify_handle = nil
@@ -452,7 +456,7 @@ local function dismiss_panel(panel)
 	panel.notify_handle = nil
 end
 
-local function clear_panel_contents(panel)
+clear_panel_contents = function(panel)
 	panel.items = {}
 	panel.spinner_active_keys = {}
 	panel.boot_active = false
