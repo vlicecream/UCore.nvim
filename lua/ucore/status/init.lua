@@ -14,6 +14,7 @@ local float_state = {
 local clear_panel_contents
 local dismiss_panel
 local render
+local bump_dismiss_version
 
 local function uses_builtin_notify()
 	local info = debug.getinfo(vim.notify, "S")
@@ -35,6 +36,7 @@ local function make_panel(title, notify_id, ordered_keys)
 		pending_finish_message = nil,
 		dismiss_version = 0,
 		countdown_seconds = nil,
+		manual_dismissed = false,
 	}
 end
 
@@ -193,6 +195,8 @@ local function bind_modal_keys(panel_key, buf)
 		if not panel or panel.state == "running" or panel.boot_active then
 			return
 		end
+		panel.manual_dismissed = true
+		bump_dismiss_version(panel)
 		clear_panel_contents(panel)
 		dismiss_panel(panel)
 		render()
@@ -517,7 +521,11 @@ local function unsuppress_key(panel, key)
 	panel.suppressed_keys[key] = nil
 end
 
-local function bump_dismiss_version(panel)
+local function panel_updates_suppressed(panel)
+	return panel == panels.init and panel.manual_dismissed == true
+end
+
+bump_dismiss_version = function(panel)
 	panel.dismiss_version = (panel.dismiss_version or 0) + 1
 end
 
@@ -614,6 +622,7 @@ local function reset_panel(panel)
 	clear_panel_contents(panel)
 	panel.suppressed_keys = {}
 	panel.state = "running"
+	panel.manual_dismissed = false
 	bump_dismiss_version(panel)
 end
 
@@ -650,6 +659,12 @@ end
 
 function M.finish(message)
 	local panel = panels.init
+	if panel_updates_suppressed(panel) then
+		panel.boot_active = false
+		panel.spinner_active_keys.boot = nil
+		panel.pending_finish_message = nil
+		return
+	end
 	panel.boot_active = false
 	panel.spinner_active_keys.boot = nil
 	panel.pending_finish_message = message or "UCore Ready - Initialization Complete"
@@ -659,6 +674,12 @@ end
 
 function M.fail(message, detail)
 	local panel = panels.init
+	if panel_updates_suppressed(panel) then
+		panel.boot_active = false
+		panel.spinner_active_keys.boot = nil
+		panel.pending_finish_message = nil
+		return
+	end
 	panel.boot_active = false
 	panel.state = "failed"
 	panel.pending_finish_message = nil
@@ -675,6 +696,9 @@ end
 
 function M.progress(title, message)
 	local panel = panel_for_key("progress:" .. title)
+	if panel_updates_suppressed(panel) then
+		return
+	end
 	local key = "progress:" .. title
 	if should_ignore_suppressed_update(panel, key, message) then
 		return
@@ -690,6 +714,9 @@ end
 
 function M.progress_finish(title, message)
 	local panel = panel_for_key("progress:" .. title)
+	if panel_updates_suppressed(panel) then
+		return
+	end
 	local key = "progress:" .. title
 	local text = compact_message(message or string.format("%s Complete", title))
 	if should_ignore_suppressed_update(panel, key, text) then
@@ -783,6 +810,9 @@ end
 
 function M.progress_fail(title, message)
 	local panel = panel_for_key("progress:" .. title)
+	if panel_updates_suppressed(panel) then
+		return
+	end
 	local key = "progress:" .. title
 	panel.spinner_active_keys[key] = nil
 	panel.state = "failed"
@@ -793,6 +823,9 @@ end
 
 function M.clear(key)
 	local panel = panel_for_key(key)
+	if panel_updates_suppressed(panel) then
+		return
+	end
 	if panel.suppressed_keys[key] then
 		return
 	end
