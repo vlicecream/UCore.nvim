@@ -1,9 +1,26 @@
 local cli = require("ucore.client.cli")
+local bootstrap = require("ucore.bootstrap")
 local completion_debug = require("ucore.completion.debug")
 local project = require("ucore.project")
 local rpc = require("ucore.client.rpc")
 
 local M = {}
+
+local function blocked_query_result(kind)
+	if kind == "GetDiagnostics" or kind == "ParseBuildDiagnostics" then
+		return { items = {} }
+	end
+
+	if kind == "GetCompletions" then
+		return { items = {} }
+	end
+
+	if kind == "GetSignatureHelp" then
+		return { signatures = {} }
+	end
+
+	return {}
+end
 
 -- Resolve the shared Engine DB for a project when it already exists.
 -- 当共享 Engine DB 已存在时，解析当前项目对应的 Engine DB。
@@ -24,6 +41,10 @@ end
 -- Send a typed query with the current project root attached.
 -- 发送带 project_root 的类型化查询。
 function M.query(project_root, query, callback)
+	if bootstrap.is_booting() then
+		return callback(blocked_query_result(query and query.kind), nil)
+	end
+
 	query.project_root = project_root
 	query.engine_db_path = existing_engine_db_path(project_root)
 

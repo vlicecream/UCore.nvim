@@ -425,4 +425,8 @@ function M.boot(callback, opts)
 	})
 end
 
+function M.is_booting()
+	return booting == true
+end
+
 return M
