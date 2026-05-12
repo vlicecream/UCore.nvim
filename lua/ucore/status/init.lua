@@ -109,6 +109,24 @@ local function is_detail_line(line)
 	return type(line) == "string" and line:find("^%-%-%-%- ", 1, true) ~= nil
 end
 
+local function preserve_detail_suffix(previous, next_text)
+	local next_lines = split_message_lines(next_text)
+	if #next_lines > 1 then
+		return table.concat(next_lines, "\n")
+	end
+
+	local previous_lines = split_message_lines(previous)
+	if #previous_lines <= 1 then
+		return next_lines[1] or ""
+	end
+
+	local merged = { next_lines[1] or "" }
+	for index = 2, #previous_lines do
+		table.insert(merged, previous_lines[index])
+	end
+	return table.concat(merged, "\n")
+end
+
 local function render_message_lines(panel, key, message)
 	local lines = split_message_lines(message)
 	if #lines == 0 then
@@ -690,7 +708,8 @@ end
 function M.progress_finish(title, message)
 	local panel = panel_for_key("progress:" .. title)
 	local key = "progress:" .. title
-	local text = compact_message(message or string.format("%s Complete", title))
+	local incoming = tostring(message or string.format("%s Complete", title))
+	local text = preserve_detail_suffix(panel.items[key], incoming)
 	if should_ignore_suppressed_update(panel, key, text) then
 		return
 	end
