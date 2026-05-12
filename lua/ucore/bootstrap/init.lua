@@ -34,6 +34,25 @@ local function other_progress(percent, detail)
 	status.progress(title, message)
 end
 
+local function other_finish()
+	status.progress_finish("UCore Other Initialization", "UCore Other Initialization 100%")
+end
+
+local function project_progress(percent, detail)
+	local title = "UCore Project Index"
+	local message = string.format("UCore Project Index %d%%", percent)
+	detail = vim.trim(tostring(detail or ""))
+	if detail ~= "" then
+		message = message .. "\n---- " .. detail
+	end
+	if percent >= 100 then
+		status.progress_finish(title, message)
+		return
+	end
+
+	status.progress(title, message)
+end
+
 -- Build a setup/refresh/watch payload for the current Unreal project.
 -- 为当前 Unreal 工程构造 setup/refresh/watch 请求体。
 local function current_project_payload(project_root)
@@ -227,16 +246,10 @@ end
 -- Run refresh when setup says the database is stale or missing.
 -- 当 setup 判断数据库缺失或过期时执行 refresh。
 local function run_refresh_if_needed(payload, setup_result, callback)
-	status.progress(
-		"UCore Project Index",
-		"UCore Project Index 0%\n---- Checking whether project refresh is needed..."
-	)
+	project_progress(0, "Checking whether project refresh is needed...")
 
 	if not setup_result.needs_full_refresh then
-		status.progress_finish(
-			"UCore Project Index",
-			"UCore Project Index 100%\n---- Up to date, full refresh not needed."
-		)
+		project_progress(90, "Project index is already up to date.")
 		return callback(true)
 	end
 
@@ -319,11 +332,7 @@ function M.boot(callback, opts)
 					fail(tostring(setup_result))
 					return callback(false, setup_result)
 				end
-				if setup_result.needs_full_refresh then
-					other_progress(60, "Workspace registered. Running project index refresh...")
-				else
-					other_progress(60, "Workspace registered. Project index already up to date...")
-				end
+				other_finish()
 
 				run_refresh_if_needed(payload, setup_result, function(refresh_ok, refresh_err)
 					if not refresh_ok then
@@ -332,15 +341,16 @@ function M.boot(callback, opts)
 						return callback(false, refresh_err)
 					end
 
-					other_progress(80, "Project ready. Starting filesystem watcher...")
+					project_progress(95, "Starting filesystem watcher...")
 					run_watch(payload, function(watch_ok, watch_err)
 						if not watch_ok then
 							booting = false
 							fail(tostring(watch_err))
 							return callback(false, watch_err)
 						end
+
+						project_progress(100)
 						booting = false
-						other_progress(100, "Workspace ready. Engine index may continue in background.")
 						callback(true)
 						run_engine_refresh_in_background(payload, opts.after_finish)
 					end)

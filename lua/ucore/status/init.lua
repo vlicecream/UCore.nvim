@@ -91,6 +91,11 @@ local function split_message_lines(message)
 	return lines
 end
 
+local function compact_message(message)
+	local lines = split_message_lines(message)
+	return lines[1] or ""
+end
+
 local function render_message_lines(panel, key, message)
 	local lines = split_message_lines(message)
 	if #lines == 0 then
@@ -474,7 +479,7 @@ end
 function M.progress_finish(title, message)
 	local panel = panel_for_key("progress:" .. title)
 	local key = "progress:" .. title
-	local text = message or string.format("%s Complete", title)
+	local text = compact_message(message or string.format("%s Complete", title))
 	if should_ignore_suppressed_update(panel, key, text) then
 		return
 	end
