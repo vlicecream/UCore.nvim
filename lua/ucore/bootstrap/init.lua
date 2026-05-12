@@ -51,8 +51,23 @@ local function project_code_progress(percent, detail)
 		percent = percent,
 		detail = detail,
 	})
-	local title = "UCore Project Code Init"
-	local message = string.format("UCore Project Code Init %d%%", percent)
+	local title = "UCore Project Discovery"
+	local message = string.format("UCore Project Discovery %d%%", percent)
+	if percent >= 100 then
+		status.progress_finish(title, message)
+		return
+	end
+
+	status.progress(title, message)
+end
+
+local function project_finalize_progress(percent, detail)
+	log.write_progress("boot-project-finalize", {
+		percent = percent,
+		detail = detail,
+	})
+	local title = "UCore Project Finalize"
+	local message = string.format("UCore Project Finalize %d%%", percent)
 	if percent >= 100 then
 		status.progress_finish(title, message)
 		return
@@ -197,10 +212,10 @@ local function run_engine_refresh_if_needed(payload, callback)
 			engine_root = engine.engine_root,
 		})
 		status.progress_finish(
-			"UCore Engine Code Init",
-			"UCore Engine Code Init 100%"
+			"UCore Engine Discovery",
+			"UCore Engine Discovery 100%"
 		)
-		status.progress_finish("UCore Engine Asset Init", "UCore Engine Asset Init 100%")
+		status.progress_finish("UCore Engine Asset Persist", "UCore Engine Asset Persist 100%")
 		return callback(true)
 	end
 
@@ -218,7 +233,7 @@ local function run_engine_refresh_if_needed(payload, callback)
 	})
 	engine_refreshing[engine.engine_id] = true
 	local settled = false
-	local title = "UCore Engine Code Init"
+	local title = "UCore Engine Discovery"
 
 	local function finish_once(ok, err)
 		if settled then
@@ -271,7 +286,7 @@ local function run_engine_refresh_step(payload, after_finish)
 			return
 		end
 
-		status.fail("UCore Engine Code Init Failed", tostring(err))
+		status.fail("UCore Engine Discovery Failed", tostring(err))
 		if type(after_finish) == "function" then
 			after_finish(false, err)
 		end
@@ -288,8 +303,8 @@ local function run_refresh_if_needed(payload, setup_result, callback)
 			reason = "index-up-to-date",
 			project_root = payload.project_root,
 		})
-		project_code_progress(90, "Project code index is up to date.")
-		status.progress_finish("UCore Project Asset Init", "UCore Project Asset Init 100%")
+		project_code_progress(90, "Project index is up to date.")
+		status.progress_finish("UCore Project Asset Persist", "UCore Project Asset Persist 100%")
 		return callback(true)
 	end
 
@@ -307,7 +322,7 @@ local function run_refresh_if_needed(payload, setup_result, callback)
 
 		callback(true)
 	end, {
-		label = "UCore Project Code Init",
+		label = "UCore Project Discovery",
 		detail = "Scanning project...",
 	})
 end
@@ -389,7 +404,7 @@ function M.boot(callback, opts)
 						return callback(false, refresh_err)
 					end
 
-					project_code_progress(95, "Starting file watcher...")
+					project_finalize_progress(95, "Starting file watcher...")
 					run_watch(payload, function(watch_ok, watch_err)
 						if not watch_ok then
 							booting = false
@@ -397,7 +412,7 @@ function M.boot(callback, opts)
 							return callback(false, watch_err)
 						end
 
-						project_code_progress(100)
+						project_finalize_progress(100)
 						run_engine_refresh_step(payload, function(engine_ok, engine_err)
 							booting = false
 							if not engine_ok then

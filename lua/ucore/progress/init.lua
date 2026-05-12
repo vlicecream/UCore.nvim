@@ -275,67 +275,56 @@ local function stage_label(stage)
 	return table.concat(words, " ")
 end
 
-local function stage_group(stage)
-	if stage == "asset_index" then
-		return "asset"
-	end
-
-	return "code"
-end
-
-local function display_title_for_group(group)
+local function target_prefix()
 	if target_kind == "engine" then
-		if group == "asset" then
-			return "UCore Engine Asset Init"
-		end
-		return "UCore Engine Code Init"
+		return "UCore Engine"
 	end
 
-	if group == "asset" then
-		return "UCore Project Asset Init"
-	end
-
-	return "UCore Project Code Init"
+	return "UCore Project"
 end
 
-local function group_percent(event)
+local function asset_stage_label(detail)
+	local normalized = normalize_detail(detail):lower()
+	if normalized:find("persist", 1, true) or normalized:find("ready", 1, true) then
+		return "Asset Persist"
+	end
+	return "Asset Scan"
+end
+
+local function display_title_for_event(event, detail)
+	local prefix = target_prefix()
 	local stage = event.stage
-	if stage == "complete" then
-		return 100
+
+	if stage == "discovery" then
+		return prefix .. " Discovery"
+	end
+	if stage == "db_prepare" then
+		return prefix .. " DB Prepare"
+	end
+	if stage == "analysis" then
+		return prefix .. " Analysis"
+	end
+	if stage == "db_write" then
+		return prefix .. " DB Write"
+	end
+	if stage == "finalizing" then
+		return prefix .. " Finalize"
+	end
+	if stage == "asset_index" then
+		return prefix .. " " .. asset_stage_label(detail)
 	end
 
-	local group = stage_group(stage)
-	local phase = phases[stage]
-	if not phase then
-		local current = tonumber(event.current) or 0
-		local total = tonumber(event.total) or 100
-		return clamp(math.floor((current / math.max(total, 1)) * 100), 0, 100)
-	end
+	return prefix .. " " .. (stage_label(stage) or "Progress")
+end
 
-	local group_weight = 0
-	local before = 0
-	for _, name in ipairs(phase_order) do
-		local info = phases[name]
-		local weight = (info and info.weight) or 0
-		if stage_group(name) == group then
-			group_weight = group_weight + weight
-			if name ~= stage then
-				before = before + weight
-			else
-				break
-			end
-		end
-	end
-
+local function stage_percent(event)
 	local current = tonumber(event.current) or 0
 	local total = tonumber(event.total) or 100
-	local local_ratio = clamp(current / math.max(total, 1), 0, 1)
-	local percent = ((before + local_ratio * phase.weight) / math.max(group_weight, 0.0001)) * 100
-	return clamp(math.floor(percent), 0, 100)
+	return clamp(math.floor((current / math.max(total, 1)) * 100), 0, 100)
 end
 
-local function format_progress_message(display_title, overall)
-	return string.format("%s %d%%", display_title, overall)
+local function format_progress_message(display_title, percent)
+	return string.format("%s %d%%", display_title, percent)
 end
 
 -- Show user-facing progress notifications, throttled by overall percentage.
@@ -355,8 +344,8 @@ function M.handle_progress(event)
 	local overall = overall_percent(event)
 	local is_complete = overall >= 100 or event.stage == "complete"
 	local detail = normalize_detail(event.message)
-	local display_title = display_title_for_group(stage_group(event.stage))
-	local rendered = format_progress_message(display_title, group_percent(event))
+	local display_title = display_title_for_event(event, detail)
+	local rendered = format_progress_message(display_title, stage_percent(event))
 	local same_render = overall == last_percent and event.stage == last_stage and rendered == (last_detail or "")
 
 	-- Rust owns progress throttling; Lua ignores only stale or truly duplicate events.

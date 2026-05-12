@@ -34,10 +34,10 @@ local function refresh_progress_title(payload, opts)
 	end
 
 	if refresh_target_kind(payload, opts) == "engine" then
-		return "UCore Engine Code Init"
+		return "UCore Engine Discovery"
 	end
 
-	return "UCore Project Code Init"
+	return "UCore Project Discovery"
 end
 
 local function refresh_progress_detail(payload, opts)
