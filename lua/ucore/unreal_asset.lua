@@ -162,6 +162,24 @@ local function powershell_quote(value)
 	return "'" .. value:gsub("'", "''") .. "'"
 end
 
+local function ps_clear_p4_env_prefix()
+	return table.concat({
+		"Remove-Item Env:P4CONFIG -ErrorAction SilentlyContinue",
+		"Remove-Item Env:P4PORT -ErrorAction SilentlyContinue",
+		"Remove-Item Env:P4USER -ErrorAction SilentlyContinue",
+		"Remove-Item Env:P4CLIENT -ErrorAction SilentlyContinue",
+		"Remove-Item Env:P4CHARSET -ErrorAction SilentlyContinue",
+	}, "; ")
+end
+
+local function env_value(name)
+	local value = vim.fn.getenv(name)
+	if value == nil or value == vim.NIL or value == "" then
+		return "<unset>"
+	end
+	return tostring(value)
+end
+
 local function launch_editor(metadata)
 	local editor_path = editor_executable(metadata.engine_root)
 	if not editor_path then
@@ -173,7 +191,19 @@ local function launch_editor(metadata)
 	local job
 	if vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1 then
 		local shell = vim.fn.executable("pwsh") == 1 and "pwsh" or "powershell"
+		require("ucore.log").write("ucore.unreal_asset_launch", {
+			project = metadata.project_name,
+			program = editor_path,
+			root = project_dir,
+			shell = shell,
+			p4_env_mode = "cleared_for_child_process",
+			p4config = env_value("P4CONFIG"),
+			p4port = env_value("P4PORT"),
+			p4user = env_value("P4USER"),
+			p4client = env_value("P4CLIENT"),
+		})
 		local command = table.concat({
+			ps_clear_p4_env_prefix(),
 			"Start-Process",
 			"-FilePath", powershell_quote(editor_path),
 			"-ArgumentList", powershell_quote(metadata.uproject_path),
