@@ -29,8 +29,8 @@ local function other_progress(percent, detail)
 		percent = percent,
 		detail = detail,
 	})
-	local title = "UCore Other Initialization"
-	local message = string.format("UCore Other Initialization %d%%", percent)
+	local title = "UCore Server Init"
+	local message = string.format("UCore Server Init %d%%", percent)
 	if percent >= 100 then
 		status.progress_finish(title, message)
 		return
@@ -43,16 +43,16 @@ local function other_finish()
 	log.write_progress("boot-other-finish", {
 		percent = 100,
 	})
-	status.progress_finish("UCore Other Initialization", "UCore Other Initialization 100%")
+	status.progress_finish("UCore Server Init", "UCore Server Init 100%")
 end
 
-local function project_progress(percent, detail)
+local function project_code_progress(percent, detail)
 	log.write_progress("boot-project", {
 		percent = percent,
 		detail = detail,
 	})
-	local title = "UCore Project Index"
-	local message = string.format("UCore Project Index %d%%", percent)
+	local title = "UCore Project Code Init"
+	local message = string.format("UCore Project Code Init %d%%", percent)
 	if percent >= 100 then
 		status.progress_finish(title, message)
 		return
@@ -197,9 +197,10 @@ local function run_engine_refresh_if_needed(payload, callback)
 			engine_root = engine.engine_root,
 		})
 		status.progress_finish(
-			"UCore Engine Index",
-			"UCore Engine Index 100%\n---- Shared index reused."
+			"UCore Engine Code Init",
+			"UCore Engine Code Init 100%"
 		)
+		status.progress_finish("UCore Engine Asset Init", "UCore Engine Asset Init 100%")
 		return callback(true)
 	end
 
@@ -217,7 +218,7 @@ local function run_engine_refresh_if_needed(payload, callback)
 	})
 	engine_refreshing[engine.engine_id] = true
 	local settled = false
-	local title = "UCore Engine Index"
+	local title = "UCore Engine Code Init"
 
 	local function finish_once(ok, err)
 		if settled then
@@ -270,7 +271,7 @@ local function run_engine_refresh_step(payload, after_finish)
 			return
 		end
 
-		status.fail("UCore Engine Index Failed", tostring(err))
+		status.fail("UCore Engine Code Init Failed", tostring(err))
 		if type(after_finish) == "function" then
 			after_finish(false, err)
 		end
@@ -280,14 +281,15 @@ end
 -- Run refresh when setup says the database is stale or missing.
 -- 当 setup 判断数据库缺失或过期时执行 refresh。
 local function run_refresh_if_needed(payload, setup_result, callback)
-	project_progress(0, "Checking project refresh...")
+	project_code_progress(0, "Checking project refresh...")
 
 	if not setup_result.needs_full_refresh then
 		log.write_progress("boot-project-skip", {
 			reason = "index-up-to-date",
 			project_root = payload.project_root,
 		})
-		project_progress(90, "Project index is up to date.")
+		project_code_progress(90, "Project code index is up to date.")
+		status.progress_finish("UCore Project Asset Init", "UCore Project Asset Init 100%")
 		return callback(true)
 	end
 
@@ -305,7 +307,7 @@ local function run_refresh_if_needed(payload, setup_result, callback)
 
 		callback(true)
 	end, {
-		label = "UCore Project Index",
+		label = "UCore Project Code Init",
 		detail = "Scanning project...",
 	})
 end
@@ -387,7 +389,7 @@ function M.boot(callback, opts)
 						return callback(false, refresh_err)
 					end
 
-					project_progress(95, "Starting file watcher...")
+					project_code_progress(95, "Starting file watcher...")
 					run_watch(payload, function(watch_ok, watch_err)
 						if not watch_ok then
 							booting = false
@@ -395,7 +397,7 @@ function M.boot(callback, opts)
 							return callback(false, watch_err)
 						end
 
-						project_progress(100)
+						project_code_progress(100)
 						run_engine_refresh_step(payload, function(engine_ok, engine_err)
 							booting = false
 							if not engine_ok then

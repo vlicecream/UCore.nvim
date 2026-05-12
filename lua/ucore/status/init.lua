@@ -46,10 +46,12 @@ local panels = {
 	}),
 	init = make_panel("UCore Workspace Init", "ucore.status.init", {
 		"boot",
-		"progress:UCore Other Initialization",
+		"progress:UCore Server Init",
 		"progress:UCore Syntax Highlight",
-		"progress:UCore Project Index",
-		"progress:UCore Engine Index",
+		"progress:UCore Project Code Init",
+		"progress:UCore Project Asset Init",
+		"progress:UCore Engine Code Init",
+		"progress:UCore Engine Asset Init",
 	}),
 }
 

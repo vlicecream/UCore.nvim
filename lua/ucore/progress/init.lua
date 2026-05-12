@@ -34,6 +34,8 @@ local active = false
 local title = "UCore refresh"
 local visible = true
 local stage_progress = {}
+local target_kind = "project"
+local current_display_title = nil
 
 -- Load the built-in overall progress plan.
 -- 加载内置的整体进度计划。
@@ -52,6 +54,7 @@ local function reset()
 	last_tail = nil
 	stage_progress = {}
 	active = true
+	current_display_title = nil
 end
 
 -- Start a new visible progress run with a user-facing title.
@@ -59,6 +62,7 @@ end
 function M.start(next_title, opts)
 	opts = opts or {}
 	title = next_title or "UCore refresh"
+	target_kind = opts.target_kind or "project"
 	visible = opts.silent ~= true
 	reset()
 	if visible then
@@ -76,11 +80,12 @@ function M.finish(message)
 	active = false
 	last_percent = 100
 	last_stage = "complete"
-	local finish_message = message or string.format("%s 100%%", title)
+	local finish_title = current_display_title or title
+	local finish_message = message or string.format("%s 100%%", finish_title)
 	last_detail = nil
 	last_tail = nil
 	if visible then
-		status.progress_finish(title, finish_message)
+		status.progress_finish(finish_title, finish_message)
 	end
 end
 
@@ -92,7 +97,7 @@ function M.fail(message)
 	last_detail = nil
 	last_tail = nil
 	if visible then
-		status.progress_fail(title, message or string.format("%s failed", title))
+		status.progress_fail(current_display_title or title, message or string.format("%s failed", title))
 	end
 end
 
@@ -270,8 +275,67 @@ local function stage_label(stage)
 	return table.concat(words, " ")
 end
 
-local function format_progress_message(overall, event)
-	return string.format("%s %d%%", title, overall)
+local function stage_group(stage)
+	if stage == "asset_index" then
+		return "asset"
+	end
+
+	return "code"
+end
+
+local function display_title_for_group(group)
+	if target_kind == "engine" then
+		if group == "asset" then
+			return "UCore Engine Asset Init"
+		end
+		return "UCore Engine Code Init"
+	end
+
+	if group == "asset" then
+		return "UCore Project Asset Init"
+	end
+
+	return "UCore Project Code Init"
+end
+
+local function group_percent(event)
+	local stage = event.stage
+	if stage == "complete" then
+		return 100
+	end
+
+	local group = stage_group(stage)
+	local phase = phases[stage]
+	if not phase then
+		local current = tonumber(event.current) or 0
+		local total = tonumber(event.total) or 100
+		return clamp(math.floor((current / math.max(total, 1)) * 100), 0, 100)
+	end
+
+	local group_weight = 0
+	local before = 0
+	for _, name in ipairs(phase_order) do
+		local info = phases[name]
+		local weight = (info and info.weight) or 0
+		if stage_group(name) == group then
+			group_weight = group_weight + weight
+			if name ~= stage then
+				before = before + weight
+			else
+				break
+			end
+		end
+	end
+
+	local current = tonumber(event.current) or 0
+	local total = tonumber(event.total) or 100
+	local local_ratio = clamp(current / math.max(total, 1), 0, 1)
+	local percent = ((before + local_ratio * phase.weight) / math.max(group_weight, 0.0001)) * 100
+	return clamp(math.floor(percent), 0, 100)
+end
+
+local function format_progress_message(display_title, overall)
+	return string.format("%s %d%%", display_title, overall)
 end
 
 -- Show user-facing progress notifications, throttled by overall percentage.
@@ -291,7 +355,8 @@ function M.handle_progress(event)
 	local overall = overall_percent(event)
 	local is_complete = overall >= 100 or event.stage == "complete"
 	local detail = normalize_detail(event.message)
-	local rendered = format_progress_message(overall, event)
+	local display_title = display_title_for_group(stage_group(event.stage))
+	local rendered = format_progress_message(display_title, group_percent(event))
 	local same_render = overall == last_percent and event.stage == last_stage and rendered == (last_detail or "")
 
 	-- Rust owns progress throttling; Lua ignores only stale or truly duplicate events.
@@ -310,15 +375,21 @@ function M.handle_progress(event)
 		current = event.current,
 		total = event.total,
 		overall = overall,
+		display_title = display_title,
 		detail = detail,
 	})
 
+	if current_display_title and current_display_title ~= display_title and visible then
+		status.progress_finish(current_display_title, string.format("%s 100%%", current_display_title))
+	end
+	current_display_title = display_title
+
 	if is_complete then
-		return M.finish(string.format("%s 100%%", title))
+		return M.finish(string.format("%s 100%%", display_title))
 	end
 
 	if visible then
-		status.progress(title, rendered)
+		status.progress(display_title, rendered)
 	end
 end
 

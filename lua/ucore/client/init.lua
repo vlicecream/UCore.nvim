@@ -7,6 +7,18 @@ local M = {
 	rpc = rpc,
 }
 
+local function refresh_target_kind(payload, opts)
+	if opts and opts.target_kind then
+		return opts.target_kind
+	end
+
+	if payload and payload.engine_root == nil then
+		return "engine"
+	end
+
+	return "project"
+end
+
 -- Keep most lifecycle commands on the CLI bridge, but run refresh over RPC so
 -- progress notifications can reach Neovim.
 -- 大多数生命周期命令仍走 CLI 桥；refresh 走 RPC，方便把进度通知送回 Neovim。
@@ -21,11 +33,11 @@ local function refresh_progress_title(payload, opts)
 		return opts.label
 	end
 
-	if payload and payload.engine_root == nil then
-		return "UCore Engine Index"
+	if refresh_target_kind(payload, opts) == "engine" then
+		return "UCore Engine Code Init"
 	end
 
-	return "UCore Project Index"
+	return "UCore Project Code Init"
 end
 
 local function refresh_progress_detail(payload, opts)
@@ -43,6 +55,7 @@ end
 function M.refresh(payload, callback, opts)
 	opts = vim.tbl_extend("force", {
 		detail = refresh_progress_detail(payload, opts),
+		target_kind = refresh_target_kind(payload, opts),
 	}, opts or {})
 	progress.start(refresh_progress_title(payload, opts), opts)
 
