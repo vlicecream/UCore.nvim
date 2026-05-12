@@ -157,11 +157,6 @@ local function editor_executable(engine_root)
 	return nil
 end
 
-local function powershell_quote(value)
-	value = tostring(value or "")
-	return "'" .. value:gsub("'", "''") .. "'"
-end
-
 local function env_value(name)
 	local value = vim.fn.getenv(name)
 	if value == nil or value == vim.NIL or value == "" then
@@ -178,41 +173,21 @@ local function launch_editor(metadata)
 
 	local project_dir = dirname(metadata.uproject_path) or metadata.project_root or metadata.engine_root or ""
 
-	local job
-	if vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1 then
-		local shell = vim.fn.executable("pwsh") == 1 and "pwsh" or "powershell"
-		require("ucore.log").write("ucore.unreal_asset_launch", {
-			project = metadata.project_name,
-			program = editor_path,
-			root = project_dir,
-			shell = shell,
-			p4config = env_value("P4CONFIG"),
-			p4port = env_value("P4PORT"),
-			p4user = env_value("P4USER"),
-			p4client = env_value("P4CLIENT"),
-		})
-		local command = table.concat({
-			"Start-Process",
-			"-FilePath", powershell_quote(editor_path),
-			"-ArgumentList", powershell_quote(metadata.uproject_path),
-			"-WorkingDirectory", powershell_quote(project_dir),
-			"-WindowStyle Normal",
-		}, " ")
-		job = vim.fn.jobstart({
-			shell,
-			"-NoProfile",
-			"-NonInteractive",
-			"-ExecutionPolicy", "Bypass",
-			"-Command", command,
-		}, {
-			detach = true,
-		})
-	else
-		job = vim.fn.jobstart({ editor_path, metadata.uproject_path }, {
-			detach = true,
-			cwd = project_dir,
-		})
-	end
+	require("ucore.log").write("ucore.unreal_asset_launch", {
+		project = metadata.project_name,
+		program = editor_path,
+		root = project_dir,
+		shell = "direct",
+		p4config = env_value("P4CONFIG"),
+		p4port = env_value("P4PORT"),
+		p4user = env_value("P4USER"),
+		p4client = env_value("P4CLIENT"),
+	})
+
+	local job = vim.fn.jobstart({ editor_path, metadata.uproject_path }, {
+		detach = true,
+		cwd = project_dir,
+	})
 
 	if tonumber(job or 0) <= 0 then
 		return false, "Failed to launch Unreal Editor"
