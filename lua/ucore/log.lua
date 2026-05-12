@@ -145,4 +145,13 @@ function M.write(tag, fields)
 	end
 end
 
+function M.write_progress(tag, fields)
+	local progress_config = config.values.progress or {}
+	if progress_config.log == false then
+		return
+	end
+
+	M.write(tag, fields)
+end
+
 return M

@@ -367,7 +367,7 @@ function M.handle_progress(event)
 	last_detail = rendered
 	last_tail = rendered:match("\n%-%-%-%- (.+)$") or detail
 
-	log.write("progress-ui", {
+	log.write_progress("progress-ui", {
 		stage = event.stage,
 		current = event.current,
 		total = event.total,

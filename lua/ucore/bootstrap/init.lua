@@ -1,6 +1,7 @@
 local backend = require("ucore.backend")
 local client = require("ucore.client")
 local config = require("ucore.config")
+local log = require("ucore.log")
 local protocol = require("ucore.protocol")
 local project = require("ucore.project")
 local server = require("ucore.server")
@@ -14,12 +15,20 @@ local engine_refreshing = {}
 -- Report boot failures through the persistent initialization status.
 -- 通过持久初始化状态报告 boot 错误。
 local function fail(message, detail)
+	log.write_progress("boot-fail", {
+		message = message,
+		detail = detail,
+	})
 	status.fail("UCore Initialization Failed", detail or message)
 end
 
 -- Update the non-indexing part of boot progress.
 -- 更新非索引部分的初始化进度。
 local function other_progress(percent, detail)
+	log.write_progress("boot-other", {
+		percent = percent,
+		detail = detail,
+	})
 	local title = "UCore Other Initialization"
 	local message = string.format("UCore Other Initialization %d%%", percent)
 	detail = vim.trim(tostring(detail or ""))
@@ -35,10 +44,17 @@ local function other_progress(percent, detail)
 end
 
 local function other_finish()
+	log.write_progress("boot-other-finish", {
+		percent = 100,
+	})
 	status.progress_finish("UCore Other Initialization", "UCore Other Initialization 100%")
 end
 
 local function project_progress(percent, detail)
+	log.write_progress("boot-project", {
+		percent = percent,
+		detail = detail,
+	})
 	local title = "UCore Project Index"
 	local message = string.format("UCore Project Index %d%%", percent)
 	detail = vim.trim(tostring(detail or ""))
@@ -158,6 +174,9 @@ end
 -- Run setup and decide whether a full refresh is required.
 -- 执行 setup，并判断是否需要 full refresh。
 local function run_setup(payload, callback)
+	log.write_progress("boot-setup", {
+		project_root = payload.project_root,
+	})
 	client.setup(rust_payload(payload), function(result, err)
 		if err then
 			return callback(false, err)
@@ -174,10 +193,17 @@ local function run_engine_refresh_if_needed(payload, callback)
 	local engine_paths = payload._engine_paths
 
 	if not engine or not engine_paths then
+		log.write_progress("boot-engine-skip", {
+			reason = "missing-engine-metadata",
+		})
 		return callback(true)
 	end
 
 	if not project.engine_needs_refresh(engine) then
+		log.write_progress("boot-engine-skip", {
+			reason = "shared-index-reused",
+			engine_root = engine.engine_root,
+		})
 		status.progress_finish(
 			"UCore Engine Index",
 			"UCore Engine Index 100%\n---- Shared index reused."
@@ -186,9 +212,17 @@ local function run_engine_refresh_if_needed(payload, callback)
 	end
 
 	if engine_refreshing[engine.engine_id] then
+		log.write_progress("boot-engine-skip", {
+			reason = "refresh-already-running",
+			engine_id = engine.engine_id,
+		})
 		return callback(true)
 	end
 
+	log.write_progress("boot-engine-start", {
+		engine_id = engine.engine_id,
+		engine_root = engine.engine_root,
+	})
 	engine_refreshing[engine.engine_id] = true
 	local settled = false
 	local title = "UCore Engine Index"
@@ -213,10 +247,18 @@ local function run_engine_refresh_if_needed(payload, callback)
 		vcs_hash = nil,
 	}, function(_, err)
 		if err then
+			log.write_progress("boot-engine-finish", {
+				ok = false,
+				error = tostring(err),
+			})
 			return finish_once(false, err)
 		end
 
 		project.write_engine_index_metadata(engine)
+		log.write_progress("boot-engine-finish", {
+			ok = true,
+			engine_id = engine.engine_id,
+		})
 		finish_once(true)
 	end, {
 		label = title,
@@ -249,10 +291,17 @@ local function run_refresh_if_needed(payload, setup_result, callback)
 	project_progress(0, "Checking project refresh...")
 
 	if not setup_result.needs_full_refresh then
+		log.write_progress("boot-project-skip", {
+			reason = "index-up-to-date",
+			project_root = payload.project_root,
+		})
 		project_progress(90, "Project index is up to date.")
 		return callback(true)
 	end
 
+	log.write_progress("boot-project-refresh", {
+		project_root = payload.project_root,
+	})
 	local refresh_payload = rust_payload(payload)
 	refresh_payload.type = "refresh"
 	refresh_payload.scope = "Game"
@@ -272,6 +321,9 @@ end
 -- Start watcher after setup/refresh.
 -- setup/refresh 后启动 watcher。
 local function run_watch(payload, callback)
+	log.write_progress("boot-watch", {
+		project_root = payload.project_root,
+	})
 	client.watch({
 		project_root = payload.project_root,
 		db_path = payload.db_path,
@@ -307,6 +359,9 @@ function M.boot(callback, opts)
 	end
 
 	booting = true
+	log.write_progress("boot-start", {
+		project_root = payload.project_root,
+	})
 	status.start("UCore Initializing...")
 	other_progress(0, "Starting backend...")
 
@@ -356,6 +411,9 @@ function M.boot(callback, opts)
 								return callback(false, engine_err)
 							end
 
+							log.write_progress("boot-finish", {
+								project_root = payload.project_root,
+							})
 							callback(true)
 						end)
 					end)

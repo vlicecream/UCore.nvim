@@ -179,7 +179,7 @@ local function handle_frame(frame)
 
 		vim.schedule(function()
 			if method == "progress_plan" then
-				log.write("rpc-progress-plan", {
+				log.write_progress("rpc-progress-plan", {
 					phase_count = type(params) == "table" and #(params.phases or params[2] or {}) or 0,
 				})
 				progress.handle_plan(params)
@@ -187,7 +187,7 @@ local function handle_frame(frame)
 			end
 
 			if method == "progress" then
-				log.write("rpc-progress", {
+				log.write_progress("rpc-progress", {
 					stage = params and (params.stage or params[2]) or nil,
 					current = params and (params.current or params[3]) or nil,
 					total = params and (params.total or params[4]) or nil,
