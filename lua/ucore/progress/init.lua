@@ -62,12 +62,7 @@ function M.start(next_title, opts)
 	visible = opts.silent ~= true
 	reset()
 	if visible then
-		local message = string.format("%s 0%%", title)
-		local detail = vim.trim(tostring(opts.detail or ""))
-		if detail ~= "" then
-			message = message .. "\n---- " .. detail
-		end
-		status.progress(title, message)
+		status.progress(title, string.format("%s 0%%", title))
 	end
 end
 
@@ -81,13 +76,7 @@ function M.finish(message)
 	active = false
 	last_percent = 100
 	last_stage = "complete"
-	local finish_message = message
-	if not finish_message then
-		finish_message = string.format("%s 100%%", title)
-		if last_tail and last_tail ~= "" then
-			finish_message = finish_message .. "\n---- " .. last_tail
-		end
-	end
+	local finish_message = message or string.format("%s 100%%", title)
 	last_detail = nil
 	last_tail = nil
 	if visible then
@@ -282,69 +271,7 @@ local function stage_label(stage)
 end
 
 local function format_progress_message(overall, event)
-	local lines = { string.format("%s %d%%", title, overall) }
-	local label = stage_label(event.stage)
-	local current, total = event_numbers(event)
-	local detail = normalize_detail(event.message)
-	local computed_detail = nil
-
-	local function merge_detail(prefix, tail)
-		local normalized_tail = normalize_detail(tail)
-		if normalized_tail == "" then
-			return prefix
-		end
-
-		local lower_tail = normalized_tail:lower()
-		local lower_prefix = prefix:lower()
-		if lower_tail == lower_prefix or lower_tail:find(lower_prefix, 1, true) then
-			return prefix
-		end
-
-		return string.format("%s | %s", prefix, normalized_tail)
-	end
-
-	if total > 0 and (event.stage == "analysis" or event.stage == "db_write" or event.stage == "asset_index") then
-		local prefix = label or tostring(event.stage or "Progress")
-		computed_detail = string.format("%s %d/%d", prefix, current, total)
-	end
-
-	if computed_detail and (event.stage == "analysis" or event.stage == "db_write") then
-		detail = merge_detail(computed_detail, detail)
-	elseif computed_detail and event.stage == "asset_index" then
-		local short_detail = detail
-		if short_detail:find("Scanning", 1, true) then
-			short_detail = "Scan"
-		elseif short_detail:find("Persist", 1, true) then
-			short_detail = "Persist"
-		elseif short_detail:find("ready", 1, true) or short_detail:find("Ready", 1, true) then
-			short_detail = "Ready"
-		end
-		detail = merge_detail(computed_detail, short_detail)
-	elseif computed_detail and detail ~= "" then
-		local lower_detail = detail:lower()
-		local lower_prefix = computed_detail:lower()
-		if lower_detail ~= lower_prefix and not lower_detail:find(lower_prefix, 1, true) then
-			detail = string.format("%s | %s", computed_detail, detail)
-		else
-			detail = computed_detail
-		end
-	elseif computed_detail then
-		detail = computed_detail
-	elseif detail ~= "" and label then
-		local lower_detail = detail:lower()
-		local lower_label = label:lower()
-		local lower_stage = tostring(event.stage or ""):lower()
-		if not lower_detail:find(lower_label, 1, true) and (lower_stage == "" or not lower_detail:find(lower_stage, 1, true)) then
-			detail = string.format("%s: %s", label, detail)
-		end
-	end
-
-	if detail == "" then
-		return table.concat(lines, "\n")
-	end
-
-	table.insert(lines, "---- " .. detail)
-	return table.concat(lines, "\n")
+	return string.format("%s %d%%", title, overall)
 end
 
 -- Show user-facing progress notifications, throttled by overall percentage.
@@ -383,11 +310,11 @@ function M.handle_progress(event)
 		current = event.current,
 		total = event.total,
 		overall = overall,
-		detail = last_tail,
+		detail = detail,
 	})
 
 	if is_complete then
-		return M.finish(string.format("%s 100%%\n---- %s", title, detail ~= "" and detail or "Complete."))
+		return M.finish(string.format("%s 100%%", title))
 	end
 
 	if visible then

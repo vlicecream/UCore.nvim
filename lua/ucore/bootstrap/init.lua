@@ -31,10 +31,6 @@ local function other_progress(percent, detail)
 	})
 	local title = "UCore Other Initialization"
 	local message = string.format("UCore Other Initialization %d%%", percent)
-	detail = vim.trim(tostring(detail or ""))
-	if detail ~= "" then
-		message = message .. "\n---- " .. detail
-	end
 	if percent >= 100 then
 		status.progress_finish(title, message)
 		return
@@ -57,10 +53,6 @@ local function project_progress(percent, detail)
 	})
 	local title = "UCore Project Index"
 	local message = string.format("UCore Project Index %d%%", percent)
-	detail = vim.trim(tostring(detail or ""))
-	if detail ~= "" then
-		message = message .. "\n---- " .. detail
-	end
 	if percent >= 100 then
 		status.progress_finish(title, message)
 		return
