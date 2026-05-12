@@ -149,7 +149,8 @@ pub async fn handle_setup(state: Arc<AppState>, params: &Value) -> Result<Value>
 
     drop_db_connections(&state, &db_path_native, cache_db_path_unix.as_deref());
 
-    let needs_full_refresh = ensure_database_ready(db_path_native.clone()).await?;
+    let needs_full_refresh =
+        ensure_database_ready(db_path_native.clone(), req.project_root.clone()).await?;
 
     {
         let mut projects = state.projects.lock();
@@ -1840,7 +1841,11 @@ fn schedule_asset_index_ready(state: Arc<AppState>, db_path_native: String, proj
 
 /// Ensure SQLite database exists, version matches, and has required data.
 /// 确保 SQLite 数据库存在、版本正确，并且不是空索引。
-async fn ensure_database_ready(db_path_native: String) -> Result<bool> {
+fn is_engine_root_path(path: &Path) -> bool {
+    path.join("Engine/Source").is_dir() || path.join("Engine/Build/Build.version").is_file()
+}
+
+async fn ensure_database_ready(db_path_native: String, project_root: String) -> Result<bool> {
     tokio::task::spawn_blocking(move || {
         let reinitialized = db::ensure_correct_version(&db_path_native).unwrap_or(false);
 
@@ -1856,7 +1861,16 @@ async fn ensure_database_ready(db_path_native: String) -> Result<bool> {
             .query_row("SELECT COUNT(*) FROM classes", [], |row| row.get(0))
             .unwrap_or(0);
 
-        Ok(file_count == 0 || class_count == 0)
+        if file_count == 0 || class_count == 0 {
+            return Ok(true);
+        }
+
+        if is_engine_root_path(Path::new(&project_root)) {
+            return Ok(false);
+        }
+
+        let asset_ready = asset::asset_index_initialized(&conn).unwrap_or(false);
+        Ok(!asset_ready)
     })
     .await?
 }
