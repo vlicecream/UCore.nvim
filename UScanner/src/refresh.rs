@@ -26,6 +26,7 @@ const ENGINE_SCAN_SUBDIRS: &[&str] = &[
     "Engine/Config",
     "Engine/Shaders",
 ];
+const DISCOVERY_PROGRESS_EVERY: usize = 250;
 
 /// Run a full project refresh.
 /// 执行一次完整工程刷新。
@@ -37,15 +38,43 @@ pub fn run_refresh(req: RefreshRequest, reporter: Arc<dyn ProgressReporter>) -> 
     }
 
     report_plan(reporter.as_ref());
-    reporter.report("discovery", 0, 100, &format!("Scanning: {}", ctx.project_root.display()));
+    let search_roots = ctx.search_roots();
+    reporter.report(
+        "discovery",
+        0,
+        100,
+        &format!(
+            "Scanning {} roots: {}",
+            search_roots.len(),
+            summarize_search_roots(&ctx, &search_roots)
+        ),
+    );
 
     let ue_version = ctx.engine_root.as_deref().and_then(read_ue_version);
     let discovery = discover_project(&ctx, reporter.clone())?;
 
-    reporter.report("discovery", 70, 100, "Resolving module dependencies...");
+    reporter.report(
+        "discovery",
+        70,
+        100,
+        &format!(
+            "Resolving module dependencies ({} modules, {} files discovered)...",
+            discovery.modules.len(),
+            discovery.files.len()
+        ),
+    );
     let resolved_modules = resolve_modules(discovery.modules);
 
-    reporter.report("db_prepare", 0, 100, "Preparing database...");
+    reporter.report(
+        "db_prepare",
+        0,
+        100,
+        &format!(
+            "Preparing database ({} components, {} modules)...",
+            discovery.components.len(),
+            resolved_modules.len()
+        ),
+    );
     let mut conn = open_refresh_db(&ctx.db_path_native)?;
     write_engine_version(&conn, ue_version)?;
 
@@ -234,6 +263,41 @@ fn should_index_assets(ctx: &RefreshContext) -> bool {
     !is_engine_root_path(&ctx.project_root)
 }
 
+fn display_progress_path(path: &Path, project_root: &Path, engine_root: Option<&Path>) -> String {
+    if let Ok(relative) = path.strip_prefix(project_root) {
+        if relative.as_os_str().is_empty() {
+            return root_name(project_root);
+        }
+        return normalize_path(relative);
+    }
+
+    if let Some(root) = engine_root {
+        if let Ok(relative) = path.strip_prefix(root) {
+            if relative.as_os_str().is_empty() {
+                return root_name(root);
+            }
+            return normalize_path(relative);
+        }
+    }
+
+    normalize_path(path)
+}
+
+fn summarize_search_roots(ctx: &RefreshContext, roots: &[PathBuf]) -> String {
+    let items = roots
+        .iter()
+        .take(4)
+        .map(|path| display_progress_path(path, &ctx.project_root, ctx.engine_root.as_deref()))
+        .collect::<Vec<_>>();
+
+    let mut summary = items.join(", ");
+    if roots.len() > items.len() {
+        summary.push_str(&format!(", +{}", roots.len() - items.len()));
+    }
+
+    summary
+}
+
 /// Discover components, modules, and files.
 /// 扫描工程，发现 component、module 和文件。
 fn discover_project(ctx: &RefreshContext, reporter: Arc<dyn ProgressReporter>) -> Result<DiscoveryResult> {
@@ -247,9 +311,10 @@ fn discover_project(ctx: &RefreshContext, reporter: Arc<dyn ProgressReporter>) -
     let build_files = Arc::new(parking_lot::Mutex::new(Vec::<(PathBuf, String)>::new()));
     let plugin_components = Arc::new(parking_lot::Mutex::new(Vec::<ComponentDef>::new()));
     let seen_count = Arc::new(AtomicUsize::new(0));
+    let search_roots = ctx.search_roots();
 
-    let mut builder = WalkBuilder::new(ctx.search_roots().first().unwrap());
-    for root in ctx.search_roots().iter().skip(1) {
+    let mut builder = WalkBuilder::new(search_roots.first().unwrap());
+    for root in search_roots.iter().skip(1) {
         builder.add(root);
     }
 
@@ -290,13 +355,15 @@ fn discover_project(ctx: &RefreshContext, reporter: Arc<dyn ProgressReporter>) -
             };
 
             let count = seen_count.fetch_add(1, Ordering::Relaxed) + 1;
-            if count % 1000 == 0 {
+            if count == 1 || count % DISCOVERY_PROGRESS_EVERY == 0 {
                 let current = (count / 1000).clamp(1, 69);
+                let display_path =
+                    display_progress_path(entry.path(), &project_root, engine_root.as_deref());
                 reporter.report(
                     "discovery",
                     current,
                     100,
-                    &format!("Discovery: {} files seen", count),
+                    &format!("Scanning {} ({} entries seen)", display_path, count),
                 );
             }
 

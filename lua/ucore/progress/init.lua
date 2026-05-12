@@ -26,6 +26,8 @@ local default_phases = {
 local phases = {}
 local phase_order = {}
 local last_percent = -1
+local last_stage = nil
+local last_detail = nil
 local active = false
 local title = "UCore refresh"
 local visible = true
@@ -42,6 +44,8 @@ end
 local function reset()
 	load_default_plan()
 	last_percent = -1
+	last_stage = nil
+	last_detail = nil
 	active = true
 end
 
@@ -66,6 +70,8 @@ function M.finish(message)
 
 	active = false
 	last_percent = 100
+	last_stage = "complete"
+	last_detail = nil
 	if visible then
 		status.progress_finish(title, message or string.format("%s 100%%", title))
 	end
@@ -75,6 +81,8 @@ end
 -- 标记当前进度展示失败。
 function M.fail(message)
 	active = false
+	last_stage = "failed"
+	last_detail = nil
 	if visible then
 		status.progress_fail(title, message or string.format("%s failed", title))
 	end
@@ -198,6 +206,54 @@ local function overall_percent(event)
 	return clamp(math.floor(percent), last_percent, 100)
 end
 
+local function normalize_detail(message)
+	message = tostring(message or "")
+	return vim.trim(message)
+end
+
+local function stage_label(stage)
+	local phase = phases[stage]
+	if phase and phase.label and phase.label ~= "" then
+		return phase.label
+	end
+
+	if type(stage) ~= "string" or stage == "" then
+		return nil
+	end
+
+	local words = {}
+	for part in stage:gmatch("[^_]+") do
+		table.insert(words, part:sub(1, 1):upper() .. part:sub(2))
+	end
+
+	if #words == 0 then
+		return nil
+	end
+
+	return table.concat(words, " ")
+end
+
+local function format_progress_message(overall, event)
+	local lines = { string.format("%s %d%%", title, overall) }
+	local detail = normalize_detail(event.message)
+	if detail == "" then
+		return table.concat(lines, "\n")
+	end
+
+	local label = stage_label(event.stage)
+	if label then
+		local lower_detail = detail:lower()
+		local lower_label = label:lower()
+		local lower_stage = tostring(event.stage or ""):lower()
+		if not lower_detail:find(lower_label, 1, true) and (lower_stage == "" or not lower_detail:find(lower_stage, 1, true)) then
+			detail = string.format("%s: %s", label, detail)
+		end
+	end
+
+	table.insert(lines, "---- " .. detail)
+	return table.concat(lines, "\n")
+end
+
 -- Show user-facing progress notifications, throttled by overall percentage.
 -- 按整体百分比节流显示面向用户的进度通知。
 function M.handle_progress(event)
@@ -214,22 +270,25 @@ function M.handle_progress(event)
 
 	local overall = overall_percent(event)
 	local is_complete = overall >= 100 or event.stage == "complete"
+	local detail = normalize_detail(event.message)
+	local same_render = overall == last_percent and event.stage == last_stage and detail == (last_detail or "")
 
-	-- Rust owns progress throttling; Lua only ignores duplicate or stale events.
-	-- Rust 负责进度节流；Lua 只忽略重复或过期事件。
-	if not is_complete and overall <= last_percent then
+	-- Rust owns progress throttling; Lua ignores only stale or truly duplicate events.
+	-- Rust 负责节流；Lua 只忽略过期或完全重复的事件。
+	if not is_complete and (overall < last_percent or same_render) then
 		return
 	end
 
 	last_percent = overall
+	last_stage = event.stage
+	last_detail = detail
 
-	local message = string.format("%s %d%%", title, overall)
 	if is_complete then
 		return M.finish(string.format("%s 100%%", title))
 	end
 
 	if visible then
-		status.progress(title, message)
+		status.progress(title, format_progress_message(overall, event))
 	end
 end
 

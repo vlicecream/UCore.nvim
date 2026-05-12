@@ -78,12 +78,30 @@ local function spinner_frame()
 	return spinner_frames[spinner_index] or spinner_frames[1]
 end
 
-local function render_line(panel, key, message)
-	if panel.spinner_active_keys[key] and message and message ~= "" then
-		return string.format("%s %s", message, spinner_frame())
+local function split_message_lines(message)
+	if message == nil then
+		return {}
 	end
 
-	return message
+	local lines = vim.split(tostring(message), "\n", { plain = true })
+	if #lines == 0 then
+		return { tostring(message) }
+	end
+
+	return lines
+end
+
+local function render_message_lines(panel, key, message)
+	local lines = split_message_lines(message)
+	if #lines == 0 then
+		return lines
+	end
+
+	if panel.spinner_active_keys[key] and lines[1] and lines[1] ~= "" then
+		lines[1] = string.format("%s %s", lines[1], spinner_frame())
+	end
+
+	return lines
 end
 
 local function panel_lines(panel)
@@ -92,14 +110,14 @@ local function panel_lines(panel)
 
 	for _, key in ipairs(panel.ordered_keys) do
 		if panel.items[key] then
-			table.insert(lines, render_line(panel, key, panel.items[key]))
+			vim.list_extend(lines, render_message_lines(panel, key, panel.items[key]))
 			seen[key] = true
 		end
 	end
 
 	for key, line in pairs(panel.items) do
 		if not seen[key] then
-			table.insert(lines, render_line(panel, key, line))
+			vim.list_extend(lines, render_message_lines(panel, key, line))
 		end
 	end
 
