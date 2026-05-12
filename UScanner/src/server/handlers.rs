@@ -617,6 +617,15 @@ fn handle_state_query(
                 return Ok(Some(value));
             }
 
+            if is_refreshing(&state, root_key) {
+                info!(
+                    "Diagnostics skipped during refresh: root={} file={}",
+                    root_key,
+                    file_path.as_deref().unwrap_or("-"),
+                );
+                return Ok(Some(json!({ "items": [] })));
+            }
+
             let engine_conn = match engine_db_path
                 .as_deref()
                 .map(normalize_to_native)

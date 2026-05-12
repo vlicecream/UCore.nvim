@@ -8,7 +8,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tree_sitter::Query;
+use tracing::info;
 
 use crate::db;
 use crate::db::project_path::get_or_create_directory;
@@ -808,6 +810,8 @@ fn parse_changed_sources(
     let results = files
         .into_par_iter()
         .map(|input| {
+            let parse_started_at = Instant::now();
+            let path = input.path.clone();
             let result = scanner::process_file(&input, &language, &query, &include_query)
                 .unwrap_or_else(|_| ParseResult {
                     path: input.path,
@@ -816,6 +820,19 @@ fn parse_changed_sources(
                     data: None,
                     module_id: input.module_id,
                 });
+            let elapsed_ms = parse_started_at.elapsed().as_millis();
+            if elapsed_ms >= 1000 {
+                let filename = Path::new(&path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(path.as_str());
+                info!(
+                    "Slow analysis file: {} took {} ms (status={})",
+                    filename,
+                    elapsed_ms,
+                    result.status
+                );
+            }
 
             let current = processed.fetch_add(1, Ordering::Relaxed) + 1;
             let percent = (current * 100 / total).min(100);
