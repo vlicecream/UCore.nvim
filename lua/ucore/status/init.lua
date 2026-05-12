@@ -46,7 +46,9 @@ local panels = {
 	}),
 	init = make_panel("UCore Workspace Init", "ucore.status.init", {
 		"boot",
-		"progress:UCore Server Init",
+		"progress:UCore Server Start",
+		"progress:UCore Server Ready",
+		"progress:UCore Workspace Register",
 		"progress:UCore Syntax Highlight",
 		"progress:UCore Project Discovery",
 		"progress:UCore Project DB Prepare",
@@ -246,7 +248,7 @@ local function init_modal_sections(panel)
 		end
 	end
 
-	local min_height = 12
+	local min_height = 18
 	local body_target = math.max(min_height, #lines)
 	while #lines < body_target do
 		table.insert(lines, "")
@@ -257,9 +259,30 @@ end
 
 local function init_modal_width(lines)
 	local content_width = float_text_width(lines)
-	local min_width = 76
+	local min_width = 98
 	local max_width = math.max(vim.o.columns - 8, min_width)
 	return math.min(math.max(content_width, min_width), max_width)
+end
+
+local function default_progress_message(key)
+	if type(key) ~= "string" then
+		return nil
+	end
+
+	local title = key:match("^progress:(.+)$")
+	if not title or title == "" then
+		return nil
+	end
+
+	return string.format("%s 0%%", title)
+end
+
+local function seed_init_panel_items(panel)
+	for _, key in ipairs(panel.ordered_keys or {}) do
+		if key ~= "boot" and panel.items[key] == nil then
+			panel.items[key] = default_progress_message(key)
+		end
+	end
 end
 
 local function center_text(text, width)
@@ -620,6 +643,7 @@ function M.start(message)
 	panels.init.state = "running"
 	panels.init.spinner_active_keys.boot = true
 	panels.init.items.boot = message or "UCore Initializing..."
+	seed_init_panel_items(panels.init)
 	render()
 	schedule_spinner()
 end

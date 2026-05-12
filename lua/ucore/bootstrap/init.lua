@@ -22,16 +22,14 @@ local function fail(message, detail)
 	status.fail("UCore Initialization Failed", detail or message)
 end
 
--- Update the non-indexing part of boot progress.
--- 更新非索引部分的初始化进度。
-local function other_progress(percent, detail)
-	log.write_progress("boot-other", {
+local function server_step(title, percent, detail, done)
+	log.write_progress("boot-server-step", {
+		title = title,
 		percent = percent,
 		detail = detail,
 	})
-	local title = "UCore Server Init"
-	local message = string.format("UCore Server Init %d%%", percent)
-	if percent >= 100 then
+	local message = string.format("%s %d%%", title, percent)
+	if done or percent >= 100 then
 		status.progress_finish(title, message)
 		return
 	end
@@ -39,11 +37,16 @@ local function other_progress(percent, detail)
 	status.progress(title, message)
 end
 
-local function other_finish()
-	log.write_progress("boot-other-finish", {
-		percent = 100,
-	})
-	status.progress_finish("UCore Server Init", "UCore Server Init 100%")
+local function server_start_progress(percent, detail)
+	server_step("UCore Server Start", percent, detail, percent >= 100)
+end
+
+local function server_ready_progress(percent, detail)
+	server_step("UCore Server Ready", percent, detail, percent >= 100)
+end
+
+local function workspace_register_progress(percent, detail)
+	server_step("UCore Workspace Register", percent, detail, percent >= 100)
 end
 
 local function project_code_progress(percent, detail)
@@ -148,13 +151,14 @@ local function wait_compatible(payload, replaced, callback)
 			return callback(false, protocol.compatibility_error(result))
 		end
 
-		other_progress(30, "Replacing server...")
+		server_start_progress(60, "Replacing server...")
 		local function replace_server()
 			server.replace(function(ok, replace_message)
 				if not ok then
 					return callback(false, replace_message)
 				end
 
+				server_start_progress(100, "Server replaced.")
 				wait_compatible(payload, true, callback)
 			end, {
 				project_root = payload.project_root,
@@ -371,7 +375,9 @@ function M.boot(callback, opts)
 		project_root = payload.project_root,
 	})
 	status.start("UCore Initializing...")
-	other_progress(0, "Starting backend...")
+	server_start_progress(0, "Starting backend...")
+	server_ready_progress(0, "Waiting for RPC...")
+	workspace_register_progress(0, "Registering workspace...")
 
 	server.start(function(ok, start_message)
 		if not ok then
@@ -379,7 +385,8 @@ function M.boot(callback, opts)
 			fail(start_message)
 			return callback(false, start_message)
 		end
-		other_progress(25, "Waiting for RPC...")
+		server_start_progress(100, "Backend started.")
+		server_ready_progress(25, "Waiting for RPC...")
 
 		wait_compatible(payload, false, function(ready, ready_err)
 			if not ready then
@@ -387,7 +394,8 @@ function M.boot(callback, opts)
 				fail(tostring(ready_err), "Log: " .. tostring(server.log_path()))
 				return callback(false, ready_err)
 			end
-			other_progress(40, "Registering workspace...")
+			server_ready_progress(100, "RPC ready.")
+			workspace_register_progress(40, "Registering workspace...")
 
 			run_setup(payload, function(setup_ok, setup_result)
 				if not setup_ok then
@@ -395,7 +403,7 @@ function M.boot(callback, opts)
 					fail(tostring(setup_result))
 					return callback(false, setup_result)
 				end
-				other_finish()
+				workspace_register_progress(100, "Workspace registered.")
 
 				run_refresh_if_needed(payload, setup_result, function(refresh_ok, refresh_err)
 					if not refresh_ok then
