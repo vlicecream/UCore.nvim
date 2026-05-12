@@ -275,6 +275,7 @@ local function run_engine_refresh_if_needed(payload, callback)
 	end, {
 		label = title,
 		detail = "Scanning engine...",
+		auto_finish = false,
 	})
 end
 
@@ -328,6 +329,7 @@ local function run_refresh_if_needed(payload, setup_result, callback)
 	end, {
 		label = "UCore Project Discovery",
 		detail = "Scanning project...",
+		auto_finish = false,
 	})
 end
 
@@ -375,6 +377,7 @@ function M.boot(callback, opts)
 		project_root = payload.project_root,
 	})
 	status.start("UCore Initializing...")
+	status.progress_finish("UCore Syntax Highlight", "UCore Syntax Highlight 100%")
 	server_start_progress(0, "Starting backend...")
 	server_ready_progress(0, "Waiting for RPC...")
 	workspace_register_progress(0, "Registering workspace...")

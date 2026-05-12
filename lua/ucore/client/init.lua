@@ -56,18 +56,23 @@ function M.refresh(payload, callback, opts)
 	opts = vim.tbl_extend("force", {
 		detail = refresh_progress_detail(payload, opts),
 		target_kind = refresh_target_kind(payload, opts),
+		auto_finish = true,
 	}, opts or {})
 	progress.start(refresh_progress_title(payload, opts), opts)
 
 	rpc.request("refresh", payload, function(result, err)
 		if not err then
-			progress.finish()
+			if opts.auto_finish ~= false then
+				progress.finish()
+			end
 			return callback(result, nil)
 		end
 
 		local text = tostring(err)
 		if text:find("ECONNREFUSED", 1, true) or text:lower():find("connection refused", 1, true) then
-			progress.finish()
+			if opts.auto_finish ~= false then
+				progress.finish()
+			end
 			return cli.refresh(payload, callback)
 		end
 
