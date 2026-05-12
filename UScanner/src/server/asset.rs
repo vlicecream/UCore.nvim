@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::time::Instant;
 use tracing::{debug, info, warn};
 
 use crate::server::state::{AppState, AssetGraph};
@@ -430,8 +431,8 @@ fn parse_asset_files(
     reporter: Option<&dyn ProgressReporter>,
 ) -> Result<AssetScanReport> {
     let total_seen = asset_files.len();
-    let processed = AtomicUsize::new(0);
-    let reported = AtomicUsize::new(0);
+    let completed = AtomicUsize::new(0);
+    let reported_bucket = AtomicUsize::new(0);
     if let Some(reporter) = reporter {
         reporter.report("asset_index", 0, total_seen.max(1), "Scan");
     }
@@ -439,28 +440,44 @@ fn parse_asset_files(
     let parsed_results = asset_files
         .par_iter()
         .filter_map(|path| {
-            let current = processed.fetch_add(1, Ordering::Relaxed) + 1;
+            let filename = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.to_string())
+                .unwrap_or_else(|| path.to_string_lossy().to_string());
+
+            let started_at = Instant::now();
+            let result = match parse_asset_record(path) {
+                Ok(record) => Some(Ok(record)),
+                Err(err) => Some(Err((path.clone(), err))),
+            };
+
+            let elapsed_ms = started_at.elapsed().as_millis();
+            if elapsed_ms >= 1000 {
+                info!("Slow asset parse: {} took {} ms", filename, elapsed_ms);
+            }
+
+            let current = completed.fetch_add(1, Ordering::Relaxed) + 1;
             if current > 0 && current % LOG_EVERY == 0 {
-                debug!("Asset scan progress: {} files visited", current);
+                debug!("Asset scan progress: {} files completed", current);
             }
             if let Some(reporter) = reporter {
-                let previous = reported.load(Ordering::Relaxed);
+                let bucket = (current * 1000 / total_seen.max(1)).min(1000);
+                let previous = reported_bucket.load(Ordering::Relaxed);
                 if current == total_seen
                     || current == 1
                     || current % ASSET_PROGRESS_EVERY == 0
-                    || (current > previous
-                        && reported
-                            .compare_exchange(previous, current, Ordering::Relaxed, Ordering::Relaxed)
+                    || (bucket > previous
+                        && bucket < 1000
+                        && reported_bucket
+                            .compare_exchange(previous, bucket, Ordering::Relaxed, Ordering::Relaxed)
                             .is_ok())
                 {
                     reporter.report("asset_index", current, total_seen.max(1), "Scan");
                 }
             }
 
-            match parse_asset_record(path) {
-                Ok(record) => Some(Ok(record)),
-                Err(err) => Some(Err((path.clone(), err))),
-            }
+            result
         })
         .collect::<Vec<_>>();
 
