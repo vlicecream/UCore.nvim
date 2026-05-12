@@ -272,31 +272,11 @@ fn display_progress_path(path: &Path, project_root: &Path, engine_root: Option<&
     normalize_path(path)
 }
 
-fn compact_progress_path(path: &str, max_len: usize) -> String {
-    if path.len() <= max_len {
-        return path.to_string();
-    }
-
-    let parts = path.split('/').collect::<Vec<_>>();
-    if parts.len() <= 3 {
-        let keep = max_len.saturating_sub(3);
-        let tail = path.chars().rev().take(keep).collect::<String>().chars().rev().collect::<String>();
-        return format!("...{}", tail);
-    }
-
-    let mut tail_parts = Vec::new();
-    let mut current_len = 3usize;
-    for part in parts.iter().rev() {
-        let extra = if tail_parts.is_empty() { part.len() } else { part.len() + 1 };
-        if current_len + extra > max_len && !tail_parts.is_empty() {
-            break;
-        }
-        tail_parts.push(*part);
-        current_len += extra;
-    }
-
-    tail_parts.reverse();
-    format!(".../{}", tail_parts.join("/"))
+fn progress_entry_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.to_string())
+        .unwrap_or_else(|| normalize_path(path))
 }
 
 fn summarize_search_roots(ctx: &RefreshContext, roots: &[PathBuf]) -> String {
@@ -373,10 +353,7 @@ fn discover_project(ctx: &RefreshContext, reporter: Arc<dyn ProgressReporter>) -
             let count = seen_count.fetch_add(1, Ordering::Relaxed) + 1;
             if count == 1 || count % DISCOVERY_PROGRESS_EVERY == 0 {
                 let current = (count / 1000).clamp(1, 69);
-                let display_path = compact_progress_path(
-                    &display_progress_path(entry.path(), &project_root, engine_root.as_deref()),
-                    56,
-                );
+                let display_path = progress_entry_name(entry.path());
                 reporter.report(
                     "discovery",
                     current,
