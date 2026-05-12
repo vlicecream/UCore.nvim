@@ -6,8 +6,10 @@ use rusqlite::{params, Connection};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 use std::time::Instant;
 use tree_sitter::Query;
 use tracing::info;
@@ -804,14 +806,54 @@ fn parse_changed_sources(
     let include_query = Arc::new(Query::new(&language, scanner::INCLUDE_QUERY_STR)?);
 
     let total = files.len();
-    let processed = AtomicUsize::new(0);
+    let started = Arc::new(AtomicUsize::new(0));
+    let processed = Arc::new(AtomicUsize::new(0));
     let reported_bucket = AtomicUsize::new(0);
+    let heartbeat_stop = Arc::new(AtomicBool::new(false));
+    let heartbeat_file = Arc::new(parking_lot::Mutex::new(String::new()));
+
+    let heartbeat = {
+        let reporter = reporter.clone();
+        let started = started.clone();
+        let processed = processed.clone();
+        let heartbeat_stop = heartbeat_stop.clone();
+        let heartbeat_file = heartbeat_file.clone();
+
+        thread::spawn(move || {
+            while !heartbeat_stop.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(600));
+                if heartbeat_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                let current = processed.load(Ordering::Relaxed);
+                let launched = started.load(Ordering::Relaxed);
+                let active = launched.saturating_sub(current);
+                let file = heartbeat_file.lock().clone();
+
+                let message = if file.is_empty() {
+                    format!("Started {} | Active {}", launched, active)
+                } else {
+                    format!("Started {} | Active {} | {}", launched, active, file)
+                };
+
+                reporter.report("analysis", current, total, &message);
+            }
+        })
+    };
 
     let results = files
         .into_par_iter()
         .map(|input| {
             let parse_started_at = Instant::now();
             let path = input.path.clone();
+            let filename = Path::new(&path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(path.as_str())
+                .to_string();
+            started.fetch_add(1, Ordering::Relaxed);
+            *heartbeat_file.lock() = filename.clone();
             let result = scanner::process_file(&input, &language, &query, &include_query)
                 .unwrap_or_else(|_| ParseResult {
                     path: input.path,
@@ -822,10 +864,6 @@ fn parse_changed_sources(
                 });
             let elapsed_ms = parse_started_at.elapsed().as_millis();
             if elapsed_ms >= 1000 {
-                let filename = Path::new(&path)
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or(path.as_str());
                 info!(
                     "Slow analysis file: {} took {} ms (status={})",
                     filename,
@@ -857,6 +895,9 @@ fn parse_changed_sources(
             result
         })
         .collect::<Vec<_>>();
+
+    heartbeat_stop.store(true, Ordering::Relaxed);
+    let _ = heartbeat.join();
 
     reporter.report(
         "analysis",

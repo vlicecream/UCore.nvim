@@ -288,13 +288,28 @@ local function format_progress_message(overall, event)
 	local detail = normalize_detail(event.message)
 	local computed_detail = nil
 
+	local function merge_detail(prefix, tail)
+		local normalized_tail = normalize_detail(tail)
+		if normalized_tail == "" then
+			return prefix
+		end
+
+		local lower_tail = normalized_tail:lower()
+		local lower_prefix = prefix:lower()
+		if lower_tail == lower_prefix or lower_tail:find(lower_prefix, 1, true) then
+			return prefix
+		end
+
+		return string.format("%s | %s", prefix, normalized_tail)
+	end
+
 	if total > 0 and (event.stage == "analysis" or event.stage == "db_write" or event.stage == "asset_index") then
 		local prefix = label or tostring(event.stage or "Progress")
 		computed_detail = string.format("%s %d/%d", prefix, current, total)
 	end
 
 	if computed_detail and (event.stage == "analysis" or event.stage == "db_write") then
-		detail = computed_detail
+		detail = merge_detail(computed_detail, detail)
 	elseif computed_detail and event.stage == "asset_index" then
 		local short_detail = detail
 		if short_detail:find("Scanning", 1, true) then
@@ -304,11 +319,7 @@ local function format_progress_message(overall, event)
 		elseif short_detail:find("ready", 1, true) or short_detail:find("Ready", 1, true) then
 			short_detail = "Ready"
 		end
-		if short_detail ~= "" and short_detail ~= computed_detail then
-			detail = string.format("%s | %s", computed_detail, short_detail)
-		else
-			detail = computed_detail
-		end
+		detail = merge_detail(computed_detail, short_detail)
 	elseif computed_detail and detail ~= "" then
 		local lower_detail = detail:lower()
 		local lower_prefix = computed_detail:lower()
