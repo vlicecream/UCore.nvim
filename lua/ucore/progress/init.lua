@@ -33,6 +33,7 @@ local last_tail = nil
 local active = false
 local title = "UCore refresh"
 local visible = true
+local stage_progress = {}
 
 -- Load the built-in overall progress plan.
 -- 加载内置的整体进度计划。
@@ -49,6 +50,7 @@ local function reset()
 	last_stage = nil
 	last_detail = nil
 	last_tail = nil
+	stage_progress = {}
 	active = true
 end
 
@@ -153,10 +155,33 @@ local function normalize_event(event)
 
 	return {
 		stage = event.stage or event[2],
-		current = event.current or event[3],
-		total = event.total or event[4],
+		current = tonumber(event.current or event[3]) or 0,
+		total = tonumber(event.total or event[4]) or 0,
 		message = event.message or event[5],
 	}
+end
+
+local function monotonic_event(event)
+	local stage = event.stage
+	if type(stage) ~= "string" or stage == "" then
+		return event
+	end
+
+	local previous = stage_progress[stage]
+	if previous then
+		if event.total > 0 and previous.total > 0 and event.total < previous.total then
+			event.total = previous.total
+		end
+		if event.current < previous.current then
+			event.current = previous.current
+		end
+	end
+
+	stage_progress[stage] = {
+		current = event.current,
+		total = event.total,
+	}
+	return event
 end
 
 -- Build a lookup table from Rust's phase plan.
@@ -314,7 +339,7 @@ end
 -- Show user-facing progress notifications, throttled by overall percentage.
 -- 按整体百分比节流显示面向用户的进度通知。
 function M.handle_progress(event)
-	event = normalize_event(event)
+	event = monotonic_event(normalize_event(event))
 
 	local progress_config = config.values.progress or {}
 	if progress_config.enable == false then

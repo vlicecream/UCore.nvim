@@ -5,6 +5,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use tracing::{debug, info, warn};
@@ -169,16 +170,16 @@ pub fn refresh_asset_index(
 
     reporter.report(
         "asset_index",
-        report.total_seen.max(1),
-        report.total_seen.max(1),
+        0,
+        report.parsed.len().max(1),
         "Persist",
     );
 
-    replace_asset_index(conn, &report.parsed)?;
+    replace_asset_index(conn, &report.parsed, Some(reporter.as_ref()))?;
     reporter.report(
         "asset_index",
-        report.total_seen.max(1),
-        report.total_seen.max(1),
+        report.parsed.len().max(1),
+        report.parsed.len().max(1),
         "Ready",
     );
     Ok(())
@@ -186,7 +187,11 @@ pub fn refresh_asset_index(
 
 /// Persist a full asset index replacement.
 /// 全量替换资产索引。
-pub fn replace_asset_index(conn: &mut Connection, records: &[AssetRecord]) -> Result<()> {
+pub fn replace_asset_index(
+    conn: &mut Connection,
+    records: &[AssetRecord],
+    reporter: Option<&dyn ProgressReporter>,
+) -> Result<()> {
     let tx = conn.transaction()?;
 
     tx.execute("DELETE FROM asset_references", [])?;
@@ -206,7 +211,15 @@ pub fn replace_asset_index(conn: &mut Connection, records: &[AssetRecord]) -> Re
             "INSERT INTO asset_functions (asset_path, function_key) VALUES (?1, ?2)",
         )?;
 
-        for record in records {
+        let total = records.len().max(1);
+        for (index, record) in records.iter().enumerate() {
+            let current = index + 1;
+            if let Some(reporter) = reporter {
+                if current == total || current == 1 || current % ASSET_PROGRESS_EVERY == 0 {
+                    reporter.report("asset_index", current, total, "Persist");
+                }
+            }
+
             insert_asset_record_db(
                 &mut stmt_asset,
                 &mut stmt_reference,
@@ -304,22 +317,28 @@ pub fn scan_project_assets(
     let asset_files = collect_candidate_assets(&content_dirs);
 
     let total_seen = asset_files.len();
+    let processed = AtomicUsize::new(0);
+    let reported = AtomicUsize::new(0);
     if let Some(reporter) = reporter {
         reporter.report("asset_index", 0, total_seen.max(1), "Scan");
     }
 
     let parsed_results = asset_files
         .par_iter()
-        .enumerate()
-        .filter_map(|(index, path)| {
-            if index > 0 && index % LOG_EVERY == 0 {
-                debug!("Asset scan progress: {} files visited", index);
+        .filter_map(|path| {
+            let current = processed.fetch_add(1, Ordering::Relaxed) + 1;
+            if current > 0 && current % LOG_EVERY == 0 {
+                debug!("Asset scan progress: {} files visited", current);
             }
             if let Some(reporter) = reporter {
-                let current = index + 1;
+                let previous = reported.load(Ordering::Relaxed);
                 if current == total_seen
                     || current == 1
                     || current % ASSET_PROGRESS_EVERY == 0
+                    || (current > previous
+                        && reported
+                            .compare_exchange(previous, current, Ordering::Relaxed, Ordering::Relaxed)
+                            .is_ok())
                 {
                     reporter.report("asset_index", current, total_seen.max(1), "Scan");
                 }
