@@ -11,6 +11,24 @@ local M = {}
 
 local booting = false
 local engine_refreshing = {}
+local ready_projects = {}
+
+local function project_key(project_root)
+	return tostring(project_root or "")
+end
+
+local function set_project_ready(project_root, ready)
+	local key = project_key(project_root)
+	if key == "" then
+		return
+	end
+
+	if ready then
+		ready_projects[key] = true
+	else
+		ready_projects[key] = nil
+	end
+end
 
 -- Report boot failures through the persistent initialization status.
 -- 通过持久初始化状态报告 boot 错误。
@@ -403,6 +421,7 @@ function M.boot(callback, opts)
 	end
 
 	booting = true
+	set_project_ready(payload.project_root, false)
 	log.write_progress("boot-start", {
 		project_root = payload.project_root,
 	})
@@ -457,9 +476,11 @@ function M.boot(callback, opts)
 						run_engine_refresh_step(payload, function(engine_ok, engine_err)
 							booting = false
 							if not engine_ok then
+								set_project_ready(payload.project_root, false)
 								return callback(false, engine_err)
 							end
 
+							set_project_ready(payload.project_root, true)
 							log.write_progress("boot-finish", {
 								project_root = payload.project_root,
 							})
@@ -476,6 +497,26 @@ end
 
 function M.is_booting()
 	return booting == true
+end
+
+function M.is_project_ready(project_root)
+	return ready_projects[project_key(project_root)] == true
+end
+
+function M.mark_project_not_ready(project_root)
+	set_project_ready(project_root, false)
+end
+
+function M.is_query_blocked(project_root)
+	if booting then
+		return true
+	end
+
+	if not project_root or project_root == "" then
+		return false
+	end
+
+	return not M.is_project_ready(project_root)
 end
 
 return M

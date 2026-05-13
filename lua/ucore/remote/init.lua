@@ -5,6 +5,7 @@ local project = require("ucore.project")
 local rpc = require("ucore.client.rpc")
 
 local M = {}
+local recovery_pending = {}
 
 local function blocked_query_result(kind)
 	if kind == "GetDiagnostics" or kind == "ParseBuildDiagnostics" then
@@ -41,7 +42,7 @@ end
 -- Send a typed query with the current project root attached.
 -- 发送带 project_root 的类型化查询。
 function M.query(project_root, query, callback)
-	if bootstrap.is_booting() then
+	if bootstrap.is_query_blocked(project_root) then
 		return callback(blocked_query_result(query and query.kind), nil)
 	end
 
@@ -53,6 +54,22 @@ function M.query(project_root, query, callback)
 	rpc.request("query", query, function(result, err)
 		if not err then
 			return callback(result, nil)
+		end
+
+		local err_text = tostring(err or "")
+		if err_text:find("Project not found:", 1, true) then
+			bootstrap.mark_project_not_ready(project_root)
+			if not recovery_pending[project_root] then
+				recovery_pending[project_root] = true
+				vim.schedule(function()
+					bootstrap.boot(function()
+						recovery_pending[project_root] = nil
+					end, {
+						project_root = project_root,
+					})
+				end)
+			end
+			return callback(blocked_query_result(query and query.kind), nil)
 		end
 
 		-- Fall back to the CLI bridge so early development stays forgiving.
