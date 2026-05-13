@@ -651,6 +651,53 @@ function M.cached_engine_metadata(project_root)
 	}
 end
 
+local function find_loaded_file_buffer(path)
+	path = path_key(path) or normalize(path)
+	if not path then
+		return nil
+	end
+
+	for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+		if vim.api.nvim_buf_is_valid(bufnr) then
+			local name = vim.api.nvim_buf_get_name(bufnr)
+			if name ~= "" and same_path(name, path) then
+				return bufnr
+			end
+		end
+	end
+
+	return nil
+end
+
+local function safe_open_project_target(target)
+	target = path_key(target) or normalize(target)
+	if not target then
+		return
+	end
+
+	local existing = find_loaded_file_buffer(target)
+	if existing then
+		vim.api.nvim_set_current_buf(existing)
+		return
+	end
+
+	local ok, err = pcall(vim.api.nvim_cmd, { cmd = "edit", args = { target } }, {})
+	if ok then
+		return
+	end
+
+	local message = tostring(err or "")
+	if message:find("E325", 1, true) then
+		vim.notify(
+			"UCore: swap file exists for " .. vim.fn.fnamemodify(target, ":t") .. ". Workspace switched without opening it.",
+			vim.log.levels.WARN
+		)
+		return
+	end
+
+	error(err)
+end
+
 -- Open a project by changing cwd and editing its .uproject when possible.
 -- 通过切换 cwd 并打开 .uproject 来打开项目。
 function M.open_project(project_root)
@@ -660,9 +707,9 @@ function M.open_project(project_root)
 	vim.api.nvim_set_current_dir(project_root)
 
 	if metadata.uproject_path then
-		vim.api.nvim_cmd({ cmd = "edit", args = { metadata.uproject_path } }, {})
+		safe_open_project_target(metadata.uproject_path)
 	else
-		vim.api.nvim_cmd({ cmd = "edit", args = { project_root } }, {})
+		safe_open_project_target(project_root)
 	end
 
 	return metadata
