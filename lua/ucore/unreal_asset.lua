@@ -17,9 +17,6 @@ local function same_path(a, b)
 	if not left or not right then
 		return false
 	end
-	if vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1 then
-		return left:lower() == right:lower()
-	end
 	return left == right
 end
 
