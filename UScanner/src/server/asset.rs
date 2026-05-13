@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use crate::server::state::{AppState, AssetGraph};
@@ -18,8 +18,57 @@ use crate::uasset::UAssetParser;
 
 const DISCOVERY_MAX_DEPTH: usize = 4;
 const LOG_EVERY: usize = 1000;
-const ASSET_INDEX_VERSION: i32 = 3;
+const ASSET_INDEX_VERSION: i32 = 4;
 const ASSET_PROGRESS_EVERY: usize = 100;
+const ASSET_BULK_BUSY_TIMEOUT: Duration = Duration::from_millis(60_000);
+const LOGICAL_ASSET_CLASS_SUFFIXES: &[&str] = &[
+    "Blueprint",
+    "WidgetBlueprint",
+    "AnimBlueprint",
+    "DataAsset",
+    "PrimaryDataAsset",
+    "DataTable",
+    "CurveTable",
+    "CurveFloat",
+    "CurveVector",
+    "CurveLinearColor",
+    "UserDefinedStruct",
+    "UserDefinedEnum",
+    "BehaviorTree",
+    "BlackboardData",
+];
+const RESOURCE_ONLY_CLASS_SUFFIXES: &[&str] = &[
+    "Texture",
+    "Texture2D",
+    "TextureCube",
+    "TextureRenderTarget2D",
+    "TextureRenderTargetCube",
+    "Material",
+    "MaterialInstance",
+    "MaterialFunction",
+    "MaterialParameterCollection",
+    "StaticMesh",
+    "SkeletalMesh",
+    "Skeleton",
+    "PhysicsAsset",
+    "AnimSequence",
+    "AnimMontage",
+    "BlendSpace",
+    "BlendSpace1D",
+    "AimOffsetBlendSpace",
+    "AimOffsetBlendSpace1D",
+    "PoseAsset",
+    "SoundWave",
+    "SoundCue",
+    "SoundClass",
+    "MetaSoundSource",
+    "NiagaraSystem",
+    "NiagaraEmitter",
+    "ParticleSystem",
+    "MediaSource",
+    "MediaPlayer",
+    "Font",
+];
 
 fn script_path_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -78,17 +127,25 @@ pub async fn handle_asset_scan(state: Arc<AppState>, project_root: String) {
 pub async fn update_single_asset(state: Arc<AppState>, project_root: &str, file_path: &Path) {
     let root_key = normalize_path_key(project_root);
     let path = file_path.to_path_buf();
+    let asset_path = to_asset_path(file_path);
 
     let parse_result = tokio::task::spawn_blocking(move || parse_asset_record(&path)).await;
 
     match parse_result {
-        Ok(Ok(record)) => {
+        Ok(Ok(Some(record))) => {
             let mut graphs = state.asset_graphs.lock();
 
             if let Some(graph) = graphs.get_mut(&root_key) {
                 remove_asset_from_graph(graph, &record.asset_path);
                 insert_asset_record(graph, record);
                 info!("Incremental asset update: {}", file_path.display());
+            }
+        }
+
+        Ok(Ok(None)) => {
+            let mut graphs = state.asset_graphs.lock();
+            if let Some(graph) = graphs.get_mut(&root_key) {
+                remove_asset_from_graph(graph, &asset_path);
             }
         }
 
@@ -173,6 +230,13 @@ pub fn refresh_asset_index(
 
     if !initialized {
         let report = parse_asset_files(&asset_files, Some(reporter.as_ref()))?;
+        info!(
+            "Asset index full scan: candidates={} indexed={} skipped={} errors={}",
+            report.total_seen,
+            report.parsed.len(),
+            report.skipped,
+            report.errors
+        );
         reporter.report(
             "asset_index",
             0,
@@ -216,6 +280,15 @@ pub fn refresh_asset_index(
 
     let report = parse_asset_files(&changed_files, None)?;
     let work_total = (deleted_paths.len() + report.parsed.len()).max(1);
+    info!(
+        "Asset index delta scan: candidates={} changed={} deleted={} indexed={} skipped={} errors={}",
+        total_seen,
+        changed_files.len(),
+        deleted_paths.len(),
+        report.parsed.len(),
+        report.skipped,
+        report.errors
+    );
 
     reporter.report("asset_index", 0, work_total, "Persist");
     apply_asset_index_delta(conn, &report.parsed, &deleted_paths, Some(reporter.as_ref()))?;
@@ -230,46 +303,48 @@ pub fn replace_asset_index(
     records: &[AssetRecord],
     reporter: Option<&dyn ProgressReporter>,
 ) -> Result<()> {
-    let tx = conn.transaction()?;
+    with_asset_bulk_write(conn, |conn| {
+        let tx = conn.transaction()?;
 
-    tx.execute("DELETE FROM asset_references", [])?;
-    tx.execute("DELETE FROM asset_functions", [])?;
-    tx.execute("DELETE FROM assets", [])?;
+        tx.execute("DELETE FROM asset_references", [])?;
+        tx.execute("DELETE FROM asset_functions", [])?;
+        tx.execute("DELETE FROM assets", [])?;
 
-    {
-        let mut stmt_asset = tx.prepare(
-            "INSERT INTO assets
-             (asset_path, asset_key, source_path, source_path_key, parent_class, parent_class_key, mtime)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        )?;
-        let mut stmt_reference = tx.prepare(
-            "INSERT INTO asset_references (asset_path, reference_key) VALUES (?1, ?2)",
-        )?;
-        let mut stmt_function = tx.prepare(
-            "INSERT INTO asset_functions (asset_path, function_key) VALUES (?1, ?2)",
-        )?;
-
-        let total = records.len().max(1);
-        for (index, record) in records.iter().enumerate() {
-            let current = index + 1;
-            if let Some(reporter) = reporter {
-                if current == total || current == 1 || current % ASSET_PROGRESS_EVERY == 0 {
-                    reporter.report("asset_index", current, total, "Persist");
-                }
-            }
-
-            insert_asset_record_db(
-                &mut stmt_asset,
-                &mut stmt_reference,
-                &mut stmt_function,
-                record,
+        {
+            let mut stmt_asset = tx.prepare(
+                "INSERT INTO assets
+                 (asset_path, asset_key, source_path, source_path_key, parent_class, parent_class_key, mtime)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?;
-        }
-    }
+            let mut stmt_reference = tx.prepare(
+                "INSERT INTO asset_references (asset_path, reference_key) VALUES (?1, ?2)",
+            )?;
+            let mut stmt_function = tx.prepare(
+                "INSERT INTO asset_functions (asset_path, function_key) VALUES (?1, ?2)",
+            )?;
 
-    write_asset_index_initialized(&tx)?;
-    tx.commit()?;
-    Ok(())
+            let total = records.len().max(1);
+            for (index, record) in records.iter().enumerate() {
+                let current = index + 1;
+                if let Some(reporter) = reporter {
+                    if current == total || current == 1 || current % ASSET_PROGRESS_EVERY == 0 {
+                        reporter.report("asset_index", current, total, "Persist");
+                    }
+                }
+
+                insert_asset_record_db(
+                    &mut stmt_asset,
+                    &mut stmt_reference,
+                    &mut stmt_function,
+                    record,
+                )?;
+            }
+        }
+
+        write_asset_index_initialized(&tx)?;
+        tx.commit()?;
+        Ok(())
+    })
 }
 
 fn apply_asset_index_delta(
@@ -278,73 +353,76 @@ fn apply_asset_index_delta(
     deleted_paths: &[String],
     reporter: Option<&dyn ProgressReporter>,
 ) -> Result<()> {
-    let tx = conn.transaction()?;
+    with_asset_bulk_write(conn, |conn| {
+        let tx = conn.transaction()?;
 
-    let total = (deleted_paths.len() + records.len()).max(1);
-    let mut current = 0usize;
-    let mut delete_keys = deleted_paths
-        .iter()
-        .map(|path| path.to_ascii_lowercase())
-        .collect::<Vec<_>>();
+        let total = (deleted_paths.len() + records.len()).max(1);
+        let mut current = 0usize;
+        let mut delete_keys = deleted_paths
+            .iter()
+            .map(|path| path.to_ascii_lowercase())
+            .collect::<Vec<_>>();
 
-    {
-        let mut stmt_asset = tx.prepare(
-            "INSERT INTO assets
-             (asset_path, asset_key, source_path, source_path_key, parent_class, parent_class_key, mtime)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        )?;
-        let mut stmt_reference = tx.prepare(
-            "INSERT INTO asset_references (asset_path, reference_key) VALUES (?1, ?2)",
-        )?;
-        let mut stmt_function = tx.prepare(
-            "INSERT INTO asset_functions (asset_path, function_key) VALUES (?1, ?2)",
-        )?;
-
-        for _source_path in deleted_paths {
-            current += 1;
-            if let Some(reporter) = reporter {
-                if current == total || current == 1 || current % ASSET_PROGRESS_EVERY == 0 {
-                    reporter.report("asset_index", current, total, "Persist");
-                }
-            }
-        }
-
-        for record in records {
-            current += 1;
-            if let Some(reporter) = reporter {
-                if current == total || current == 1 || current % ASSET_PROGRESS_EVERY == 0 {
-                    reporter.report("asset_index", current, total, "Persist");
-                }
-            }
-            delete_keys.push(record.source_path.to_ascii_lowercase());
-        }
-
-        delete_assets_by_source_path_keys_tx(&tx, &delete_keys)?;
-
-        for record in records {
-            insert_asset_record_db(
-                &mut stmt_asset,
-                &mut stmt_reference,
-                &mut stmt_function,
-                record,
+        {
+            let mut stmt_asset = tx.prepare(
+                "INSERT INTO assets
+                 (asset_path, asset_key, source_path, source_path_key, parent_class, parent_class_key, mtime)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?;
-        }
-    }
+            let mut stmt_reference = tx.prepare(
+                "INSERT INTO asset_references (asset_path, reference_key) VALUES (?1, ?2)",
+            )?;
+            let mut stmt_function = tx.prepare(
+                "INSERT INTO asset_functions (asset_path, function_key) VALUES (?1, ?2)",
+            )?;
 
-    write_asset_index_initialized(&tx)?;
-    tx.commit()?;
-    Ok(())
+            for _source_path in deleted_paths {
+                current += 1;
+                if let Some(reporter) = reporter {
+                    if current == total || current == 1 || current % ASSET_PROGRESS_EVERY == 0 {
+                        reporter.report("asset_index", current, total, "Persist");
+                    }
+                }
+            }
+
+            for record in records {
+                current += 1;
+                if let Some(reporter) = reporter {
+                    if current == total || current == 1 || current % ASSET_PROGRESS_EVERY == 0 {
+                        reporter.report("asset_index", current, total, "Persist");
+                    }
+                }
+                delete_keys.push(record.source_path.to_ascii_lowercase());
+            }
+
+            delete_assets_by_source_path_keys_tx(&tx, &delete_keys)?;
+
+            for record in records {
+                insert_asset_record_db(
+                    &mut stmt_asset,
+                    &mut stmt_reference,
+                    &mut stmt_function,
+                    record,
+                )?;
+            }
+        }
+
+        write_asset_index_initialized(&tx)?;
+        tx.commit()?;
+        Ok(())
+    })
 }
 
 /// Upsert one asset file into the persistent asset index.
 /// 把单个资产文件写入持久化资产索引。
 pub fn upsert_asset_file(conn: &mut Connection, file_path: &Path) -> Result<()> {
     let record = parse_asset_record(file_path)?;
+    let source_path = normalize_path(file_path);
     let tx = conn.unchecked_transaction()?;
 
-    delete_asset_by_source_path_tx(&tx, &record.source_path)?;
+    delete_asset_by_source_path_tx(&tx, &source_path)?;
 
-    {
+    if let Some(record) = record {
         let mut stmt_asset = tx.prepare(
             "INSERT INTO assets
              (asset_path, asset_key, source_path, source_path_key, parent_class, parent_class_key, mtime)
@@ -404,6 +482,7 @@ pub struct AssetRecord {
     pub asset_path: String,
     pub source_path: String,
     pub mtime: i64,
+    pub asset_class: Option<String>,
     pub parent_class: Option<String>,
     pub imports: Vec<String>,
     pub functions: Vec<String>,
@@ -490,12 +569,14 @@ fn parse_asset_files(
         .collect::<Vec<_>>();
 
     let mut parsed = Vec::new();
+    let mut skipped = 0usize;
     let mut errors = 0usize;
     let mut error_buckets = HashMap::<String, (usize, String)>::new();
 
     for item in parsed_results {
         match item {
-            Ok(record) => parsed.push(record),
+            Ok(Some(record)) => parsed.push(record),
+            Ok(None) => skipped += 1,
             Err((path, err)) => {
                 errors += 1;
                 let reason = err.to_string();
@@ -545,7 +626,7 @@ fn parse_asset_files(
 
     Ok(AssetScanReport {
         total_seen,
-        skipped: 0,
+        skipped,
         errors,
         parsed,
         error_summary,
@@ -603,7 +684,7 @@ fn collect_candidate_assets(content_dirs: &[PathBuf]) -> Vec<PathBuf> {
                 continue;
             }
 
-            if !is_unreal_asset_file(path) {
+            if !is_index_candidate_asset_file(path) {
                 continue;
             }
 
@@ -625,9 +706,9 @@ fn collect_candidate_assets(content_dirs: &[PathBuf]) -> Vec<PathBuf> {
     files
 }
 
-/// Parse one asset file into an AssetRecord.
-/// 把单个资产文件解析成 AssetRecord。
-pub fn parse_asset_record(path: &Path) -> Result<AssetRecord> {
+/// Parse one asset file into an indexed AssetRecord when it participates in the logical asset index.
+/// 把单个资产文件解析成逻辑资产索引记录；不需要完整索引时返回 None。
+pub fn parse_asset_record(path: &Path) -> Result<Option<AssetRecord>> {
     let path = path.to_path_buf();
     let parse_path = path.clone();
 
@@ -639,6 +720,7 @@ pub fn parse_asset_record(path: &Path) -> Result<AssetRecord> {
                 asset_path: to_asset_path(&parse_path),
                 source_path: normalize_path(&parse_path),
                 mtime: file_mtime(&parse_path),
+                asset_class: parser.asset_class,
                 parent_class: parser.parent_class,
                 imports: parser.imports,
                 functions: parser.functions,
@@ -646,13 +728,14 @@ pub fn parse_asset_record(path: &Path) -> Result<AssetRecord> {
     });
 
     match parse_result {
-        Ok(Ok(record)) => Ok(record),
+        Ok(Ok(record)) => Ok(filter_indexed_asset_record(path.as_path(), record)),
         Ok(Err(err)) => fallback_parse_asset_record(&path).or(Err(err)),
-        Err(_) => fallback_parse_asset_record(&path).or_else(|_| Err(anyhow::anyhow!("panic while parsing asset"))),
+        Err(_) => fallback_parse_asset_record(&path)
+            .or_else(|_| Err(anyhow::anyhow!("panic while parsing asset"))),
     }
 }
 
-fn fallback_parse_asset_record(path: &Path) -> Result<AssetRecord> {
+fn fallback_parse_asset_record(path: &Path) -> Result<Option<AssetRecord>> {
     let bytes = std::fs::read(path)?;
     let strings = extract_ascii_strings(&bytes, 4);
     let parent_class = detect_parent_class_from_strings(&strings);
@@ -698,14 +781,18 @@ fn fallback_parse_asset_record(path: &Path) -> Result<AssetRecord> {
     functions.sort();
     functions.dedup();
 
-    Ok(AssetRecord {
+    Ok(filter_indexed_asset_record(
+        path,
+        AssetRecord {
         asset_path,
         source_path: normalize_path(path),
         mtime: file_mtime(path),
+        asset_class: None,
         parent_class,
         imports,
         functions,
-    })
+        },
+    ))
 }
 
 // -----------------------------------------------------------------------------
@@ -878,19 +965,106 @@ fn is_ignored_dir(path: &Path) -> bool {
 
     matches!(
         name,
-        "Intermediate" | "Binaries" | "Build" | "Saved" | ".git" | ".vs" | "DerivedDataCache"
+        "Intermediate"
+            | "Binaries"
+            | "Build"
+            | "Saved"
+            | ".git"
+            | ".vs"
+            | "DerivedDataCache"
+            | "ExternalActors"
+            | "ExternalObjects"
     )
 }
 
-/// Return true for .uasset and .umap files.
-/// 判断是否是 Unreal 资产文件。
-fn is_unreal_asset_file(path: &Path) -> bool {
+/// Return true for candidate Unreal asset files that participate in the logical/reference index pipeline.
+/// 判断是否是会参与逻辑/引用索引的 Unreal 候选资产文件。
+fn is_index_candidate_asset_file(path: &Path) -> bool {
     matches!(
         path.extension()
             .and_then(|ext| ext.to_str())
             .map(|ext| ext.to_ascii_lowercase()),
-        Some(ext) if ext == "uasset" || ext == "umap"
+        Some(ext) if ext == "uasset"
     )
+}
+
+fn filter_indexed_asset_record(path: &Path, record: AssetRecord) -> Option<AssetRecord> {
+    if should_fully_index_asset(path, &record) {
+        Some(record)
+    } else {
+        None
+    }
+}
+
+fn should_fully_index_asset(path: &Path, record: &AssetRecord) -> bool {
+    if !matches!(
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .as_deref(),
+        Some("uasset")
+    ) {
+        return false;
+    }
+
+    if record.parent_class.is_some() {
+        return true;
+    }
+
+    if let Some(asset_class) = record.asset_class.as_deref() {
+        let class_name = asset_class_leaf(asset_class);
+
+        if is_resource_only_asset_class(class_name) {
+            return false;
+        }
+
+        if is_explicit_logical_asset_class(class_name) {
+            return true;
+        }
+
+        if asset_class.starts_with("/Script/") || asset_class.starts_with("/Game/") {
+            return true;
+        }
+    }
+
+    imports_indicate_logical_asset(record) || likely_fallback_logical_asset(record)
+}
+
+fn imports_indicate_logical_asset(record: &AssetRecord) -> bool {
+    record.imports.iter().any(|value| {
+        let tail = asset_class_leaf(value);
+        is_explicit_logical_asset_class(tail)
+            || tail == "BlueprintGeneratedClass"
+            || tail == "WidgetBlueprintGeneratedClass"
+            || tail == "AnimBlueprintGeneratedClass"
+    })
+}
+
+fn likely_fallback_logical_asset(record: &AssetRecord) -> bool {
+    if record.functions.is_empty() {
+        return false;
+    }
+
+    record
+        .imports
+        .iter()
+        .any(|value| value.starts_with("/Script/") || value.starts_with("/Game/"))
+}
+
+fn asset_class_leaf(path: &str) -> &str {
+    path.rsplit(['.', ':']).next().unwrap_or(path)
+}
+
+fn is_explicit_logical_asset_class(class_name: &str) -> bool {
+    LOGICAL_ASSET_CLASS_SUFFIXES
+        .iter()
+        .any(|suffix| class_name.eq_ignore_ascii_case(suffix))
+}
+
+fn is_resource_only_asset_class(class_name: &str) -> bool {
+    RESOURCE_ONLY_CLASS_SUFFIXES
+        .iter()
+        .any(|suffix| class_name.eq_ignore_ascii_case(suffix))
 }
 
 /// Convert a filesystem path to Unreal asset path.
@@ -986,6 +1160,62 @@ fn delete_assets_by_source_path_keys_tx(
 
     tx.execute_batch("DROP TABLE IF EXISTS temp_ucore_asset_source_keys;")?;
 
+    Ok(())
+}
+
+fn with_asset_bulk_write<T, F>(conn: &mut Connection, work: F) -> Result<T>
+where
+    F: FnOnce(&mut Connection) -> Result<T>,
+{
+    prepare_asset_bulk_write(conn)?;
+    let work_result = work(conn);
+    let finalize_result = finalize_asset_bulk_write(conn);
+
+    match (work_result, finalize_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(err), Ok(())) => Err(err),
+        (Ok(_), Err(err)) => Err(err),
+        (Err(work_err), Err(finalize_err)) => {
+            warn!(
+                "Asset bulk write failed and finalize also failed: work={}, finalize={}",
+                work_err, finalize_err
+            );
+            Err(work_err)
+        }
+    }
+}
+
+fn prepare_asset_bulk_write(conn: &Connection) -> Result<()> {
+    conn.busy_timeout(ASSET_BULK_BUSY_TIMEOUT)?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "synchronous", "OFF")?;
+    conn.pragma_update(None, "cache_size", "-200000")?;
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
+    conn.execute("PRAGMA foreign_keys = OFF", [])?;
+    conn.execute_batch(
+        "DROP INDEX IF EXISTS idx_assets_asset_key;
+         DROP INDEX IF EXISTS idx_assets_source_path_key;
+         DROP INDEX IF EXISTS idx_assets_parent_class_key;
+         DROP INDEX IF EXISTS idx_asset_references_asset_path;
+         DROP INDEX IF EXISTS idx_asset_references_reference_key;
+         DROP INDEX IF EXISTS idx_asset_functions_asset_path;
+         DROP INDEX IF EXISTS idx_asset_functions_function_key;",
+    )?;
+    Ok(())
+}
+
+fn finalize_asset_bulk_write(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_assets_asset_key ON assets(asset_key);
+         CREATE INDEX IF NOT EXISTS idx_assets_source_path_key ON assets(source_path_key);
+         CREATE INDEX IF NOT EXISTS idx_assets_parent_class_key ON assets(parent_class_key);
+         CREATE INDEX IF NOT EXISTS idx_asset_references_asset_path ON asset_references(asset_path);
+         CREATE INDEX IF NOT EXISTS idx_asset_references_reference_key ON asset_references(reference_key);
+         CREATE INDEX IF NOT EXISTS idx_asset_functions_asset_path ON asset_functions(asset_path);
+         CREATE INDEX IF NOT EXISTS idx_asset_functions_function_key ON asset_functions(function_key);",
+    )?;
+    conn.execute("PRAGMA foreign_keys = ON", [])?;
+    conn.execute("PRAGMA optimize", [])?;
     Ok(())
 }
 
@@ -1200,9 +1430,9 @@ fn normalize_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_parent_class_from_strings, extract_ascii_strings, looks_like_blueprint_function_token,
-        looks_like_unreal_type_token,
-        make_asset_lookup_names,
+        asset_class_leaf, detect_parent_class_from_strings, extract_ascii_strings,
+        is_explicit_logical_asset_class, is_resource_only_asset_class,
+        looks_like_blueprint_function_token, looks_like_unreal_type_token, make_asset_lookup_names,
     };
 
     #[test]
@@ -1248,5 +1478,31 @@ mod tests {
         assert!(looks_like_unreal_type_token("SInventoryManagerComponent"));
         assert!(looks_like_unreal_type_token("UWeaponForgeMain"));
         assert!(!looks_like_unreal_type_token("RefreshCurrency"));
+    }
+
+    #[test]
+    fn logical_asset_class_list_covers_blueprints_and_data_assets() {
+        assert!(is_explicit_logical_asset_class("Blueprint"));
+        assert!(is_explicit_logical_asset_class("WidgetBlueprint"));
+        assert!(is_explicit_logical_asset_class("PrimaryDataAsset"));
+        assert!(is_explicit_logical_asset_class("BehaviorTree"));
+    }
+
+    #[test]
+    fn resource_only_asset_class_list_covers_common_heavy_content() {
+        assert!(is_resource_only_asset_class("Texture2D"));
+        assert!(is_resource_only_asset_class("StaticMesh"));
+        assert!(is_resource_only_asset_class("AnimMontage"));
+        assert!(is_resource_only_asset_class("NiagaraSystem"));
+    }
+
+    #[test]
+    fn asset_class_leaf_handles_script_and_function_paths() {
+        assert_eq!(asset_class_leaf("/Script/Engine.Texture2D"), "Texture2D");
+        assert_eq!(asset_class_leaf("/Game/Hero/BP_Hero.BP_Hero_C"), "BP_Hero_C");
+        assert_eq!(
+            asset_class_leaf("/Script/Game.SHero:RefreshCurrency"),
+            "RefreshCurrency"
+        );
     }
 }

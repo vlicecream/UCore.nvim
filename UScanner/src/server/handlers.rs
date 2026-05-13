@@ -149,8 +149,7 @@ pub async fn handle_setup(state: Arc<AppState>, params: &Value) -> Result<Value>
 
     drop_db_connections(&state, &db_path_native, cache_db_path_unix.as_deref());
 
-    let needs_full_refresh =
-        ensure_database_ready(db_path_native.clone(), req.project_root.clone()).await?;
+    let readiness = ensure_database_ready(db_path_native.clone(), req.project_root.clone()).await?;
 
     {
         let mut projects = state.projects.lock();
@@ -171,7 +170,7 @@ pub async fn handle_setup(state: Arc<AppState>, params: &Value) -> Result<Value>
         let _ = state.get_persistent_cache_connection(&normalize_to_native(cache_path));
     }
 
-    if !needs_full_refresh {
+    if !readiness.needs_full_refresh && readiness.needs_asset_index {
         schedule_asset_index_ready(state.clone(), db_path_native.clone(), req.project_root.clone());
     }
 
@@ -179,7 +178,7 @@ pub async fn handle_setup(state: Arc<AppState>, params: &Value) -> Result<Value>
 
     Ok(json!({
         "status": "ok",
-        "needs_full_refresh": needs_full_refresh,
+        "needs_full_refresh": readiness.needs_full_refresh,
     }))
 }
 
@@ -1807,6 +1806,11 @@ async fn ensure_asset_index_ready(db_path_native: &str, project_root: &str) -> R
     .await?
 }
 
+struct SetupReadiness {
+    needs_full_refresh: bool,
+    needs_asset_index: bool,
+}
+
 /// Schedule persistent asset index initialization in the background.
 /// 后台调度持久化资产索引初始化，不阻塞 setup 返回。
 fn schedule_asset_index_ready(state: Arc<AppState>, db_path_native: String, project_root: String) {
@@ -1845,12 +1849,15 @@ fn is_engine_root_path(path: &Path) -> bool {
     path.join("Engine/Source").is_dir() || path.join("Engine/Build/Build.version").is_file()
 }
 
-async fn ensure_database_ready(db_path_native: String, project_root: String) -> Result<bool> {
+async fn ensure_database_ready(db_path_native: String, project_root: String) -> Result<SetupReadiness> {
     tokio::task::spawn_blocking(move || {
         let reinitialized = db::ensure_correct_version(&db_path_native).unwrap_or(false);
 
         if reinitialized {
-            return Ok(true);
+            return Ok(SetupReadiness {
+                needs_full_refresh: true,
+                needs_asset_index: false,
+            });
         }
 
         let conn = rusqlite::Connection::open(&db_path_native)?;
@@ -1862,15 +1869,24 @@ async fn ensure_database_ready(db_path_native: String, project_root: String) -> 
             .unwrap_or(0);
 
         if file_count == 0 || class_count == 0 {
-            return Ok(true);
+            return Ok(SetupReadiness {
+                needs_full_refresh: true,
+                needs_asset_index: false,
+            });
         }
 
         if is_engine_root_path(Path::new(&project_root)) {
-            return Ok(false);
+            return Ok(SetupReadiness {
+                needs_full_refresh: false,
+                needs_asset_index: false,
+            });
         }
 
         let asset_ready = asset::asset_index_initialized(&conn).unwrap_or(false);
-        Ok(!asset_ready)
+        Ok(SetupReadiness {
+            needs_full_refresh: false,
+            needs_asset_index: !asset_ready,
+        })
     })
     .await?
 }

@@ -8,7 +8,7 @@ use crate::server::utils::{normalize_to_native, normalize_path_key};
 use crate::{db, scanner};
 
 const SOURCE_EXTENSIONS: &[&str] = &["h", "hh", "hpp", "cpp", "cc", "cxx", "inl", "cs"];
-const ASSET_EXTENSIONS: &[&str] = &["uasset", "umap"];
+const ASSET_EXTENSIONS: &[&str] = &["uasset"];
 const IGNORED_WATCH_DIRS: &[&str] = &[
     "Intermediate",
     "Binaries",
@@ -188,7 +188,7 @@ async fn handle_asset_delete(state: Arc<AppState>, project: MatchedProject, path
 /// Return true if the asset extension participates in the asset index.
 /// 判断这个资产扩展名是否会进入资产索引。
 fn is_indexed_asset(ext: &str) -> bool {
-    ext == "uasset" || ext == "umap"
+    ext == "uasset"
 }
 
 // -----------------------------------------------------------------------------

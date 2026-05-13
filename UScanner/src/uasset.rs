@@ -42,6 +42,7 @@ pub struct UAssetParser {
     pub imports: Vec<String>,
     pub functions: Vec<String>,
     pub parent_class: Option<String>,
+    pub asset_class: Option<String>,
     pub asset_name: String,
 }
 
@@ -76,6 +77,7 @@ impl UAssetParser {
 
         self.read_export_map(&mut reader, &summary)?;
         self.resolve_parent_class();
+        self.resolve_asset_class();
 
         Ok(())
     }
@@ -89,6 +91,7 @@ impl UAssetParser {
         self.imports.clear();
         self.functions.clear();
         self.parent_class = None;
+        self.asset_class = None;
         self.asset_name.clear();
     }
 
@@ -259,6 +262,49 @@ impl UAssetParser {
                 return;
             }
         }
+    }
+
+    /// Resolve the top-level asset class from ExportMap.
+    /// 从 ExportMap 推断顶层资产类。
+    fn resolve_asset_class(&mut self) {
+        let generated_class = format!("{}_C", self.asset_name);
+        let mut best: Option<(i32, String)> = None;
+
+        for export in &self.export_map {
+            let class_path = self.resolve_object_path(export.class_index);
+            if !looks_like_asset_class_path(&class_path) {
+                continue;
+            }
+
+            let mut score = 0i32;
+
+            if export.object_name == self.asset_name {
+                score += 100;
+            }
+
+            if export.outer_index == 0 {
+                score += 40;
+            }
+
+            if !class_path.contains("GeneratedClass") {
+                score += 20;
+            }
+
+            if export.object_name == generated_class {
+                score -= 20;
+            }
+
+            let replace = best
+                .as_ref()
+                .map(|(best_score, _)| score > *best_score)
+                .unwrap_or(true);
+
+            if replace {
+                best = Some((score, class_path));
+            }
+        }
+
+        self.asset_class = best.map(|(_, value)| value);
     }
 
     /// Resolve UObject index into path-like string.
@@ -605,6 +651,19 @@ where
     }
 
     Ok(())
+}
+
+fn looks_like_asset_class_path(path: &str) -> bool {
+    if !path.starts_with('/') || !path.contains('.') {
+        return false;
+    }
+
+    let class_name = path.rsplit('.').next().unwrap_or(path);
+
+    !matches!(
+        class_name,
+        "Class" | "Package" | "MetaData" | "Default__Object" | "LinkerPlaceholderClass"
+    )
 }
 
 #[cfg(test)]
