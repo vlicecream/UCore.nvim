@@ -9,6 +9,7 @@ const PACKAGE_TAG_SWAPPED: u32 = 0xC1832A9E;
 const MAX_ANSI_STRING_LEN: i32 = 32 * 1024;
 const MAX_WIDE_STRING_LEN: i32 = 16 * 1024;
 const MAX_RECURSION_DEPTH: usize = 32;
+const ASSET_CLASS_SNIFF_EXPORT_LIMIT: i32 = 64;
 
 /// One UObject import entry.
 /// 一个 UObject Import 表条目。
@@ -651,6 +652,75 @@ where
     }
 
     Ok(())
+}
+
+/// Read just enough package data to guess the top-level asset class quickly.
+/// 只读取足够少的包数据，快速猜测顶层资产类。
+pub fn sniff_top_level_asset_class<P: AsRef<Path>>(path: P) -> Result<Option<String>> {
+    let path = path.as_ref();
+    let file = File::open(path)?;
+    let file_size = file.metadata()?.len();
+    let mut reader = BufReader::new(file);
+    let summary = PackageSummary::read(&mut reader, file_size)?;
+
+    let mut parser = UAssetParser::new();
+    parser.asset_name = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| summary.asset_name.clone());
+
+    parser.read_name_map(&mut reader, &summary)?;
+    parser.read_import_map(&mut reader, &summary)?;
+
+    if summary.export_count <= 0 || summary.export_offset <= 0 {
+        return Ok(None);
+    }
+
+    seek_checked(&mut reader, summary.export_offset, summary.file_size)?;
+
+    for _ in 0..summary.export_count.min(ASSET_CLASS_SNIFF_EXPORT_LIMIT) {
+        let class_index = reader.read_i32::<LittleEndian>()?;
+        let super_index = reader.read_i32::<LittleEndian>()?;
+
+        let template_index = if summary.ue4_version >= 517 {
+            reader.read_i32::<LittleEndian>()?
+        } else {
+            0
+        };
+
+        let outer_index = reader.read_i32::<LittleEndian>()?;
+        let object_name_index = reader.read_i64::<LittleEndian>()?;
+        let _object_flags = reader.read_u32::<LittleEndian>()?;
+
+        let (serial_size, serial_offset) = if summary.ue4_version >= 511 {
+            (
+                reader.read_i64::<LittleEndian>()?,
+                reader.read_i64::<LittleEndian>()?,
+            )
+        } else {
+            (
+                reader.read_i32::<LittleEndian>()? as i64,
+                reader.read_i32::<LittleEndian>()? as i64,
+            )
+        };
+
+        skip_export_tail(&mut reader, &summary)?;
+
+        parser.export_map.push(UObjectExport {
+            class_index,
+            super_index,
+            template_index,
+            outer_index,
+            object_name: parser.name_by_index(object_name_index as i32),
+            serial_size,
+            serial_offset,
+        });
+    }
+
+    parser.resolve_asset_class();
+    Ok(parser.asset_class)
 }
 
 fn looks_like_asset_class_path(path: &str) -> bool {

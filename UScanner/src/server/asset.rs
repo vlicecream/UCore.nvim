@@ -14,7 +14,7 @@ use tracing::{debug, info, warn};
 use crate::server::state::{AppState, AssetGraph};
 use crate::server::utils::normalize_path_key;
 use crate::types::ProgressReporter;
-use crate::uasset::UAssetParser;
+use crate::uasset::{sniff_top_level_asset_class, UAssetParser};
 
 const DISCOVERY_MAX_DEPTH: usize = 4;
 const LOG_EVERY: usize = 1000;
@@ -755,6 +755,20 @@ fn collect_candidate_assets(content_dirs: &[PathBuf]) -> Vec<PathBuf> {
 pub fn parse_asset_record(path: &Path) -> Result<Option<AssetRecord>> {
     let path = path.to_path_buf();
     let parse_path = path.clone();
+    let sniff_started_at = Instant::now();
+
+    if let Ok(Some(asset_class)) = sniff_top_level_asset_class(&path) {
+        let class_name = asset_class_leaf(&asset_class);
+        if is_resource_only_asset_class(class_name) {
+            info!(
+                asset = %path.display(),
+                asset_class = %asset_class,
+                elapsed_ms = sniff_started_at.elapsed().as_millis(),
+                "Skipping deep asset parse for resource-only asset class"
+            );
+            return Ok(None);
+        }
+    }
 
     let parse_result = std::panic::catch_unwind(move || {
         let mut parser = UAssetParser::new();
