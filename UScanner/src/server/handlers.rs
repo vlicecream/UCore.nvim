@@ -150,6 +150,13 @@ pub async fn handle_setup(state: Arc<AppState>, params: &Value) -> Result<Value>
     drop_db_connections(&state, &db_path_native, cache_db_path_unix.as_deref());
 
     let readiness = ensure_database_ready(db_path_native.clone(), req.project_root.clone()).await?;
+    info!(
+        project_root = %req.project_root,
+        db_path = %db_path_native,
+        needs_full_refresh = readiness.needs_full_refresh,
+        needs_asset_index = readiness.needs_asset_index,
+        "setup readiness resolved"
+    );
 
     {
         let mut projects = state.projects.lock();
@@ -171,6 +178,10 @@ pub async fn handle_setup(state: Arc<AppState>, params: &Value) -> Result<Value>
     }
 
     if !readiness.needs_full_refresh && readiness.needs_asset_index {
+        info!(
+            project_root = %req.project_root,
+            "setup scheduling background asset index"
+        );
         schedule_asset_index_ready(state.clone(), db_path_native.clone(), req.project_root.clone());
     }
 
@@ -1799,15 +1810,41 @@ async fn ensure_asset_index_ready(db_path_native: &str, project_root: &str) -> R
     let project_root = project_root.to_string();
 
     tokio::task::spawn_blocking(move || {
+        let started_at = Instant::now();
         let mut conn = rusqlite::Connection::open(&db_path_native)?;
         db::init_db(&conn)?;
 
         if asset::asset_index_initialized(&conn)? {
+            info!(
+                project_root = %project_root,
+                db_path = %db_path_native,
+                elapsed_ms = started_at.elapsed().as_millis(),
+                "background asset index skipped because it is already initialized"
+            );
             return Ok(());
         }
 
         let reporter = Arc::new(crate::types::StdoutReporter);
-        asset::refresh_asset_index(&mut conn, Path::new(&project_root), reporter)
+        info!(
+            project_root = %project_root,
+            db_path = %db_path_native,
+            "background asset index started"
+        );
+        let result = asset::refresh_asset_index(&mut conn, Path::new(&project_root), reporter);
+        match &result {
+            Ok(()) => info!(
+                project_root = %project_root,
+                elapsed_ms = started_at.elapsed().as_millis(),
+                "background asset index finished"
+            ),
+            Err(err) => warn!(
+                project_root = %project_root,
+                elapsed_ms = started_at.elapsed().as_millis(),
+                error = %err,
+                "background asset index failed"
+            ),
+        }
+        result
     })
     .await?
 }
@@ -1825,10 +1862,22 @@ fn schedule_asset_index_ready(state: Arc<AppState>, db_path_native: String, proj
     {
         let mut active = state.active_asset_scans.lock();
         if active.contains(&root_key) {
+            info!(
+                project_root = %project_root,
+                root_key = %root_key,
+                "background asset index already active; skipping duplicate schedule"
+            );
             return;
         }
         active.insert(root_key.clone());
     }
+
+    info!(
+        project_root = %project_root,
+        root_key = %root_key,
+        db_path = %db_path_native,
+        "background asset index scheduled"
+    );
 
     tokio::spawn(async move {
         let result = ensure_asset_index_ready(&db_path_native, &project_root).await;
@@ -1860,6 +1909,11 @@ async fn ensure_database_ready(db_path_native: String, project_root: String) -> 
         let reinitialized = db::ensure_correct_version(&db_path_native).unwrap_or(false);
 
         if reinitialized {
+            info!(
+                project_root = %project_root,
+                db_path = %db_path_native,
+                "setup requires full refresh because database was reinitialized"
+            );
             return Ok(SetupReadiness {
                 needs_full_refresh: true,
                 needs_asset_index: false,
@@ -1875,6 +1929,13 @@ async fn ensure_database_ready(db_path_native: String, project_root: String) -> 
             .unwrap_or(0);
 
         if file_count == 0 || class_count == 0 {
+            info!(
+                project_root = %project_root,
+                db_path = %db_path_native,
+                file_count = file_count,
+                class_count = class_count,
+                "setup requires full refresh because code index is empty"
+            );
             return Ok(SetupReadiness {
                 needs_full_refresh: true,
                 needs_asset_index: false,
@@ -1882,6 +1943,13 @@ async fn ensure_database_ready(db_path_native: String, project_root: String) -> 
         }
 
         if is_engine_root_path(Path::new(&project_root)) {
+            info!(
+                project_root = %project_root,
+                db_path = %db_path_native,
+                file_count = file_count,
+                class_count = class_count,
+                "setup ready for engine database without asset index"
+            );
             return Ok(SetupReadiness {
                 needs_full_refresh: false,
                 needs_asset_index: false,
@@ -1889,6 +1957,14 @@ async fn ensure_database_ready(db_path_native: String, project_root: String) -> 
         }
 
         let asset_ready = asset::asset_index_initialized(&conn).unwrap_or(false);
+        info!(
+            project_root = %project_root,
+            db_path = %db_path_native,
+            file_count = file_count,
+            class_count = class_count,
+            asset_ready = asset_ready,
+            "setup checked project database readiness"
+        );
         Ok(SetupReadiness {
             needs_full_refresh: false,
             needs_asset_index: !asset_ready,

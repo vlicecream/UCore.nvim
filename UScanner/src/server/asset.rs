@@ -224,14 +224,26 @@ pub fn refresh_asset_index(
     project_root: &Path,
     reporter: Arc<dyn ProgressReporter>,
 ) -> Result<()> {
+    let overall_started_at = Instant::now();
     let initialized = asset_index_initialized(conn)?;
     let content_dirs = discover_content_dirs(project_root);
     let asset_files = collect_candidate_assets(&content_dirs);
+    info!(
+        project_root = %project_root.display(),
+        initialized = initialized,
+        content_dirs = content_dirs.len(),
+        candidate_assets = asset_files.len(),
+        "Asset index refresh started"
+    );
 
     if !initialized {
+        let parse_started_at = Instant::now();
         let report = parse_asset_files(&asset_files, Some(reporter.as_ref()))?;
+        let parse_elapsed_ms = parse_started_at.elapsed().as_millis();
         info!(
-            "Asset index full scan: candidates={} indexed={} skipped={} errors={}",
+            project_root = %project_root.display(),
+            elapsed_ms = parse_elapsed_ms,
+            "Asset index full scan parsed: candidates={} indexed={} skipped={} errors={}",
             report.total_seen,
             report.parsed.len(),
             report.skipped,
@@ -243,12 +255,20 @@ pub fn refresh_asset_index(
             report.parsed.len().max(1),
             "Persist",
         );
+        let persist_started_at = Instant::now();
         replace_asset_index(conn, &report.parsed, Some(reporter.as_ref()))?;
+        let persist_elapsed_ms = persist_started_at.elapsed().as_millis();
         reporter.report(
             "asset_index",
             report.parsed.len().max(1),
             report.parsed.len().max(1),
             "Ready",
+        );
+        info!(
+            project_root = %project_root.display(),
+            persist_elapsed_ms = persist_elapsed_ms,
+            total_elapsed_ms = overall_started_at.elapsed().as_millis(),
+            "Asset index full refresh finished"
         );
         return Ok(());
     }
@@ -278,11 +298,16 @@ pub fn refresh_asset_index(
         .cloned()
         .collect::<Vec<_>>();
 
+    let parse_started_at = Instant::now();
     let report = parse_asset_files(&changed_files, None)?;
+    let parse_elapsed_ms = parse_started_at.elapsed().as_millis();
     let work_total = (deleted_paths.len() + report.parsed.len()).max(1);
     info!(
-        "Asset index delta scan: candidates={} changed={} deleted={} indexed={} skipped={} errors={}",
+        project_root = %project_root.display(),
+        elapsed_ms = parse_elapsed_ms,
+        "Asset index delta parsed: candidates={} existing={} changed={} deleted={} indexed={} skipped={} errors={}",
         total_seen,
+        existing.len(),
         changed_files.len(),
         deleted_paths.len(),
         report.parsed.len(),
@@ -291,8 +316,15 @@ pub fn refresh_asset_index(
     );
 
     reporter.report("asset_index", 0, work_total, "Persist");
+    let persist_started_at = Instant::now();
     apply_asset_index_delta(conn, &report.parsed, &deleted_paths, Some(reporter.as_ref()))?;
     reporter.report("asset_index", work_total, work_total, "Ready");
+    info!(
+        project_root = %project_root.display(),
+        persist_elapsed_ms = persist_started_at.elapsed().as_millis(),
+        total_elapsed_ms = overall_started_at.elapsed().as_millis(),
+        "Asset index delta refresh finished"
+    );
     Ok(())
 }
 
@@ -517,6 +549,7 @@ fn parse_asset_files(
     asset_files: &[PathBuf],
     reporter: Option<&dyn ProgressReporter>,
 ) -> Result<AssetScanReport> {
+    let started_at = Instant::now();
     let total_seen = asset_files.len();
     let completed = AtomicUsize::new(0);
     let reported_bucket = AtomicUsize::new(0);
@@ -630,6 +663,17 @@ fn parse_asset_files(
         errors,
         parsed,
         error_summary,
+    })
+    .map(|report| {
+        info!(
+            elapsed_ms = started_at.elapsed().as_millis(),
+            total_seen = report.total_seen,
+            indexed = report.parsed.len(),
+            skipped = report.skipped,
+            errors = report.errors,
+            "Asset parse pass finished"
+        );
+        report
     })
 }
 
