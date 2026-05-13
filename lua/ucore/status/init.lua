@@ -70,7 +70,7 @@ local panels = {
 }
 
 local function panel_is_modal(panel)
-	return panel == panels.init
+	return false
 end
 
 local function panel_for_key(key)
@@ -442,18 +442,22 @@ local function render_now()
 	local builtin_notify = uses_builtin_notify()
 	if builtin_notify then
 		local row = 1
+		local init_height = render_float_panel("init", panels.init, row)
+		if init_height > 0 then
+			row = row + init_height + 1
+		end
 		local unreal_height = render_float_panel("unreal_init", panels.unreal_init, row)
 		if unreal_height > 0 then
 			row = row + unreal_height + 1
 		end
+		panels.init.notify_handle = nil
 		panels.unreal_init.notify_handle = nil
 	else
+		close_float("init")
 		close_float("unreal_init")
+		render_notify_panel(panels.init)
 		render_notify_panel(panels.unreal_init)
 	end
-
-	render_float_panel("init", panels.init, 1)
-	panels.init.notify_handle = nil
 end
 
 render = function()
