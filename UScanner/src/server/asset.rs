@@ -868,6 +868,73 @@ pub fn get_assets(conn: &Connection) -> Result<Value> {
     Ok(json!(assets))
 }
 
+/// Query integrity and summary status for the logical asset index.
+/// 查询逻辑资产索引的完整性和摘要状态。
+pub fn get_asset_index_status(conn: &Connection) -> Result<Value> {
+    let db_version = read_project_meta(conn, "db_version")?;
+    let asset_index_initialized = read_project_meta(conn, "asset_index_initialized")?;
+    let asset_index_version = read_project_meta(conn, "asset_index_version")?;
+
+    let assets_count = query_count(conn, "SELECT COUNT(*) FROM assets")?;
+    let references_count = query_count(conn, "SELECT COUNT(*) FROM asset_references")?;
+    let functions_count = query_count(conn, "SELECT COUNT(*) FROM asset_functions")?;
+    let blueprint_like_count = query_count(
+        conn,
+        "SELECT COUNT(*) FROM assets
+         WHERE parent_class IS NOT NULL
+            OR asset_path LIKE '%.BP_%'
+            OR asset_path LIKE '%/WBP_%'
+            OR asset_path LIKE '%/WB_%'",
+    )?;
+    let orphan_references = query_count(
+        conn,
+        "SELECT COUNT(*)
+         FROM asset_references ar
+         LEFT JOIN assets a ON a.asset_path = ar.asset_path
+         WHERE a.asset_path IS NULL",
+    )?;
+    let orphan_functions = query_count(
+        conn,
+        "SELECT COUNT(*)
+         FROM asset_functions af
+         LEFT JOIN assets a ON a.asset_path = af.asset_path
+         WHERE a.asset_path IS NULL",
+    )?;
+
+    let sample_assets = query_single_column(
+        conn,
+        "SELECT asset_path FROM assets ORDER BY asset_path COLLATE NOCASE LIMIT 8",
+    )?;
+
+    let issues = build_asset_index_issues(
+        &db_version,
+        &asset_index_initialized,
+        &asset_index_version,
+        assets_count,
+        references_count,
+        orphan_references,
+        orphan_functions,
+    );
+
+    Ok(json!({
+        "ok": issues.is_empty(),
+        "db_version": db_version,
+        "asset_index_initialized": asset_index_initialized,
+        "asset_index_version": asset_index_version,
+        "expected_asset_index_version": ASSET_INDEX_VERSION,
+        "counts": {
+            "assets": assets_count,
+            "asset_references": references_count,
+            "asset_functions": functions_count,
+            "blueprint_like_assets": blueprint_like_count,
+            "orphan_asset_references": orphan_references,
+            "orphan_asset_functions": orphan_functions,
+        },
+        "sample_assets": sample_assets,
+        "issues": issues,
+    }))
+}
+
 /// Query asset usages from the persistent DB.
 /// 从持久化数据库查询资产引用和派生关系。
 pub fn get_asset_usages(conn: &Connection, asset_path: &str) -> Result<Value> {
@@ -1231,6 +1298,85 @@ fn write_asset_index_initialized(tx: &rusqlite::Transaction) -> Result<()> {
         [ASSET_INDEX_VERSION.to_string()],
     )?;
     Ok(())
+}
+
+fn read_project_meta(conn: &Connection, key: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT value FROM project_meta WHERE key = ?1",
+            [key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?)
+}
+
+fn query_count(conn: &Connection, sql: &str) -> Result<i64> {
+    Ok(conn.query_row(sql, [], |row| row.get::<_, i64>(0)).unwrap_or(0))
+}
+
+fn query_single_column(conn: &Connection, sql: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut values = Vec::new();
+    for row in rows {
+        values.push(row?);
+    }
+    Ok(values)
+}
+
+fn build_asset_index_issues(
+    db_version: &Option<String>,
+    asset_index_initialized: &Option<String>,
+    asset_index_version: &Option<String>,
+    assets_count: i64,
+    references_count: i64,
+    orphan_references: i64,
+    orphan_functions: i64,
+) -> Vec<String> {
+    let mut issues = Vec::new();
+
+    if db_version.is_none() {
+        issues.push("project_meta.db_version is missing".to_string());
+    }
+
+    if !matches!(asset_index_initialized.as_deref(), Some("1")) {
+        issues.push("asset_index_initialized is not set to 1".to_string());
+    }
+
+    let parsed_version = asset_index_version
+        .as_deref()
+        .and_then(|value| value.parse::<i32>().ok());
+    if parsed_version != Some(ASSET_INDEX_VERSION) {
+        issues.push(format!(
+            "asset_index_version is {}, expected {}",
+            asset_index_version.as_deref().unwrap_or("missing"),
+            ASSET_INDEX_VERSION
+        ));
+    }
+
+    if assets_count <= 0 {
+        issues.push("assets table is empty".to_string());
+    }
+
+    if references_count <= 0 {
+        issues.push("asset_references table is empty".to_string());
+    }
+
+    if orphan_references > 0 {
+        issues.push(format!(
+            "asset_references has {} orphan rows",
+            orphan_references
+        ));
+    }
+
+    if orphan_functions > 0 {
+        issues.push(format!(
+            "asset_functions has {} orphan rows",
+            orphan_functions
+        ));
+    }
+
+    issues
 }
 
 fn collect_asset_rows<P: rusqlite::Params>(

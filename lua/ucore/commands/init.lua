@@ -25,6 +25,7 @@ function M.dispatch(args)
 		find = function()
 			actions.find(tail)
 		end,
+		verify = actions.verify,
 		["goto"] = function()
 			actions["goto"](tail)
 		end,
@@ -61,6 +62,7 @@ function M.register()
 				"boot",
 				"explorer",
 				"find",
+				"verify",
 				"goto",
 				"signature",
 				"blueprint",

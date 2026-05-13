@@ -676,6 +676,7 @@ pub enum QueryRequest {
     // Asset queries.
     // 资产查询。
     GetAssets,
+    GetAssetIndexStatus,
     GetAssetUsages { asset_path: String },
     GetAssetDependencies { asset_path: String },
     GrepAssets { pattern: String },

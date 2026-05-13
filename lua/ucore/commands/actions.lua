@@ -798,6 +798,87 @@ function M.find(pattern)
 	show_find_results(pattern, fallback_items)
 end
 
+local function format_verify_count(label, value)
+	return string.format("  %s: %s", label, tostring(value or 0))
+end
+
+function M.verify()
+	local root = project.find_project_root_from_context()
+	if not root then
+		local items = project.list_registered_projects()
+		if vim.tbl_isempty(items) then
+			return vim.notify(
+				"UCore verify: not inside an Unreal project.\nOpen a .uproject file and run :UCore boot first.",
+				vim.log.levels.WARN
+			)
+		end
+		return vim.notify(
+			"UCore verify: not inside an Unreal project.\nOpen a registered project first.",
+			vim.log.levels.WARN
+		)
+	end
+
+	local paths = project.build_paths(root)
+	if vim.fn.filereadable(paths.db_path) ~= 1 then
+		return vim.notify(
+			"UCore verify: project index database is missing.\nRun :UCore boot first.",
+			vim.log.levels.WARN
+		)
+	end
+
+	remote.get_asset_index_status(root, function(result, err)
+		if err then
+			return vim.notify("UCore verify failed:\n" .. tostring(err), vim.log.levels.ERROR)
+		end
+
+		result = type(result) == "table" and result or {}
+		local counts = type(result.counts) == "table" and result.counts or {}
+		local issues = type(result.issues) == "table" and result.issues or {}
+		local sample_assets = type(result.sample_assets) == "table" and result.sample_assets or {}
+		local title = result.ok and "UCore verify: asset index looks healthy"
+			or "UCore verify: asset index has issues"
+
+		local lines = {
+			title,
+			"Project: " .. tostring(vim.fn.fnamemodify(root, ":t")),
+			"DB: " .. tostring(paths.db_path),
+			string.format(
+				"Meta: db_version=%s asset_index_initialized=%s asset_index_version=%s expected=%s",
+				tostring(result.db_version or "missing"),
+				tostring(result.asset_index_initialized or "missing"),
+				tostring(result.asset_index_version or "missing"),
+				tostring(result.expected_asset_index_version or "unknown")
+			),
+			"Counts:",
+			format_verify_count("assets", counts.assets),
+			format_verify_count("asset_references", counts.asset_references),
+			format_verify_count("asset_functions", counts.asset_functions),
+			format_verify_count("blueprint_like_assets", counts.blueprint_like_assets),
+			format_verify_count("orphan_asset_references", counts.orphan_asset_references),
+			format_verify_count("orphan_asset_functions", counts.orphan_asset_functions),
+		}
+
+		if #issues > 0 then
+			table.insert(lines, "Issues:")
+			for _, item in ipairs(issues) do
+				table.insert(lines, "  - " .. tostring(item))
+			end
+		end
+
+		if #sample_assets > 0 then
+			table.insert(lines, "Sample assets:")
+			for _, item in ipairs(sample_assets) do
+				table.insert(lines, "  - " .. tostring(item))
+			end
+		end
+
+		vim.notify(table.concat(lines, "\n"), result.ok and vim.log.levels.INFO or vim.log.levels.WARN, {
+			title = "UCore verify",
+			timeout = result.ok and 8000 or 12000,
+		})
+	end)
+end
+
 -- Print :UCore command help.
 -- 打印 :UCore 命令帮助。
 function M.help()
@@ -808,6 +889,7 @@ UCore commands:
   :UCore boot         Boot current project, or pick a registered one
   :UCore explorer     Toggle the left-side Project/Source/Config tree
   :UCore find         Find indexed symbols, modules, assets, config
+  :UCore verify       Verify current project asset index integrity
   :UCore goto         Navigation subcommands (see :UCore goto help)
   :UCore signature    Show signature help for current call
   :UCore blueprint    Show related Blueprint assets for symbol under cursor

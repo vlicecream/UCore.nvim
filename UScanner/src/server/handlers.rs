@@ -521,6 +521,10 @@ fn handle_state_query(
             Ok(Some(asset::get_asset_usages(conn, &asset_path)?))
         }
 
+        QueryRequest::GetAssetIndexStatus => {
+            Ok(Some(asset::get_asset_index_status(conn)?))
+        }
+
         QueryRequest::GetAssetDependencies { asset_path } => {
             Ok(Some(get_asset_dependencies(project_root, &asset_path)?))
         }
@@ -1674,6 +1678,7 @@ fn query_request_label(request: &QueryRequest) -> &'static str {
         QueryRequest::GetClassMembersRecursive { .. } => "GetClassMembersRecursive",
         QueryRequest::FindDerivedClasses { .. } => "FindDerivedClasses",
         QueryRequest::GetAssets => "GetAssets",
+        QueryRequest::GetAssetIndexStatus => "GetAssetIndexStatus",
         QueryRequest::GetAssetUsages { .. } => "GetAssetUsages",
         QueryRequest::GetAssetDependencies { .. } => "GetAssetDependencies",
         QueryRequest::FastFind { .. } => "FastFind",
@@ -1717,6 +1722,7 @@ fn query_request_detail(request: &QueryRequest) -> Option<String> {
             "scope={}",
             scope.as_deref().unwrap_or("project")
         )),
+        QueryRequest::GetAssetIndexStatus => Some("project".to_string()),
         QueryRequest::GetAssetUsages { asset_path } => Some(format!("asset={}", asset_path)),
         QueryRequest::GetAssetDependencies { asset_path } => Some(format!("asset={}", asset_path)),
         _ => None,

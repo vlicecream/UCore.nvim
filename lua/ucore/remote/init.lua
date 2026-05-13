@@ -87,6 +87,12 @@ function M.get_assets(project_root, callback)
 	}, callback)
 end
 
+function M.get_asset_index_status(project_root, callback)
+	M.query(project_root, {
+		kind = "GetAssetIndexStatus",
+	}, callback)
+end
+
 -- Fetch resolved Unreal config values.
 -- 获取解析后的 Unreal 配置数据。
 function M.get_config_data(project_root, callback)

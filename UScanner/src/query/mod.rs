@@ -200,6 +200,7 @@ pub fn process_query(conn: &Connection, request: QueryRequest) -> Result<Value> 
         // ---------------------------------------------------------------------
 
         QueryRequest::GetAssets => asset::get_assets(conn),
+        QueryRequest::GetAssetIndexStatus => asset::get_asset_index_status(conn),
 
         QueryRequest::GrepAssets { pattern } => {
             asset::grep_assets(conn, pattern, |_| Ok(()))

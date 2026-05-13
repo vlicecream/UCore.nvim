@@ -79,6 +79,12 @@ pub fn get_assets(conn: &Connection) -> Result<Value> {
     collect_json_rows(rows)
 }
 
+/// Return logical asset index integrity information from the persistent DB.
+/// 返回持久化逻辑资产索引的完整性信息。
+pub fn get_asset_index_status(conn: &Connection) -> Result<Value> {
+    crate::server::asset::get_asset_index_status(conn)
+}
+
 /// Search files by filename.
 /// 按文件名搜索文件。
 pub fn search_files(conn: &Connection, part: String) -> Result<Value> {
