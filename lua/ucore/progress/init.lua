@@ -38,6 +38,15 @@ local target_kind = "project"
 local current_display_title = nil
 local auto_finish = true
 
+local function finish_visible_stage(message)
+	if not visible then
+		return
+	end
+
+	local finish_title = current_display_title or title
+	status.progress_finish(finish_title, message or string.format("%s 100%%", finish_title))
+end
+
 -- Load the built-in overall progress plan.
 -- 加载内置的整体进度计划。
 local function load_default_plan()
@@ -62,6 +71,10 @@ end
 -- Start a new visible progress run with a user-facing title.
 -- 使用面向用户的标题开始一次新的进度展示。
 function M.start(next_title, opts)
+	if active and current_display_title then
+		finish_visible_stage()
+	end
+
 	opts = opts or {}
 	title = next_title or "UCore refresh"
 	target_kind = opts.target_kind or "project"
@@ -78,6 +91,9 @@ end
 -- 完成当前进度展示，并在短暂显示后自动消失。
 function M.finish(message)
 	if not active then
+		if current_display_title then
+			finish_visible_stage(message)
+		end
 		return
 	end
 
@@ -88,9 +104,7 @@ function M.finish(message)
 	local finish_message = message or string.format("%s 100%%", finish_title)
 	last_detail = nil
 	last_tail = nil
-	if visible then
-		status.progress_finish(finish_title, finish_message)
-	end
+	finish_visible_stage(finish_message)
 end
 
 -- Mark the current progress run as failed.
@@ -354,6 +368,7 @@ function M.handle_progress(event)
 		if auto_finish then
 			return M.finish()
 		end
+		finish_visible_stage()
 		return
 	end
 
