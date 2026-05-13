@@ -757,16 +757,49 @@ pub fn parse_asset_record(path: &Path) -> Result<Option<AssetRecord>> {
     let parse_path = path.clone();
     let sniff_started_at = Instant::now();
 
-    if let Ok(Some(asset_class)) = sniff_top_level_asset_class(&path) {
-        let class_name = asset_class_leaf(&asset_class);
-        if is_resource_only_asset_class(class_name) {
-            info!(
-                asset = %path.display(),
-                asset_class = %asset_class,
-                elapsed_ms = sniff_started_at.elapsed().as_millis(),
-                "Skipping deep asset parse for resource-only asset class"
-            );
-            return Ok(None);
+    match sniff_top_level_asset_class(&path) {
+        Ok(Some(asset_class)) => {
+            let sniff_elapsed_ms = sniff_started_at.elapsed().as_millis();
+            if sniff_elapsed_ms >= 1000 {
+                info!(
+                    asset = %path.display(),
+                    asset_class = %asset_class,
+                    elapsed_ms = sniff_elapsed_ms,
+                    "Slow asset class sniff"
+                );
+            }
+
+            let class_name = asset_class_leaf(&asset_class);
+            if is_resource_only_asset_class(class_name) {
+                info!(
+                    asset = %path.display(),
+                    asset_class = %asset_class,
+                    elapsed_ms = sniff_elapsed_ms,
+                    "Skipping deep asset parse for resource-only asset class"
+                );
+                return Ok(None);
+            }
+        }
+        Ok(None) => {
+            let sniff_elapsed_ms = sniff_started_at.elapsed().as_millis();
+            if sniff_elapsed_ms >= 1000 {
+                info!(
+                    asset = %path.display(),
+                    elapsed_ms = sniff_elapsed_ms,
+                    "Slow asset class sniff without resolved class"
+                );
+            }
+        }
+        Err(err) => {
+            let sniff_elapsed_ms = sniff_started_at.elapsed().as_millis();
+            if sniff_elapsed_ms >= 1000 {
+                info!(
+                    asset = %path.display(),
+                    elapsed_ms = sniff_elapsed_ms,
+                    error = %err,
+                    "Slow asset class sniff before fallback"
+                );
+            }
         }
     }
 

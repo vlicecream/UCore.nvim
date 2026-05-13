@@ -10,6 +10,23 @@ const MAX_ANSI_STRING_LEN: i32 = 32 * 1024;
 const MAX_WIDE_STRING_LEN: i32 = 16 * 1024;
 const MAX_RECURSION_DEPTH: usize = 32;
 const ASSET_CLASS_SNIFF_EXPORT_LIMIT: i32 = 64;
+const PKG_FILTER_EDITOR_ONLY: u32 = 0x8000_0000;
+
+const UE4_ENGINE_VERSION_OBJECT: i32 = 336;
+const UE4_ADD_STRING_ASSET_REFERENCES_MAP: i32 = 384;
+const UE4_PACKAGE_SUMMARY_HAS_COMPATIBLE_ENGINE_VERSION: i32 = 444;
+const UE4_SERIALIZE_TEXT_IN_PACKAGES: i32 = 459;
+const UE4_ADDED_SEARCHABLE_NAMES: i32 = 510;
+const UE4_ADDED_PACKAGE_SUMMARY_LOCALIZATION_ID: i32 = 516;
+const UE4_ADDED_PACKAGE_OWNER: i32 = 518;
+const UE4_NON_OUTER_PACKAGE_IMPORT: i32 = 520;
+const UE4_ASSETREGISTRY_DEPENDENCYFLAGS: i32 = 521;
+
+const UE5_ADD_SOFTOBJECTPATH_LIST: i32 = 1008;
+const UE5_METADATE_SERIALIZATION_OFFSET: i32 = 1014;
+const UE5_VERSE_CELLS: i32 = 1015;
+const UE5_PACKAGE_SAVED_HASH: i32 = 1016;
+const UE5_IMPORT_TYPE_HIERARCHIES: i32 = 1018;
 
 /// One UObject import entry.
 /// 一个 UObject Import 表条目。
@@ -408,12 +425,14 @@ struct PackageSummary {
     ue4_version: i32,
     ue5_version: i32,
     asset_name: String,
+    filter_editor_only: bool,
     name_count: i32,
     name_offset: i32,
     import_count: i32,
     import_offset: i32,
     export_count: i32,
     export_offset: i32,
+    asset_registry_data_offset: i32,
 }
 
 impl PackageSummary {
@@ -443,21 +462,23 @@ impl PackageSummary {
             0
         };
 
-        let _licensee_version = reader.read_i32::<LittleEndian>()?;
+        let licensee_version = reader.read_i32::<LittleEndian>()?;
+        let unversioned = ue4_version == 0 && ue5_version == 0 && licensee_version == 0;
 
-        if legacy_version <= -9 {
+        if unversioned {
+            return Err(anyhow!("unversioned packages are not supported by the lightweight parser"));
+        }
+
+        if ue5_version >= UE5_PACKAGE_SAVED_HASH {
             skip_bytes(reader, 20)?;
             let _total_header_size = reader.read_i32::<LittleEndian>()?;
         }
 
         if legacy_version <= -2 {
-            let custom_version_count = reader.read_i32::<LittleEndian>()?;
-            if (0..2000).contains(&custom_version_count) {
-                skip_bytes(reader, custom_version_count as i64 * 20)?;
-            }
+            skip_custom_versions(reader, legacy_version)?;
         }
 
-        if legacy_version > -9 {
+        if ue5_version < UE5_PACKAGE_SAVED_HASH {
             let _total_header_size = reader.read_i32::<LittleEndian>()?;
         }
 
@@ -465,39 +486,106 @@ impl PackageSummary {
         let asset_name = package_name.rsplit('/').next().unwrap_or("").to_string();
 
         let package_flags = reader.read_u32::<LittleEndian>()?;
-        let _has_unversioned_properties = (package_flags & 0x8000_0000) != 0;
+        let filter_editor_only = (package_flags & PKG_FILTER_EDITOR_ONLY) != 0;
 
         let name_count = reader.read_i32::<LittleEndian>()?;
         let name_offset = reader.read_i32::<LittleEndian>()?;
 
-        let _localization_id = read_unreal_string(reader)?;
+        if ue5_version >= UE5_ADD_SOFTOBJECTPATH_LIST {
+            skip_bytes(reader, 8)?;
+        }
 
-        skip_bytes(reader, 8)?;
+        if !filter_editor_only && ue4_version >= UE4_ADDED_PACKAGE_SUMMARY_LOCALIZATION_ID {
+            let _localization_id = read_unreal_string(reader)?;
+        }
+
+        if ue4_version >= UE4_SERIALIZE_TEXT_IN_PACKAGES {
+            skip_bytes(reader, 8)?;
+        }
 
         let export_count = reader.read_i32::<LittleEndian>()?;
         let export_offset = reader.read_i32::<LittleEndian>()?;
         let import_count = reader.read_i32::<LittleEndian>()?;
         let import_offset = reader.read_i32::<LittleEndian>()?;
 
+        if ue5_version >= UE5_VERSE_CELLS {
+            skip_bytes(reader, 16)?;
+        }
+
+        if ue5_version >= UE5_METADATE_SERIALIZATION_OFFSET {
+            let _metadata_offset = reader.read_i32::<LittleEndian>()?;
+        }
+
         let _depends_offset = reader.read_i32::<LittleEndian>()?;
 
-        if ue4_version >= 515 {
+        if ue4_version >= UE4_ADD_STRING_ASSET_REFERENCES_MAP {
             skip_bytes(reader, 8)?;
         }
 
-        if ue4_version >= 516 {
+        if ue4_version >= UE4_ADDED_SEARCHABLE_NAMES {
             let _searchable_names_offset = reader.read_i32::<LittleEndian>()?;
         }
 
         let _thumbnail_table_offset = reader.read_i32::<LittleEndian>()?;
 
-        if legacy_version > -9 {
+        if ue5_version >= UE5_IMPORT_TYPE_HIERARCHIES {
+            skip_bytes(reader, 8)?;
+        }
+
+        if ue5_version < UE5_PACKAGE_SAVED_HASH {
             skip_bytes(reader, 16)?;
         }
+
+        if !filter_editor_only && ue4_version >= UE4_ADDED_PACKAGE_OWNER {
+            skip_bytes(reader, 16)?;
+            if ue4_version < UE4_NON_OUTER_PACKAGE_IMPORT {
+                skip_bytes(reader, 16)?;
+            }
+        }
+
+        let generation_count = reader.read_i32::<LittleEndian>()?;
+        if generation_count < 0 || generation_count > 4096 {
+            return Err(anyhow!("invalid generation count: {}", generation_count));
+        }
+        skip_bytes(reader, generation_count as i64 * 8)?;
+
+        if ue4_version >= UE4_ENGINE_VERSION_OBJECT {
+            skip_engine_version(reader)?;
+        } else {
+            let _engine_changelist = reader.read_i32::<LittleEndian>()?;
+        }
+
+        if ue4_version >= UE4_PACKAGE_SUMMARY_HAS_COMPATIBLE_ENGINE_VERSION {
+            skip_engine_version(reader)?;
+        }
+
+        let _compression_flags = reader.read_u32::<LittleEndian>()?;
+        let compressed_chunk_count = reader.read_i32::<LittleEndian>()?;
+        if compressed_chunk_count < 0 || compressed_chunk_count > 1_000_000 {
+            return Err(anyhow!(
+                "invalid compressed chunk count: {}",
+                compressed_chunk_count
+            ));
+        }
+        skip_bytes(reader, compressed_chunk_count as i64 * 16)?;
+
+        let _package_source = reader.read_u32::<LittleEndian>()?;
+        skip_unreal_string_array(reader)?;
+
+        if legacy_version > -7 {
+            let _num_texture_allocations = reader.read_i32::<LittleEndian>()?;
+        }
+
+        let asset_registry_data_offset = reader.read_i32::<LittleEndian>()?;
 
         validate_table("name map", name_count, name_offset, file_size)?;
         validate_table("import map", import_count, import_offset, file_size)?;
         validate_table("export map", export_count, export_offset, file_size)?;
+        validate_optional_offset(
+            "asset registry data",
+            asset_registry_data_offset,
+            file_size,
+        )?;
 
         Ok(Self {
             file_size,
@@ -505,12 +593,14 @@ impl PackageSummary {
             ue4_version,
             ue5_version,
             asset_name,
+            filter_editor_only,
             name_count,
             name_offset,
             import_count,
             import_offset,
             export_count,
             export_offset,
+            asset_registry_data_offset,
         })
     }
 }
@@ -654,9 +744,130 @@ where
     Ok(())
 }
 
+fn validate_optional_offset(name: &str, offset: i32, file_size: u64) -> Result<()> {
+    if offset < 0 {
+        return Err(anyhow!("{} offset is negative: {}", name, offset));
+    }
+
+    if offset == 0 {
+        return Ok(());
+    }
+
+    if offset as u64 >= file_size {
+        return Err(anyhow!("{} offset is invalid: {}", name, offset));
+    }
+
+    Ok(())
+}
+
+fn skip_custom_versions<R>(reader: &mut R, legacy_version: i32) -> Result<()>
+where
+    R: Read + Seek,
+{
+    let version_count = reader.read_i32::<LittleEndian>()?;
+    if version_count < 0 || version_count > 1_000_000 {
+        return Err(anyhow!("invalid custom version count: {}", version_count));
+    }
+
+    match legacy_version {
+        -2 => skip_bytes(reader, version_count as i64 * 8)?,
+        -3 | -4 | -5 => {
+            for _ in 0..version_count {
+                skip_bytes(reader, 16 + 4)?;
+                let _friendly_name = read_unreal_string(reader)?;
+            }
+        }
+        _ => skip_bytes(reader, version_count as i64 * (16 + 4))?,
+    }
+
+    Ok(())
+}
+
+fn skip_engine_version<R>(reader: &mut R) -> Result<()>
+where
+    R: Read + Seek,
+{
+    let _major = reader.read_u16::<LittleEndian>()?;
+    let _minor = reader.read_u16::<LittleEndian>()?;
+    let _patch = reader.read_u16::<LittleEndian>()?;
+    let _changelist = reader.read_u32::<LittleEndian>()?;
+    let _branch = read_unreal_string(reader)?;
+    Ok(())
+}
+
+fn skip_unreal_string_array<R>(reader: &mut R) -> Result<()>
+where
+    R: Read + Seek,
+{
+    let count = reader.read_i32::<LittleEndian>()?;
+    if count < 0 || count > 1_000_000 {
+        return Err(anyhow!("invalid string array count: {}", count));
+    }
+
+    for _ in 0..count {
+        let _value = read_unreal_string(reader)?;
+    }
+
+    Ok(())
+}
+
 /// Read just enough package data to guess the top-level asset class quickly.
 /// 只读取足够少的包数据，快速猜测顶层资产类。
 pub fn sniff_top_level_asset_class<P: AsRef<Path>>(path: P) -> Result<Option<String>> {
+    match sniff_asset_registry_asset_class(path.as_ref()) {
+        Ok(Some(asset_class)) => Ok(Some(asset_class)),
+        Ok(None) => sniff_top_level_asset_class_from_exports(path),
+        Err(_) => sniff_top_level_asset_class_from_exports(path),
+    }
+}
+
+fn sniff_asset_registry_asset_class(path: &Path) -> Result<Option<String>> {
+    let file = File::open(path)?;
+    let file_size = file.metadata()?.len();
+    let mut reader = BufReader::new(file);
+    let summary = PackageSummary::read(&mut reader, file_size)?;
+
+    if summary.asset_registry_data_offset <= 0 {
+        return Ok(None);
+    }
+
+    seek_checked(
+        &mut reader,
+        summary.asset_registry_data_offset,
+        summary.file_size,
+    )?;
+
+    if summary.ue4_version >= UE4_ASSETREGISTRY_DEPENDENCYFLAGS && !summary.filter_editor_only {
+        let _dependency_data_offset = reader.read_i64::<LittleEndian>()?;
+    }
+
+    let object_count = reader.read_i32::<LittleEndian>()?;
+    if object_count <= 0 || object_count > 1024 {
+        return Ok(None);
+    }
+
+    for _ in 0..object_count {
+        let _object_path = read_unreal_string(&mut reader)?;
+        let object_class_name = read_unreal_string(&mut reader)?;
+        let tag_count = reader.read_i32::<LittleEndian>()?;
+        if tag_count < 0 || tag_count > 100_000 {
+            return Ok(None);
+        }
+
+        if !object_class_name.is_empty() {
+            return Ok(Some(object_class_name));
+        }
+
+        for _ in 0..tag_count {
+            let _tag_key = read_unreal_string(&mut reader)?;
+            let _tag_value = read_unreal_string(&mut reader)?;
+        }
+    }
+
+    Ok(None)
+}
+
+fn sniff_top_level_asset_class_from_exports<P: AsRef<Path>>(path: P) -> Result<Option<String>> {
     let path = path.as_ref();
     let file = File::open(path)?;
     let file_size = file.metadata()?.len();
@@ -823,12 +1034,14 @@ mod tests {
             ue4_version: 521,
             ue5_version: 0,
             asset_name: String::new(),
+            filter_editor_only: false,
             name_count: parser.name_map.len() as i32,
             name_offset: 0,
             import_count: 2,
             import_offset: 64,
             export_count: 0,
             export_offset: 0,
+            asset_registry_data_offset: 0,
         };
 
         let mut bytes = vec![0u8; 64];
