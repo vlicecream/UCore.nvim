@@ -2985,7 +2985,7 @@ fn append_global_type_items(
             SELECT s.text, c.symbol_type
             FROM classes c
             JOIN strings s ON c.name_id = s.id
-            WHERE c.symbol_type IN ('class', 'struct', 'UCLASS', 'USTRUCT', 'enum', 'UENUM', 'typedef')
+            WHERE c.symbol_type IN ('class', 'struct', 'UCLASS', 'USTRUCT', 'enum', 'UENUM', 'UINTERFACE', 'typedef')
               AND lower(s.text) LIKE ?
             ORDER BY s.text
             LIMIT ?
@@ -3416,6 +3416,7 @@ fn unreal_macro_call_before_cursor(before: &str) -> Option<(&'static str, usize)
         "UPROPERTY",
         "UFUNCTION",
         "UCLASS",
+        "UINTERFACE",
         "USTRUCT",
         "UENUM",
         "UPARAM",
@@ -3585,7 +3586,7 @@ fn macro_specifier_specs(macro_name: &str) -> Option<Vec<MacroSpecifierSpec>> {
             macro_snippet("meta", "metadata key", "meta=(${1})"),
         ],
 
-        "UCLASS" => vec![
+        "UCLASS" | "UINTERFACE" => vec![
             macro_plain("Blueprintable", "type specifier"),
             macro_plain("BlueprintType", "type specifier"),
             macro_plain("Abstract", "type specifier"),
@@ -3672,7 +3673,7 @@ fn meta_specifier_specs(macro_name: &str) -> Option<Vec<MacroSpecifierSpec>> {
             macro_snippet("Keywords", "metadata key", "Keywords=\"${1:Keyword1 Keyword2}\""),
         ],
 
-        "UCLASS" => vec![
+        "UCLASS" | "UINTERFACE" => vec![
             macro_plain("BlueprintSpawnableComponent", "metadata key"),
             macro_plain("ChildCanTick", "metadata key"),
             macro_plain("ChildCannotTick", "metadata key"),

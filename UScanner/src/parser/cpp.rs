@@ -359,8 +359,10 @@ pub fn parse_content_mmap(
                 &mut calls,
                 &mut pending_members,
             );
+            merge_reflected_type_fallbacks(root, content_bytes, &mut classes);
 
             attach_pending_members(&mut classes, pending_members);
+            normalize_member_access(content_bytes, &mut classes);
 
             Ok((classes, calls, includes))
         })
@@ -678,6 +680,303 @@ fn dedupe_delegate_classes(items: Vec<ClassInfo>) -> Vec<ClassInfo> {
     result
 }
 
+fn merge_reflected_type_fallbacks(root: Node, content_bytes: &[u8], classes: &mut Vec<ClassInfo>) {
+    let Ok(content) = std::str::from_utf8(content_bytes) else {
+        return;
+    };
+
+    for item in collect_reflected_type_fallbacks(root, content) {
+        if let Some(existing) = classes.iter_mut().find(|class_info| {
+            class_info.class_name == item.class_name
+                && (
+                    class_info.line == item.line
+                        || (class_info.line >= item.line && class_info.line <= item.end_line)
+                        || ranges_overlap(
+                            class_info.range_start,
+                            class_info.range_end,
+                            item.range_start,
+                            item.range_end,
+                        )
+                )
+        }) {
+            if is_reflected_symbol_type(&item.symbol_type)
+                && !is_reflected_symbol_type(&existing.symbol_type)
+            {
+                existing.symbol_type = item.symbol_type.clone();
+                existing.base_classes = item.base_classes.clone();
+                existing.range_start = item.range_start;
+                existing.range_end = item.range_end;
+                existing.end_line = item.end_line;
+                existing.is_interface = item.is_interface;
+                if existing.namespace.is_none() {
+                    existing.namespace = item.namespace.clone();
+                }
+            }
+
+            continue;
+        }
+
+        classes.push(item);
+    }
+}
+
+fn ranges_overlap(left_start: usize, left_end: usize, right_start: usize, right_end: usize) -> bool {
+    left_start < right_end && right_start < left_end
+}
+
+fn collect_reflected_type_fallbacks(root: Node, content: &str) -> Vec<ClassInfo> {
+    let bytes = content.as_bytes();
+    let mut items = Vec::new();
+
+    for (macro_name, symbol_type, keyword, is_interface) in [
+        ("UCLASS", "UCLASS", "class", false),
+        ("USTRUCT", "USTRUCT", "struct", false),
+        ("UENUM", "UENUM", "enum", false),
+        ("UINTERFACE", "UINTERFACE", "class", true),
+    ] {
+        let mut search_from = 0usize;
+
+        while let Some(relative_start) = content[search_from..].find(macro_name) {
+            let macro_start = search_from + relative_start;
+            search_from = macro_start + macro_name.len();
+
+            if !is_identifier_boundary(bytes, macro_start, macro_name.len()) {
+                continue;
+            }
+
+            let mut cursor = macro_start + macro_name.len();
+            cursor = skip_inline_whitespace(bytes, cursor);
+            if bytes.get(cursor) != Some(&b'(') {
+                continue;
+            }
+
+            let Some(close_paren) = find_matching_paren(content, cursor) else {
+                continue;
+            };
+
+            let mut decl_start = skip_ws_and_comments(content, close_paren + 1);
+            if decl_start >= bytes.len() {
+                continue;
+            }
+
+            if symbol_type == "UENUM" {
+                if content[decl_start..].starts_with("enum") {
+                    decl_start += "enum".len();
+                    decl_start = skip_inline_whitespace(bytes, decl_start);
+                    if content[decl_start..].starts_with("class") {
+                        decl_start += "class".len();
+                    } else if content[decl_start..].starts_with("struct") {
+                        decl_start += "struct".len();
+                    }
+                } else {
+                    continue;
+                }
+            } else if content[decl_start..].starts_with(keyword) {
+                decl_start += keyword.len();
+            } else {
+                continue;
+            }
+
+            decl_start = skip_inline_whitespace(bytes, decl_start);
+            decl_start = skip_optional_api_macro(content, decl_start);
+            decl_start = skip_inline_whitespace(bytes, decl_start);
+
+            let Some((name, after_name)) = parse_identifier_like(content, decl_start) else {
+                continue;
+            };
+
+            let after_name = skip_inline_whitespace(bytes, after_name);
+            let Some(body_start) = content[after_name..].find('{').map(|offset| after_name + offset) else {
+                continue;
+            };
+
+            let header_text = &content[decl_start..body_start];
+            let base_classes = parse_base_classes(header_text);
+            let range_end = find_matching_brace(content, body_start)
+                .map(|close_brace| close_brace + 1)
+                .unwrap_or(body_start + 1);
+            let namespace = namespace_for_offset(root, content, macro_start);
+
+            items.push(ClassInfo {
+                class_name: strip_namespace(name).to_string(),
+                namespace,
+                base_classes,
+                symbol_type: symbol_type.to_string(),
+                line: line_number_for_offset(content, macro_start),
+                end_line: line_number_for_offset(content, range_end.saturating_sub(1)),
+                range_start: macro_start,
+                range_end,
+                members: Vec::new(),
+                is_final: header_text.split_whitespace().any(|token| token == "final"),
+                is_interface,
+            });
+        }
+    }
+
+    items
+}
+
+fn is_reflected_symbol_type(symbol_type: &str) -> bool {
+    matches!(
+        symbol_type,
+        "UCLASS" | "USTRUCT" | "UENUM" | "UINTERFACE"
+    )
+}
+
+fn is_identifier_boundary(bytes: &[u8], start: usize, len: usize) -> bool {
+    let prev_ok = start == 0 || !is_identifier_byte(bytes[start - 1]);
+    let next_index = start + len;
+    let next_ok = next_index >= bytes.len() || !is_identifier_byte(bytes[next_index]);
+    prev_ok && next_ok
+}
+
+fn is_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn skip_inline_whitespace(bytes: &[u8], mut index: usize) -> usize {
+    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+        index += 1;
+    }
+    index
+}
+
+fn skip_ws_and_comments(content: &str, mut index: usize) -> usize {
+    let bytes = content.as_bytes();
+
+    loop {
+        index = skip_inline_whitespace(bytes, index);
+
+        if bytes.get(index) == Some(&b'/') && bytes.get(index + 1) == Some(&b'/') {
+            index += 2;
+            while index < bytes.len() && bytes[index] != b'\n' {
+                index += 1;
+            }
+            continue;
+        }
+
+        if bytes.get(index) == Some(&b'/') && bytes.get(index + 1) == Some(&b'*') {
+            index += 2;
+            while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/') {
+                index += 1;
+            }
+            index = (index + 2).min(bytes.len());
+            continue;
+        }
+
+        break;
+    }
+
+    index
+}
+
+fn skip_optional_api_macro(content: &str, index: usize) -> usize {
+    let bytes = content.as_bytes();
+    let Some((token, after_token)) = parse_identifier_like(content, index) else {
+        return index;
+    };
+
+    if token.ends_with("_API") || token == "NO_API" {
+        skip_inline_whitespace(bytes, after_token)
+    } else {
+        index
+    }
+}
+
+fn parse_identifier_like(content: &str, index: usize) -> Option<(&str, usize)> {
+    let bytes = content.as_bytes();
+    if index >= bytes.len() {
+        return None;
+    }
+
+    let first = bytes[index];
+    if !first.is_ascii_alphabetic() && first != b'_' {
+        return None;
+    }
+
+    let mut end = index + 1;
+    while end < bytes.len() {
+        let byte = bytes[end];
+        if byte.is_ascii_alphanumeric() || byte == b'_' || byte == b':' {
+            end += 1;
+        } else {
+            break;
+        }
+    }
+
+    content.get(index..end).map(|text| (text, end))
+}
+
+fn parse_base_classes(header_text: &str) -> Vec<String> {
+    let Some(colon_index) = header_text.find(':') else {
+        return Vec::new();
+    };
+
+    let mut result = Vec::new();
+    let base_section = &header_text[colon_index + 1..];
+
+    for raw_base in split_top_level_args(base_section) {
+        let mut tokens = raw_base
+            .split_whitespace()
+            .filter(|token| {
+                !matches!(
+                    *token,
+                    "public" | "protected" | "private" | "virtual" | "final"
+                )
+            })
+            .collect::<Vec<_>>();
+
+        if let Some(last) = tokens.pop() {
+            let name = strip_namespace(last).trim();
+            if !name.is_empty() {
+                result.push(name.to_string());
+            }
+        }
+    }
+
+    result
+}
+
+fn find_matching_brace(content: &str, open_brace: usize) -> Option<usize> {
+    let bytes = content.as_bytes();
+    let mut depth = 0usize;
+    let mut index = open_brace;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+
+        index += 1;
+    }
+
+    None
+}
+
+fn namespace_for_offset(root: Node, content: &str, offset: usize) -> Option<String> {
+    let point = point_for_offset(content, offset);
+    let node = root.descendant_for_point_range(point, point)?;
+    get_namespace(&node, content.as_bytes())
+}
+
+fn point_for_offset(content: &str, offset: usize) -> tree_sitter::Point {
+    let clamped = offset.min(content.len());
+    let prefix = &content[..clamped];
+    let row = prefix.bytes().filter(|byte| *byte == b'\n').count();
+    let col = prefix
+        .rsplit_once('\n')
+        .map(|(_, tail)| tail.len())
+        .unwrap_or(prefix.len());
+    tree_sitter::Point::new(row, col)
+}
+
 fn line_number_for_offset(content: &str, offset: usize) -> usize {
     content[..offset.min(content.len())]
         .bytes()
@@ -794,13 +1093,9 @@ fn collect_class_like(
     content_bytes: &[u8],
     classes: &mut Vec<ClassInfo>,
 ) {
-    let Some(parent) = node.parent() else {
+    let Some(parent) = find_class_like_container(node) else {
         return;
     };
-
-    if parent.child_by_field_name("body").is_none() {
-        return;
-    }
 
     let mut name = get_node_text(&node, content_bytes).to_string();
     let namespace = get_namespace(&parent, content_bytes);
@@ -833,6 +1128,29 @@ fn collect_class_like(
         is_final: node_has_token(parent, content_bytes, "final"),
         is_interface: node_has_child_kind(parent, "unreal_interface_macro"),
     });
+}
+
+fn find_class_like_container(node: Node) -> Option<Node> {
+    let mut current = Some(node);
+
+    while let Some(candidate) = current {
+        if matches!(
+            candidate.kind(),
+            "class_specifier"
+                | "struct_specifier"
+                | "enum_specifier"
+                | "unreal_reflected_class_declaration"
+                | "unreal_reflected_struct_declaration"
+                | "unreal_reflected_enum_declaration"
+        ) && candidate.child_by_field_name("body").is_some()
+        {
+            return Some(candidate);
+        }
+
+        current = candidate.parent();
+    }
+
+    None
 }
 
 /// Attach a base class to the current class.
@@ -1026,7 +1344,11 @@ fn infer_access(node: Node, content_bytes: &[u8]) -> String {
     while let Some(parent) = current.parent() {
         if matches!(
             parent.kind(),
-            "field_declaration_list" | "class_specifier" | "struct_specifier"
+            "field_declaration_list"
+                | "class_specifier"
+                | "struct_specifier"
+                | "unreal_reflected_class_declaration"
+                | "unreal_reflected_struct_declaration"
         ) {
             let mut cursor = parent.walk();
 
@@ -1138,6 +1460,10 @@ fn get_node_text<'a>(node: &Node, source: &'a [u8]) -> &'a str {
     node.utf8_text(source).unwrap_or("")
 }
 
+fn strip_namespace(name: &str) -> &str {
+    name.rsplit("::").next().unwrap_or(name).trim()
+}
+
 /// Build namespace path from parent namespace/class/struct nodes.
 /// 从父级 namespace/class/struct 节点构造命名空间路径。
 fn get_namespace<'a>(node: &Node<'a>, source: &'a [u8]) -> Option<String> {
@@ -1147,7 +1473,11 @@ fn get_namespace<'a>(node: &Node<'a>, source: &'a [u8]) -> Option<String> {
     while let Some(parent) = current {
         if matches!(
             parent.kind(),
-            "namespace_definition" | "class_specifier" | "struct_specifier"
+            "namespace_definition"
+                | "class_specifier"
+                | "struct_specifier"
+                | "unreal_reflected_class_declaration"
+                | "unreal_reflected_struct_declaration"
         ) {
             if let Some(name) = parent.child_by_field_name("name") {
                 parts.push(get_node_text(&name, source).to_string());
@@ -1256,7 +1586,9 @@ pub(crate) fn clean_type_string(raw: &str) -> String {
 mod tests {
     use super::{
         collect_delegate_definitions, collect_gameplay_tags, collect_macro_definitions,
+        parse_content, QUERY_STR,
     };
+    use tree_sitter::Query;
 
     #[test]
     fn collect_gameplay_tag_definitions_and_declarations() {
@@ -1305,4 +1637,183 @@ DECLARE_DELEGATE_RetVal(bool, FCanOpenMenu);
         assert_eq!(delegates[2].class_name, "FCanOpenMenu");
         assert_eq!(delegates[2].symbol_type, "delegate");
     }
+
+    #[test]
+    fn parse_reflected_classes_with_unreal_macros_and_base_classes() {
+        let language: tree_sitter::Language = tree_sitter_unreal_cpp::LANGUAGE.into();
+        let query = Query::new(&language, QUERY_STR).expect("query should compile");
+        let content = r#"
+UCLASS(Blueprintable, MinimalAPI)
+class UGameplayAbility : public UObject, public IGameplayTaskOwnerInterface
+{
+    GENERATED_UCLASS_BODY()
+};
+
+UCLASS(Blueprintable, meta = (ShowWorldContextPin), hidecategories = (Replication), MinimalAPI)
+class AGameplayCueNotify_Actor : public AActor
+{
+    GENERATED_UCLASS_BODY()
+};
+"#;
+
+        let (classes, _, _) =
+            parse_content(content, "GameplayAbilityLike.h", &language, &query).expect("parse should succeed");
+
+        let gameplay_ability = classes
+            .iter()
+            .find(|class_info| class_info.class_name == "UGameplayAbility")
+            .expect("UGameplayAbility should be indexed");
+        assert_eq!(gameplay_ability.symbol_type, "UCLASS");
+        assert_eq!(
+            gameplay_ability.base_classes,
+            vec![
+                "UObject".to_string(),
+                "IGameplayTaskOwnerInterface".to_string()
+            ]
+        );
+
+        let gameplay_cue = classes
+            .iter()
+            .find(|class_info| class_info.class_name == "AGameplayCueNotify_Actor")
+            .expect("AGameplayCueNotify_Actor should be indexed");
+        assert_eq!(gameplay_cue.symbol_type, "UCLASS");
+        assert_eq!(gameplay_cue.base_classes, vec!["AActor".to_string()]);
+    }
+
+    #[test]
+    fn parse_uinterface_and_preserve_reflected_access_levels() {
+        let language: tree_sitter::Language = tree_sitter_unreal_cpp::LANGUAGE.into();
+        let query = Query::new(&language, QUERY_STR).expect("query should compile");
+        let content = r#"
+namespace Outer
+{
+UINTERFACE(BlueprintType)
+class SAMPLE_API UMyInterface : public UInterface
+{
+    GENERATED_BODY()
+protected:
+    UFUNCTION()
+    void HiddenAction();
+private:
+    int32 HiddenValue;
+};
+}
+"#;
+
+        let (classes, _, _) =
+            parse_content(content, "MyInterface.h", &language, &query).expect("parse should succeed");
+
+        let interface_class = classes
+            .iter()
+            .find(|class_info| class_info.class_name == "UMyInterface")
+            .expect("UMyInterface should be indexed");
+        assert_eq!(interface_class.symbol_type, "UINTERFACE");
+        assert_eq!(interface_class.namespace.as_deref(), Some("Outer"));
+        assert_eq!(interface_class.base_classes, vec!["UInterface".to_string()]);
+        assert!(interface_class.is_interface);
+
+        let hidden_action = interface_class
+            .members
+            .iter()
+            .find(|member| member.name == "HiddenAction")
+            .expect("HiddenAction should be indexed");
+        assert_eq!(hidden_action.access, "protected");
+
+        let hidden_value = interface_class
+            .members
+            .iter()
+            .find(|member| member.name == "HiddenValue")
+            .expect("HiddenValue should be indexed");
+        assert_eq!(hidden_value.access, "private");
+    }
+
+    #[test]
+    fn parse_uenum_with_underlying_type_and_namespace() {
+        let language: tree_sitter::Language = tree_sitter_unreal_cpp::LANGUAGE.into();
+        let query = Query::new(&language, QUERY_STR).expect("query should compile");
+        let content = r#"
+namespace Demo
+{
+UENUM(BlueprintType)
+enum class EAbilityPhase : uint8
+{
+    None,
+    Start,
+    End,
+};
+}
+"#;
+
+        let (classes, _, _) =
+            parse_content(content, "AbilityPhase.h", &language, &query).expect("parse should succeed");
+
+        let enum_info = classes
+            .iter()
+            .find(|class_info| class_info.class_name == "EAbilityPhase")
+            .expect("EAbilityPhase should be indexed");
+        assert_eq!(enum_info.symbol_type, "UENUM");
+        assert_eq!(enum_info.namespace.as_deref(), Some("Demo"));
+    }
+}
+
+fn normalize_member_access(content_bytes: &[u8], classes: &mut [ClassInfo]) {
+    let Ok(content) = std::str::from_utf8(content_bytes) else {
+        return;
+    };
+
+    for class_info in classes {
+        if class_info.members.is_empty()
+            || !matches!(
+                class_info.symbol_type.as_str(),
+                "class" | "struct" | "UCLASS" | "USTRUCT" | "UINTERFACE"
+            )
+        {
+            continue;
+        }
+
+        let Some(snippet) = content.get(class_info.range_start..class_info.range_end) else {
+            continue;
+        };
+
+        let default_access = if matches!(class_info.symbol_type.as_str(), "struct" | "USTRUCT") {
+            "public"
+        } else {
+            "private"
+        };
+
+        for member in &mut class_info.members {
+            if member.access == "impl" {
+                continue;
+            }
+
+            member.access = access_for_member_line(snippet, class_info.line, member.line, default_access).to_string();
+        }
+    }
+}
+
+fn access_for_member_line<'a>(
+    snippet: &'a str,
+    class_line: usize,
+    member_line: usize,
+    default_access: &'a str,
+) -> &'a str {
+    let mut access = default_access;
+
+    for (index, raw_line) in snippet.lines().enumerate() {
+        let line_number = class_line + index;
+        if line_number > member_line {
+            break;
+        }
+
+        let trimmed = raw_line.trim();
+        if trimmed.starts_with("public:") {
+            access = "public";
+        } else if trimmed.starts_with("protected:") {
+            access = "protected";
+        } else if trimmed.starts_with("private:") {
+            access = "private";
+        }
+    }
+
+    access
 }

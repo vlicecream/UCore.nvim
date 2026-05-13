@@ -280,6 +280,9 @@ local function normalize_kind(kind)
 	if lowered == "uclass" then
 		return "class"
 	end
+	if lowered == "uinterface" then
+		return "class"
+	end
 	if lowered == "ustruct" then
 		return "struct"
 	end

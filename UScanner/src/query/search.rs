@@ -112,7 +112,7 @@ pub fn search_symbols(
                 ELSE 9
             END,
             CASE
-                WHEN COALESCE(sfts.type, '') IN ('class', 'struct', 'enum', 'UCLASS', 'USTRUCT', 'UENUM') THEN 0
+                WHEN COALESCE(sfts.type, '') IN ('class', 'struct', 'enum', 'UCLASS', 'USTRUCT', 'UENUM', 'UINTERFACE') THEN 0
                 WHEN lower(COALESCE(sfts.type, '')) LIKE '%function%' OR lower(COALESCE(sfts.type, '')) LIKE '%method%' THEN 1
                 ELSE 2
             END,
@@ -567,7 +567,7 @@ pub fn search_class_symbols(
 
 fn class_symbol_predicate(alias: &str) -> String {
     format!(
-        "COALESCE({alias}.type, '') IN ('class', 'struct', 'enum', 'UCLASS', 'USTRUCT', 'UENUM')"
+        "COALESCE({alias}.type, '') IN ('class', 'struct', 'enum', 'UCLASS', 'USTRUCT', 'UENUM', 'UINTERFACE')"
     )
 }
 
@@ -761,7 +761,7 @@ fn search_symbols_fuzzy_fallback(
         WHERE {}
         ORDER BY
             CASE
-                WHEN COALESCE(sfts.type, '') IN ('class', 'struct', 'enum', 'UCLASS', 'USTRUCT', 'UENUM') THEN 0
+                WHEN COALESCE(sfts.type, '') IN ('class', 'struct', 'enum', 'UCLASS', 'USTRUCT', 'UENUM', 'UINTERFACE') THEN 0
                 WHEN lower(COALESCE(sfts.type, '')) LIKE '%function%' OR lower(COALESCE(sfts.type, '')) LIKE '%method%' THEN 1
                 ELSE 2
             END,

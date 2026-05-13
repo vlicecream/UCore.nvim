@@ -1140,7 +1140,7 @@ end
 
 local function forward_decl_keyword(symbol_type)
 	symbol_type = tostring(symbol_type or "")
-	if symbol_type == "class" or symbol_type == "UCLASS" then
+	if symbol_type == "class" or symbol_type == "UCLASS" or symbol_type == "UINTERFACE" then
 		return "class"
 	end
 	if symbol_type == "struct" or symbol_type == "USTRUCT" then

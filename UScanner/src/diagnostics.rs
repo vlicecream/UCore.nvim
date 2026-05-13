@@ -2533,15 +2533,17 @@ fn build_log_diagnostics(output: &str) -> Vec<DiagnosticItem> {
 
 fn starts_unreal_type_macro(text: &str) -> bool {
     text.starts_with("UCLASS(")
+        || text.starts_with("UINTERFACE(")
         || text.starts_with("USTRUCT(")
         || text.starts_with("UENUM(")
         || text == "UCLASS"
+        || text == "UINTERFACE"
         || text == "USTRUCT"
         || text == "UENUM"
 }
 
 fn macro_matches_declaration(macro_line: &str, declaration: &str) -> bool {
-    if macro_line.starts_with("UCLASS") {
+    if macro_line.starts_with("UCLASS") || macro_line.starts_with("UINTERFACE") {
         declaration.contains("class ")
     } else if macro_line.starts_with("USTRUCT") {
         declaration.contains("struct ")
@@ -2583,7 +2585,11 @@ fn declaration_block_has_generated_body(lines: &[&str], declaration_index: usize
     let end = (declaration_index + 20).min(lines.len());
     lines[declaration_index..end]
         .iter()
-        .any(|line| line.contains("GENERATED_BODY") || line.contains("GENERATED_UCLASS_BODY"))
+        .any(|line| {
+            line.contains("GENERATED_BODY")
+                || line.contains("GENERATED_UCLASS_BODY")
+                || line.contains("GENERATED_UINTERFACE_BODY")
+        })
 }
 
 fn next_meaningful_line<'a>(lines: &'a [&str], start: usize) -> Option<(usize, &'a str)> {
