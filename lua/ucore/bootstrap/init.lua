@@ -426,7 +426,6 @@ function M.boot(callback, opts)
 		project_root = payload.project_root,
 	})
 	status.start("UCore Initializing...")
-	status.progress_finish("UCore Syntax Highlight", "UCore Syntax Highlight 100%")
 	server_start_progress(0, "Starting backend...")
 	server_ready_progress(0, "Waiting for RPC...")
 	workspace_register_progress(0, "Registering workspace...")

@@ -51,7 +51,6 @@ local panels = {
 		"progress:UCore Server Start",
 		"progress:UCore Server Ready",
 		"progress:UCore Workspace Register",
-		"progress:UCore Syntax Highlight",
 		"progress:UCore Project Discovery",
 		"progress:UCore Project DB Prepare",
 		"progress:UCore Project Analysis",
