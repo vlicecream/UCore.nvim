@@ -6,6 +6,18 @@ local rpc = require("ucore.client.rpc")
 
 local M = {}
 local recovery_pending = {}
+local inflight_file_symbols = {}
+
+local function normalize_key_part(value)
+	return tostring(value or ""):gsub("\\", "/"):lower()
+end
+
+local function file_symbols_key(project_root, file_path)
+	return table.concat({
+		normalize_key_part(project_root),
+		normalize_key_part(file_path),
+	}, "::")
+end
 
 local function blocked_query_result(kind)
 	if kind == "GetDiagnostics" or kind == "ParseBuildDiagnostics" then
@@ -205,10 +217,24 @@ end
 -- Fetch indexed symbols declared in one source file.
 -- 获取某个源码文件中声明的已索引符号。
 function M.get_file_symbols(project_root, file_path, callback)
+	local key = file_symbols_key(project_root, file_path)
+	local waiters = inflight_file_symbols[key]
+	if waiters then
+		table.insert(waiters, callback)
+		return
+	end
+
+	inflight_file_symbols[key] = { callback }
 	M.query(project_root, {
 		kind = "GetFileSymbols",
 		file_path = file_path,
-	}, callback)
+	}, function(result, err)
+		local pending = inflight_file_symbols[key] or {}
+		inflight_file_symbols[key] = nil
+		for _, waiter in ipairs(pending) do
+			waiter(result, err)
+		end
+	end)
 end
 
 -- Fetch members declared on a class.

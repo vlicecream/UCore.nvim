@@ -319,10 +319,15 @@ local function flush_query_waiters(kind, root, name, result, err)
 	end
 end
 
-local function get_asset_usages_cached(root, name, callback)
+local function get_asset_usages_cached(root, name, callback, opts)
+	opts = opts or {}
+
 	local cached = get_cached_query("asset_usages", root, name)
 	if cached ~= nil then
 		return callback(cached, nil)
+	end
+	if opts.allow_remote == false then
+		return callback(nil, nil)
 	end
 	if push_query_waiter("asset_usages", root, name, callback) then
 		return
@@ -471,25 +476,33 @@ end
 
 local function fetch_class_hint(root, target, callback)
 	get_asset_usages_cached(root, target.name, function(usage_result)
+		if type(usage_result) ~= "table" then
+			return callback(target)
+		end
 		local derived_count = type(usage_result) == "table" and #list_value(usage_result.derived) or 0
 		callback(vim.tbl_extend("force", target, {
 			derived_count = derived_count,
 			hint_text = class_hint_text(derived_count),
 		}))
-	end)
+	end, {
+		allow_remote = false,
+	})
 end
 
 local function fetch_member_hint(root, target, callback)
 	get_asset_usages_cached(root, target.name, function(result)
-		local reference_count = 0
-		if type(result) == "table" then
-			reference_count = #list_value(result.references) + #list_value(result.function_references)
+		if type(result) ~= "table" then
+			return callback(target)
 		end
+		local reference_count = 0
+		reference_count = #list_value(result.references) + #list_value(result.function_references)
 		callback(vim.tbl_extend("force", target, {
 			reference_count = reference_count,
 			hint_text = member_hint_text(reference_count),
 		}))
-	end)
+	end, {
+		allow_remote = false,
+	})
 end
 
 local function refresh_buffer(bufnr)
