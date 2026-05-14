@@ -310,7 +310,8 @@ pub fn fast_find(
     extend_json_array(&mut results, fast_find_symbols(conn, pattern, target.max(limit))?);
     extend_json_array(&mut results, search_files_for_global(conn, pattern, target.max(limit))?);
 
-    if results.len() < target {
+    let should_run_fallback = results.len() < target && !has_strong_explicit_type_match(&results, pattern);
+    if should_run_fallback {
         extend_json_array(
             &mut results,
             search_symbols_fuzzy_fallback(conn, pattern, FIND_FUZZY_FALLBACK_LIMIT)?,
@@ -340,6 +341,10 @@ fn fast_find_symbols(conn: &Connection, pattern: &str, limit: usize) -> anyhow::
     let prefix_query = format!("{}%", escape_like(&query));
     let contains_query = format!("%{}%", escape_like(&query));
     let allow_owner_match = !is_explicit_type_query(query_text);
+    let allow_compact_name_match = is_identifier_query(query_text);
+    let compact_query = compact_identifier(query_text);
+    let compact_prefix_query = format!("{}%", escape_like(&compact_query));
+    let compact_contains_query = format!("%{}%", escape_like(&compact_query));
     let owner_rank_sql = if allow_owner_match {
         "WHEN lower(COALESCE(sfts.class_name, '')) LIKE ? ESCAPE '\\' THEN 3"
     } else {
@@ -347,6 +352,20 @@ fn fast_find_symbols(conn: &Connection, pattern: &str, limit: usize) -> anyhow::
     };
     let owner_where_sql = if allow_owner_match {
         " OR lower(COALESCE(sfts.class_name, '')) LIKE ? ESCAPE '\\'"
+    } else {
+        ""
+    };
+    let compact_rank_sql = if allow_compact_name_match {
+        r#"
+                    WHEN lower(replace(replace(COALESCE(sfts.name, ''), '_', ''), ':', '')) = ? THEN 3
+                    WHEN lower(replace(replace(COALESCE(sfts.name, ''), '_', ''), ':', '')) LIKE ? ESCAPE '\' THEN 4
+                    WHEN lower(replace(replace(COALESCE(sfts.name, ''), '_', ''), ':', '')) LIKE ? ESCAPE '\' THEN 5
+        "#
+    } else {
+        ""
+    };
+    let compact_where_sql = if allow_compact_name_match {
+        " OR lower(replace(replace(COALESCE(sfts.name, ''), '_', ''), ':', '')) LIKE ? ESCAPE '\\'"
     } else {
         ""
     };
@@ -365,10 +384,12 @@ fn fast_find_symbols(conn: &Connection, pattern: &str, limit: usize) -> anyhow::
                     WHEN lower(sfts.name) LIKE ? ESCAPE '\' THEN 1
                     WHEN lower(sfts.name) LIKE ? ESCAPE '\' THEN 2
                     {}
+                    {}
                     ELSE 9
                 END AS rank
             FROM symbols_fts sfts
             WHERE lower(sfts.name) LIKE ? ESCAPE '\'
+               {}
                {}
             ORDER BY rank, lower(sfts.name) ASC
             LIMIT ?
@@ -392,7 +413,9 @@ fn fast_find_symbols(conn: &Connection, pattern: &str, limit: usize) -> anyhow::
         ORDER BY matched.rank, lower(matched.name) ASC, path ASC
         "#,
         PATH_CTE,
+        compact_rank_sql,
         owner_rank_sql,
+        compact_where_sql,
         owner_where_sql,
         class_symbol_predicate("matched"),
         class_symbol_predicate("matched")
@@ -404,10 +427,18 @@ fn fast_find_symbols(conn: &Connection, pattern: &str, limit: usize) -> anyhow::
         SqlValue::Text(prefix_query),
         SqlValue::Text(contains_query.clone()),
     ];
+    if allow_compact_name_match {
+        params.push(SqlValue::Text(compact_query.clone()));
+        params.push(SqlValue::Text(compact_prefix_query));
+        params.push(SqlValue::Text(compact_contains_query.clone()));
+    }
     if allow_owner_match {
         params.push(SqlValue::Text(contains_query.clone()));
     }
     params.push(SqlValue::Text(contains_query.clone()));
+    if allow_compact_name_match {
+        params.push(SqlValue::Text(compact_contains_query));
+    }
     if allow_owner_match {
         params.push(SqlValue::Text(contains_query));
     }
@@ -627,6 +658,36 @@ fn is_explicit_type_query(query: &str) -> bool {
     }
 
     query.chars().next().map(|ch| ch.is_ascii_uppercase()).unwrap_or(false)
+}
+
+fn compact_identifier(input: &str) -> String {
+    input
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
+}
+
+fn has_strong_explicit_type_match(results: &[Value], pattern: &str) -> bool {
+    if !is_explicit_type_query(pattern.trim()) {
+        return false;
+    }
+
+    let compact_query = compact_identifier(pattern.trim());
+    if compact_query.is_empty() {
+        return false;
+    }
+
+    results.iter().any(|item| {
+        let symbol_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+        if !is_class_like_symbol_type(symbol_type) {
+            return false;
+        }
+
+        let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+        let compact_name = compact_identifier(name);
+        !compact_name.is_empty() && compact_name.contains(&compact_query)
+    })
 }
 
 fn suppress_broad_class_contains_when_exact_type_exists(results: &mut Vec<Value>, pattern: &str) {
@@ -1342,5 +1403,19 @@ mod tests {
 
         assert!(items.iter().any(|item| item["name"] == "UGameplayAbility"));
         assert!(!items.iter().any(|item| item["name"] == "UGameplayAbilityStatics"));
+    }
+
+    #[test]
+    fn fast_find_matches_unreal_type_names_without_underscores() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let file_id = insert_project_header_file(&conn, "Game", "GameplayCueNotify_Actor.h");
+        insert_class_symbol(&conn, file_id, "AGameplayCueNotify_Actor");
+
+        let items = fast_find(&conn, "GameplayCueNotifyActor", 20, 0).unwrap();
+        let items = items.as_array().unwrap();
+
+        assert!(items.iter().any(|item| item["name"] == "AGameplayCueNotify_Actor"));
     }
 }
