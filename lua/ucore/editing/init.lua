@@ -30,7 +30,6 @@ function M.apply_indent(bufnr)
 		if config.values.editing.indent.fallback_cindent ~= false then
 			-- Some distros install a tree-sitter indentexpr for unknown filetypes.
 			-- unreal_cpp should fall back to stock C++ indentation instead.
-			vim.bo.indentexpr = ""
 			vim.bo.autoindent = true
 			vim.bo.smartindent = false
 			vim.bo.cindent = true
