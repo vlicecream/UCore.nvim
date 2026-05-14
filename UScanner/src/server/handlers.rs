@@ -46,6 +46,115 @@ struct QueryPerfWindow {
     stats: HashMap<&'static str, QueryPerfStat>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SearchQueryProfile {
+    is_identifier: bool,
+    is_short: bool,
+    is_sym_strong: bool,
+    is_path_like: bool,
+    is_literal_code: bool,
+    is_text_like: bool,
+    looks_like_unreal_type: bool,
+}
+
+impl SearchQueryProfile {
+    fn classify(query: &str) -> Self {
+        Self {
+            is_identifier: live_find_is_identifier_query(query),
+            is_short: live_find_is_short_query(query),
+            is_sym_strong: live_find_is_sym_strong_query(query),
+            is_path_like: live_find_is_path_like_query(query),
+            is_literal_code: live_find_is_literal_code_query(query),
+            is_text_like: live_find_is_text_like_query(query),
+            looks_like_unreal_type: live_find_looks_like_unreal_type_query(query),
+        }
+    }
+
+    fn tag_summary(&self) -> String {
+        let mut tags = Vec::new();
+        if self.is_short {
+            tags.push("SHORT");
+        }
+        if self.is_sym_strong {
+            tags.push("SYM_STRONG");
+        }
+        if self.is_path_like {
+            tags.push("PATH_LIKE");
+        }
+        if self.is_literal_code {
+            tags.push("LITERAL_CODE");
+        }
+        if self.is_text_like {
+            tags.push("TEXT_LIKE");
+        }
+        if tags.is_empty() {
+            return "GENERIC".to_string();
+        }
+        tags.join("|")
+    }
+
+    fn should_run_live_find_text_stage(&self, hqh: usize, repeated_query: bool) -> bool {
+        if self.is_short || self.is_path_like {
+            return false;
+        }
+
+        if hqh >= 10 {
+            return false;
+        }
+
+        if self.is_sym_strong {
+            return repeated_query && hqh == 0;
+        }
+
+        if self.is_literal_code || self.is_text_like {
+            return true;
+        }
+
+        hqh < 4
+    }
+
+    fn reference_engine_skip_reason(
+        &self,
+        scope: &str,
+        project_result_count: usize,
+        project_path_count: usize,
+        found_definition: bool,
+        cursor_in_project: bool,
+    ) -> Option<&'static str> {
+        if matches!(scope, "local" | "member") {
+            return Some("scope_local");
+        }
+
+        if !cursor_in_project || project_result_count == 0 {
+            return None;
+        }
+
+        if found_definition && project_result_count >= 24 {
+            return Some("project_definition_dense");
+        }
+
+        if self.is_sym_strong {
+            if self.looks_like_unreal_type && project_result_count >= 4 && project_path_count >= 2 {
+                return Some("unreal_type_project_hits");
+            }
+
+            if project_result_count >= 8 {
+                return Some("sym_strong_project_hits");
+            }
+        }
+
+        if self.is_identifier && !self.is_text_like && project_result_count >= 16 {
+            return Some("identifier_project_hits");
+        }
+
+        if project_result_count >= 40 || project_path_count >= 8 {
+            return Some("project_hits_dense");
+        }
+
+        None
+    }
+}
+
 fn hash_text(text: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     text.hash(&mut hasher);
@@ -1194,6 +1303,8 @@ fn find_references_with_engine(
     line: Option<u32>,
     character: Option<u32>,
 ) -> Result<Value> {
+    let log_enabled = fast_find_log_enabled() || query_log_enabled();
+    let profile = SearchQueryProfile::classify(symbol_name);
     let project_value = query::usage::find_symbol_usages_for_cursor(
         project_conn,
         symbol_name,
@@ -1217,11 +1328,36 @@ fn find_references_with_engine(
         .get("scope")
         .and_then(Value::as_str)
         .unwrap_or("global");
+    let cursor_in_project = file_path
+        .map(|path| file_exists_in_index(project_conn, path))
+        .unwrap_or(false);
+    let project_result_count = results.len();
+    let project_path_count = result_path_count(&results);
+    let skip_reason = profile.reference_engine_skip_reason(
+        scope,
+        project_result_count,
+        project_path_count,
+        found_definition,
+        cursor_in_project,
+    );
 
-    // Project-local scopes should not merge Engine DB results; otherwise common member
-    // names like CameraComponent get polluted by unrelated Engine symbols.
-    // 项目内局部/成员作用域不合并 Engine DB，否则 CameraComponent 这类同名成员会被引擎源码污染。
-    if matches!(scope, "local" | "member") {
+    if log_enabled {
+        info!(
+            target: "ucore::fast_find",
+            "FindReferences project symbol={:?} tags={} scope={} cursor_in_project={} project={} files={} found_definition={} engine_merge={} reason={}",
+            symbol_name,
+            profile.tag_summary(),
+            scope,
+            cursor_in_project,
+            project_result_count,
+            project_path_count,
+            found_definition,
+            skip_reason.is_none(),
+            skip_reason.unwrap_or("eligible")
+        );
+    }
+
+    if skip_reason.is_some() {
         return Ok(json!({
             "results": results,
             "searched_files": searched_files,
@@ -1283,7 +1419,23 @@ fn find_references_with_engine(
 
             let mut engine_results = nested_results_array(&engine_value);
             tag_source(&mut engine_results, "engine");
+            let engine_result_count = engine_results.len();
             merge_query_results(&mut results, engine_results, 300);
+
+            if log_enabled {
+                info!(
+                    target: "ucore::fast_find",
+                    "FindReferences merge symbol={:?} tags={} scope={} project={} engine={} total={} searched_files={} found_definition={}",
+                    symbol_name,
+                    profile.tag_summary(),
+                    scope,
+                    project_result_count,
+                    engine_result_count,
+                    results.len(),
+                    searched_files,
+                    found_definition
+                );
+            }
         }
         Err(err) => {
             warn!("Failed to query Engine DB references: {}", err);
@@ -1839,26 +1991,7 @@ fn unified_live_find_with_engine(
 }
 
 fn live_find_tag_summary(pattern: &str) -> String {
-    let mut tags = Vec::new();
-    if live_find_is_short_query(pattern) {
-        tags.push("SHORT");
-    }
-    if live_find_is_sym_strong_query(pattern) {
-        tags.push("SYM_STRONG");
-    }
-    if live_find_is_path_like_query(pattern) {
-        tags.push("PATH_LIKE");
-    }
-    if live_find_is_literal_code_query(pattern) {
-        tags.push("LITERAL_CODE");
-    }
-    if live_find_is_text_like_query(pattern) {
-        tags.push("TEXT_LIKE");
-    }
-    if tags.is_empty() {
-        return "GENERIC".to_string();
-    }
-    tags.join("|")
+    SearchQueryProfile::classify(pattern).tag_summary()
 }
 
 fn live_find_text_limit(pattern: &str, limit: usize, repeated_query: bool) -> usize {
@@ -1870,23 +2003,7 @@ fn live_find_text_limit(pattern: &str, limit: usize, repeated_query: bool) -> us
 }
 
 fn should_run_live_find_text_stage(pattern: &str, hqh: usize, repeated_query: bool) -> bool {
-    if live_find_is_short_query(pattern) || live_find_is_path_like_query(pattern) {
-        return false;
-    }
-
-    if hqh >= 10 {
-        return false;
-    }
-
-    if live_find_is_sym_strong_query(pattern) {
-        return repeated_query && hqh == 0;
-    }
-
-    if live_find_is_literal_code_query(pattern) || live_find_is_text_like_query(pattern) {
-        return true;
-    }
-
-    hqh < 4
+    SearchQueryProfile::classify(pattern).should_run_live_find_text_stage(hqh, repeated_query)
 }
 
 fn live_find_is_identifier_query(query: &str) -> bool {
@@ -2252,6 +2369,36 @@ fn live_find_hqh_count(results: &[Value]) -> usize {
             matches!(quality, "exact_symbol" | "prefix_symbol" | "normalized_symbol")
         })
         .count()
+}
+
+fn file_exists_in_index(conn: &rusqlite::Connection, path: &str) -> bool {
+    let path = normalize_to_unix(path);
+    conn.query_row(
+        r#"
+        SELECT 1
+        FROM files f
+        JOIN dir_paths dp ON f.directory_id = dp.id
+        JOIN strings sn ON f.filename_id = sn.id
+        WHERE lower(dp.full_path || '/' || sn.text) = lower(?)
+        LIMIT 1
+        "#,
+        [path.as_str()],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
+fn result_path_count(results: &[Value]) -> usize {
+    results
+        .iter()
+        .filter_map(|item| {
+            item.get("path")
+                .or_else(|| item.get("file_path"))
+                .and_then(Value::as_str)
+                .map(str::to_ascii_lowercase)
+        })
+        .collect::<HashSet<_>>()
+        .len()
 }
 
 fn module_name_for_file(conn: &rusqlite::Connection, path: &str) -> Option<String> {
