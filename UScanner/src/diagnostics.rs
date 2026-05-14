@@ -6,9 +6,17 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::Path;
+use std::sync::OnceLock;
+use std::time::Instant;
 use tree_sitter::Parser;
+use tracing::info;
 
 use crate::types::OpenBufferOverlay;
+
+const PROJECT_TEXT_VISIBILITY_SCAN_LIMIT: usize = 64;
+const ENGINE_TEXT_VISIBILITY_SCAN_LIMIT: usize = 0;
+
+static DIAGNOSTICS_LOG_ENABLED: OnceLock<bool> = OnceLock::new();
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -70,27 +78,102 @@ pub fn process_diagnostics(
     open_files: &[OpenBufferOverlay],
 ) -> Result<Value> {
     let mut items = Vec::new();
-    items.extend(unreal_rule_diagnostics(content, file_path.as_deref())?);
-    items.extend(unreal_include_diagnostics(conn, content, file_path.as_deref())?);
-    items.extend(missing_return_diagnostics(content, file_path.as_deref())?);
-    items.extend(override_diagnostics(conn, engine_conn, content, file_path.as_deref())?);
-    items.extend(missing_visible_type_diagnostics(
-        conn,
-        engine_conn,
-        content,
-        file_path.as_deref(),
-    )?);
-    items.extend(incomplete_member_declaration_diagnostics(
-        content,
-        file_path.as_deref(),
-    )?);
-    items.extend(missing_implementation_diagnostics(
-        conn,
-        content,
-        file_path.as_deref(),
-        open_files,
-    )?);
+    let log_enabled = diagnostics_log_enabled();
+    let file_label = file_path.as_deref().unwrap_or("-");
+
+    extend_diagnostic_phase(
+        &mut items,
+        "unreal_rules",
+        file_label,
+        log_enabled,
+        || unreal_rule_diagnostics(content, file_path.as_deref()),
+    )?;
+    extend_diagnostic_phase(
+        &mut items,
+        "include_rules",
+        file_label,
+        log_enabled,
+        || unreal_include_diagnostics(conn, content, file_path.as_deref()),
+    )?;
+    extend_diagnostic_phase(
+        &mut items,
+        "missing_return",
+        file_label,
+        log_enabled,
+        || missing_return_diagnostics(content, file_path.as_deref()),
+    )?;
+    extend_diagnostic_phase(
+        &mut items,
+        "override_rules",
+        file_label,
+        log_enabled,
+        || override_diagnostics(conn, engine_conn, content, file_path.as_deref()),
+    )?;
+    extend_diagnostic_phase(
+        &mut items,
+        "visible_types",
+        file_label,
+        log_enabled,
+        || {
+            missing_visible_type_diagnostics(
+                conn,
+                engine_conn,
+                content,
+                file_path.as_deref(),
+            )
+        },
+    )?;
+    extend_diagnostic_phase(
+        &mut items,
+        "incomplete_member_decl",
+        file_label,
+        log_enabled,
+        || incomplete_member_declaration_diagnostics(content, file_path.as_deref()),
+    )?;
+    extend_diagnostic_phase(
+        &mut items,
+        "missing_impl",
+        file_label,
+        log_enabled,
+        || missing_implementation_diagnostics(conn, content, file_path.as_deref(), open_files),
+    )?;
     Ok(json!({ "items": items }))
+}
+
+fn diagnostics_log_enabled() -> bool {
+    *DIAGNOSTICS_LOG_ENABLED.get_or_init(|| {
+        std::env::var("UCORE_QUERY_LOG")
+            .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "on" | "ON"))
+            .unwrap_or(false)
+    })
+}
+
+fn extend_diagnostic_phase<F>(
+    items: &mut Vec<DiagnosticItem>,
+    phase_name: &'static str,
+    file_label: &str,
+    log_enabled: bool,
+    build: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Result<Vec<DiagnosticItem>>,
+{
+    let started_at = Instant::now();
+    let phase_items = build()?;
+
+    if log_enabled {
+        info!(
+            target: "ucore::diagnostics",
+            "Diagnostics phase file={} phase={} ms={} items={}",
+            file_label,
+            phase_name,
+            started_at.elapsed().as_millis(),
+            phase_items.len()
+        );
+    }
+
+    items.extend(phase_items);
+    Ok(())
 }
 
 pub fn parse_build_diagnostics(output: &str) -> Value {
@@ -293,6 +376,8 @@ fn missing_visible_type_diagnostics(
         .map(|engine_conn| reachable_engine_file_ids(engine_conn, &engine_seed_include_paths))
         .unwrap_or_default();
     let mut seen = HashSet::new();
+    let mut project_lookup_cache = HashMap::new();
+    let mut engine_lookup_cache = HashMap::new();
     let mut project_text_visibility_cache = HashMap::new();
     let mut engine_text_visibility_cache = HashMap::new();
     let mut items = Vec::new();
@@ -308,6 +393,8 @@ fn missing_visible_type_diagnostics(
         &engine_seed_include_paths,
         &project_visible_file_ids,
         &engine_visible_file_ids,
+        &mut project_lookup_cache,
+        &mut engine_lookup_cache,
         &mut project_text_visibility_cache,
         &mut engine_text_visibility_cache,
         &mut seen,
@@ -328,6 +415,8 @@ fn collect_missing_visible_type_items(
     engine_seed_include_paths: &HashSet<String>,
     project_visible_file_ids: &HashSet<i64>,
     engine_visible_file_ids: &HashSet<i64>,
+    project_lookup_cache: &mut HashMap<String, TypeVisibilityMatch>,
+    engine_lookup_cache: &mut HashMap<String, TypeVisibilityMatch>,
     project_text_visibility_cache: &mut HashMap<String, bool>,
     engine_text_visibility_cache: &mut HashMap<String, bool>,
     seen: &mut HashSet<(u32, u32, String)>,
@@ -372,7 +461,8 @@ fn collect_missing_visible_type_items(
             continue;
         }
 
-        let project_match = lookup_type_visibility(
+        let project_match = cached_type_visibility_lookup(
+            project_lookup_cache,
             conn,
             &reference.name,
             Some(project_visible_file_ids),
@@ -386,6 +476,7 @@ fn collect_missing_visible_type_items(
                     &reference.name,
                     project_visible_file_ids,
                     project_text_visibility_cache,
+                    PROJECT_TEXT_VISIBILITY_SCAN_LIMIT,
                 )?);
 
         if project_visible {
@@ -393,7 +484,8 @@ fn collect_missing_visible_type_items(
         }
 
         let engine_match = if let Some(engine_conn) = engine_conn {
-            lookup_type_visibility(
+            cached_type_visibility_lookup(
+                engine_lookup_cache,
                 engine_conn,
                 &reference.name,
                 Some(engine_visible_file_ids),
@@ -411,6 +503,7 @@ fn collect_missing_visible_type_items(
                         &reference.name,
                         engine_visible_file_ids,
                         engine_text_visibility_cache,
+                        ENGINE_TEXT_VISIBILITY_SCAN_LIMIT,
                     )?)
         } else {
             false
@@ -452,6 +545,8 @@ fn collect_missing_visible_type_items(
             engine_seed_include_paths,
             project_visible_file_ids,
             engine_visible_file_ids,
+            project_lookup_cache,
+            engine_lookup_cache,
             project_text_visibility_cache,
             engine_text_visibility_cache,
             seen,
@@ -1538,6 +1633,22 @@ fn lookup_type_visibility(
     Ok(matched)
 }
 
+fn cached_type_visibility_lookup(
+    cache: &mut HashMap<String, TypeVisibilityMatch>,
+    conn: &Connection,
+    type_name: &str,
+    visible_file_ids: Option<&HashSet<i64>>,
+    include_paths: Option<&HashSet<String>>,
+) -> Result<TypeVisibilityMatch> {
+    if let Some(cached) = cache.get(type_name) {
+        return Ok(cached.clone());
+    }
+
+    let value = lookup_type_visibility(conn, type_name, visible_file_ids, include_paths)?;
+    cache.insert(type_name.to_string(), value.clone());
+    Ok(value)
+}
+
 fn include_path_from_file_path(file_path: &str) -> Option<String> {
     let normalized = file_path.replace('\\', "/");
     if normalized.is_empty() {
@@ -1590,12 +1701,13 @@ fn visible_type_declared_in_files(
     type_name: &str,
     visible_file_ids: &HashSet<i64>,
     cache: &mut HashMap<String, bool>,
+    scan_limit: usize,
 ) -> Result<bool> {
     if let Some(cached) = cache.get(type_name) {
         return Ok(*cached);
     }
 
-    let declared = type_declared_in_file_set(conn, type_name, visible_file_ids)?;
+    let declared = type_declared_in_file_set(conn, type_name, visible_file_ids, scan_limit)?;
     cache.insert(type_name.to_string(), declared);
     Ok(declared)
 }
@@ -1604,8 +1716,9 @@ fn type_declared_in_file_set(
     conn: &Connection,
     type_name: &str,
     visible_file_ids: &HashSet<i64>,
+    scan_limit: usize,
 ) -> Result<bool> {
-    if visible_file_ids.is_empty() || type_name.trim().is_empty() {
+    if visible_file_ids.is_empty() || type_name.trim().is_empty() || scan_limit == 0 {
         return Ok(false);
     }
 
@@ -1628,7 +1741,7 @@ fn type_declared_in_file_set(
         "#,
     )?;
 
-    for file_id in visible_file_ids {
+    for file_id in visible_file_ids.iter().take(scan_limit) {
         let full_path: String = match stmt.query_row([file_id], |row| row.get(0)) {
             Ok(path) => path,
             Err(_) => continue,

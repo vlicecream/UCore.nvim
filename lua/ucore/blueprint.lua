@@ -10,6 +10,11 @@ local pending = {}
 local refresh_seq = {}
 local query_cache = {}
 local query_waiters = {}
+local warm_queue = {}
+local warm_pending = {}
+local warm_running = false
+local hint_refresh_timers = {}
+local refresh_buffer
 
 local function normalize_path(path)
 	return tostring(path or ""):gsub("\\", "/"):gsub("/+", "/")
@@ -319,6 +324,29 @@ local function flush_query_waiters(kind, root, name, result, err)
 	end
 end
 
+local function schedule_hint_refresh(bufnr)
+	if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then
+		return
+	end
+
+	if hint_refresh_timers[bufnr] then
+		hint_refresh_timers[bufnr]:stop()
+		hint_refresh_timers[bufnr]:close()
+	end
+
+	local timer = vim.loop.new_timer()
+	hint_refresh_timers[bufnr] = timer
+	timer:start(180, 0, function()
+		hint_refresh_timers[bufnr] = nil
+		timer:close()
+		vim.schedule(function()
+			if vim.api.nvim_buf_is_valid(bufnr) and refresh_buffer then
+				refresh_buffer(bufnr)
+			end
+		end)
+	end)
+end
+
 local function get_asset_usages_cached(root, name, callback, opts)
 	opts = opts or {}
 
@@ -338,6 +366,45 @@ local function get_asset_usages_cached(root, name, callback, opts)
 		end
 		flush_query_waiters("asset_usages", root, name, result, err)
 	end)
+end
+
+local function pump_asset_usage_warm_queue()
+	if warm_running then
+		return
+	end
+
+	local item = table.remove(warm_queue, 1)
+	if not item then
+		return
+	end
+
+	warm_running = true
+	get_asset_usages_cached(item.root, item.name, function()
+		warm_pending[item.key] = nil
+		warm_running = false
+		if item.bufnr and vim.api.nvim_buf_is_valid(item.bufnr) then
+			schedule_hint_refresh(item.bufnr)
+		end
+		pump_asset_usage_warm_queue()
+	end, {
+		allow_remote = true,
+	})
+end
+
+local function queue_asset_usage_warm(root, name, bufnr)
+	local key = query_cache_key("asset_usages", root, name)
+	if warm_pending[key] or get_cached_query("asset_usages", root, name) ~= nil then
+		return
+	end
+
+	warm_pending[key] = true
+	table.insert(warm_queue, {
+		key = key,
+		root = root,
+		name = name,
+		bufnr = bufnr,
+	})
+	pump_asset_usage_warm_queue()
 end
 
 local function resolve_target_from_parse(ctx, parse_result)
@@ -474,9 +541,10 @@ local function collect_class_assets(ctx, target)
 	end)
 end
 
-local function fetch_class_hint(root, target, callback)
+local function fetch_class_hint(root, target, bufnr, callback)
 	get_asset_usages_cached(root, target.name, function(usage_result)
 		if type(usage_result) ~= "table" then
+			queue_asset_usage_warm(root, target.name, bufnr)
 			return callback(target)
 		end
 		local derived_count = type(usage_result) == "table" and #list_value(usage_result.derived) or 0
@@ -489,9 +557,10 @@ local function fetch_class_hint(root, target, callback)
 	})
 end
 
-local function fetch_member_hint(root, target, callback)
+local function fetch_member_hint(root, target, bufnr, callback)
 	get_asset_usages_cached(root, target.name, function(result)
 		if type(result) ~= "table" then
+			queue_asset_usage_warm(root, target.name, bufnr)
 			return callback(target)
 		end
 		local reference_count = 0
@@ -505,7 +574,7 @@ local function fetch_member_hint(root, target, callback)
 	})
 end
 
-local function refresh_buffer(bufnr)
+refresh_buffer = function(bufnr)
 	if not is_enabled() then
 		clear(bufnr)
 		return
@@ -572,10 +641,10 @@ local function refresh_buffer(bufnr)
 
 		for _, target in ipairs(targets) do
 			if target.kind == "class" then
-				fetch_class_hint(root, target, on_item_done)
+				fetch_class_hint(root, target, bufnr, on_item_done)
 			elseif member_hints < member_hint_limit() then
 				member_hints = member_hints + 1
-				fetch_member_hint(root, target, on_item_done)
+				fetch_member_hint(root, target, bufnr, on_item_done)
 			else
 				on_item_done(target)
 			end
@@ -650,6 +719,11 @@ function M.setup()
 				pending[args.buf]:close()
 				pending[args.buf] = nil
 			end
+			if hint_refresh_timers[args.buf] then
+				hint_refresh_timers[args.buf]:stop()
+				hint_refresh_timers[args.buf]:close()
+				hint_refresh_timers[args.buf] = nil
+			end
 			refresh_seq[args.buf] = nil
 		end,
 	})
@@ -667,7 +741,18 @@ function M.reset()
 	refresh_seq = {}
 	query_cache = {}
 	query_waiters = {}
+	warm_queue = {}
+	warm_pending = {}
+	warm_running = false
 	pcall(vim.api.nvim_del_augroup_by_name, group_name)
+
+	for bufnr, timer in pairs(hint_refresh_timers) do
+		if timer then
+			timer:stop()
+			timer:close()
+		end
+		hint_refresh_timers[bufnr] = nil
+	end
 
 	for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
 		clear(bufnr)
