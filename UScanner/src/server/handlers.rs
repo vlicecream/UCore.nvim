@@ -113,6 +113,14 @@ impl SearchQueryProfile {
         hqh < 4
     }
 
+    fn should_force_reliable_text_search(&self, hqh: usize) -> bool {
+        if self.is_short || self.is_path_like || self.is_sym_strong {
+            return false;
+        }
+
+        hqh == 0 && (self.is_literal_code || self.is_text_like)
+    }
+
     fn reference_engine_skip_reason(
         &self,
         scope: &str,
@@ -1858,6 +1866,7 @@ fn unified_live_find_with_engine(
         .as_deref()
         .and_then(|path| module_name_for_file(project_conn, path));
     let log_enabled = fast_find_log_enabled() || query_log_enabled();
+    let profile = SearchQueryProfile::classify(pattern);
     let project_db_path = project_db_path.to_string();
     let pattern_owned = pattern.to_string();
     let engine_db_path_owned = engine_db_path.clone();
@@ -1895,10 +1904,20 @@ fn unified_live_find_with_engine(
         current_module.as_deref(),
     );
     let phase0_hqh = live_find_hqh_count(&results);
-    let should_run_text_stage = should_run_live_find_text_stage(pattern, phase0_hqh, repeated_query);
+    let forced_reliable_text = profile.should_force_reliable_text_search(phase0_hqh);
+    let should_run_text_stage = forced_reliable_text
+        || should_run_live_find_text_stage(pattern, phase0_hqh, repeated_query);
 
     let mut text_count = 0usize;
-    if should_run_text_stage {
+    if forced_reliable_text {
+        let mut text_results =
+            value_array(query::search::search_code_text(project_conn, pattern, target, 0)?);
+        tag_source(&mut text_results, "project");
+        text_count = text_results.len();
+        if !text_results.is_empty() {
+            results = text_results;
+        }
+    } else if should_run_text_stage {
         let text_limit = live_find_text_limit(pattern, limit, repeated_query);
         let mut phase_reports = Vec::new();
         let mut text_state = LiveTextSearchState::new(pattern, "project", text_limit);
@@ -1971,7 +1990,11 @@ fn unified_live_find_with_engine(
             target: "ucore::fast_find",
             "UnifiedLiveFind pattern={:?} tags={} repeated={} phase0={} hqh={} text_stage={} text_count={} total={} sample={}",
             pattern,
-            tag_summary,
+            if forced_reliable_text {
+                format!("{tag_summary}|FORCED_TEXT")
+            } else {
+                tag_summary
+            },
             repeated_query,
             phase0_count,
             phase0_hqh,
