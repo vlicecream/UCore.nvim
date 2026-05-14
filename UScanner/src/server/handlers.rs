@@ -2211,7 +2211,8 @@ fn live_find_match_quality(item: &Value, pattern: &str) -> MatchQuality {
         if !compact_name.is_empty()
             && (compact_name == compact_query
                 || compact_name.starts_with(&compact_query)
-                || compact_name.contains(&compact_query))
+                || compact_name.contains(&compact_query)
+                || live_find_is_compact_fuzzy_match(&compact_name, &compact_query))
         {
             return MatchQuality::NormalizedSymbol;
         }
@@ -2222,6 +2223,8 @@ fn live_find_match_quality(item: &Value, pattern: &str) -> MatchQuality {
     if kind == "file"
         || filename == query
         || (!query.is_empty() && (filename.starts_with(&query) || filename.contains(&query)))
+        || (!compact_query.is_empty()
+            && live_find_is_compact_fuzzy_match(&live_find_compact_identifier(&filename), &compact_query))
     {
         return MatchQuality::FileNameMatch;
     }
@@ -2235,6 +2238,49 @@ fn live_find_match_quality(item: &Value, pattern: &str) -> MatchQuality {
     }
 
     MatchQuality::Other
+}
+
+fn live_find_is_compact_fuzzy_match(compact_name: &str, compact_query: &str) -> bool {
+    if compact_name.is_empty() || compact_query.is_empty() || compact_query.len() < 3 {
+        return false;
+    }
+
+    let name_chars = compact_name.chars().collect::<Vec<_>>();
+    let query_chars = compact_query.chars().collect::<Vec<_>>();
+    let mut query_index = 0usize;
+    let mut first_match = None;
+    let mut last_match = 0usize;
+    let mut previous_match = None;
+    let mut max_gap = 0usize;
+
+    for (index, ch) in name_chars.iter().enumerate() {
+        if query_index >= query_chars.len() {
+            break;
+        }
+
+        if *ch != query_chars[query_index] {
+            continue;
+        }
+
+        first_match.get_or_insert(index);
+        if let Some(previous) = previous_match {
+            max_gap = max_gap.max(index.saturating_sub(previous + 1));
+        }
+        previous_match = Some(index);
+        last_match = index;
+        query_index += 1;
+    }
+
+    if query_index != query_chars.len() {
+        return false;
+    }
+
+    let span = last_match.saturating_sub(first_match.unwrap_or(0)) + 1;
+    let extra = span.saturating_sub(query_chars.len());
+    let max_extra = if compact_query.len() <= 4 { 1 } else { 2 };
+    let max_gap_allowed = if compact_query.len() <= 4 { 1 } else { 2 };
+
+    extra <= max_extra && max_gap <= max_gap_allowed
 }
 
 fn is_class_like_kind(kind: &str) -> bool {
@@ -2337,6 +2383,7 @@ fn rank_live_find_results(
             let key = live_find_sort_key(&item, pattern, current_file, current_module, index);
             (key, item)
         })
+        .filter(|(key, _)| live_find_should_keep_match(pattern, key.quality))
         .collect::<Vec<_>>();
 
     ranked.sort_by(|left, right| left.0.cmp(&right.0));
@@ -2356,6 +2403,11 @@ fn rank_live_find_results(
     }
 
     *results = out;
+}
+
+fn live_find_should_keep_match(pattern: &str, quality: MatchQuality) -> bool {
+    let _ = pattern;
+    quality != MatchQuality::Other
 }
 
 fn live_find_hqh_count(results: &[Value]) -> usize {
