@@ -1142,9 +1142,10 @@ fn find_class_like_container(node: Node) -> Option<Node> {
                 | "unreal_reflected_class_declaration"
                 | "unreal_reflected_struct_declaration"
                 | "unreal_reflected_enum_declaration"
-        ) && candidate.child_by_field_name("body").is_some()
-        {
-            return Some(candidate);
+        ) {
+            return candidate
+                .child_by_field_name("body")
+                .map(|_| candidate);
         }
 
         current = candidate.parent();
@@ -1753,6 +1754,40 @@ enum class EAbilityPhase : uint8
             .expect("EAbilityPhase should be indexed");
         assert_eq!(enum_info.symbol_type, "UENUM");
         assert_eq!(enum_info.namespace.as_deref(), Some("Demo"));
+    }
+
+    #[test]
+    fn does_not_index_forward_decl_type_inside_template_argument_as_class() {
+        let language: tree_sitter::Language = tree_sitter_unreal_cpp::LANGUAGE.into();
+        let query = Query::new(&language, QUERY_STR).expect("query should compile");
+        let content = r#"
+USTRUCT(BlueprintType)
+struct FZoraEquipValidationResult
+{
+    GENERATED_BODY()
+
+    UPROPERTY(BlueprintReadOnly)
+    TSoftClassPtr<class UGameplayAbility> Ability;
+};
+"#;
+
+        let (classes, _, _) =
+            parse_content(content, "ZoraEquipValidationResult.h", &language, &query)
+                .expect("parse should succeed");
+
+        let struct_info = classes
+            .iter()
+            .find(|class_info| class_info.class_name == "FZoraEquipValidationResult")
+            .expect("FZoraEquipValidationResult should be indexed");
+        assert_eq!(struct_info.symbol_type, "USTRUCT");
+        assert!(struct_info.members.iter().any(|member| member.name == "Ability"));
+
+        assert!(
+            classes
+                .iter()
+                .all(|class_info| class_info.class_name != "UGameplayAbility"),
+            "forward-declared template argument should not be indexed as a class"
+        );
     }
 }
 
