@@ -1,6 +1,7 @@
 local config = require("ucore.config")
 local project = require("ucore.project")
 local remote = require("ucore.remote")
+local ui_select = require("ucore.ui.select")
 local write_access = require("ucore.write_access")
 
 local M = {}
@@ -1292,6 +1293,36 @@ local function insert_include_line(bufnr, include_path, target_line)
 	return true
 end
 
+local function resolve_forward_declaration_insert_line(lines, bufnr, target_line)
+	lines = lines or {}
+	target_line = math.max(tonumber(target_line) or 1, 1)
+	local file_path = normalize(vim.api.nvim_buf_get_name(bufnr))
+
+	if is_header_file(file_path) then
+		local generated_row
+		local last_include
+		for index, line in ipairs(lines) do
+			if is_include_directive(line) then
+				last_include = index
+			end
+			if is_generated_include_line(line) then
+				generated_row = index
+				break
+			end
+		end
+
+		if generated_row then
+			return generated_row + 1
+		end
+
+		if last_include then
+			return last_include + 1
+		end
+	end
+
+	return target_line
+end
+
 local function line_contains_forward_declaration(lines, keyword, symbol)
 	local pattern = "^%s*" .. keyword .. "%s+" .. symbol .. "%s*;%s*$"
 	for _, line in ipairs(lines or {}) do
@@ -1309,7 +1340,8 @@ local function insert_forward_declaration(bufnr, keyword, symbol, target_line)
 		return false, "already_declared"
 	end
 
-	local row = math.max((tonumber(target_line) or 1) - 1, 0)
+	local insert_line = resolve_forward_declaration_insert_line(lines, bufnr, target_line)
+	local row = math.max(insert_line - 1, 0)
 	local insert = string.format("%s %s;", keyword, symbol)
 	vim.api.nvim_buf_set_lines(bufnr, row, row, false, { insert })
 	return true
@@ -1367,6 +1399,26 @@ local function choose_and_insert_dependency(bufnr, metadata, candidates, opts)
 		return vim.notify("No indexed symbol found for the current symbol", vim.log.levels.INFO)
 	end
 
+	local deduped = {}
+	for _, candidate in ipairs(candidates) do
+		local key
+		if candidate.action == "forward_decl" then
+			key = string.format("forward_decl:%s:%s", tostring(candidate.keyword or ""), tostring(candidate.name or ""))
+		else
+			key = string.format("include:%s", tostring(candidate.include_path or ""))
+		end
+
+		local existing = deduped[key]
+		if not existing or (tonumber(candidate.score) or 0) > (tonumber(existing.score) or 0) then
+			deduped[key] = candidate
+		end
+	end
+
+	candidates = {}
+	for _, candidate in pairs(deduped) do
+		table.insert(candidates, candidate)
+	end
+
 	table.sort(candidates, function(left, right)
 		if left.score ~= right.score then
 			return left.score > right.score
@@ -1412,19 +1464,17 @@ local function choose_and_insert_dependency(bufnr, metadata, candidates, opts)
 		return apply(auto_choice)
 	end
 
-	vim.ui.select(candidates, {
-		prompt = "Select dependency",
+	ui_select.items("Select dependency", candidates, {
 		format_item = function(entry)
 			if entry.action == "forward_decl" then
-				return string.format("%s %s;", entry.keyword, entry.name)
+				return string.format("Forward declaration  %s %s;", entry.keyword, entry.name)
 			end
-			return entry.include_path
+			return string.format("Include              %s", entry.include_path)
 		end,
-	}, function(choice)
-		if choice then
+		on_choice = function(choice)
 			apply(choice)
-		end
-	end)
+		end,
+	})
 end
 
 local function diagnostic_missing_type_symbol(diagnostic)
