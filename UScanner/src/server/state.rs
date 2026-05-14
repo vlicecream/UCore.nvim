@@ -285,6 +285,7 @@ fn make_completion_key(class_name: &str, prefix: &str) -> (String, String) {
 pub struct AppState {
     pub projects: Mutex<HashMap<String, ProjectContext>>,
     pub connections: Mutex<HashMap<String, Arc<Mutex<rusqlite::Connection>>>>,
+    pub read_only_connections: Mutex<HashMap<String, Arc<Mutex<rusqlite::Connection>>>>,
     pub persistent_cache_connections: Mutex<HashMap<String, Arc<Mutex<rusqlite::Connection>>>>,
     pub active_refreshes: Mutex<HashSet<String>>,
     pub active_asset_scans: Mutex<HashSet<String>>,
@@ -376,6 +377,30 @@ impl AppState {
         open_read_only_connection(db_path)
     }
 
+    /// Get or open a shared read-only database connection.
+    /// 获取或打开共享只读数据库连接。
+    pub fn get_shared_read_only_connection(
+        &self,
+        db_path: &str,
+    ) -> Result<Arc<Mutex<rusqlite::Connection>>> {
+        {
+            let conns = self.read_only_connections.lock();
+            if let Some(conn) = conns.get(db_path) {
+                return Ok(Arc::clone(conn));
+            }
+        }
+
+        let conn = open_read_only_connection(db_path)?;
+        let conn = Arc::new(Mutex::new(conn));
+
+        let mut conns = self.read_only_connections.lock();
+        let existing = conns
+            .entry(db_path.to_string())
+            .or_insert_with(|| Arc::clone(&conn));
+
+        Ok(Arc::clone(existing))
+    }
+
     /// Get or create the per-project completion cache.
     /// 获取或创建某个工程的补全缓存。
     pub fn get_completion_cache(&self, project_root: &str) -> Arc<Mutex<CompletionCache>> {
@@ -444,6 +469,7 @@ impl AppState {
     /// 删除某个工程相关的缓存 DB 连接。
     pub fn drop_connections(&self, db_path: &str, cache_db_path: Option<&str>) {
         self.connections.lock().remove(db_path);
+        self.read_only_connections.lock().remove(db_path);
 
         if let Some(cache_path) = cache_db_path {
             self.persistent_cache_connections.lock().remove(cache_path);

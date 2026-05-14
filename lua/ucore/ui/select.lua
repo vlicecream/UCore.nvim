@@ -449,18 +449,19 @@ end
 
 local function find_item_score(item, current)
 	-- Lower score wins. Source priority is applied before bucket priority:
-	-- project results are pulled forward; Engine results are pushed behind all
-	-- project buckets even when they are exact matches.
-	-- 分数越低越靠前。先按 source 拉开 Project / Engine，再按桶排序。
+	-- project results still come first by default, but Engine hits should be
+	-- able to surface when they are much stronger than weak project fuzzy
+	-- matches. The final per-query token score is applied later.
+	-- 分数越低越靠前。Project 默认优先，但不能重到把强 Engine 命中永远压没。
 	local source = normalize_source(item.source)
 	local kind = normalize_kind(item.symbol_type or item.type):lower()
 	local path = normalize_path(item.path or item.file_path or item.asset_path or "")
 	local score = 0
 
 	if source == "project" then
-		score = score - 300
+		score = score - 120
 	elseif source == "engine" then
-		score = score + 1000
+		score = score + 120
 	end
 
 	score = score + (find_group_order(item) * 100)

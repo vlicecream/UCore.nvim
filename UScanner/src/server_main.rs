@@ -36,6 +36,7 @@ async fn main() -> Result<()> {
     let state = Arc::new(AppState {
         projects: Mutex::new(load_initial_projects(startup.registry_path.as_ref())),
         connections: Mutex::new(HashMap::new()),
+        read_only_connections: Mutex::new(HashMap::new()),
         persistent_cache_connections: Mutex::new(HashMap::new()),
         active_refreshes: Mutex::new(HashSet::new()),
         active_asset_scans: Mutex::new(HashSet::new()),

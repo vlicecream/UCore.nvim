@@ -741,7 +741,7 @@ fn goto_definition_with_engine(
         return Ok(Value::Null);
     }
 
-    let engine_conn = match state.get_read_only_connection(&engine_db_path) {
+    let engine_conn = match state.get_shared_read_only_connection(&engine_db_path) {
         Ok(conn) => conn,
         Err(err) => {
             warn!("Failed to open Engine DB for goto definition: {}", err);
@@ -749,13 +749,10 @@ fn goto_definition_with_engine(
         }
     };
 
-    let mut engine_result = match query::goto::goto_definition(
-        &engine_conn,
-        content,
-        line,
-        character,
-        file_path,
-    ) {
+    let mut engine_result = match {
+        let engine_conn = engine_conn.lock();
+        query::goto::goto_definition(&engine_conn, content, line, character, file_path)
+    } {
         Ok(value) => value,
         Err(err) => {
             warn!("Failed to query Engine DB goto definition: {}", err);
@@ -803,7 +800,7 @@ fn goto_implementation_with_engine(
         return Ok(Value::Null);
     }
 
-    let engine_conn = match state.get_read_only_connection(&engine_db_path) {
+    let engine_conn = match state.get_shared_read_only_connection(&engine_db_path) {
         Ok(conn) => conn,
         Err(err) => {
             warn!("Failed to open Engine DB for goto implementation: {}", err);
@@ -811,13 +808,10 @@ fn goto_implementation_with_engine(
         }
     };
 
-    let mut engine_result = match query::goto::goto_implementation(
-        &engine_conn,
-        content,
-        line,
-        character,
-        file_path,
-    ) {
+    let mut engine_result = match {
+        let engine_conn = engine_conn.lock();
+        query::goto::goto_implementation(&engine_conn, content, line, character, file_path)
+    } {
         Ok(value) => value,
         Err(err) => {
             warn!("Failed to query Engine DB goto implementation: {}", err);
@@ -1253,7 +1247,10 @@ fn fast_find_with_scope(
         let Some(engine_conn) = open_engine_query_connection(state, engine_db_path, "fast find")? else {
             return Ok(json!([]));
         };
-        let mut results = value_array(query::search::fast_find(&engine_conn, pattern, limit, offset)?);
+        let mut results = {
+            let engine_conn = engine_conn.lock();
+            value_array(query::search::fast_find(&engine_conn, pattern, limit, offset)?)
+        };
         tag_source(&mut results, "engine");
         return Ok(json!(results));
     }
@@ -1270,7 +1267,10 @@ fn fast_find_with_scope(
         return Ok(json!(results));
     };
     let remaining = limit.saturating_sub(results.len()).max(1);
-    let mut engine_results = value_array(query::search::fast_find(&engine_conn, pattern, remaining, 0)?);
+    let mut engine_results = {
+        let engine_conn = engine_conn.lock();
+        value_array(query::search::fast_find(&engine_conn, pattern, remaining, 0)?)
+    };
     tag_source(&mut engine_results, "engine");
     merge_query_results(&mut results, engine_results, limit);
 
@@ -1335,7 +1335,10 @@ fn search_code_text_with_scope(
         let Some(engine_conn) = open_engine_query_connection(state, engine_db_path, "code text")? else {
             return Ok(json!([]));
         };
-        let mut results = value_array(query::search::search_code_text(&engine_conn, pattern, limit, offset)?);
+        let mut results = {
+            let engine_conn = engine_conn.lock();
+            value_array(query::search::search_code_text(&engine_conn, pattern, limit, offset)?)
+        };
         tag_source(&mut results, "engine");
         return Ok(json!(results));
     }
@@ -1349,7 +1352,7 @@ fn open_engine_query_connection(
     state: Arc<AppState>,
     engine_db_path: Option<String>,
     label: &str,
-) -> Result<Option<rusqlite::Connection>> {
+) -> Result<Option<Arc<parking_lot::Mutex<rusqlite::Connection>>>> {
     let Some(engine_db_path) = engine_db_path.filter(|path| !path.trim().is_empty()) else {
         return Ok(None);
     };
@@ -1359,7 +1362,7 @@ fn open_engine_query_connection(
         return Ok(None);
     }
 
-    match state.get_read_only_connection(&engine_db_path) {
+    match state.get_shared_read_only_connection(&engine_db_path) {
         Ok(conn) => Ok(Some(conn)),
         Err(err) => {
             warn!("Failed to open Engine DB for {}: {}", label, err);
