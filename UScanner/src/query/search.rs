@@ -306,9 +306,12 @@ pub fn fast_find(
 
     let target = offset.saturating_add(limit);
     let mut results = Vec::new();
+    let identifier_query = is_identifier_query(pattern);
 
     extend_json_array(&mut results, fast_find_symbols(conn, pattern, target.max(limit))?);
-    extend_json_array(&mut results, search_files_for_global(conn, pattern, target.max(limit))?);
+    if !identifier_query {
+        extend_json_array(&mut results, search_files_for_global(conn, pattern, target.max(limit))?);
+    }
 
     let should_run_fallback = results.len() < target && !has_strong_explicit_type_match(&results, pattern);
     if should_run_fallback {
@@ -316,10 +319,12 @@ pub fn fast_find(
             &mut results,
             search_symbols_fuzzy_fallback(conn, pattern, FIND_FUZZY_FALLBACK_LIMIT)?,
         );
-        extend_json_array(
-            &mut results,
-            search_files_fuzzy_fallback(conn, pattern, FIND_FUZZY_FALLBACK_LIMIT)?,
-        );
+        if !identifier_query {
+            extend_json_array(
+                &mut results,
+                search_files_fuzzy_fallback(conn, pattern, FIND_FUZZY_FALLBACK_LIMIT)?,
+            );
+        }
     }
 
     dedupe_find_results(&mut results);
@@ -1456,5 +1461,19 @@ mod tests {
 
         assert!(items.iter().any(|item| item["name"] == "UGameplayAbility"));
         assert!(!items.iter().any(|item| item["name"] == "AbilityTags"));
+    }
+
+    #[test]
+    fn fast_find_identifier_query_skips_file_bucket() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let file_id = insert_project_header_file(&conn, "Game", "GameplayAbility.h");
+        insert_class_symbol(&conn, file_id, "UGameplayAbility");
+
+        let items = fast_find(&conn, "UGameplayAbility", 20, 0).unwrap();
+        let items = items.as_array().unwrap();
+
+        assert!(items.iter().all(|item| item["type"] != "file"));
     }
 }
