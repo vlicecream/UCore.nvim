@@ -692,7 +692,7 @@ function M.find(pattern)
 		return vim.notify("Could not find .uproject", vim.log.levels.ERROR)
 	end
 
-	local cache = M.prewarm_find(root, { include_assets = true })
+	local cache = M.prewarm_find(root, { include_assets = false })
 	local snapshot = find_cache_snapshot(cache)
 	local initial_symbols = pattern == "" and snapshot.initial_symbols or {}
 

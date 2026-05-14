@@ -854,8 +854,9 @@ fn search_files_for_global(
         LEFT JOIN modules m ON f.module_id = m.id
         LEFT JOIN strings sm ON m.name_id = sm.id
         LEFT JOIN dir_paths rd ON m.root_directory_id = rd.id
-        WHERE lower(sn.text) LIKE ? ESCAPE '\'
-           OR lower(dp.full_path || '/' || sn.text) LIKE ? ESCAPE '\'
+        WHERE (lower(sn.text) LIKE ? ESCAPE '\'
+           OR lower(dp.full_path || '/' || sn.text) LIKE ? ESCAPE '\')
+          AND lower(f.extension) NOT IN ('uasset', 'umap')
         ORDER BY
             CASE
                 WHEN lower(sn.text) = ? THEN 0
@@ -1033,6 +1034,7 @@ fn search_files_fuzzy_fallback(
         LEFT JOIN strings sm ON m.name_id = sm.id
         LEFT JOIN dir_paths rd ON m.root_directory_id = rd.id
         WHERE {}
+          AND lower(f.extension) NOT IN ('uasset', 'umap')
         ORDER BY
             length(lower(sn.text)) ASC,
             lower(sn.text) ASC,
