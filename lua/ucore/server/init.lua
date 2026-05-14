@@ -167,9 +167,9 @@ end
 
 local function build_server_env()
 	local env = vim.fn.environ()
-	local progress_config = config.values.progress or {}
-	env.UCORE_FAST_FIND_LOG = progress_config.log == true and "1" or "0"
-	env.UCORE_QUERY_LOG = progress_config.log == true and "1" or "0"
+	local log_enabled = config.log_enabled()
+	env.UCORE_FAST_FIND_LOG = log_enabled and "1" or "0"
+	env.UCORE_QUERY_LOG = log_enabled and "1" or "0"
 	return env
 end
 

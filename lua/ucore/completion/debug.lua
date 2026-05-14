@@ -3,8 +3,7 @@ local config = require("ucore.config")
 local M = {}
 
 local function debug_enabled()
-	local progress_config = config.values.progress or {}
-	return progress_config.log == true
+	return config.log_enabled()
 end
 
 local function log_path()

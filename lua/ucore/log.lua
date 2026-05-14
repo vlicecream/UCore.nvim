@@ -146,8 +146,7 @@ function M.write(tag, fields)
 end
 
 function M.write_progress(tag, fields)
-	local progress_config = config.values.progress or {}
-	if progress_config.log == false then
+	if not config.log_enabled() then
 		return
 	end
 

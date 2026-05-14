@@ -246,9 +246,12 @@ local function default_values()
 
 		-- Refresh progress notification options.
 		-- refresh 进度通知配置。
-		progress = {
+		progress = {},
+
+		-- Detailed logging options.
+		-- 详细日志配置。
+		log = {
 			enable = true,
-			log = true,
 		},
 
 		-- UI integration options.
@@ -314,7 +317,6 @@ local function default_values()
 		completion = {
 			min_chars = 2,
 			debounce_ms = 180,
-			debug = true,
 		},
 
 		-- UCore diagnostics rendered through vim.diagnostic.
@@ -516,11 +518,35 @@ local function normalize_user_opts(opts)
 	end
 
 	local normalized = vim.deepcopy(opts)
+	normalized.log = normalized.log or {}
 	if normalized.scanner_dir ~= nil then
 		normalized.backend = normalized.backend or {}
 		if normalized.backend.source_dir == nil then
 			normalized.backend.source_dir = normalized.scanner_dir
 		end
+	end
+
+	if normalized.log.enable == nil
+		and type(normalized.progress) == "table"
+		and normalized.progress.log ~= nil
+	then
+		normalized.log.enable = normalized.progress.log
+	end
+
+	if normalized.log.enable == nil
+		and type(normalized.completion) == "table"
+		and normalized.completion.debug ~= nil
+	then
+		normalized.log.enable = normalized.completion.debug
+	end
+
+	if type(normalized.progress) == "table" then
+		normalized.progress.log = nil
+		normalized.progress.enable = nil
+	end
+
+	if type(normalized.completion) == "table" then
+		normalized.completion.debug = nil
 	end
 
 	return normalized
@@ -538,6 +564,21 @@ function M.setup(opts)
 		scanner = not has_custom_scanner_cmd,
 		server = not has_custom_server_cmd,
 	})
+end
+
+function M.log_enabled(values)
+	values = values or M.values
+	local log_config = (values or {}).log or {}
+	if log_config.enable ~= nil then
+		return log_config.enable == true
+	end
+
+	local progress_config = (values or {}).progress or {}
+	if progress_config.log ~= nil then
+		return progress_config.log == true
+	end
+
+	return true
 end
 
 M.refresh_backend_commands()

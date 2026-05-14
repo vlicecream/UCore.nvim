@@ -350,11 +350,6 @@ end
 function M.handle_progress(event)
 	event = monotonic_event(normalize_event(event))
 
-	local progress_config = config.values.progress or {}
-	if progress_config.enable == false then
-		return
-	end
-
 	if not active then
 		reset()
 	end
