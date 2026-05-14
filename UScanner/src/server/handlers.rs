@@ -428,6 +428,7 @@ pub async fn handle_query(
         if let Some(value) = handle_state_query(
             state.clone(),
             &conn,
+            &db_path_native,
             &root_key,
             &req.project_root,
             req.engine_db_path.clone(),
@@ -510,6 +511,7 @@ pub async fn handle_query(
 fn handle_state_query(
     state: Arc<AppState>,
     conn: &rusqlite::Connection,
+    project_db_path: &str,
     root_key: &str,
     project_root: &str,
     engine_db_path: Option<String>,
@@ -585,6 +587,7 @@ fn handle_state_query(
             let value = unified_live_find_with_engine(
                 state,
                 conn,
+                project_db_path,
                 engine_db_path,
                 &pattern,
                 limit,
@@ -1680,6 +1683,7 @@ impl<'a> LiveTextSearchState<'a> {
 fn unified_live_find_with_engine(
     state: Arc<AppState>,
     project_conn: &rusqlite::Connection,
+    project_db_path: &str,
     engine_db_path: Option<String>,
     pattern: &str,
     limit: usize,
@@ -1702,20 +1706,35 @@ fn unified_live_find_with_engine(
         .as_deref()
         .and_then(|path| module_name_for_file(project_conn, path));
     let log_enabled = fast_find_log_enabled() || query_log_enabled();
+    let project_db_path = project_db_path.to_string();
+    let pattern_owned = pattern.to_string();
+    let engine_db_path_owned = engine_db_path.clone();
+    let project_state = state.clone();
+    let engine_state = state.clone();
+    let (project_result, engine_result) = rayon::join(
+        move || -> Result<Vec<Value>> {
+            let conn = project_state.get_read_only_connection(&project_db_path)?;
+            let mut results = value_array(query::search::fast_find(&conn, &pattern_owned, target, 0)?);
+            tag_source(&mut results, "project");
+            Ok(results)
+        },
+        move || -> Result<Vec<Value>> {
+            let Some(engine_conn) =
+                open_engine_query_connection(engine_state, engine_db_path_owned, "unified live find")?
+            else {
+                return Ok(Vec::new());
+            };
+            let mut results = {
+                let engine_conn = engine_conn.lock();
+                value_array(query::search::fast_find(&engine_conn, pattern, target, 0)?)
+            };
+            tag_source(&mut results, "engine");
+            Ok(results)
+        },
+    );
 
-    let mut results = value_array(query::search::fast_find(project_conn, pattern, target, 0)?);
-    tag_source(&mut results, "project");
-
-    if let Some(engine_conn) =
-        open_engine_query_connection(state.clone(), engine_db_path.clone(), "unified live find")?
-    {
-        let mut engine_results = {
-            let engine_conn = engine_conn.lock();
-            value_array(query::search::fast_find(&engine_conn, pattern, target, 0)?)
-        };
-        tag_source(&mut engine_results, "engine");
-        results.extend(engine_results);
-    }
+    let mut results = project_result?;
+    results.extend(engine_result?);
 
     rank_live_find_results(
         &mut results,
@@ -2059,6 +2078,10 @@ fn live_find_match_quality(item: &Value, pattern: &str) -> MatchQuality {
         return MatchQuality::TextMatch;
     }
 
+    if is_class_like_kind(&kind) && matches_unreal_type_fragment(&name, &query) {
+        return MatchQuality::ExactSymbol;
+    }
+
     if name == query && kind != "file" {
         return MatchQuality::ExactSymbol;
     }
@@ -2095,6 +2118,37 @@ fn live_find_match_quality(item: &Value, pattern: &str) -> MatchQuality {
     }
 
     MatchQuality::Other
+}
+
+fn is_class_like_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "class" | "struct" | "enum" | "uclass" | "ustruct" | "uenum" | "uinterface"
+    )
+}
+
+fn matches_unreal_type_fragment(name: &str, query: &str) -> bool {
+    if query.is_empty() || query.len() < 6 {
+        return false;
+    }
+
+    let compact_name = live_find_compact_identifier(name);
+    if compact_name.is_empty() {
+        return false;
+    }
+
+    let compact_query = live_find_compact_identifier(query);
+    if compact_query.is_empty() {
+        return false;
+    }
+
+    if compact_name == compact_query {
+        return true;
+    }
+
+    ["u", "a", "f", "e", "i"]
+        .iter()
+        .any(|prefix| compact_name == format!("{prefix}{compact_query}"))
 }
 
 fn live_find_sort_key(
