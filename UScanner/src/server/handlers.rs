@@ -1899,6 +1899,7 @@ fn live_find_is_sym_strong_query(query: &str) -> bool {
         .next()
         .map(|ch| ch.is_ascii_uppercase())
         .unwrap_or(false)
+        || live_find_looks_like_unreal_type_query(query)
 }
 
 fn live_find_is_path_like_query(query: &str) -> bool {
@@ -1923,11 +1924,27 @@ fn live_find_is_text_like_query(query: &str) -> bool {
         return false;
     }
 
+    if live_find_is_identifier_query(query) && !query.contains('_') {
+        return false;
+    }
+
     query.contains(' ')
         || query.contains('_')
         || query
             .chars()
             .all(|ch| !ch.is_ascii_alphabetic() || ch.is_ascii_lowercase())
+}
+
+fn live_find_looks_like_unreal_type_query(query: &str) -> bool {
+    let query = query.trim();
+    if query.len() < 8 || query.contains('_') || query.contains("::") || !live_find_is_identifier_query(query) {
+        return false;
+    }
+
+    matches!(
+        query.chars().next().map(|ch| ch.to_ascii_lowercase()),
+        Some('u' | 'a' | 'f' | 'e' | 'i')
+    )
 }
 
 fn live_find_compact_identifier(input: &str) -> String {

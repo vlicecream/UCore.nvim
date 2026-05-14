@@ -340,8 +340,9 @@ fn fast_find_symbols(conn: &Connection, pattern: &str, limit: usize) -> anyhow::
     let query = query_text.to_ascii_lowercase();
     let prefix_query = format!("{}%", escape_like(&query));
     let contains_query = format!("%{}%", escape_like(&query));
-    let allow_owner_match = !is_explicit_type_query(query_text);
-    let allow_compact_name_match = is_identifier_query(query_text);
+    let identifier_query = is_identifier_query(query_text);
+    let allow_owner_match = !identifier_query;
+    let allow_compact_name_match = identifier_query;
     let compact_query = compact_identifier(query_text);
     let compact_prefix_query = format!("{}%", escape_like(&compact_query));
     let compact_contains_query = format!("%{}%", escape_like(&compact_query));
@@ -658,6 +659,19 @@ fn is_explicit_type_query(query: &str) -> bool {
     }
 
     query.chars().next().map(|ch| ch.is_ascii_uppercase()).unwrap_or(false)
+        || looks_like_unreal_type_query(query)
+}
+
+fn looks_like_unreal_type_query(query: &str) -> bool {
+    let query = query.trim();
+    if query.len() < 8 || query.contains('_') || query.contains("::") || !is_identifier_query(query) {
+        return false;
+    }
+
+    matches!(
+        query.chars().next().map(|ch| ch.to_ascii_lowercase()),
+        Some('u' | 'a' | 'f' | 'e' | 'i')
+    )
 }
 
 fn compact_identifier(input: &str) -> String {
@@ -1417,5 +1431,30 @@ mod tests {
         let items = items.as_array().unwrap();
 
         assert!(items.iter().any(|item| item["name"] == "AGameplayCueNotify_Actor"));
+    }
+
+    #[test]
+    fn fast_find_treats_lowercase_unreal_type_query_as_type_like() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let exact_file_id = insert_project_header_file(&conn, "Game", "GameplayAbility.h");
+        let exact_class_id = insert_class_symbol(&conn, exact_file_id, "UGameplayAbility");
+        insert_property_symbol(
+            &conn,
+            exact_class_id,
+            exact_file_id,
+            "UGameplayAbility",
+            "AbilityTags",
+        );
+
+        let broad_file_id = insert_project_header_file(&conn, "Game", "GameplayAbilityStatics.h");
+        insert_class_symbol(&conn, broad_file_id, "UGameplayAbilityStatics");
+
+        let items = fast_find(&conn, "ugameplayability", 20, 0).unwrap();
+        let items = items.as_array().unwrap();
+
+        assert!(items.iter().any(|item| item["name"] == "UGameplayAbility"));
+        assert!(!items.iter().any(|item| item["name"] == "AbilityTags"));
     }
 }
