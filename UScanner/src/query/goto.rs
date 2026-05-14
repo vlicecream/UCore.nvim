@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use tree_sitter::{Node, Parser, Point};
 
+use crate::db::ensure_search_projections;
 use crate::db::project_path::PATH_CTE;
 
 // -----------------------------------------------------------------------------
@@ -788,29 +789,22 @@ fn find_type_definition(conn: &Connection, name: &str) -> Result<Option<Value>> 
         return Ok(None);
     }
 
-    let sql = format!(
-        r#"
-        {}
-        SELECT sc.text,
-               c.line_number,
-               dp.full_path || '/' || sf.text,
-               c.symbol_type
-        FROM classes c
-        JOIN strings sc ON c.name_id = sc.id
-        JOIN files f ON c.file_id = f.id
-        JOIN dir_paths dp ON f.directory_id = dp.id
-        JOIN strings sf ON f.filename_id = sf.id
-        WHERE sc.text = ?
+    let sql = r#"
+        SELECT name, line_number, path, kind
+        FROM search_symbols
+        WHERE is_class_like = 1
+          AND name = ?
         ORDER BY
-            {generated_priority},
-            {header_priority},
-            c.line_number
+            CASE WHEN basename_lc LIKE '%.generated.h' THEN 1 ELSE 0 END,
+            CASE
+                WHEN basename_lc LIKE '%.h' THEN 0
+                WHEN basename_lc LIKE '%.hpp' THEN 1
+                WHEN basename_lc LIKE '%.inl' THEN 2
+                ELSE 3
+            END,
+            line_number
         LIMIT 1
-        "#,
-        PATH_CTE,
-        generated_priority = GENERATED_PRIORITY_SQL,
-        header_priority = HEADER_PRIORITY_SQL
-    );
+        "#;
 
     let mut result = conn
         .query_row(&sql, [name.as_str()], |row| {
@@ -854,32 +848,23 @@ fn find_type_in_module(
     module_name: &str,
     symbol_name: &str,
 ) -> Result<Option<Value>> {
-    let sql = format!(
-        r#"
-        {}
-        SELECT sc.text,
-               c.line_number,
-               dp.full_path || '/' || sf.text,
-               c.symbol_type
-        FROM classes c
-        JOIN strings sc ON c.name_id = sc.id
-        JOIN files f ON c.file_id = f.id
-        JOIN dir_paths dp ON f.directory_id = dp.id
-        JOIN strings sf ON f.filename_id = sf.id
-        JOIN modules m ON f.module_id = m.id
-        JOIN strings sm ON m.name_id = sm.id
-        WHERE sm.text = ?
-          AND sc.text = ?
+    let sql = r#"
+        SELECT name, line_number, path, kind
+        FROM search_symbols
+        WHERE is_class_like = 1
+          AND module_name = ?
+          AND name = ?
         ORDER BY
-            {generated_priority},
-            {header_priority},
-            c.line_number
+            CASE WHEN basename_lc LIKE '%.generated.h' THEN 1 ELSE 0 END,
+            CASE
+                WHEN basename_lc LIKE '%.h' THEN 0
+                WHEN basename_lc LIKE '%.hpp' THEN 1
+                WHEN basename_lc LIKE '%.inl' THEN 2
+                ELSE 3
+            END,
+            line_number
         LIMIT 1
-        "#,
-        PATH_CTE,
-        generated_priority = GENERATED_PRIORITY_SQL,
-        header_priority = HEADER_PRIORITY_SQL
-    );
+        "#;
 
     let mut result = conn
         .query_row(&sql, params![module_name, symbol_name], |row| {
@@ -907,31 +892,45 @@ fn find_member_in_module(
     symbol_name: &str,
     prefer_impl: bool,
 ) -> Result<Option<Value>> {
-    let order_by = member_order_by_clause(prefer_impl);
-    let sql = format!(
+    let sql = if prefer_impl {
         r#"
-        {}
-        SELECT smem.text,
-               mem.line_number,
-               dp.full_path || '/' || sf.text,
-               sc.text
-        FROM members mem
-        JOIN strings smem ON mem.name_id = smem.id
-        JOIN classes c ON mem.class_id = c.id
-        JOIN strings sc ON c.name_id = sc.id
-        JOIN files f ON COALESCE(mem.file_id, c.file_id) = f.id
-        JOIN dir_paths dp ON f.directory_id = dp.id
-        JOIN strings sf ON f.filename_id = sf.id
-        JOIN modules m ON f.module_id = m.id
-        JOIN strings smod ON m.name_id = smod.id
-        WHERE smod.text = ?
-          AND smem.text = ?
-        {}
+        SELECT name, line_number, path, owner_name
+        FROM search_symbols
+        WHERE module_name = ?
+          AND name = ?
+          AND is_class_like = 0
+        ORDER BY
+            CASE
+                WHEN basename_lc LIKE '%.cpp' THEN 0
+                WHEN basename_lc LIKE '%.cc' THEN 1
+                WHEN basename_lc LIKE '%.cxx' THEN 2
+                ELSE 3
+            END,
+            line_number
         LIMIT 1
-        "#,
-        PATH_CTE,
-        order_by,
-    );
+        "#
+    } else {
+        r#"
+        SELECT name, line_number, path, owner_name
+        FROM search_symbols
+        WHERE module_name = ?
+          AND name = ?
+          AND is_class_like = 0
+        ORDER BY
+            CASE WHEN basename_lc LIKE '%.generated.h' THEN 1 ELSE 0 END,
+            CASE
+                WHEN basename_lc LIKE '%.h' THEN 0
+                WHEN basename_lc LIKE '%.hpp' THEN 1
+                WHEN basename_lc LIKE '%.inl' THEN 2
+                WHEN basename_lc LIKE '%.cpp' THEN 3
+                WHEN basename_lc LIKE '%.cc' THEN 4
+                WHEN basename_lc LIKE '%.cxx' THEN 5
+                ELSE 6
+            END,
+            line_number
+        LIMIT 1
+        "#
+    };
 
     let mut result = conn
         .query_row(&sql, params![module_name, symbol_name], |row| {
@@ -954,28 +953,43 @@ fn find_member_in_module(
 /// Final fallback: find a member by name anywhere.
 /// 最终兜底：在全工程按成员名查找。
 fn find_member_anywhere(conn: &Connection, symbol_name: &str, prefer_impl: bool) -> Result<Option<Value>> {
-    let order_by = member_order_by_clause(prefer_impl);
-    let sql = format!(
+    let sql = if prefer_impl {
         r#"
-        {}
-        SELECT sm.text,
-               m.line_number,
-               dp.full_path || '/' || sf.text,
-               sc.text
-        FROM members m
-        JOIN strings sm ON m.name_id = sm.id
-        JOIN classes c ON m.class_id = c.id
-        JOIN strings sc ON c.name_id = sc.id
-        JOIN files f ON COALESCE(m.file_id, c.file_id) = f.id
-        JOIN dir_paths dp ON f.directory_id = dp.id
-        JOIN strings sf ON f.filename_id = sf.id
-        WHERE sm.text = ?
-        {}
+        SELECT name, line_number, path, owner_name
+        FROM search_symbols
+        WHERE name = ?
+          AND is_class_like = 0
+        ORDER BY
+            CASE
+                WHEN basename_lc LIKE '%.cpp' THEN 0
+                WHEN basename_lc LIKE '%.cc' THEN 1
+                WHEN basename_lc LIKE '%.cxx' THEN 2
+                ELSE 3
+            END,
+            line_number
         LIMIT 1
-        "#,
-        PATH_CTE,
-        order_by,
-    );
+        "#
+    } else {
+        r#"
+        SELECT name, line_number, path, owner_name
+        FROM search_symbols
+        WHERE name = ?
+          AND is_class_like = 0
+        ORDER BY
+            CASE WHEN basename_lc LIKE '%.generated.h' THEN 1 ELSE 0 END,
+            CASE
+                WHEN basename_lc LIKE '%.h' THEN 0
+                WHEN basename_lc LIKE '%.hpp' THEN 1
+                WHEN basename_lc LIKE '%.inl' THEN 2
+                WHEN basename_lc LIKE '%.cpp' THEN 3
+                WHEN basename_lc LIKE '%.cc' THEN 4
+                WHEN basename_lc LIKE '%.cxx' THEN 5
+                ELSE 6
+            END,
+            line_number
+        LIMIT 1
+        "#
+    };
 
     let mut result = conn
         .query_row(&sql, [symbol_name], |row| {
@@ -2152,6 +2166,7 @@ pub fn goto_definition(
     character: u32,
     file_path: Option<String>,
 ) -> Result<Value> {
+    ensure_search_projections(conn)?;
     goto_definition_inner(conn, content, line, character, file_path, false)
 }
 
@@ -2164,6 +2179,7 @@ pub fn goto_implementation(
     character: u32,
     file_path: Option<String>,
 ) -> Result<Value> {
+    ensure_search_projections(conn)?;
     goto_definition_inner(conn, content, line, character, file_path, true)
 }
 
@@ -2176,6 +2192,7 @@ pub fn get_hover(
     character: u32,
     file_path: Option<String>,
 ) -> Result<Value> {
+    ensure_search_projections(conn)?;
     let Some(ctx) = extract_cursor_context(&content, line, character) else {
         return Ok(Value::Null);
     };
@@ -2230,6 +2247,7 @@ pub fn get_signature_help(
     character: u32,
     _file_path: Option<String>,
 ) -> Result<Value> {
+    ensure_search_projections(conn)?;
     let Some(ctx) = extract_signature_call_context(&content, line, character) else {
         return Ok(Value::Null);
     };

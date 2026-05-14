@@ -4,6 +4,7 @@ use anyhow::Result;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, ToSql};
 use serde_json::{json, Value};
 
+use crate::db::ensure_search_projections;
 use crate::db::project_path::PATH_CTE;
 
 const MODULE_CHUNK_SIZE: usize = 500;
@@ -150,6 +151,7 @@ pub fn search_classes_prefix(
     prefix: &str,
     limit: Option<usize>,
 ) -> Result<Value> {
+    ensure_search_projections(conn)?;
     let prefix = prefix.trim();
 
     if prefix.is_empty() {
@@ -159,34 +161,23 @@ pub fn search_classes_prefix(
     let limit = limit.unwrap_or(50).clamp(1, 1000) as i64;
     let pattern = format!("{}%", prefix);
 
-    let sql = format!(
-        r#"
-        {}
+    let sql = r#"
         SELECT
-            c.id,
-            sc.text AS name,
-            sb.text AS base_class,
-            c.symbol_type,
-            {} AS path,
-            sm.text AS module_name,
-            c.line_number,
-            c.end_line_number
-        FROM classes c
-        JOIN strings sc ON c.name_id = sc.id
-        LEFT JOIN strings sb ON c.base_class_id = sb.id
-        LEFT JOIN files f ON c.file_id = f.id
-        LEFT JOIN dir_paths dp ON f.directory_id = dp.id
-        LEFT JOIN strings sf ON f.filename_id = sf.id
-        LEFT JOIN modules m ON f.module_id = m.id
-        LEFT JOIN strings sm ON m.name_id = sm.id
-        WHERE sc.text LIKE ?1
-          AND sc.text NOT LIKE '(%'
-        ORDER BY sc.text ASC
+            symbol_rowid,
+            name,
+            NULL AS base_class,
+            kind,
+            path,
+            module_name,
+            line_number,
+            NULL AS end_line_number
+        FROM search_symbols
+        WHERE is_class_like = 1
+          AND name_lc LIKE lower(?1)
+          AND name NOT LIKE '(%'
+        ORDER BY name_lc ASC, path_lc ASC
         LIMIT ?2
-        "#,
-        PATH_CTE,
-        file_path_expr("dp", "sf"),
-    );
+        "#;
 
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params![pattern, limit], |row| {
@@ -335,30 +326,22 @@ pub fn find_symbol_usages(
     symbol_name: &str,
     limit: usize,
 ) -> Result<Value> {
+    ensure_search_projections(conn)?;
     let limit = if limit == 0 {
         DEFAULT_USAGE_LIMIT
     } else {
         limit
     };
 
-    let sql = format!(
-        r#"
-        {}
+    let sql = r#"
         SELECT
-            sc.line,
-            {} AS path
-        FROM symbol_calls sc
-        JOIN strings s ON sc.name_id = s.id
-        JOIN files f ON sc.file_id = f.id
-        JOIN dir_paths dp ON f.directory_id = dp.id
-        JOIN strings sn ON f.filename_id = sn.id
-        WHERE s.text = ?1
-        ORDER BY path, sc.line
+            line_number,
+            path
+        FROM search_symbol_calls
+        WHERE name_lc = lower(?1)
+        ORDER BY path_lc, line_number
         LIMIT ?2
-        "#,
-        PATH_CTE,
-        file_path_expr("dp", "sn"),
-    );
+        "#;
 
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params![symbol_name, limit as i64], |row| {

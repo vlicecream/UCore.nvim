@@ -2,10 +2,9 @@ use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, ToSql};
 use serde_json::{json, Value};
 use std::collections::HashSet;
-use std::io::BufRead;
 use tree_sitter::{Node, Parser, Point};
 
-use crate::db::project_path::PATH_CTE;
+use crate::db::ensure_search_projections;
 use crate::query::goto;
 
 const MAX_RESULTS: usize = 300;
@@ -20,6 +19,7 @@ pub fn find_symbol_usages(
     symbol_name: &str,
     current_file: Option<&str>,
 ) -> Result<Value> {
+    ensure_search_projections(conn)?;
     find_symbol_usages_inner(conn, symbol_name, current_file, None)
 }
 
@@ -33,6 +33,7 @@ pub fn find_symbol_usages_for_cursor(
     line: Option<u32>,
     character: Option<u32>,
 ) -> Result<Value> {
+    ensure_search_projections(conn)?;
     let scope = match (content, line, character) {
         (Some(content), Some(line), Some(character)) => {
             resolve_usage_scope(conn, symbol_name, content, line, character)?
@@ -74,7 +75,7 @@ fn find_symbol_usages_inner(
             break;
         }
 
-        search_in_file(path, symbol_name, MAX_RESULTS - results.len(), scope, |item| {
+        search_in_file(conn, path, symbol_name, MAX_RESULTS - results.len(), scope, |item| {
             push_unique_result(&mut results, item);
             Ok(())
         })?;
@@ -346,7 +347,7 @@ where
             break;
         }
 
-        search_in_file(path, symbol_name, MAX_RESULTS - total_results, None, |item| {
+        search_in_file(conn, path, symbol_name, MAX_RESULTS - total_results, None, |item| {
             batch.push(item);
             total_results += 1;
 
@@ -531,13 +532,7 @@ fn collect_type_candidate_files(
 fn is_type_like_symbol(conn: &Connection, symbol_name: &str) -> Result<bool> {
     let exists = conn
         .query_row(
-            r#"
-            SELECT 1
-            FROM classes c
-            JOIN strings s ON c.name_id = s.id
-            WHERE s.text = ?
-            LIMIT 1
-            "#,
+            "SELECT 1 FROM search_symbols WHERE is_class_like = 1 AND name = ? LIMIT 1",
             [symbol_name],
             |_| Ok(()),
         )
@@ -548,51 +543,22 @@ fn is_type_like_symbol(conn: &Connection, symbol_name: &str) -> Result<bool> {
 }
 
 fn find_type_reference_file_ids(conn: &Connection, symbol_name: &str) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT DISTINCT file_id
+        FROM search_text_lines
+        WHERE instr(line_text_lc, lower(?1)) > 0
+        ORDER BY file_id
+        LIMIT ?2
+        "#,
+    )?;
+    let rows = stmt.query_map(rusqlite::params![symbol_name, MAX_FILES as i64], |row| {
+        row.get::<_, i64>(0)
+    })?;
     let mut ids = Vec::new();
-    let mut seen = HashSet::new();
-    let detail_pattern = format!("%{}%", symbol_name);
-
-    collect_ids(
-        conn,
-        r#"
-        SELECT DISTINCT m.file_id
-        FROM members m
-        JOIN strings st ON m.type_id = st.id
-        WHERE st.text = ?
-          AND m.file_id IS NOT NULL
-        "#,
-        &[symbol_name],
-        &mut seen,
-        &mut ids,
-    )?;
-
-    collect_ids(
-        conn,
-        r#"
-        SELECT DISTINCT m.file_id
-        FROM members m
-        JOIN strings srt ON m.return_type_id = srt.id
-        WHERE srt.text = ?
-          AND m.file_id IS NOT NULL
-        "#,
-        &[symbol_name],
-        &mut seen,
-        &mut ids,
-    )?;
-
-    collect_ids(
-        conn,
-        r#"
-        SELECT DISTINCT COALESCE(m.file_id, c.file_id)
-        FROM members m
-        JOIN classes c ON m.class_id = c.id
-        WHERE m.detail LIKE ?
-          AND COALESCE(m.file_id, c.file_id) IS NOT NULL
-        "#,
-        &[detail_pattern.as_str()],
-        &mut seen,
-        &mut ids,
-    )?;
+    for row in rows {
+        ids.push(row?);
+    }
 
     Ok(ids)
 }
@@ -610,14 +576,11 @@ fn find_member_definition_file_ids(
     collect_ids(
         conn,
         r#"
-        SELECT DISTINCT COALESCE(m.file_id, c.file_id)
-        FROM members m
-        JOIN strings sm ON m.name_id = sm.id
-        JOIN classes c ON m.class_id = c.id
-        JOIN strings sc ON c.name_id = sc.id
-        WHERE sm.text = ?
-          AND sc.text = ?
-          AND COALESCE(m.file_id, c.file_id) IS NOT NULL
+        SELECT DISTINCT file_id
+        FROM search_symbols
+        WHERE name = ?
+          AND owner_name = ?
+          AND is_class_like = 0
         "#,
         &[symbol_name, owner_class],
         &mut seen,
@@ -636,26 +599,9 @@ fn find_symbol_definition_file_ids(conn: &Connection, symbol_name: &str) -> Resu
     collect_ids(
         conn,
         r#"
-        SELECT DISTINCT f.id
-        FROM classes c
-        JOIN strings sc ON c.name_id = sc.id
-        JOIN files f ON c.file_id = f.id
-        WHERE sc.text = ?
-        "#,
-        &[symbol_name],
-        &mut seen,
-        &mut ids,
-    )?;
-
-    collect_ids(
-        conn,
-        r#"
-        SELECT DISTINCT COALESCE(m.file_id, c.file_id)
-        FROM members m
-        JOIN strings sm ON m.name_id = sm.id
-        JOIN classes c ON m.class_id = c.id
-        WHERE sm.text = ?
-          AND COALESCE(m.file_id, c.file_id) IS NOT NULL
+        SELECT DISTINCT file_id
+        FROM search_symbols
+        WHERE name = ?
         "#,
         &[symbol_name],
         &mut seen,
@@ -688,10 +634,9 @@ fn find_symbol_call_file_ids(conn: &Connection, symbol_name: &str) -> Result<Vec
     collect_ids(
         conn,
         r#"
-        SELECT DISTINCT sc.file_id
-        FROM symbol_calls sc
-        JOIN strings ss ON sc.name_id = ss.id
-        WHERE ss.text = ?
+        SELECT DISTINCT file_id
+        FROM search_symbol_calls
+        WHERE name_lc = lower(?)
         "#,
         &[symbol_name],
         &mut seen,
@@ -704,13 +649,7 @@ fn find_symbol_call_file_ids(conn: &Connection, symbol_name: &str) -> Result<Vec
 /// Collect all indexed file ids as a last-resort unresolved usage scope fallback.
 /// 作为最后兜底，收集所有已索引文件 id。
 fn collect_all_file_ids(conn: &Connection) -> Result<Vec<i64>> {
-    let mut stmt = conn.prepare(
-        r#"
-        SELECT f.id
-        FROM files f
-        ORDER BY f.id
-        "#,
-    )?;
+    let mut stmt = conn.prepare("SELECT file_id FROM search_files ORDER BY file_id")?;
     let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
 
     let mut ids = Vec::new();
@@ -728,36 +667,29 @@ fn get_member_declaration_results(
     symbol_name: &str,
     owner_class: &str,
 ) -> Result<Vec<Value>> {
-    let sql = format!(
-        r#"
-        {}
-        SELECT dp.full_path || '/' || sf.text,
-               m.line_number,
-               sc.text
-        FROM members m
-        JOIN strings sm ON m.name_id = sm.id
-        JOIN classes c ON m.class_id = c.id
-        JOIN strings sc ON c.name_id = sc.id
-        JOIN files f ON COALESCE(m.file_id, c.file_id) = f.id
-        JOIN dir_paths dp ON f.directory_id = dp.id
-        JOIN strings sf ON f.filename_id = sf.id
-        WHERE sm.text = ?
-          AND sc.text = ?
-          AND COALESCE(m.file_id, c.file_id) IS NOT NULL
-        ORDER BY m.line_number
-        "#,
-        PATH_CTE
-    );
+    let sql = r#"
+        SELECT
+            ss.path,
+            ss.line_number,
+            ss.owner_name,
+            COALESCE(stl.line_text, '')
+        FROM search_symbols ss
+        LEFT JOIN search_text_lines stl
+            ON stl.file_id = ss.file_id
+           AND stl.line_number = ss.line_number
+        WHERE ss.name = ?
+          AND ss.owner_name = ?
+          AND ss.is_class_like = 0
+        ORDER BY ss.line_number
+        "#;
 
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([symbol_name, owner_class], |row| {
         let path = normalize_path(&row.get::<_, String>(0)?);
         let line = row.get::<_, i64>(1)?;
         let class_name = row.get::<_, String>(2)?;
-        let (line, col) =
-            find_symbol_location_near(&path, symbol_name, line as usize).unwrap_or((line as usize, 0));
-        let context = read_line_context(&path, line)
-            .unwrap_or_else(|| format!("{class_name}::{symbol_name}"));
+        let context = row.get::<_, String>(3)?;
+        let col = find_identifier_in_line(&context, symbol_name).unwrap_or(0);
         let kind = classify_member_location(&path, &context, symbol_name);
 
         Ok(json!({
@@ -819,20 +751,11 @@ fn find_including_file_ids(conn: &Connection, def_ids: &[i64]) -> Result<Vec<i64
 fn find_file_id(conn: &Connection, file_path: &str) -> Result<Option<i64>> {
     let normalized = normalize_path(file_path);
 
-    let sql = format!(
-        r#"
-        {}
-        SELECT f.id
-        FROM files f
-        JOIN dir_paths dp ON f.directory_id = dp.id
-        JOIN strings sn ON f.filename_id = sn.id
-        WHERE dp.full_path || '/' || sn.text = ?
-        LIMIT 1
-        "#,
-        PATH_CTE
-    );
-
-    if let Ok(id) = conn.query_row(&sql, [normalized], |row| row.get::<_, i64>(0)) {
+    if let Ok(id) = conn.query_row(
+        "SELECT file_id FROM search_files WHERE path = ? LIMIT 1",
+        [normalized.as_str()],
+        |row| row.get::<_, i64>(0),
+    ) {
         return Ok(Some(id));
     }
 
@@ -846,10 +769,9 @@ fn find_file_id(conn: &Connection, file_path: &str) -> Result<Option<i64>> {
     let id = conn
         .query_row(
             r#"
-            SELECT f.id
-            FROM files f
-            JOIN strings sn ON f.filename_id = sn.id
-            WHERE sn.text = ?
+            SELECT file_id
+            FROM search_files
+            WHERE basename = ?
             LIMIT 1
             "#,
             [filename],
@@ -899,15 +821,11 @@ fn get_file_paths_by_ids(conn: &Connection, ids: &[i64]) -> Result<Vec<String>> 
         let placeholders = repeat_placeholders(chunk.len());
         let sql = format!(
             r#"
-            {}
-            SELECT dp.full_path || '/' || sn.text AS path
-            FROM files f
-            JOIN dir_paths dp ON f.directory_id = dp.id
-            JOIN strings sn ON f.filename_id = sn.id
-            WHERE f.id IN ({})
+            SELECT path
+            FROM search_files
+            WHERE file_id IN ({})
             ORDER BY path
             "#,
-            PATH_CTE,
             placeholders
         );
 
@@ -931,6 +849,7 @@ fn get_file_paths_by_ids(conn: &Connection, ids: &[i64]) -> Result<Vec<String>> 
 /// Search a single file line by line.
 /// 逐行搜索单个文件。
 fn search_in_file<F>(
+    conn: &Connection,
     path: &str,
     symbol_name: &str,
     remaining_limit: usize,
@@ -944,25 +863,38 @@ where
         return Ok(());
     }
 
-    let content = match std::fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(_) => return Ok(()),
+    let content = match scope {
+        Some(UsageScope::Member(_)) => std::fs::read_to_string(path).ok(),
+        _ => None,
     };
-
     let mut emitted = 0usize;
     let member_context = match scope {
         Some(UsageScope::Member(member_scope)) => {
-            Some(FileMemberContext::new(&content, member_scope))
+            content
+                .as_deref()
+                .map(|content| FileMemberContext::new(content, member_scope))
         }
         _ => None,
     };
 
-    for (line_index, line) in content.lines().enumerate() {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT line_number, line_text
+        FROM search_text_lines
+        WHERE path = ?1
+          AND instr(line_text_lc, lower(?2)) > 0
+        ORDER BY line_number
+        "#,
+    )?;
+    let mut rows = stmt.query(rusqlite::params![path, symbol_name])?;
+
+    while let Some(row) = rows.next()? {
         if emitted >= remaining_limit {
             break;
         }
 
-        let current_line = line_index + 1;
+        let current_line = row.get::<_, i64>(0)? as usize;
+        let line = row.get::<_, String>(1)?;
 
         if let Some(UsageScope::Local(local_scope)) = scope {
             if current_line < local_scope.start_line || current_line > local_scope.end_line {
@@ -977,14 +909,14 @@ where
                 break;
             };
 
-            if !is_code_occurrence(line, col) {
+            if !is_code_occurrence(&line, col) {
                 search_start = col + symbol_name.len();
                 continue;
             }
 
             if !should_emit_match(
-                &content,
-                line,
+                content.as_deref().unwrap_or(""),
+                &line,
                 current_line,
                 col,
                 scope,
@@ -999,7 +931,7 @@ where
                 "line": current_line,
                 "col": col,
                 "context": line.trim(),
-                "kind": classify_usage_line(line, symbol_name, col),
+                "kind": classify_usage_line(&line, symbol_name, col),
             }))?;
 
             emitted += 1;
@@ -1304,42 +1236,6 @@ fn usage_identity(item: &Value) -> String {
         .unwrap_or_default();
 
     format!("{}:{}:{}", normalize_path(path), line, col)
-}
-
-fn read_line_context(path: &str, line_number: usize) -> Option<String> {
-    let file = std::fs::File::open(path).ok()?;
-    let reader = std::io::BufReader::new(file);
-
-    reader
-        .lines()
-        .nth(line_number.saturating_sub(1))?
-        .ok()
-        .map(|line| line.trim().to_string())
-}
-
-fn find_symbol_location_near(
-    path: &str,
-    symbol_name: &str,
-    start_line: usize,
-) -> Option<(usize, usize)> {
-    let file = std::fs::File::open(path).ok()?;
-    let reader = std::io::BufReader::new(file);
-    let lines = reader.lines().collect::<Result<Vec<_>, _>>().ok()?;
-
-    if lines.is_empty() {
-        return None;
-    }
-
-    let start = start_line.saturating_sub(1).min(lines.len() - 1);
-    let end = (start + 8).min(lines.len() - 1);
-
-    for (index, line) in lines.iter().enumerate().take(end + 1).skip(start) {
-        if let Some(col) = find_identifier_in_line(line, symbol_name) {
-            return Some((index + 1, col));
-        }
-    }
-
-    None
 }
 
 fn find_identifier_in_line(line: &str, symbol_name: &str) -> Option<usize> {

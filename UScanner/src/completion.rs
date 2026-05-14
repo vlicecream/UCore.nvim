@@ -9,6 +9,7 @@ use tree_sitter::{Node, Parser, Point};
 use tracing::info;
 
 use crate::server::state::CompletionCache;
+use crate::db::ensure_search_projections;
 
 const MAX_COMPLETION_ITEMS: usize = 128;
 const MAX_MEMBER_ITEMS_PER_CLASS: usize = 96;
@@ -225,6 +226,10 @@ pub fn process_completion_with_engine(
     cache: Option<Arc<Mutex<CompletionCache>>>,
     persistent_cache: Option<Arc<Mutex<Connection>>>,
 ) -> Result<Value> {
+    ensure_search_projections(conn)?;
+    if let Some(engine_conn) = engine_conn {
+        ensure_search_projections(engine_conn)?;
+    }
     let log_enabled = completion_log_enabled();
     let started_at = Instant::now();
     let mut ctx = CompletionContext::new(conn, file_path.as_deref());
@@ -3154,12 +3159,11 @@ fn append_global_type_items(
     for (pattern, limit) in global_search_patterns(prefix) {
         let mut stmt = conn.prepare(
             r#"
-            SELECT s.text, c.symbol_type
-            FROM classes c
-            JOIN strings s ON c.name_id = s.id
-            WHERE c.symbol_type IN ('class', 'struct', 'UCLASS', 'USTRUCT', 'enum', 'UENUM', 'UINTERFACE', 'typedef')
-              AND lower(s.text) LIKE ?
-            ORDER BY s.text
+            SELECT name, kind
+            FROM search_symbols
+            WHERE is_class_like = 1
+              AND name_lc LIKE ?
+            ORDER BY name_lc, path_lc
             LIMIT ?
             "#,
         )?;
@@ -3328,15 +3332,9 @@ fn fetch_include_paths(
     let mut stmt = ctx.conn.prepare(
         r#"
         SELECT
-            CASE
-                WHEN dp.full_path = '/' THEN '/' || sn.text
-                WHEN substr(dp.full_path, -1) = '/' THEN dp.full_path || sn.text
-                ELSE dp.full_path || '/' || sn.text
-            END AS path
-        FROM files f
-        JOIN strings sn ON f.filename_id = sn.id
-        JOIN dir_paths dp ON f.directory_id = dp.id
-        WHERE f.is_header = 1
+            path
+        FROM search_files
+        WHERE is_header = 1
           AND (path LIKE ? OR path LIKE ?)
         ORDER BY
           CASE
@@ -4935,19 +4933,7 @@ fn unix_timestamp() -> i64 {
 fn get_file_id_by_full_path(conn: &Connection, file_path: &str) -> Option<i64> {
     let normalized = file_path.replace('\\', "/");
 
-    let sql = r#"
-        SELECT f.id
-        FROM files f
-        JOIN dir_paths dp ON f.directory_id = dp.id
-        JOIN strings sf ON f.filename_id = sf.id
-        WHERE
-            CASE
-                WHEN dp.full_path = '/' THEN '/' || sf.text
-                WHEN substr(dp.full_path, -1) = '/' THEN dp.full_path || sf.text
-                ELSE dp.full_path || '/' || sf.text
-            END = ?
-        LIMIT 1
-    "#;
+    let sql = "SELECT file_id FROM search_files WHERE path = ? LIMIT 1";
 
     conn.query_row(sql, [&normalized], |row| row.get::<_, i64>(0))
         .optional()

@@ -14,7 +14,7 @@ use tracing::info;
 use crate::types::OpenBufferOverlay;
 
 const PROJECT_TEXT_VISIBILITY_SCAN_LIMIT: usize = 64;
-const ENGINE_TEXT_VISIBILITY_SCAN_LIMIT: usize = 0;
+const ENGINE_TEXT_VISIBILITY_SCAN_LIMIT: usize = 64;
 
 static DIAGNOSTICS_LOG_ENABLED: OnceLock<bool> = OnceLock::new();
 
@@ -1907,10 +1907,12 @@ fn member_function_declaration(
     content: &str,
     file_path: &str,
 ) -> Option<HeaderFunctionDecl> {
+    let text = node_text(node, content).trim().to_string();
     if !matches!(
         node.kind(),
         "field_declaration" | "unreal_function_declaration" | "declaration"
-    ) {
+    ) && !text.contains("UFUNCTION")
+    {
         return None;
     }
 
@@ -1918,7 +1920,6 @@ fn member_function_declaration(
         return None;
     }
 
-    let text = node_text(node, content).trim().to_string();
     if text.is_empty()
         || text.contains('{')
         || !text.contains(';')
@@ -1933,7 +1934,8 @@ fn member_function_declaration(
         return None;
     }
 
-    let declarator = find_child_by_field(node, "declarator")?;
+    let declarator = find_child_by_field(node, "declarator")
+        .or_else(|| find_child_by_type(node, "function_declarator"))?;
     let name_node = find_name_node(declarator)?;
     let parameters = find_child_by_type(declarator, "parameter_list")
         .map(|params| node_text(params, content).to_string())
@@ -1998,9 +2000,35 @@ fn is_macro_invocation_statement(text: &str) -> bool {
         return false;
     }
 
-    prefix
+    if !prefix
         .chars()
         .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+    {
+        return false;
+    }
+
+    let mut depth = 0i32;
+    let mut close_index = None;
+    for (offset, ch) in trimmed[open_paren..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close_index = Some(open_paren + offset + ch.len_utf8());
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let Some(close_index) = close_index else {
+        return false;
+    };
+
+    let trailing = trimmed[close_index..].trim();
+    trailing.is_empty() || trailing == ";"
 }
 
 fn build_definition_signature(decl: &HeaderFunctionDecl, expected: &ExpectedDefinition) -> String {

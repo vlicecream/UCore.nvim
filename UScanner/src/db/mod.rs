@@ -16,7 +16,7 @@ use crate::types::{ParseResult, ProgressReporter};
 ///
 /// Increment this when table structures, indexes, or stored data semantics change.
 /// 当表结构、索引或存储语义变化时递增。
-pub const DB_VERSION: i32 = 24;
+pub const DB_VERSION: i32 = 25;
 
 /// Completion cache version.
 /// 补全缓存版本。
@@ -348,6 +348,30 @@ fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
             line_text_lc TEXT NOT NULL,
             FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS search_symbol_calls (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id INTEGER NOT NULL,
+            module_id INTEGER,
+            module_name TEXT,
+            module_name_lc TEXT,
+            path TEXT NOT NULL,
+            path_lc TEXT NOT NULL,
+            line_number INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            name_lc TEXT NOT NULL,
+            FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS search_asset_usages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            lookup_key TEXT NOT NULL,
+            usage_kind TEXT NOT NULL,
+            asset_path TEXT NOT NULL,
+            asset_name TEXT NOT NULL,
+            asset_name_lc TEXT NOT NULL,
+            source_path TEXT NOT NULL
+        );
         "#,
     )?;
 
@@ -458,6 +482,15 @@ fn create_indices(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_search_text_lines_file_line ON search_text_lines(file_id, line_number);
         CREATE INDEX IF NOT EXISTS idx_search_text_lines_module_name_lc ON search_text_lines(module_name_lc);
         CREATE INDEX IF NOT EXISTS idx_search_text_lines_path_lc ON search_text_lines(path_lc);
+
+        CREATE INDEX IF NOT EXISTS idx_search_symbol_calls_name_lc ON search_symbol_calls(name_lc);
+        CREATE INDEX IF NOT EXISTS idx_search_symbol_calls_file_id ON search_symbol_calls(file_id);
+        CREATE INDEX IF NOT EXISTS idx_search_symbol_calls_path_lc ON search_symbol_calls(path_lc);
+        CREATE INDEX IF NOT EXISTS idx_search_symbol_calls_module_name_lc ON search_symbol_calls(module_name_lc);
+
+        CREATE INDEX IF NOT EXISTS idx_search_asset_usages_lookup_kind ON search_asset_usages(lookup_key, usage_kind);
+        CREATE INDEX IF NOT EXISTS idx_search_asset_usages_asset_path ON search_asset_usages(asset_path);
+        CREATE INDEX IF NOT EXISTS idx_search_asset_usages_asset_name_lc ON search_asset_usages(asset_name_lc);
         "#,
     )?;
 
@@ -510,6 +543,13 @@ fn drop_indices(conn: &Connection) -> rusqlite::Result<()> {
         "idx_search_text_lines_file_line",
         "idx_search_text_lines_module_name_lc",
         "idx_search_text_lines_path_lc",
+        "idx_search_symbol_calls_name_lc",
+        "idx_search_symbol_calls_file_id",
+        "idx_search_symbol_calls_path_lc",
+        "idx_search_symbol_calls_module_name_lc",
+        "idx_search_asset_usages_lookup_kind",
+        "idx_search_asset_usages_asset_path",
+        "idx_search_asset_usages_asset_name_lc",
     ];
 
     for index_name in indices {
@@ -689,6 +729,22 @@ pub fn save_to_db(
              WHERE file_id = ?6",
         )?;
 
+        let mut stmt_search_call = tx.prepare(
+            "INSERT INTO search_symbol_calls
+             (file_id, module_id, module_name, module_name_lc, path, path_lc, line_number, name, name_lc)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        )?;
+
+        let mut stmt_update_search_call_meta = tx.prepare(
+            "UPDATE search_symbol_calls
+             SET module_id = ?1,
+                 module_name = ?2,
+                 module_name_lc = ?3,
+                 path = ?4,
+                 path_lc = ?5
+             WHERE file_id = ?6",
+        )?;
+
         let mut last_reported_percent = 0usize;
 
         for (index, result) in results.iter().enumerate() {
@@ -777,6 +833,15 @@ pub fn save_to_db(
                         &path_lc,
                         file_id,
                     ])?;
+
+                    stmt_update_search_call_meta.execute(params![
+                        result.module_id,
+                        module_name.as_deref(),
+                        module_name_lc.as_deref(),
+                        &path,
+                        &path_lc,
+                        file_id,
+                    ])?;
                 }
                 continue;
             }
@@ -835,7 +900,11 @@ pub fn save_to_db(
                 &tx,
                 &mut string_cache,
                 &mut stmt_call,
+                &mut stmt_search_call,
                 file_id,
+                result.module_id,
+                module_name.as_deref(),
+                path_obj,
                 &data.calls,
             )?;
 
@@ -872,6 +941,199 @@ pub fn save_to_db(
     );
 
     finalize_bulk_write(conn, reporter)?;
+    Ok(())
+}
+
+pub fn ensure_search_projections(conn: &Connection) -> anyhow::Result<()> {
+    let search_file_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM search_files", [], |row| row.get(0))?;
+    let search_symbol_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM search_symbols", [], |row| row.get(0))?;
+    let search_call_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM search_symbol_calls", [], |row| row.get(0))?;
+
+    if search_file_count > 0 && search_symbol_count > 0 && search_call_count > 0 {
+        return Ok(());
+    }
+
+    if search_file_count == 0 {
+        let sql = format!(
+            r#"
+            {}
+            INSERT INTO search_files
+                (file_id, module_id, module_name, module_name_lc, path, path_lc, basename, basename_lc, ext, is_source, is_header, is_searchable_text)
+            SELECT
+                f.id,
+                f.module_id,
+                sm.text,
+                lower(sm.text),
+                CASE
+                    WHEN dp.full_path = '/' THEN '/' || sn.text
+                    WHEN substr(dp.full_path, -1) = '/' THEN dp.full_path || sn.text
+                    ELSE dp.full_path || '/' || sn.text
+                END,
+                lower(CASE
+                    WHEN dp.full_path = '/' THEN '/' || sn.text
+                    WHEN substr(dp.full_path, -1) = '/' THEN dp.full_path || sn.text
+                    ELSE dp.full_path || '/' || sn.text
+                END),
+                sn.text,
+                lower(sn.text),
+                f.extension,
+                CASE WHEN lower(COALESCE(f.extension, '')) IN ('h','hh','hpp','hxx','inl','ipp','c','cc','cpp','cxx','cs') THEN 1 ELSE 0 END,
+                COALESCE(f.is_header, 0),
+                CASE WHEN lower(COALESCE(f.extension, '')) IN ('h','hh','hpp','hxx','c','cc','cpp','cxx','inl','ipp','cs','ini','json','uproject','uplugin') THEN 1 ELSE 0 END
+            FROM files f
+            JOIN dir_paths dp ON f.directory_id = dp.id
+            JOIN strings sn ON f.filename_id = sn.id
+            LEFT JOIN modules m ON f.module_id = m.id
+            LEFT JOIN strings sm ON m.name_id = sm.id
+            "#,
+            project_path::PATH_CTE
+        );
+        conn.execute_batch(&sql)?;
+    }
+
+    if search_symbol_count == 0 {
+        let class_sql = format!(
+            r#"
+            {}
+            INSERT INTO search_symbols
+                (file_id, symbol_rowid, symbol_table, kind, kind_rank, name, name_lc, compact_name, owner_name, owner_name_lc, module_id, module_name, module_name_lc, path, path_lc, basename, basename_lc, ext, line_number, is_class_like, is_function_like, is_member_like)
+            SELECT
+                f.id,
+                c.id,
+                'classes',
+                c.symbol_type,
+                CASE
+                    WHEN lower(COALESCE(c.symbol_type, '')) IN ('class','struct','enum','uclass','ustruct','uenum','uinterface','typedef') THEN 0
+                    WHEN lower(COALESCE(c.symbol_type, '')) LIKE '%function%' OR lower(COALESCE(c.symbol_type, '')) LIKE '%method%' OR lower(COALESCE(c.symbol_type, '')) LIKE '%delegate%' THEN 1
+                    ELSE 2
+                END,
+                sc.text,
+                lower(sc.text),
+                lower(replace(replace(replace(sc.text, '_', ''), ':', ''), ' ', '')),
+                sc.text,
+                lower(sc.text),
+                f.module_id,
+                sm.text,
+                lower(sm.text),
+                CASE
+                    WHEN dp.full_path = '/' THEN '/' || sf.text
+                    WHEN substr(dp.full_path, -1) = '/' THEN dp.full_path || sf.text
+                    ELSE dp.full_path || '/' || sf.text
+                END,
+                lower(CASE
+                    WHEN dp.full_path = '/' THEN '/' || sf.text
+                    WHEN substr(dp.full_path, -1) = '/' THEN dp.full_path || sf.text
+                    ELSE dp.full_path || '/' || sf.text
+                END),
+                sf.text,
+                lower(sf.text),
+                f.extension,
+                c.line_number,
+                CASE WHEN lower(COALESCE(c.symbol_type, '')) IN ('class','struct','enum','uclass','ustruct','uenum','uinterface','typedef') THEN 1 ELSE 0 END,
+                CASE WHEN lower(COALESCE(c.symbol_type, '')) LIKE '%function%' OR lower(COALESCE(c.symbol_type, '')) LIKE '%method%' OR lower(COALESCE(c.symbol_type, '')) LIKE '%delegate%' THEN 1 ELSE 0 END,
+                CASE WHEN lower(COALESCE(c.symbol_type, '')) IN ('class','struct','enum','uclass','ustruct','uenum','uinterface','typedef') OR lower(COALESCE(c.symbol_type, '')) LIKE '%function%' OR lower(COALESCE(c.symbol_type, '')) LIKE '%method%' OR lower(COALESCE(c.symbol_type, '')) LIKE '%delegate%' THEN 0 ELSE 1 END
+            FROM classes c
+            JOIN strings sc ON c.name_id = sc.id
+            JOIN files f ON c.file_id = f.id
+            JOIN dir_paths dp ON f.directory_id = dp.id
+            JOIN strings sf ON f.filename_id = sf.id
+            LEFT JOIN modules m ON f.module_id = m.id
+            LEFT JOIN strings sm ON m.name_id = sm.id;
+
+            INSERT INTO search_symbols
+                (file_id, symbol_rowid, symbol_table, kind, kind_rank, name, name_lc, compact_name, owner_name, owner_name_lc, module_id, module_name, module_name_lc, path, path_lc, basename, basename_lc, ext, line_number, is_class_like, is_function_like, is_member_like)
+            SELECT
+                COALESCE(m.file_id, c.file_id),
+                m.id,
+                'members',
+                st.text,
+                CASE
+                    WHEN lower(COALESCE(st.text, '')) IN ('class','struct','enum','uclass','ustruct','uenum','uinterface','typedef') THEN 0
+                    WHEN lower(COALESCE(st.text, '')) LIKE '%function%' OR lower(COALESCE(st.text, '')) LIKE '%method%' OR lower(COALESCE(st.text, '')) LIKE '%delegate%' THEN 1
+                    ELSE 2
+                END,
+                sn.text,
+                lower(sn.text),
+                lower(replace(replace(replace(sn.text, '_', ''), ':', ''), ' ', '')),
+                sc.text,
+                lower(sc.text),
+                f.module_id,
+                sm.text,
+                lower(sm.text),
+                CASE
+                    WHEN dp.full_path = '/' THEN '/' || sf.text
+                    WHEN substr(dp.full_path, -1) = '/' THEN dp.full_path || sf.text
+                    ELSE dp.full_path || '/' || sf.text
+                END,
+                lower(CASE
+                    WHEN dp.full_path = '/' THEN '/' || sf.text
+                    WHEN substr(dp.full_path, -1) = '/' THEN dp.full_path || sf.text
+                    ELSE dp.full_path || '/' || sf.text
+                END),
+                sf.text,
+                lower(sf.text),
+                f.extension,
+                m.line_number,
+                CASE WHEN lower(COALESCE(st.text, '')) IN ('class','struct','enum','uclass','ustruct','uenum','uinterface','typedef') THEN 1 ELSE 0 END,
+                CASE WHEN lower(COALESCE(st.text, '')) LIKE '%function%' OR lower(COALESCE(st.text, '')) LIKE '%method%' OR lower(COALESCE(st.text, '')) LIKE '%delegate%' THEN 1 ELSE 0 END,
+                CASE WHEN lower(COALESCE(st.text, '')) IN ('class','struct','enum','uclass','ustruct','uenum','uinterface','typedef') OR lower(COALESCE(st.text, '')) LIKE '%function%' OR lower(COALESCE(st.text, '')) LIKE '%method%' OR lower(COALESCE(st.text, '')) LIKE '%delegate%' THEN 0 ELSE 1 END
+            FROM members m
+            JOIN strings sn ON m.name_id = sn.id
+            JOIN strings st ON m.type_id = st.id
+            JOIN classes c ON m.class_id = c.id
+            JOIN strings sc ON c.name_id = sc.id
+            JOIN files f ON COALESCE(m.file_id, c.file_id) = f.id
+            JOIN dir_paths dp ON f.directory_id = dp.id
+            JOIN strings sf ON f.filename_id = sf.id
+            LEFT JOIN modules mo ON f.module_id = mo.id
+            LEFT JOIN strings sm ON mo.name_id = sm.id
+            WHERE COALESCE(m.file_id, c.file_id) IS NOT NULL
+            "#,
+            project_path::PATH_CTE
+        );
+        conn.execute_batch(&class_sql)?;
+    }
+
+    if search_call_count == 0 {
+        let sql = format!(
+            r#"
+            {}
+            INSERT INTO search_symbol_calls
+                (file_id, module_id, module_name, module_name_lc, path, path_lc, line_number, name, name_lc)
+            SELECT
+                sc.file_id,
+                f.module_id,
+                sm.text,
+                lower(sm.text),
+                CASE
+                    WHEN dp.full_path = '/' THEN '/' || sf.text
+                    WHEN substr(dp.full_path, -1) = '/' THEN dp.full_path || sf.text
+                    ELSE dp.full_path || '/' || sf.text
+                END,
+                lower(CASE
+                    WHEN dp.full_path = '/' THEN '/' || sf.text
+                    WHEN substr(dp.full_path, -1) = '/' THEN dp.full_path || sf.text
+                    ELSE dp.full_path || '/' || sf.text
+                END),
+                sc.line,
+                ss.text,
+                lower(ss.text)
+            FROM symbol_calls sc
+            JOIN strings ss ON sc.name_id = ss.id
+            JOIN files f ON sc.file_id = f.id
+            JOIN dir_paths dp ON f.directory_id = dp.id
+            JOIN strings sf ON f.filename_id = sf.id
+            LEFT JOIN modules m ON f.module_id = m.id
+            LEFT JOIN strings sm ON m.name_id = sm.id
+            "#,
+            project_path::PATH_CTE
+        );
+        conn.execute_batch(&sql)?;
+    }
+
     Ok(())
 }
 
@@ -1062,6 +1324,22 @@ pub fn save_to_db_incremental(
          WHERE file_id = ?6",
     )?;
 
+    let mut stmt_search_call = tx.prepare(
+        "INSERT INTO search_symbol_calls
+         (file_id, module_id, module_name, module_name_lc, path, path_lc, line_number, name, name_lc)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+    )?;
+
+    let mut stmt_update_search_call_meta = tx.prepare(
+        "UPDATE search_symbol_calls
+         SET module_id = ?1,
+             module_name = ?2,
+             module_name_lc = ?3,
+             path = ?4,
+             path_lc = ?5
+         WHERE file_id = ?6",
+    )?;
+
     let mut last_reported_percent = 0usize;
     let mut written_file_ids = Vec::new();
 
@@ -1121,6 +1399,15 @@ pub fn save_to_db_incremental(
                 ])?;
 
                 stmt_update_search_text_meta.execute(params![
+                    item.result.module_id,
+                    module_name.as_deref(),
+                    module_name_lc.as_deref(),
+                    &path,
+                    &path_lc,
+                    existing_file_id,
+                ])?;
+
+                stmt_update_search_call_meta.execute(params![
                     item.result.module_id,
                     module_name.as_deref(),
                     module_name_lc.as_deref(),
@@ -1190,7 +1477,11 @@ pub fn save_to_db_incremental(
             &tx,
             &mut string_cache,
             &mut stmt_call,
+            &mut stmt_search_call,
             file_id,
+            item.result.module_id,
+            module_name.as_deref(),
+            Path::new(&item.result.path),
             &data.calls,
         )?;
 
@@ -1219,6 +1510,8 @@ pub fn save_to_db_incremental(
     drop(stmt_update_search_text_meta);
     drop(stmt_insert_search_text);
     drop(stmt_delete_search_text);
+    drop(stmt_update_search_call_meta);
+    drop(stmt_search_call);
     drop(stmt_update_search_symbol_meta);
     drop(stmt_search_symbol);
     drop(stmt_search_file);
@@ -1491,6 +1784,34 @@ fn insert_search_symbol_row(
     Ok(())
 }
 
+fn insert_search_symbol_call_row(
+    stmt: &mut rusqlite::Statement,
+    file_id: i64,
+    module_id: Option<i64>,
+    module_name: Option<&str>,
+    path: &Path,
+    line_number: i64,
+    name: &str,
+) -> anyhow::Result<()> {
+    let path = normalize_indexed_path(path);
+    let path_lc = lower_ascii(&path);
+    let module_name_lc = module_name.map(lower_ascii);
+
+    stmt.execute(params![
+        file_id,
+        module_id,
+        module_name,
+        module_name_lc,
+        path,
+        path_lc,
+        line_number,
+        name,
+        lower_ascii(name),
+    ])?;
+
+    Ok(())
+}
+
 /// Convert item progress into a 0-100 percentage.
 /// 将条目进度换算成 0-100 百分比。
 fn progress_percent(current: usize, total: usize) -> usize {
@@ -1652,6 +1973,7 @@ pub(crate) fn delete_files_by_ids_tx(
     for sql in [
         "DELETE FROM search_text_lines WHERE file_id IN (SELECT id FROM temp_ucore_deleted_file_ids)",
         "DELETE FROM search_symbols WHERE file_id IN (SELECT id FROM temp_ucore_deleted_file_ids)",
+        "DELETE FROM search_symbol_calls WHERE file_id IN (SELECT id FROM temp_ucore_deleted_file_ids)",
         "DELETE FROM search_files WHERE file_id IN (SELECT id FROM temp_ucore_deleted_file_ids)",
         "DELETE FROM gameplay_tags WHERE file_id IN (SELECT id FROM temp_ucore_deleted_file_ids)",
         "DELETE FROM macro_definitions WHERE file_id IN (SELECT id FROM temp_ucore_deleted_file_ids)",
@@ -1936,12 +2258,25 @@ fn save_calls(
     tx: &rusqlite::Transaction,
     string_cache: &mut HashMap<String, i64>,
     stmt_call: &mut rusqlite::Statement,
+    stmt_search_call: &mut rusqlite::Statement,
     file_id: i64,
+    module_id: Option<i64>,
+    module_name: Option<&str>,
+    path: &Path,
     calls: &[crate::types::CallInfo],
 ) -> anyhow::Result<()> {
     for call in calls {
         let name_id = get_or_create_string(tx, string_cache, &call.name)?;
         stmt_call.execute(params![file_id, call.line as i64, name_id])?;
+        insert_search_symbol_call_row(
+            stmt_search_call,
+            file_id,
+            module_id,
+            module_name,
+            path,
+            call.line as i64,
+            &call.name,
+        )?;
     }
 
     Ok(())

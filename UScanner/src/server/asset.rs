@@ -341,6 +341,7 @@ pub fn replace_asset_index(
         tx.execute("DELETE FROM asset_references", [])?;
         tx.execute("DELETE FROM asset_functions", [])?;
         tx.execute("DELETE FROM assets", [])?;
+        tx.execute("DELETE FROM search_asset_usages", [])?;
 
         {
             let mut stmt_asset = tx.prepare(
@@ -353,6 +354,11 @@ pub fn replace_asset_index(
             )?;
             let mut stmt_function = tx.prepare(
                 "INSERT INTO asset_functions (asset_path, function_key) VALUES (?1, ?2)",
+            )?;
+            let mut stmt_usage = tx.prepare(
+                "INSERT INTO search_asset_usages
+                 (lookup_key, usage_kind, asset_path, asset_name, asset_name_lc, source_path)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )?;
 
             let total = records.len().max(1);
@@ -368,6 +374,7 @@ pub fn replace_asset_index(
                     &mut stmt_asset,
                     &mut stmt_reference,
                     &mut stmt_function,
+                    &mut stmt_usage,
                     record,
                 )?;
             }
@@ -407,6 +414,11 @@ fn apply_asset_index_delta(
             let mut stmt_function = tx.prepare(
                 "INSERT INTO asset_functions (asset_path, function_key) VALUES (?1, ?2)",
             )?;
+            let mut stmt_usage = tx.prepare(
+                "INSERT INTO search_asset_usages
+                 (lookup_key, usage_kind, asset_path, asset_name, asset_name_lc, source_path)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
 
             for _source_path in deleted_paths {
                 current += 1;
@@ -434,6 +446,7 @@ fn apply_asset_index_delta(
                     &mut stmt_asset,
                     &mut stmt_reference,
                     &mut stmt_function,
+                    &mut stmt_usage,
                     record,
                 )?;
             }
@@ -466,11 +479,17 @@ pub fn upsert_asset_file(conn: &mut Connection, file_path: &Path) -> Result<()> 
         let mut stmt_function = tx.prepare(
             "INSERT INTO asset_functions (asset_path, function_key) VALUES (?1, ?2)",
         )?;
+        let mut stmt_usage = tx.prepare(
+            "INSERT INTO search_asset_usages
+             (lookup_key, usage_kind, asset_path, asset_name, asset_name_lc, source_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
 
         insert_asset_record_db(
             &mut stmt_asset,
             &mut stmt_reference,
             &mut stmt_function,
+            &mut stmt_usage,
             &record,
         )?;
     }
@@ -1034,26 +1053,23 @@ pub fn get_asset_usages(conn: &Connection, asset_path: &str) -> Result<Value> {
     let mut function_references = HashSet::new();
     let mut derived = HashSet::new();
 
-    let mut stmt_ref = conn.prepare(
+    let mut stmt_ref_or_derived = conn.prepare(
         "SELECT DISTINCT asset_path
-         FROM asset_references
-         WHERE reference_key = ?1 OR reference_key LIKE ?2",
+         FROM search_asset_usages
+         WHERE usage_kind = ?1
+           AND (lookup_key = ?2 OR lookup_key LIKE ?3)",
     )?;
     let mut stmt_func = conn.prepare(
         "SELECT DISTINCT asset_path
-         FROM asset_functions
-         WHERE function_key = ?1 OR function_key LIKE ?2 OR function_key LIKE ?3",
-    )?;
-    let mut stmt_derived = conn.prepare(
-        "SELECT DISTINCT asset_path
-         FROM assets
-         WHERE parent_class_key = ?1 OR parent_class_key LIKE ?2",
+         FROM search_asset_usages
+         WHERE usage_kind = 'function'
+           AND (lookup_key = ?1 OR lookup_key LIKE ?2 OR lookup_key LIKE ?3)",
     )?;
 
     for name in names {
         collect_asset_rows(
-            &mut stmt_ref,
-            params![name, format!("%.{}", name)],
+            &mut stmt_ref_or_derived,
+            params!["reference", name, format!("%.{}", name)],
             &mut references,
         )?;
         collect_asset_rows(
@@ -1062,8 +1078,8 @@ pub fn get_asset_usages(conn: &Connection, asset_path: &str) -> Result<Value> {
             &mut function_references,
         )?;
         collect_asset_rows(
-            &mut stmt_derived,
-            params![name, format!("%.{}", name)],
+            &mut stmt_ref_or_derived,
+            params!["derived", name, format!("%.{}", name)],
             &mut derived,
         )?;
     }
@@ -1082,8 +1098,9 @@ pub fn merge_derived_classes(conn: &Connection, base_class: &str, results: &mut 
     let names = make_asset_lookup_names(base_class);
     let mut stmt = conn.prepare(
         "SELECT DISTINCT asset_path
-         FROM assets
-         WHERE parent_class_key = ?1 OR parent_class_key LIKE ?2",
+         FROM search_asset_usages
+         WHERE usage_kind = 'derived'
+           AND (lookup_key = ?1 OR lookup_key LIKE ?2)",
     )?;
 
     for name in names {
@@ -1247,11 +1264,19 @@ fn insert_asset_record_db(
     stmt_asset: &mut rusqlite::Statement,
     stmt_reference: &mut rusqlite::Statement,
     stmt_function: &mut rusqlite::Statement,
+    stmt_usage: &mut rusqlite::Statement,
     record: &AssetRecord,
 ) -> Result<()> {
     let asset_key = record.asset_path.to_ascii_lowercase();
     let source_path_key = record.source_path.to_ascii_lowercase();
     let parent_class_key = record.parent_class.as_ref().map(|value| value.to_ascii_lowercase());
+    let asset_name = record
+        .asset_path
+        .rsplit('/')
+        .next()
+        .unwrap_or(record.asset_path.as_str())
+        .to_string();
+    let asset_name_lc = asset_name.to_ascii_lowercase();
 
     stmt_asset.execute(params![
         record.asset_path.as_str(),
@@ -1268,6 +1293,14 @@ fn insert_asset_record_db(
         let key = import.to_ascii_lowercase();
         if seen_references.insert(key.clone()) {
             stmt_reference.execute(params![record.asset_path.as_str(), key])?;
+            stmt_usage.execute(params![
+                key,
+                "reference",
+                record.asset_path.as_str(),
+                asset_name.as_str(),
+                asset_name_lc.as_str(),
+                record.source_path.as_str(),
+            ])?;
         }
     }
 
@@ -1276,7 +1309,26 @@ fn insert_asset_record_db(
         let key = function.to_ascii_lowercase();
         if seen_functions.insert(key.clone()) {
             stmt_function.execute(params![record.asset_path.as_str(), key])?;
+            stmt_usage.execute(params![
+                key,
+                "function",
+                record.asset_path.as_str(),
+                asset_name.as_str(),
+                asset_name_lc.as_str(),
+                record.source_path.as_str(),
+            ])?;
         }
+    }
+
+    if let Some(parent_key) = parent_class_key.as_deref() {
+        stmt_usage.execute(params![
+            parent_key,
+            "derived",
+            record.asset_path.as_str(),
+            asset_name.as_str(),
+            asset_name_lc.as_str(),
+            record.source_path.as_str(),
+        ])?;
     }
 
     Ok(())
@@ -1307,6 +1359,18 @@ fn delete_assets_by_source_path_keys_tx(
             stmt.execute([key.as_str()])?;
         }
     }
+
+    tx.execute(
+        "DELETE FROM search_asset_usages
+         WHERE source_path IN (
+             SELECT source_path
+             FROM assets
+             WHERE source_path_key IN (
+                 SELECT source_path_key FROM temp_ucore_asset_source_keys
+             )
+         )",
+        [],
+    )?;
 
     tx.execute(
         "DELETE FROM assets
@@ -1357,7 +1421,10 @@ fn prepare_asset_bulk_write(conn: &Connection) -> Result<()> {
          DROP INDEX IF EXISTS idx_asset_references_asset_path;
          DROP INDEX IF EXISTS idx_asset_references_reference_key;
          DROP INDEX IF EXISTS idx_asset_functions_asset_path;
-         DROP INDEX IF EXISTS idx_asset_functions_function_key;",
+         DROP INDEX IF EXISTS idx_asset_functions_function_key;
+         DROP INDEX IF EXISTS idx_search_asset_usages_lookup_kind;
+         DROP INDEX IF EXISTS idx_search_asset_usages_asset_path;
+         DROP INDEX IF EXISTS idx_search_asset_usages_asset_name_lc;",
     )?;
     Ok(())
 }
@@ -1370,7 +1437,10 @@ fn finalize_asset_bulk_write(conn: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS idx_asset_references_asset_path ON asset_references(asset_path);
          CREATE INDEX IF NOT EXISTS idx_asset_references_reference_key ON asset_references(reference_key);
          CREATE INDEX IF NOT EXISTS idx_asset_functions_asset_path ON asset_functions(asset_path);
-         CREATE INDEX IF NOT EXISTS idx_asset_functions_function_key ON asset_functions(function_key);",
+         CREATE INDEX IF NOT EXISTS idx_asset_functions_function_key ON asset_functions(function_key);
+         CREATE INDEX IF NOT EXISTS idx_search_asset_usages_lookup_kind ON search_asset_usages(lookup_key, usage_kind);
+         CREATE INDEX IF NOT EXISTS idx_search_asset_usages_asset_path ON search_asset_usages(asset_path);
+         CREATE INDEX IF NOT EXISTS idx_search_asset_usages_asset_name_lc ON search_asset_usages(asset_name_lc);",
     )?;
     conn.execute("PRAGMA foreign_keys = ON", [])?;
     conn.execute("PRAGMA optimize", [])?;
