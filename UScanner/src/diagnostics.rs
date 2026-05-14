@@ -1099,6 +1099,10 @@ fn type_references_for_node(node: tree_sitter::Node, content: &str) -> Vec<TypeR
         | "parameter_declaration"
         | "function_definition"
         | "unreal_function_definition" => {
+            if is_forward_declaration_node(node, content) {
+                return refs;
+            }
+
             if let Some(type_node) = find_child_by_field(node, "type") {
                 refs.extend(type_references_from_type_node(
                     type_node,
@@ -1114,6 +1118,23 @@ fn type_references_for_node(node: tree_sitter::Node, content: &str) -> Vec<TypeR
     }
 
     refs
+}
+
+fn is_forward_declaration_node(node: tree_sitter::Node, content: &str) -> bool {
+    if node.kind() != "declaration" {
+        return false;
+    }
+
+    let text = normalize_space(node_text(node, content));
+    if text.is_empty() || !text.ends_with(';') {
+        return false;
+    }
+
+    Regex::new(
+        r"^(?:class|struct|enum(?:\s+class)?)\s+[A-Za-z_][A-Za-z0-9_]*(?:\s*:\s*[A-Za-z_][A-Za-z0-9_:<>]*)?\s*;$",
+    )
+    .map(|regex| regex.is_match(&text))
+    .unwrap_or(false)
 }
 
 fn type_references_from_type_node(
@@ -3191,6 +3212,25 @@ mod tests {
 
         let items = value["items"].as_array().unwrap();
         assert!(items.iter().any(|item| item["code"] == "UECPP005"));
+    }
+
+    #[test]
+    fn does_not_warn_on_forward_declaration_itself() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "class UMyDependency;\n",
+            Some("C:/Project/Source/Game/Public/MyActor.h".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP004"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP005"));
     }
 
     #[test]
