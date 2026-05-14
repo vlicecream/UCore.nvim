@@ -56,23 +56,6 @@ local function add_ucore_rules(npairs)
 		mark(Rule("{", "}", { "cpp", "unreal_cpp" })
 			:with_cr(cond.done())),
 	})
-
-	-- UE macro auto-complete: UFUNCTION( → UFUNCTION()
-	-- UE 宏自动补全：UFUNCTION( → UFUNCTION()
-	npairs.add_rules({
-		mark(Rule("UFUNCTION", ")", "cpp")
-			:with_pair(cond.not_before_text("*/"))
-			:with_cr(true)),
-		mark(Rule("UPROPERTY", ")", "cpp")
-			:with_pair(cond.not_before_text("*/"))
-			:with_cr(true)),
-		mark(Rule("UFUNCTION", ")", "unreal_cpp")
-			:with_pair(cond.not_before_text("*/"))
-			:with_cr(true)),
-		mark(Rule("UPROPERTY", ")", "unreal_cpp")
-			:with_pair(cond.not_before_text("*/"))
-			:with_cr(true)),
-	})
 end
 
 function M.apply()
