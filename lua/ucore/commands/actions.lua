@@ -140,26 +140,51 @@ local function live_find_backend_query(query)
 	return query
 end
 
-local function live_find_fallback_query(query)
-	query = live_find_backend_query(query):lower()
-	if query:find("%s") or query:find("_", 1, true) then
-		return nil
+local function live_find_fallback_queries(query)
+	query = live_find_backend_query(query)
+	local normalized = query:lower()
+	if normalized:find("%s") then
+		return {}
 	end
 
-	if #query >= 4 then
-		return query:sub(2)
+	local results = {}
+	local seen = {}
+
+	local function add(value)
+		value = vim.trim(tostring(value or ""))
+		if value == "" then
+			return
+		end
+
+		local lowered = value:lower()
+		if lowered == normalized or seen[lowered] or #lowered < 4 then
+			return
+		end
+
+		seen[lowered] = true
+		table.insert(results, value)
 	end
 
-	return nil
+	if #normalized >= 4 then
+		add(query:sub(2))
+	end
+
+	if normalized:find("_", 1, true) then
+		local compact = query:gsub("_+", "")
+		add(compact)
+		add(compact:sub(2))
+	end
+
+	return results
 end
 
 local function fetch_live_find(root, query, request, callback)
 	local limit = request.limit or FIND_PAGE_SIZE
 	local offset = request.offset or 0
 	local query_limit = offset == 0 and math.max(limit, 120) or limit
-	local fallback_limit = math.min(query_limit, 60)
+	local fallback_limit = math.min(query_limit, 40)
 	local primary = live_find_backend_query(query)
-	local fallback = live_find_fallback_query(query)
+	local fallbacks = live_find_fallback_queries(query)
 	local code_limit = math.min(math.max(limit, 80), 120)
 
 	local function collect(values)
@@ -170,16 +195,51 @@ local function fetch_live_find(root, query, request, callback)
 		return results
 	end
 
-	local function run_fast(scope, append, done, after)
-		local pending = fallback and 2 or 1
-		local results = {}
-		local errors = {}
+	local stages = {
+		project = { append = false, done = false, emitted = false, results = {}, errors = {} },
+		engine = { append = true, done = false, emitted = false, results = {}, errors = {} },
+	}
 
-		local function add(values)
-			for _, item in ipairs(values or {}) do
-				table.insert(results, item)
-			end
+	local function add_all(target, values)
+		for _, item in ipairs(values or {}) do
+			table.insert(target, item)
 		end
+	end
+
+	local function emit_stage(name, done)
+		local stage = stages[name]
+		if not stage or stage.emitted then
+			return
+		end
+
+		stage.emitted = true
+		if vim.tbl_isempty(stage.results) and not vim.tbl_isempty(stage.errors) then
+			callback(nil, table.concat(stage.errors, "\n"), {
+				append = stage.append == true,
+				done = done == true,
+			})
+			return
+		end
+
+		callback(stage.results, nil, {
+			append = stage.append == true,
+			done = done == true,
+		})
+	end
+
+	local function flush_stages()
+		if stages.project.done and not stages.project.emitted then
+			emit_stage("project", false)
+		end
+
+		if stages.project.emitted and stages.engine.done and not stages.engine.emitted then
+			emit_stage("engine", true)
+		end
+	end
+
+	local function run_fast(scope)
+		local stage = stages[scope]
+		local pending = 1 + #fallbacks
 
 		local function finish()
 			pending = pending - 1
@@ -187,41 +247,27 @@ local function fetch_live_find(root, query, request, callback)
 				return
 			end
 
-			if vim.tbl_isempty(results) and not vim.tbl_isempty(errors) then
-				return callback(nil, table.concat(errors, "\n"), { done = done ~= false })
-			end
-
-			callback(results, nil, {
-				append = append == true,
-				done = done ~= false,
-			})
-			if type(after) == "function" then
-				after()
-			end
+			stage.done = true
+			flush_stages()
 		end
 
-		remote.fast_find(root, primary, function(result, err)
+		local function on_result(result, err)
 			if err then
-				table.insert(errors, tostring(err))
+				table.insert(stage.errors, tostring(err))
 			else
-				add(result)
+				add_all(stage.results, result)
 			end
 			finish()
-		end, {
+		end
+
+		remote.fast_find(root, primary, on_result, {
 			limit = query_limit,
 			offset = offset,
 			scope = scope,
 		})
 
-		if fallback then
-			remote.fast_find(root, fallback, function(result, err)
-				if err then
-					table.insert(errors, tostring(err))
-				else
-					add(result)
-				end
-				finish()
-			end, {
+		for _, fallback in ipairs(fallbacks) do
+			remote.fast_find(root, fallback, on_result, {
 				limit = fallback_limit,
 				offset = offset,
 				scope = scope,
@@ -246,9 +292,8 @@ local function fetch_live_find(root, query, request, callback)
 		})
 	end
 
-	run_fast("project", false, false, function()
-		run_fast("engine", true, true)
-	end)
+	run_fast("project")
+	run_fast("engine")
 end
 
 local function subscribe_find_cache(root, callback)
