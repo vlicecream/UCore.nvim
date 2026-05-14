@@ -16,7 +16,7 @@ use crate::types::{ParseResult, ProgressReporter};
 ///
 /// Increment this when table structures, indexes, or stored data semantics change.
 /// 当表结构、索引或存储语义变化时递增。
-pub const DB_VERSION: i32 = 23;
+pub const DB_VERSION: i32 = 24;
 
 /// Completion cache version.
 /// 补全缓存版本。
@@ -291,6 +291,63 @@ fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
             file_id INTEGER NOT NULL,
             FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS search_files (
+            file_id INTEGER PRIMARY KEY,
+            module_id INTEGER,
+            module_name TEXT,
+            module_name_lc TEXT,
+            path TEXT NOT NULL,
+            path_lc TEXT NOT NULL,
+            basename TEXT NOT NULL,
+            basename_lc TEXT NOT NULL,
+            ext TEXT,
+            is_source INTEGER NOT NULL DEFAULT 0,
+            is_header INTEGER NOT NULL DEFAULT 0,
+            is_searchable_text INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS search_symbols (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id INTEGER NOT NULL,
+            symbol_rowid INTEGER NOT NULL,
+            symbol_table TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            kind_rank INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            name_lc TEXT NOT NULL,
+            compact_name TEXT NOT NULL,
+            owner_name TEXT,
+            owner_name_lc TEXT,
+            module_id INTEGER,
+            module_name TEXT,
+            module_name_lc TEXT,
+            path TEXT NOT NULL,
+            path_lc TEXT NOT NULL,
+            basename TEXT NOT NULL,
+            basename_lc TEXT NOT NULL,
+            ext TEXT,
+            line_number INTEGER,
+            is_class_like INTEGER NOT NULL DEFAULT 0,
+            is_function_like INTEGER NOT NULL DEFAULT 0,
+            is_member_like INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS search_text_lines (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id INTEGER NOT NULL,
+            module_id INTEGER,
+            module_name TEXT,
+            module_name_lc TEXT,
+            path TEXT NOT NULL,
+            path_lc TEXT NOT NULL,
+            line_number INTEGER NOT NULL,
+            line_text TEXT NOT NULL,
+            line_text_lc TEXT NOT NULL,
+            FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+        );
         "#,
     )?;
 
@@ -384,6 +441,23 @@ fn create_indices(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_gameplay_tags_file_id ON gameplay_tags(file_id);
         CREATE INDEX IF NOT EXISTS idx_macro_definitions_name ON macro_definitions(name);
         CREATE INDEX IF NOT EXISTS idx_macro_definitions_file_id ON macro_definitions(file_id);
+
+        CREATE INDEX IF NOT EXISTS idx_search_files_basename_lc ON search_files(basename_lc);
+        CREATE INDEX IF NOT EXISTS idx_search_files_path_lc ON search_files(path_lc);
+        CREATE INDEX IF NOT EXISTS idx_search_files_module_name_lc ON search_files(module_name_lc);
+        CREATE INDEX IF NOT EXISTS idx_search_files_flags ON search_files(is_source, is_header, is_searchable_text);
+
+        CREATE INDEX IF NOT EXISTS idx_search_symbols_name_lc ON search_symbols(name_lc);
+        CREATE INDEX IF NOT EXISTS idx_search_symbols_compact_name ON search_symbols(compact_name);
+        CREATE INDEX IF NOT EXISTS idx_search_symbols_owner_name_lc ON search_symbols(owner_name_lc);
+        CREATE INDEX IF NOT EXISTS idx_search_symbols_module_name_lc ON search_symbols(module_name_lc);
+        CREATE INDEX IF NOT EXISTS idx_search_symbols_basename_lc ON search_symbols(basename_lc);
+        CREATE INDEX IF NOT EXISTS idx_search_symbols_kind_rank_name ON search_symbols(kind_rank, name_lc);
+        CREATE INDEX IF NOT EXISTS idx_search_symbols_file_id ON search_symbols(file_id);
+
+        CREATE INDEX IF NOT EXISTS idx_search_text_lines_file_line ON search_text_lines(file_id, line_number);
+        CREATE INDEX IF NOT EXISTS idx_search_text_lines_module_name_lc ON search_text_lines(module_name_lc);
+        CREATE INDEX IF NOT EXISTS idx_search_text_lines_path_lc ON search_text_lines(path_lc);
         "#,
     )?;
 
@@ -422,6 +496,20 @@ fn drop_indices(conn: &Connection) -> rusqlite::Result<()> {
         "idx_gameplay_tags_file_id",
         "idx_macro_definitions_name",
         "idx_macro_definitions_file_id",
+        "idx_search_files_basename_lc",
+        "idx_search_files_path_lc",
+        "idx_search_files_module_name_lc",
+        "idx_search_files_flags",
+        "idx_search_symbols_name_lc",
+        "idx_search_symbols_compact_name",
+        "idx_search_symbols_owner_name_lc",
+        "idx_search_symbols_module_name_lc",
+        "idx_search_symbols_basename_lc",
+        "idx_search_symbols_kind_rank_name",
+        "idx_search_symbols_file_id",
+        "idx_search_text_lines_file_line",
+        "idx_search_text_lines_module_name_lc",
+        "idx_search_text_lines_path_lc",
     ];
 
     for index_name in indices {
@@ -489,8 +577,11 @@ pub fn save_to_db(
     let tx = conn.transaction()?;
     let mut string_cache: HashMap<String, i64> = HashMap::new();
     let mut dir_cache: HashMap<(Option<i64>, i64), i64> = HashMap::new();
+    let mut module_name_cache: HashMap<Option<i64>, Option<String>> = HashMap::new();
 
     {
+        let mut stmt_select_file =
+            tx.prepare("SELECT id FROM files WHERE directory_id = ?1 AND filename_id = ?2")?;
         let mut stmt_delete_file =
             tx.prepare("DELETE FROM files WHERE directory_id = ?1 AND filename_id = ?2")?;
 
@@ -553,6 +644,51 @@ pub fn save_to_db(
              VALUES (?1, ?2, ?3)",
         )?;
 
+        let mut stmt_search_file = tx.prepare(
+            "INSERT OR REPLACE INTO search_files
+             (file_id, module_id, module_name, module_name_lc, path, path_lc, basename, basename_lc, ext, is_source, is_header, is_searchable_text)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        )?;
+
+        let mut stmt_search_symbol = tx.prepare(
+            "INSERT INTO search_symbols
+             (file_id, symbol_rowid, symbol_table, kind, kind_rank, name, name_lc, compact_name, owner_name, owner_name_lc, module_id, module_name, module_name_lc, path, path_lc, basename, basename_lc, ext, line_number, is_class_like, is_function_like, is_member_like)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+        )?;
+
+        let mut stmt_update_search_symbol_meta = tx.prepare(
+            "UPDATE search_symbols
+             SET module_id = ?1,
+                 module_name = ?2,
+                 module_name_lc = ?3,
+                 path = ?4,
+                 path_lc = ?5,
+                 basename = ?6,
+                 basename_lc = ?7,
+                 ext = ?8
+             WHERE file_id = ?9",
+        )?;
+
+        let mut stmt_delete_search_text = tx.prepare(
+            "DELETE FROM search_text_lines WHERE file_id = ?1",
+        )?;
+
+        let mut stmt_insert_search_text = tx.prepare(
+            "INSERT INTO search_text_lines
+             (file_id, module_id, module_name, module_name_lc, path, path_lc, line_number, line_text, line_text_lc)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        )?;
+
+        let mut stmt_update_search_text_meta = tx.prepare(
+            "UPDATE search_text_lines
+             SET module_id = ?1,
+                 module_name = ?2,
+                 module_name_lc = ?3,
+                 path = ?4,
+                 path_lc = ?5
+             WHERE file_id = ?6",
+        )?;
+
         let mut last_reported_percent = 0usize;
 
         for (index, result) in results.iter().enumerate() {
@@ -588,6 +724,9 @@ pub fn save_to_db(
                 parent_dir,
             )?;
             let filename_id = get_or_create_string(&tx, &mut string_cache, filename)?;
+            let existing_file_id = stmt_select_file
+                .query_row(params![dir_id, filename_id], |row| row.get::<_, i64>(0))
+                .optional()?;
 
             if result.status == "cache_hit" {
                 stmt_touch_file.execute(params![
@@ -598,6 +737,47 @@ pub fn save_to_db(
                     result.module_id,
                     is_header_extension(&extension) as i32,
                 ])?;
+
+                if let Some(file_id) = existing_file_id {
+                    upsert_search_file_row_tx(
+                        &tx,
+                        &mut module_name_cache,
+                        &mut stmt_search_file,
+                        file_id,
+                        result.module_id,
+                        path_obj,
+                        &extension,
+                    )?;
+
+                    let module_name =
+                        module_name_for_id_tx(&tx, &mut module_name_cache, result.module_id)?;
+                    let module_name_lc = module_name.as_deref().map(lower_ascii);
+                    let path = normalize_indexed_path(path_obj);
+                    let path_lc = lower_ascii(&path);
+                    let basename = filename.to_string();
+                    let basename_lc = lower_ascii(filename);
+
+                    stmt_update_search_symbol_meta.execute(params![
+                        result.module_id,
+                        module_name.as_deref(),
+                        module_name_lc.as_deref(),
+                        &path,
+                        &path_lc,
+                        &basename,
+                        &basename_lc,
+                        &extension,
+                        file_id,
+                    ])?;
+
+                    stmt_update_search_text_meta.execute(params![
+                        result.module_id,
+                        module_name.as_deref(),
+                        module_name_lc.as_deref(),
+                        &path,
+                        &path_lc,
+                        file_id,
+                    ])?;
+                }
                 continue;
             }
 
@@ -622,6 +802,17 @@ pub fn save_to_db(
             ])?;
 
             let file_id = tx.last_insert_rowid();
+            upsert_search_file_row_tx(
+                &tx,
+                &mut module_name_cache,
+                &mut stmt_search_file,
+                file_id,
+                result.module_id,
+                path_obj,
+                &extension,
+            )?;
+            let module_name =
+                module_name_for_id_tx(&tx, &mut module_name_cache, result.module_id)?;
 
             save_classes(
                 &tx,
@@ -631,7 +822,12 @@ pub fn save_to_db(
                 &mut stmt_enum,
                 &mut stmt_member,
                 &mut stmt_fts,
+                &mut stmt_search_symbol,
                 file_id,
+                result.module_id,
+                module_name.as_deref(),
+                path_obj,
+                &extension,
                 &data.classes,
             )?;
 
@@ -653,6 +849,16 @@ pub fn save_to_db(
 
             save_gameplay_tags(&mut stmt_tag, file_id, &data.gameplay_tags)?;
             save_macro_definitions(&mut stmt_macro, file_id, &data.macro_definitions)?;
+            replace_search_text_lines_for_file_tx(
+                &tx,
+                &mut module_name_cache,
+                &mut stmt_delete_search_text,
+                &mut stmt_insert_search_text,
+                file_id,
+                result.module_id,
+                path_obj,
+                &extension,
+            )?;
         }
     }
 
@@ -687,6 +893,7 @@ pub fn save_to_db_incremental(
     let tx = conn.transaction()?;
     let mut string_cache: HashMap<String, i64> = HashMap::new();
     let mut dir_cache: HashMap<(Option<i64>, i64), i64> = HashMap::new();
+    let mut module_name_cache: HashMap<Option<i64>, Option<String>> = HashMap::new();
 
     struct PlannedWrite<'a> {
         result: &'a ParseResult,
@@ -810,6 +1017,51 @@ pub fn save_to_db_incremental(
          VALUES (?1, ?2, ?3)",
     )?;
 
+    let mut stmt_search_file = tx.prepare(
+        "INSERT OR REPLACE INTO search_files
+         (file_id, module_id, module_name, module_name_lc, path, path_lc, basename, basename_lc, ext, is_source, is_header, is_searchable_text)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+    )?;
+
+    let mut stmt_search_symbol = tx.prepare(
+        "INSERT INTO search_symbols
+         (file_id, symbol_rowid, symbol_table, kind, kind_rank, name, name_lc, compact_name, owner_name, owner_name_lc, module_id, module_name, module_name_lc, path, path_lc, basename, basename_lc, ext, line_number, is_class_like, is_function_like, is_member_like)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+    )?;
+
+    let mut stmt_update_search_symbol_meta = tx.prepare(
+        "UPDATE search_symbols
+         SET module_id = ?1,
+             module_name = ?2,
+             module_name_lc = ?3,
+             path = ?4,
+             path_lc = ?5,
+             basename = ?6,
+             basename_lc = ?7,
+             ext = ?8
+         WHERE file_id = ?9",
+    )?;
+
+    let mut stmt_delete_search_text = tx.prepare(
+        "DELETE FROM search_text_lines WHERE file_id = ?1",
+    )?;
+
+    let mut stmt_insert_search_text = tx.prepare(
+        "INSERT INTO search_text_lines
+         (file_id, module_id, module_name, module_name_lc, path, path_lc, line_number, line_text, line_text_lc)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+    )?;
+
+    let mut stmt_update_search_text_meta = tx.prepare(
+        "UPDATE search_text_lines
+         SET module_id = ?1,
+             module_name = ?2,
+             module_name_lc = ?3,
+             path = ?4,
+             path_lc = ?5
+         WHERE file_id = ?6",
+    )?;
+
     let mut last_reported_percent = 0usize;
     let mut written_file_ids = Vec::new();
 
@@ -832,6 +1084,49 @@ pub fn save_to_db_incremental(
                     item.result.mtime as i64,
                     item.result.module_id,
                     is_header_extension(&item.extension) as i32,
+                ])?;
+
+                upsert_search_file_row_tx(
+                    &tx,
+                    &mut module_name_cache,
+                    &mut stmt_search_file,
+                    existing_file_id,
+                    item.result.module_id,
+                    Path::new(&item.result.path),
+                    &item.extension,
+                )?;
+
+                let module_name =
+                    module_name_for_id_tx(&tx, &mut module_name_cache, item.result.module_id)?;
+                let module_name_lc = module_name.as_deref().map(lower_ascii);
+                let path = normalize_indexed_path(Path::new(&item.result.path));
+                let path_lc = lower_ascii(&path);
+                let basename = Path::new(&item.result.path)
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let basename_lc = lower_ascii(&basename);
+
+                stmt_update_search_symbol_meta.execute(params![
+                    item.result.module_id,
+                    module_name.as_deref(),
+                    module_name_lc.as_deref(),
+                    &path,
+                    &path_lc,
+                    &basename,
+                    &basename_lc,
+                    &item.extension,
+                    existing_file_id,
+                ])?;
+
+                stmt_update_search_text_meta.execute(params![
+                    item.result.module_id,
+                    module_name.as_deref(),
+                    module_name_lc.as_deref(),
+                    &path,
+                    &path_lc,
+                    existing_file_id,
                 ])?;
             }
             continue;
@@ -862,6 +1157,17 @@ pub fn save_to_db_incremental(
 
         let file_id = tx.last_insert_rowid();
         written_file_ids.push(file_id);
+        upsert_search_file_row_tx(
+            &tx,
+            &mut module_name_cache,
+            &mut stmt_search_file,
+            file_id,
+            item.result.module_id,
+            Path::new(&item.result.path),
+            &item.extension,
+        )?;
+        let module_name =
+            module_name_for_id_tx(&tx, &mut module_name_cache, item.result.module_id)?;
 
         save_classes(
             &tx,
@@ -871,7 +1177,12 @@ pub fn save_to_db_incremental(
             &mut stmt_enum,
             &mut stmt_member,
             &mut stmt_fts,
+            &mut stmt_search_symbol,
             file_id,
+            item.result.module_id,
+            module_name.as_deref(),
+            Path::new(&item.result.path),
+            &item.extension,
             &data.classes,
         )?;
 
@@ -893,8 +1204,24 @@ pub fn save_to_db_incremental(
 
         save_gameplay_tags(&mut stmt_tag, file_id, &data.gameplay_tags)?;
         save_macro_definitions(&mut stmt_macro, file_id, &data.macro_definitions)?;
+        replace_search_text_lines_for_file_tx(
+            &tx,
+            &mut module_name_cache,
+            &mut stmt_delete_search_text,
+            &mut stmt_insert_search_text,
+            file_id,
+            item.result.module_id,
+            Path::new(&item.result.path),
+            &item.extension,
+        )?;
     }
 
+    drop(stmt_update_search_text_meta);
+    drop(stmt_insert_search_text);
+    drop(stmt_delete_search_text);
+    drop(stmt_update_search_symbol_meta);
+    drop(stmt_search_symbol);
+    drop(stmt_search_file);
     drop(stmt_macro);
     drop(stmt_tag);
     drop(stmt_include);
@@ -940,6 +1267,227 @@ pub fn delete_files_by_ids(conn: &mut Connection, file_ids: &[i64]) -> anyhow::R
     let tx = conn.transaction()?;
     delete_files_by_ids_tx(&tx, file_ids)?;
     tx.commit()?;
+    Ok(())
+}
+
+fn lower_ascii(input: &str) -> String {
+    input.to_ascii_lowercase()
+}
+
+fn compact_identifier_for_search(input: &str) -> String {
+    input
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
+}
+
+fn normalize_indexed_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn is_source_extension(extension: &str) -> bool {
+    matches!(extension, "h" | "hh" | "hpp" | "hxx" | "inl" | "ipp" | "c" | "cc" | "cpp" | "cxx" | "cs")
+}
+
+fn is_search_text_extension(extension: &str) -> bool {
+    matches!(
+        extension,
+        "h" | "hh" | "hpp" | "hxx"
+            | "c" | "cc" | "cpp" | "cxx"
+            | "inl" | "ipp"
+            | "cs" | "ini" | "json" | "uproject" | "uplugin"
+    )
+}
+
+fn search_symbol_kind_rank(kind: &str) -> i64 {
+    match kind.to_ascii_lowercase().as_str() {
+        "class" | "struct" | "enum" | "uclass" | "ustruct" | "uenum" | "uinterface" | "typedef" => 0,
+        "function" | "method" | "delegate" => 1,
+        _ => 2,
+    }
+}
+
+fn is_class_like_search_kind(kind: &str) -> bool {
+    matches!(
+        kind.to_ascii_lowercase().as_str(),
+        "class" | "struct" | "enum" | "uclass" | "ustruct" | "uenum" | "uinterface" | "typedef"
+    )
+}
+
+fn is_function_like_search_kind(kind: &str) -> bool {
+    let kind = kind.to_ascii_lowercase();
+    kind.contains("function") || kind.contains("method") || kind.contains("delegate")
+}
+
+fn is_member_like_search_kind(kind: &str) -> bool {
+    !is_class_like_search_kind(kind) && !is_function_like_search_kind(kind)
+}
+
+fn module_name_for_id_tx(
+    tx: &rusqlite::Transaction,
+    cache: &mut HashMap<Option<i64>, Option<String>>,
+    module_id: Option<i64>,
+) -> anyhow::Result<Option<String>> {
+    if let Some(cached) = cache.get(&module_id) {
+        return Ok(cached.clone());
+    }
+
+    let value = if let Some(module_id) = module_id {
+        tx.query_row(
+            r#"
+            SELECT s.text
+            FROM modules m
+            JOIN strings s ON m.name_id = s.id
+            WHERE m.id = ?1
+            "#,
+            params![module_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    } else {
+        None
+    };
+
+    cache.insert(module_id, value.clone());
+    Ok(value)
+}
+
+pub(crate) fn upsert_search_file_row_tx(
+    tx: &rusqlite::Transaction,
+    module_name_cache: &mut HashMap<Option<i64>, Option<String>>,
+    stmt: &mut rusqlite::Statement,
+    file_id: i64,
+    module_id: Option<i64>,
+    path: &Path,
+    extension: &str,
+) -> anyhow::Result<()> {
+    let path = normalize_indexed_path(path);
+    let path_lc = lower_ascii(&path);
+    let basename = path
+        .rsplit('/')
+        .next()
+        .map(str::to_string)
+        .unwrap_or_default();
+    let basename_lc = lower_ascii(&basename);
+    let module_name = module_name_for_id_tx(tx, module_name_cache, module_id)?;
+    let module_name_lc = module_name.as_deref().map(lower_ascii);
+
+    stmt.execute(params![
+        file_id,
+        module_id,
+        module_name,
+        module_name_lc,
+        path,
+        path_lc,
+        basename,
+        basename_lc,
+        extension,
+        is_source_extension(extension) as i32,
+        is_header_extension(extension) as i32,
+        is_search_text_extension(extension) as i32,
+    ])?;
+
+    Ok(())
+}
+
+pub(crate) fn replace_search_text_lines_for_file_tx(
+    tx: &rusqlite::Transaction,
+    module_name_cache: &mut HashMap<Option<i64>, Option<String>>,
+    stmt_delete: &mut rusqlite::Statement,
+    stmt_insert: &mut rusqlite::Statement,
+    file_id: i64,
+    module_id: Option<i64>,
+    path: &Path,
+    extension: &str,
+) -> anyhow::Result<()> {
+    stmt_delete.execute(params![file_id])?;
+
+    if !is_search_text_extension(extension) {
+        return Ok(());
+    }
+
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return Ok(());
+    };
+
+    let path = normalize_indexed_path(path);
+    let path_lc = lower_ascii(&path);
+    let module_name = module_name_for_id_tx(tx, module_name_cache, module_id)?;
+    let module_name_lc = module_name.as_deref().map(lower_ascii);
+
+    for (line_index, raw_line) in content.lines().enumerate() {
+        let line_text = raw_line.trim_end();
+        if line_text.trim().is_empty() {
+            continue;
+        }
+
+        stmt_insert.execute(params![
+            file_id,
+            module_id,
+            module_name,
+            module_name_lc,
+            path,
+            path_lc,
+            (line_index + 1) as i64,
+            line_text,
+            lower_ascii(line_text),
+        ])?;
+    }
+
+    Ok(())
+}
+
+fn insert_search_symbol_row(
+    stmt: &mut rusqlite::Statement,
+    file_id: i64,
+    symbol_rowid: i64,
+    symbol_table: &str,
+    kind: &str,
+    name: &str,
+    owner_name: Option<&str>,
+    module_id: Option<i64>,
+    module_name: Option<&str>,
+    path: &Path,
+    extension: &str,
+    line_number: i64,
+) -> anyhow::Result<()> {
+    let path = normalize_indexed_path(path);
+    let path_lc = lower_ascii(&path);
+    let basename = path
+        .rsplit('/')
+        .next()
+        .map(str::to_string)
+        .unwrap_or_default();
+    let basename_lc = lower_ascii(&basename);
+    let module_name_lc = module_name.map(lower_ascii);
+    let owner_name_lc = owner_name.map(lower_ascii);
+
+    stmt.execute(params![
+        file_id,
+        symbol_rowid,
+        symbol_table,
+        kind,
+        search_symbol_kind_rank(kind),
+        name,
+        lower_ascii(name),
+        compact_identifier_for_search(name),
+        owner_name,
+        owner_name_lc,
+        module_id,
+        module_name,
+        module_name_lc,
+        path,
+        path_lc,
+        basename,
+        basename_lc,
+        extension,
+        line_number,
+        is_class_like_search_kind(kind) as i32,
+        is_function_like_search_kind(kind) as i32,
+        is_member_like_search_kind(kind) as i32,
+    ])?;
+
     Ok(())
 }
 
@@ -1054,7 +1602,10 @@ fn populate_temp_ids_table(
     Ok(())
 }
 
-fn delete_files_by_ids_tx(tx: &rusqlite::Transaction, file_ids: &[i64]) -> anyhow::Result<()> {
+pub(crate) fn delete_files_by_ids_tx(
+    tx: &rusqlite::Transaction,
+    file_ids: &[i64],
+) -> anyhow::Result<()> {
     if file_ids.is_empty() {
         return Ok(());
     }
@@ -1099,6 +1650,9 @@ fn delete_files_by_ids_tx(tx: &rusqlite::Transaction, file_ids: &[i64]) -> anyho
     )?;
 
     for sql in [
+        "DELETE FROM search_text_lines WHERE file_id IN (SELECT id FROM temp_ucore_deleted_file_ids)",
+        "DELETE FROM search_symbols WHERE file_id IN (SELECT id FROM temp_ucore_deleted_file_ids)",
+        "DELETE FROM search_files WHERE file_id IN (SELECT id FROM temp_ucore_deleted_file_ids)",
         "DELETE FROM gameplay_tags WHERE file_id IN (SELECT id FROM temp_ucore_deleted_file_ids)",
         "DELETE FROM macro_definitions WHERE file_id IN (SELECT id FROM temp_ucore_deleted_file_ids)",
         "DELETE FROM symbol_calls WHERE file_id IN (SELECT id FROM temp_ucore_deleted_file_ids)",
@@ -1220,7 +1774,12 @@ fn save_classes(
     stmt_enum: &mut rusqlite::Statement,
     stmt_member: &mut rusqlite::Statement,
     stmt_fts: &mut rusqlite::Statement,
+    stmt_search_symbol: &mut rusqlite::Statement,
     file_id: i64,
+    module_id: Option<i64>,
+    module_name: Option<&str>,
+    path: &Path,
+    extension: &str,
     classes: &[crate::types::ClassInfo],
 ) -> anyhow::Result<()> {
     for class_info in classes {
@@ -1253,6 +1812,21 @@ fn save_classes(
             class_row_id,
         ])?;
 
+        insert_search_symbol_row(
+            stmt_search_symbol,
+            file_id,
+            class_row_id,
+            "classes",
+            &class_info.symbol_type,
+            &class_info.class_name,
+            Some(&class_info.class_name),
+            module_id,
+            module_name,
+            path,
+            extension,
+            class_info.line as i64,
+        )?;
+
         for parent in &class_info.base_classes {
             let parent_name_id = get_or_create_string(tx, string_cache, parent)?;
             stmt_inheritance.execute(params![class_row_id, parent_name_id])?;
@@ -1264,9 +1838,14 @@ fn save_classes(
             stmt_enum,
             stmt_member,
             stmt_fts,
+            stmt_search_symbol,
             file_id,
             class_row_id,
             class_info,
+            module_id,
+            module_name,
+            path,
+            extension,
         )?;
     }
 
@@ -1282,9 +1861,14 @@ fn save_members(
     stmt_enum: &mut rusqlite::Statement,
     stmt_member: &mut rusqlite::Statement,
     stmt_fts: &mut rusqlite::Statement,
+    stmt_search_symbol: &mut rusqlite::Statement,
     file_id: i64,
     class_row_id: i64,
     class_info: &crate::types::ClassInfo,
+    module_id: Option<i64>,
+    module_name: Option<&str>,
+    path: &Path,
+    extension: &str,
 ) -> anyhow::Result<()> {
     for member in &class_info.members {
         let member_name_id = get_or_create_string(tx, string_cache, &member.name)?;
@@ -1318,12 +1902,29 @@ fn save_members(
             file_id,
         ])?;
 
+        let member_row_id = tx.last_insert_rowid();
+
         stmt_fts.execute(params![
             member.name,
             member.mem_type,
             class_info.class_name,
-            tx.last_insert_rowid(),
+            member_row_id,
         ])?;
+
+        insert_search_symbol_row(
+            stmt_search_symbol,
+            file_id,
+            member_row_id,
+            "members",
+            &member.mem_type,
+            &member.name,
+            Some(&class_info.class_name),
+            module_id,
+            module_name,
+            path,
+            extension,
+            member.line as i64,
+        )?;
     }
 
     Ok(())

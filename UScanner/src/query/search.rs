@@ -27,7 +27,6 @@
 
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection};
 use serde_json::{json, Value};
-use std::fs;
 use std::sync::OnceLock;
 use tracing::info;
 
@@ -77,7 +76,12 @@ pub fn search_symbols(
     let prefix_query = format!("{}%", escape_like(&query));
     let contains_query = format!("%{}%", escape_like(&query));
     let tokens = search_tokens(pattern);
-    let searchable = searchable_sql();
+    let allow_owner_match = !is_identifier_query(pattern);
+    let searchable = if allow_owner_match {
+        "lower(COALESCE(name, '') || ' ' || COALESCE(kind, '') || ' ' || COALESCE(owner_name, '') || ' ' || COALESCE(module_name, '') || ' ' || COALESCE(path, ''))"
+    } else {
+        "lower(COALESCE(name, '') || ' ' || COALESCE(kind, '') || ' ' || COALESCE(module_name, '') || ' ' || COALESCE(path, ''))"
+    };
     let token_filter = tokens
         .iter()
         .map(|_| format!("{searchable} LIKE ? ESCAPE '\\'"))
@@ -89,52 +93,52 @@ pub fn search_symbols(
         token_filter
     };
 
+    let owner_rank_sql = if allow_owner_match {
+        "WHEN owner_name_lc LIKE ? ESCAPE '\\' THEN 3"
+    } else {
+        ""
+    };
+    let module_rank_sql = if allow_owner_match {
+        "WHEN module_name_lc LIKE ? ESCAPE '\\' THEN 4"
+    } else {
+        "WHEN module_name_lc LIKE ? ESCAPE '\\' THEN 3"
+    };
+    let path_rank_sql = if allow_owner_match {
+        "WHEN path_lc LIKE ? ESCAPE '\\' THEN 5"
+    } else {
+        "WHEN path_lc LIKE ? ESCAPE '\\' THEN 4"
+    };
+
     let sql = format!(
         r#"
-        {}
         SELECT
-            sfts.name,
-            sfts.type,
-            sfts.class_name,
-            dp.full_path || '/' || sn.text AS path,
-            COALESCE(c.line_number, mem.line_number),
-            sm.text AS module_name
-        FROM symbols_fts sfts
-        LEFT JOIN classes c
-            ON c.id = sfts.rowid_ref
-           AND {}
-        LEFT JOIN members mem
-            ON mem.id = sfts.rowid_ref
-           AND NOT ({})
-        JOIN files f ON f.id = COALESCE(c.file_id, mem.file_id)
-        JOIN dir_paths dp ON f.directory_id = dp.id
-        JOIN strings sn ON f.filename_id = sn.id
-        LEFT JOIN modules m ON f.module_id = m.id
-        LEFT JOIN strings sm ON m.name_id = sm.id
+            name,
+            kind,
+            owner_name,
+            path,
+            line_number,
+            module_name
+        FROM search_symbols
         WHERE {}
         ORDER BY
             CASE
-                WHEN lower(sfts.name) = ? THEN 0
-                WHEN lower(sfts.name) LIKE ? ESCAPE '\' THEN 1
-                WHEN lower(sfts.name) LIKE ? ESCAPE '\' THEN 2
-                WHEN lower(COALESCE(sfts.class_name, '')) LIKE ? ESCAPE '\' THEN 3
-                WHEN lower(COALESCE(sm.text, '')) LIKE ? ESCAPE '\' THEN 4
-                WHEN lower(dp.full_path || '/' || sn.text) LIKE ? ESCAPE '\' THEN 5
+                WHEN name_lc = ? THEN 0
+                WHEN name_lc LIKE ? ESCAPE '\' THEN 1
+                WHEN name_lc LIKE ? ESCAPE '\' THEN 2
+                {}
+                {}
+                {}
                 ELSE 9
             END,
-            CASE
-                WHEN COALESCE(sfts.type, '') IN ('class', 'struct', 'enum', 'UCLASS', 'USTRUCT', 'UENUM', 'UINTERFACE') THEN 0
-                WHEN lower(COALESCE(sfts.type, '')) LIKE '%function%' OR lower(COALESCE(sfts.type, '')) LIKE '%method%' THEN 1
-                ELSE 2
-            END,
-            lower(sfts.name) ASC,
-            path ASC
+            kind_rank ASC,
+            name_lc ASC,
+            path_lc ASC
         LIMIT ? OFFSET ?
         "#,
-        PATH_CTE,
-        class_symbol_predicate("sfts"),
-        class_symbol_predicate("sfts"),
-        where_clause
+        where_clause,
+        owner_rank_sql,
+        module_rank_sql,
+        path_rank_sql
     );
 
     let mut stmt = conn.prepare(&sql)?;
@@ -145,7 +149,9 @@ pub fn search_symbols(
     params.push(SqlValue::Text(query));
     params.push(SqlValue::Text(prefix_query));
     params.push(SqlValue::Text(contains_query.clone()));
-    params.push(SqlValue::Text(contains_query.clone()));
+    if allow_owner_match {
+        params.push(SqlValue::Text(contains_query.clone()));
+    }
     params.push(SqlValue::Text(contains_query.clone()));
     params.push(SqlValue::Text(contains_query));
     params.push(SqlValue::Integer(limit));
@@ -176,36 +182,19 @@ fn list_symbols(conn: &Connection, limit: usize, offset: usize) -> anyhow::Resul
     let limit = limit.clamp(1, 10_000) as i64;
     let offset = offset.min(1_000_000) as i64;
 
-    let sql = format!(
-        r#"
-        {}
+    let sql = r#"
         SELECT
-            sfts.name,
-            sfts.type,
-            sfts.class_name,
-            dp.full_path || '/' || sn.text AS path,
-            COALESCE(c.line_number, mem.line_number),
-            sm.text AS module_name
-        FROM symbols_fts sfts
-        LEFT JOIN classes c
-            ON c.id = sfts.rowid_ref
-           AND {}
-        LEFT JOIN members mem
-            ON mem.id = sfts.rowid_ref
-           AND NOT ({})
-        JOIN files f ON f.id = COALESCE(c.file_id, mem.file_id)
-        JOIN dir_paths dp ON f.directory_id = dp.id
-        JOIN strings sn ON f.filename_id = sn.id
-        LEFT JOIN modules m ON f.module_id = m.id
-        LEFT JOIN strings sm ON m.name_id = sm.id
-        WHERE sfts.name NOT LIKE '(%'
-        ORDER BY lower(sfts.name) ASC
+            name,
+            kind,
+            owner_name,
+            path,
+            line_number,
+            module_name
+        FROM search_symbols
+        WHERE name NOT LIKE '(%'
+        ORDER BY name_lc ASC, path_lc ASC
         LIMIT ? OFFSET ?
-        "#,
-        PATH_CTE,
-        class_symbol_predicate("sfts"),
-        class_symbol_predicate("sfts")
-    );
+        "#;
 
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params![limit, offset], |row| {
@@ -352,79 +341,69 @@ fn fast_find_symbols(conn: &Connection, pattern: &str, limit: usize) -> anyhow::
     let compact_prefix_query = format!("{}%", escape_like(&compact_query));
     let compact_contains_query = format!("%{}%", escape_like(&compact_query));
     let owner_rank_sql = if allow_owner_match {
-        "WHEN lower(COALESCE(sfts.class_name, '')) LIKE ? ESCAPE '\\' THEN 3"
+        "WHEN owner_name_lc LIKE ? ESCAPE '\\' THEN 3"
     } else {
         ""
     };
     let owner_where_sql = if allow_owner_match {
-        " OR lower(COALESCE(sfts.class_name, '')) LIKE ? ESCAPE '\\'"
+        " OR owner_name_lc LIKE ? ESCAPE '\\'"
     } else {
         ""
     };
     let compact_rank_sql = if allow_compact_name_match {
         r#"
-                    WHEN lower(replace(replace(COALESCE(sfts.name, ''), '_', ''), ':', '')) = ? THEN 3
-                    WHEN lower(replace(replace(COALESCE(sfts.name, ''), '_', ''), ':', '')) LIKE ? ESCAPE '\' THEN 4
-                    WHEN lower(replace(replace(COALESCE(sfts.name, ''), '_', ''), ':', '')) LIKE ? ESCAPE '\' THEN 5
+                    WHEN compact_name = ? THEN 3
+                    WHEN compact_name LIKE ? ESCAPE '\' THEN 4
+                    WHEN compact_name LIKE ? ESCAPE '\' THEN 5
         "#
     } else {
         ""
     };
     let compact_where_sql = if allow_compact_name_match {
-        " OR lower(replace(replace(COALESCE(sfts.name, ''), '_', ''), ':', '')) LIKE ? ESCAPE '\\'"
+        " OR compact_name LIKE ? ESCAPE '\\'"
     } else {
         ""
     };
 
     let sql = format!(
         r#"
-        {}
-        , matched AS (
+        WITH matched AS (
             SELECT
-                sfts.rowid_ref,
-                sfts.name,
-                sfts.type,
-                sfts.class_name,
+                name,
+                kind,
+                owner_name,
+                path,
+                line_number,
+                module_name,
                 CASE
-                    WHEN lower(sfts.name) = ? THEN 0
-                    WHEN lower(sfts.name) LIKE ? ESCAPE '\' THEN 1
-                    WHEN lower(sfts.name) LIKE ? ESCAPE '\' THEN 2
+                    WHEN name_lc = ? THEN 0
+                    WHEN name_lc LIKE ? ESCAPE '\' THEN 1
+                    WHEN name_lc LIKE ? ESCAPE '\' THEN 2
                     {}
                     {}
                     ELSE 9
                 END AS rank
-            FROM symbols_fts sfts
-            WHERE lower(sfts.name) LIKE ? ESCAPE '\'
+            FROM search_symbols
+            WHERE name_lc LIKE ? ESCAPE '\'
                {}
                {}
-            ORDER BY rank, lower(sfts.name) ASC
+            ORDER BY rank, kind_rank ASC, name_lc ASC, path_lc ASC
             LIMIT ?
         )
         SELECT
-            matched.name,
-            matched.type,
-            matched.class_name,
-            dp.full_path || '/' || sn.text AS path,
-            COALESCE(c.line_number, mem.line_number)
+            name,
+            kind,
+            owner_name,
+            path,
+            line_number,
+            module_name
         FROM matched
-        LEFT JOIN classes c
-            ON c.id = matched.rowid_ref
-           AND {}
-        LEFT JOIN members mem
-            ON mem.id = matched.rowid_ref
-           AND NOT ({})
-        JOIN files f ON f.id = COALESCE(c.file_id, mem.file_id)
-        JOIN dir_paths dp ON f.directory_id = dp.id
-        JOIN strings sn ON f.filename_id = sn.id
-        ORDER BY matched.rank, lower(matched.name) ASC, path ASC
+        ORDER BY rank, lower(name) ASC, path ASC
         "#,
-        PATH_CTE,
         compact_rank_sql,
         owner_rank_sql,
         compact_where_sql,
-        owner_where_sql,
-        class_symbol_predicate("matched"),
-        class_symbol_predicate("matched")
+        owner_where_sql
     );
 
     let mut stmt = conn.prepare(&sql)?;
@@ -457,6 +436,7 @@ fn fast_find_symbols(conn: &Connection, pattern: &str, limit: usize) -> anyhow::
             "class_name": row.get::<_, Option<String>>(2)?,
             "path": normalize_path(&row.get::<_, String>(3)?),
             "line": row.get::<_, Option<i64>>(4)?,
+            "module_name": row.get::<_, Option<String>>(5)?,
         }))
     })?;
 
@@ -844,29 +824,26 @@ fn search_files_for_global(
         r#"
         {}
         SELECT
-            sn.text AS filename,
-            dp.full_path || '/' || sn.text AS path,
-            sm.text AS module_name,
+            sf.basename AS filename,
+            sf.path,
+            sf.module_name,
             rd.full_path AS module_root
-        FROM files f
-        JOIN strings sn ON f.filename_id = sn.id
-        JOIN dir_paths dp ON f.directory_id = dp.id
-        LEFT JOIN modules m ON f.module_id = m.id
-        LEFT JOIN strings sm ON m.name_id = sm.id
+        FROM search_files sf
+        LEFT JOIN modules m ON sf.module_id = m.id
         LEFT JOIN dir_paths rd ON m.root_directory_id = rd.id
-        WHERE (lower(sn.text) LIKE ? ESCAPE '\'
-           OR lower(dp.full_path || '/' || sn.text) LIKE ? ESCAPE '\')
-          AND lower(f.extension) NOT IN ('uasset', 'umap')
+        WHERE (sf.basename_lc LIKE ? ESCAPE '\'
+           OR sf.path_lc LIKE ? ESCAPE '\')
+          AND lower(COALESCE(sf.ext, '')) NOT IN ('uasset', 'umap')
         ORDER BY
             CASE
-                WHEN lower(sn.text) = ? THEN 0
-                WHEN lower(sn.text) LIKE ? ESCAPE '\' THEN 1
-                WHEN lower(sn.text) LIKE ? ESCAPE '\' THEN 2
-                WHEN lower(dp.full_path || '/' || sn.text) LIKE ? ESCAPE '\' THEN 3
+                WHEN sf.basename_lc = ? THEN 0
+                WHEN sf.basename_lc LIKE ? ESCAPE '\' THEN 1
+                WHEN sf.basename_lc LIKE ? ESCAPE '\' THEN 2
+                WHEN sf.path_lc LIKE ? ESCAPE '\' THEN 3
                 ELSE 9
             END,
-            lower(sn.text) ASC,
-            lower(dp.full_path || '/' || sn.text) ASC
+            sf.basename_lc ASC,
+            sf.path_lc ASC
         LIMIT ?
         "#,
         PATH_CTE
@@ -920,10 +897,9 @@ fn search_symbols_fuzzy_fallback(
         .iter()
         .map(|_| {
             if allow_owner_match {
-                "(lower(sfts.name) LIKE ? ESCAPE '\\' OR lower(COALESCE(sfts.class_name, '')) LIKE ? ESCAPE '\\')"
-                    .to_string()
+                "(compact_name LIKE ? ESCAPE '\\' OR owner_name_lc LIKE ? ESCAPE '\\')".to_string()
             } else {
-                "lower(sfts.name) LIKE ? ESCAPE '\\'".to_string()
+                "compact_name LIKE ? ESCAPE '\\'".to_string()
             }
         })
         .collect::<Vec<_>>()
@@ -931,51 +907,32 @@ fn search_symbols_fuzzy_fallback(
 
     let sql = format!(
         r#"
-        {}
         SELECT
-            sfts.name,
-            sfts.type,
-            sfts.class_name,
-            dp.full_path || '/' || sn.text AS path,
-            COALESCE(c.line_number, mem.line_number),
-            sm.text AS module_name
-        FROM symbols_fts sfts
-        LEFT JOIN classes c
-            ON c.id = sfts.rowid_ref
-           AND {}
-        LEFT JOIN members mem
-            ON mem.id = sfts.rowid_ref
-           AND NOT ({})
-        JOIN files f ON f.id = COALESCE(c.file_id, mem.file_id)
-        JOIN dir_paths dp ON f.directory_id = dp.id
-        JOIN strings sn ON f.filename_id = sn.id
-        LEFT JOIN modules m ON f.module_id = m.id
-        LEFT JOIN strings sm ON m.name_id = sm.id
+            name,
+            kind,
+            owner_name,
+            path,
+            line_number,
+            module_name
+        FROM search_symbols
         WHERE {}
         ORDER BY
-            CASE
-                WHEN COALESCE(sfts.type, '') IN ('class', 'struct', 'enum', 'UCLASS', 'USTRUCT', 'UENUM', 'UINTERFACE') THEN 0
-                WHEN lower(COALESCE(sfts.type, '')) LIKE '%function%' OR lower(COALESCE(sfts.type, '')) LIKE '%method%' THEN 1
-                ELSE 2
-            END,
-            length(lower(sfts.name)) ASC,
-            lower(sfts.name) ASC,
-            path ASC
+            kind_rank ASC,
+            length(compact_name) ASC,
+            name_lc ASC,
+            path_lc ASC
         LIMIT ?
         "#,
-        PATH_CTE,
-        class_symbol_predicate("sfts"),
-        class_symbol_predicate("sfts"),
         token_filter
     );
 
     let mut stmt = conn.prepare(&sql)?;
     let mut params = Vec::new();
     for token in &tokens {
-        let like = subsequence_like_pattern(token);
+        let like = subsequence_like_pattern(&compact_identifier(token));
         params.push(SqlValue::Text(like.clone()));
         if allow_owner_match {
-            params.push(SqlValue::Text(like));
+            params.push(SqlValue::Text(subsequence_like_pattern(token)));
         }
     }
     params.push(SqlValue::Integer(limit));
@@ -1013,8 +970,7 @@ fn search_files_fuzzy_fallback(
     let token_filter = tokens
         .iter()
         .map(|_| {
-            "(lower(sn.text) LIKE ? ESCAPE '\\' OR lower(dp.full_path || '/' || sn.text) LIKE ? ESCAPE '\\')"
-                .to_string()
+            "(basename_lc LIKE ? ESCAPE '\\' OR path_lc LIKE ? ESCAPE '\\')".to_string()
         })
         .collect::<Vec<_>>()
         .join(" AND ");
@@ -1023,22 +979,19 @@ fn search_files_fuzzy_fallback(
         r#"
         {}
         SELECT
-            sn.text AS filename,
-            dp.full_path || '/' || sn.text AS path,
-            sm.text AS module_name,
+            sf.basename AS filename,
+            sf.path,
+            sf.module_name,
             rd.full_path AS module_root
-        FROM files f
-        JOIN strings sn ON f.filename_id = sn.id
-        JOIN dir_paths dp ON f.directory_id = dp.id
-        LEFT JOIN modules m ON f.module_id = m.id
-        LEFT JOIN strings sm ON m.name_id = sm.id
+        FROM search_files sf
+        LEFT JOIN modules m ON sf.module_id = m.id
         LEFT JOIN dir_paths rd ON m.root_directory_id = rd.id
         WHERE {}
-          AND lower(f.extension) NOT IN ('uasset', 'umap')
+          AND lower(COALESCE(sf.ext, '')) NOT IN ('uasset', 'umap')
         ORDER BY
-            length(lower(sn.text)) ASC,
-            lower(sn.text) ASC,
-            lower(dp.full_path || '/' || sn.text) ASC
+            length(sf.basename_lc) ASC,
+            sf.basename_lc ASC,
+            sf.path_lc ASC
         LIMIT ?
         "#,
         PATH_CTE,
@@ -1092,74 +1045,49 @@ pub fn search_code_text(
         return Ok(json!([]));
     }
 
-    let limit = limit.clamp(1, 500);
-    let offset = offset.min(1_000_000);
-    let paths = indexed_text_file_paths(conn)?;
+    let limit = limit.clamp(1, 500) as i64;
+    let offset = offset.min(1_000_000) as i64;
+    let prefix_query = format!("{}%", escape_like(&needle));
+    let contains_query = format!("%{}%", escape_like(&needle));
+    let sql = r#"
+        SELECT
+            path,
+            line_number,
+            line_text
+        FROM search_text_lines
+        WHERE instr(line_text_lc, ?) > 0
+        ORDER BY
+            CASE
+                WHEN line_text_lc = ? THEN 0
+                WHEN line_text_lc LIKE ? ESCAPE '\' THEN 1
+                WHEN line_text_lc LIKE ? ESCAPE '\' THEN 2
+                ELSE 9
+            END,
+            path_lc ASC,
+            line_number ASC
+        LIMIT ? OFFSET ?
+        "#;
+
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(
+        params![needle, needle, prefix_query, contains_query, limit, offset],
+        |row| {
+            Ok(json!({
+                "name": pattern,
+                "type": "text",
+                "path": normalize_path(&row.get::<_, String>(0)?),
+                "line": row.get::<_, i64>(1)?,
+                "text": row.get::<_, String>(2)?,
+            }))
+        },
+    )?;
+
     let mut results = Vec::new();
-    let mut skipped = 0usize;
-
-    for path in paths {
-        if results.len() >= limit {
-            break;
-        }
-
-        let Ok(content) = fs::read_to_string(&path) else {
-            continue;
-        };
-
-        for (line_index, line) in content.lines().enumerate() {
-            if line.to_ascii_lowercase().contains(&needle) {
-                if skipped < offset {
-                    skipped += 1;
-                    continue;
-                }
-
-                results.push(json!({
-                    "name": pattern,
-                    "type": "text",
-                    "path": normalize_path(&path),
-                    "line": (line_index + 1) as i64,
-                    "text": line.trim(),
-                }));
-
-                if results.len() >= limit {
-                    break;
-                }
-            }
-        }
+    for row in rows {
+        results.push(row?);
     }
 
     Ok(json!(results))
-}
-
-fn indexed_text_file_paths(conn: &Connection) -> anyhow::Result<Vec<String>> {
-    let sql = format!(
-        r#"
-        {}
-        SELECT dp.full_path || '/' || sn.text AS path
-        FROM files f
-        JOIN dir_paths dp ON f.directory_id = dp.id
-        JOIN strings sn ON f.filename_id = sn.id
-        WHERE lower(f.extension) IN (
-            'h', 'hh', 'hpp', 'hxx',
-            'c', 'cc', 'cpp', 'cxx',
-            'inl', 'ipp',
-            'cs', 'ini', 'json', 'uproject', 'uplugin'
-        )
-        ORDER BY path
-        "#,
-        PATH_CTE
-    );
-
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-    let mut paths = Vec::new();
-
-    for row in rows {
-        paths.push(normalize_path(&row?));
-    }
-
-    Ok(paths)
 }
 
 /// Get all indexed C++/Unreal structs.

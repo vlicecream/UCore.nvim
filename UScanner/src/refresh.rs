@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use ignore::{WalkBuilder, WalkState};
 use rayon::prelude::*;
 use regex::Regex;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -968,6 +968,28 @@ fn upsert_non_source_files(conn: &mut Connection, files: Vec<FileUpsert>) -> Res
     let tx = conn.transaction()?;
     let mut string_cache = HashMap::new();
     let mut dir_cache = HashMap::new();
+    let mut module_name_cache = HashMap::new();
+    let mut stmt_select_file =
+        tx.prepare("SELECT id FROM files WHERE directory_id = ?1 AND filename_id = ?2")?;
+    let mut stmt_insert_file = tx.prepare(
+        r#"
+        INSERT INTO files
+            (directory_id, filename_id, extension, mtime, module_id, is_header)
+        VALUES (?, ?, ?, ?, ?, ?)
+        "#,
+    )?;
+    let mut stmt_search_file = tx.prepare(
+        "INSERT OR REPLACE INTO search_files
+         (file_id, module_id, module_name, module_name_lc, path, path_lc, basename, basename_lc, ext, is_source, is_header, is_searchable_text)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+    )?;
+    let mut stmt_delete_search_text =
+        tx.prepare("DELETE FROM search_text_lines WHERE file_id = ?1")?;
+    let mut stmt_insert_search_text = tx.prepare(
+        "INSERT INTO search_text_lines
+         (file_id, module_id, module_name, module_name_lc, path, path_lc, line_number, line_text, line_text_lc)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+    )?;
 
     for file in files {
         let path = Path::new(&file.path);
@@ -980,24 +1002,49 @@ fn upsert_non_source_files(conn: &mut Connection, files: Vec<FileUpsert>) -> Res
 
         let dir_id = get_or_create_directory(&tx, &mut string_cache, &mut dir_cache, parent)?;
         let filename_id = db::get_or_create_string(&tx, &mut string_cache, filename)?;
+        if let Some(existing_file_id) = stmt_select_file
+            .query_row(params![dir_id, filename_id], |row| row.get::<_, i64>(0))
+            .optional()?
+        {
+            db::delete_files_by_ids_tx(&tx, &[existing_file_id])?;
+        }
 
-        tx.execute(
-            r#"
-            INSERT OR REPLACE INTO files
-                (directory_id, filename_id, extension, mtime, module_id, is_header)
-            VALUES (?, ?, ?, ?, ?, ?)
-            "#,
-            params![
-                dir_id,
-                filename_id,
-                file.extension,
-                file.mtime,
-                file.module_id,
-                is_header_extension(&file.extension) as i64,
-            ],
+        stmt_insert_file.execute(params![
+            dir_id,
+            filename_id,
+            file.extension,
+            file.mtime,
+            file.module_id,
+            is_header_extension(&file.extension) as i64,
+        ])?;
+
+        let file_id = tx.last_insert_rowid();
+        db::upsert_search_file_row_tx(
+            &tx,
+            &mut module_name_cache,
+            &mut stmt_search_file,
+            file_id,
+            Some(file.module_id),
+            path,
+            &file.extension,
+        )?;
+        db::replace_search_text_lines_for_file_tx(
+            &tx,
+            &mut module_name_cache,
+            &mut stmt_delete_search_text,
+            &mut stmt_insert_search_text,
+            file_id,
+            Some(file.module_id),
+            path,
+            &file.extension,
         )?;
     }
 
+    drop(stmt_insert_search_text);
+    drop(stmt_delete_search_text);
+    drop(stmt_search_file);
+    drop(stmt_insert_file);
+    drop(stmt_select_file);
     tx.commit()?;
     Ok(())
 }
