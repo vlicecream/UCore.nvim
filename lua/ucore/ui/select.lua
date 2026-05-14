@@ -456,6 +456,7 @@ local function find_item_score(item, current)
 	local source = normalize_source(item.source)
 	local kind = normalize_kind(item.symbol_type or item.type):lower()
 	local path = normalize_path(item.path or item.file_path or item.asset_path or "")
+	local lowered_path = path:gsub("\\", "/"):lower()
 	local score = 0
 
 	if source == "project" then
@@ -482,6 +483,14 @@ local function find_item_score(item, current)
 		score = score + 60
 	elseif kind:find("property", 1, true) or kind:find("member", 1, true) then
 		score = score + 20
+	end
+
+	if lowered_path:find("/thirdparty/", 1, true)
+		or lowered_path:find("/source/thirdparty/", 1, true)
+		or lowered_path:find("/framework/libs/", 1, true)
+		or lowered_path:find("/external/", 1, true)
+	then
+		score = score + 220
 	end
 
 	return score

@@ -335,9 +335,21 @@ pub fn fast_find(
 
 fn fast_find_symbols(conn: &Connection, pattern: &str, limit: usize) -> anyhow::Result<Value> {
     let limit = limit.clamp(1, 500) as i64;
-    let query = pattern.to_ascii_lowercase();
+    let query_text = pattern.trim();
+    let query = query_text.to_ascii_lowercase();
     let prefix_query = format!("{}%", escape_like(&query));
     let contains_query = format!("%{}%", escape_like(&query));
+    let allow_owner_match = !is_explicit_type_query(query_text);
+    let owner_rank_sql = if allow_owner_match {
+        "WHEN lower(COALESCE(sfts.class_name, '')) LIKE ? ESCAPE '\\' THEN 3"
+    } else {
+        ""
+    };
+    let owner_where_sql = if allow_owner_match {
+        " OR lower(COALESCE(sfts.class_name, '')) LIKE ? ESCAPE '\\'"
+    } else {
+        ""
+    };
 
     let sql = format!(
         r#"
@@ -352,12 +364,12 @@ fn fast_find_symbols(conn: &Connection, pattern: &str, limit: usize) -> anyhow::
                     WHEN lower(sfts.name) = ? THEN 0
                     WHEN lower(sfts.name) LIKE ? ESCAPE '\' THEN 1
                     WHEN lower(sfts.name) LIKE ? ESCAPE '\' THEN 2
-                    WHEN lower(COALESCE(sfts.class_name, '')) LIKE ? ESCAPE '\' THEN 3
+                    {}
                     ELSE 9
                 END AS rank
             FROM symbols_fts sfts
             WHERE lower(sfts.name) LIKE ? ESCAPE '\'
-               OR lower(COALESCE(sfts.class_name, '')) LIKE ? ESCAPE '\'
+               {}
             ORDER BY rank, lower(sfts.name) ASC
             LIMIT ?
         )
@@ -380,31 +392,36 @@ fn fast_find_symbols(conn: &Connection, pattern: &str, limit: usize) -> anyhow::
         ORDER BY matched.rank, lower(matched.name) ASC, path ASC
         "#,
         PATH_CTE,
+        owner_rank_sql,
+        owner_where_sql,
         class_symbol_predicate("matched"),
         class_symbol_predicate("matched")
     );
 
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(
-        params![
-            query,
-            prefix_query,
-            contains_query,
-            contains_query,
-            contains_query,
-            contains_query,
-            limit
-        ],
-        |row| {
-            Ok(json!({
-                "name": row.get::<_, String>(0)?,
-                "type": row.get::<_, String>(1)?,
-                "class_name": row.get::<_, Option<String>>(2)?,
-                "path": normalize_path(&row.get::<_, String>(3)?),
-                "line": row.get::<_, Option<i64>>(4)?,
-            }))
-        },
-    )?;
+    let mut params = vec![
+        SqlValue::Text(query),
+        SqlValue::Text(prefix_query),
+        SqlValue::Text(contains_query.clone()),
+    ];
+    if allow_owner_match {
+        params.push(SqlValue::Text(contains_query.clone()));
+    }
+    params.push(SqlValue::Text(contains_query.clone()));
+    if allow_owner_match {
+        params.push(SqlValue::Text(contains_query));
+    }
+    params.push(SqlValue::Integer(limit));
+
+    let rows = stmt.query_map(params_from_iter(params), |row| {
+        Ok(json!({
+            "name": row.get::<_, String>(0)?,
+            "type": row.get::<_, String>(1)?,
+            "class_name": row.get::<_, Option<String>>(2)?,
+            "path": normalize_path(&row.get::<_, String>(3)?),
+            "line": row.get::<_, Option<i64>>(4)?,
+        }))
+    })?;
 
     let mut results = Vec::new();
     for row in rows {
@@ -816,11 +833,17 @@ fn search_symbols_fuzzy_fallback(
         return Ok(json!([]));
     }
 
+    let allow_owner_match = !is_explicit_type_query(pattern.trim());
+
     let token_filter = tokens
         .iter()
         .map(|_| {
-            "(lower(sfts.name) LIKE ? ESCAPE '\\' OR lower(COALESCE(sfts.class_name, '')) LIKE ? ESCAPE '\\')"
-                .to_string()
+            if allow_owner_match {
+                "(lower(sfts.name) LIKE ? ESCAPE '\\' OR lower(COALESCE(sfts.class_name, '')) LIKE ? ESCAPE '\\')"
+                    .to_string()
+            } else {
+                "lower(sfts.name) LIKE ? ESCAPE '\\'".to_string()
+            }
         })
         .collect::<Vec<_>>()
         .join(" AND ");
@@ -870,7 +893,9 @@ fn search_symbols_fuzzy_fallback(
     for token in &tokens {
         let like = subsequence_like_pattern(token);
         params.push(SqlValue::Text(like.clone()));
-        params.push(SqlValue::Text(like));
+        if allow_owner_match {
+            params.push(SqlValue::Text(like));
+        }
     }
     params.push(SqlValue::Integer(limit));
 

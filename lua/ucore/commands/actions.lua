@@ -140,10 +140,41 @@ local function live_find_backend_query(query)
 	return query
 end
 
-local function live_find_fallback_queries(query)
+local function live_find_is_identifier_query(query)
+	query = tostring(query or "")
+	if query == "" then
+		return false
+	end
+
+	local first = query:sub(1, 1)
+	if not first:match("[%a_]") then
+		return false
+	end
+
+	return query:match("^[%a_][%w_:]*$") ~= nil
+end
+
+local function live_find_is_explicit_type_query(query)
+	query = vim.trim(tostring(query or ""))
+	if query == "" or not live_find_is_identifier_query(query) then
+		return false
+	end
+
+	if query:find("::", 1, true) then
+		return true
+	end
+
+	return query:sub(1, 1):match("%u") ~= nil
+end
+
+local function live_find_fallback_queries(query, scope)
 	query = live_find_backend_query(query)
 	local normalized = query:lower()
 	if normalized:find("%s") then
+		return {}
+	end
+
+	if scope == "engine" then
 		return {}
 	end
 
@@ -184,8 +215,8 @@ local function fetch_live_find(root, query, request, callback)
 	local query_limit = offset == 0 and math.max(limit, 120) or limit
 	local fallback_limit = math.min(query_limit, 40)
 	local primary = live_find_backend_query(query)
-	local fallbacks = live_find_fallback_queries(query)
 	local code_limit = math.min(math.max(limit, 80), 120)
+	local should_run_text_stage = #primary >= 4 and not live_find_is_explicit_type_query(primary)
 
 	local function collect(values)
 		local results = {}
@@ -239,6 +270,7 @@ local function fetch_live_find(root, query, request, callback)
 
 	local function run_fast(scope)
 		local stage = stages[scope]
+		local fallbacks = live_find_fallback_queries(query, scope)
 		local pending = 1 + #fallbacks
 
 		local function finish()
@@ -275,7 +307,7 @@ local function fetch_live_find(root, query, request, callback)
 		end
 	end
 
-	if #primary >= 4 then
+	if should_run_text_stage then
 		remote.search_code_text(root, primary, function(result, err)
 			if err then
 				return callback(nil, err, { append = true, done = false })
