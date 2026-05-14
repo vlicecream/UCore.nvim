@@ -43,18 +43,26 @@ end
 -- 发送带 project_root 的类型化查询。
 function M.query(project_root, query, callback)
 	if bootstrap.is_query_blocked(project_root) then
+		completion_debug.log(
+			"query",
+			"blocked",
+			completion_debug.summarize_query(query)
+		)
 		return callback(blocked_query_result(query and query.kind), nil)
 	end
 
 	query.project_root = project_root
 	query.engine_db_path = existing_engine_db_path(project_root)
+	completion_debug.log("query", "send", completion_debug.summarize_query(query))
 
 	-- Prefer the persistent TCP RPC path for interactive queries.
 	-- 交互式查询优先走持久 TCP RPC，避免每次启动 CLI 进程。
 	rpc.request("query", query, function(result, err)
 		if not err then
+			completion_debug.log("query", "result", query.kind or "unknown", completion_debug.summarize_result(result))
 			return callback(result, nil)
 		end
+		completion_debug.log("query", "rpc-error", query.kind or "unknown", tostring(err))
 
 		local err_text = tostring(err or "")
 		if err_text:find("Project not found:", 1, true) then
@@ -69,12 +77,18 @@ function M.query(project_root, query, callback)
 					})
 				end)
 			end
+			completion_debug.log("query", "project-not-ready", query.kind or "unknown")
 			return callback(blocked_query_result(query and query.kind), nil)
 		end
 
 		-- Fall back to the CLI bridge so early development stays forgiving.
 		-- RPC 失败时回退到 CLI 桥，方便开发阶段排查问题。
 		cli.query(query, function(cli_result, cli_err)
+			if cli_err then
+				completion_debug.log("query", "cli-error", query.kind or "unknown", tostring(cli_err))
+			else
+				completion_debug.log("query", "cli-result", query.kind or "unknown", completion_debug.summarize_result(cli_result))
+			end
 			callback(cli_result, cli_err)
 		end)
 	end)
@@ -125,27 +139,7 @@ end
 -- 根据当前 buffer 上下文获取补全候选。
 function M.get_completions(project_root, payload, callback)
 	payload.kind = "GetCompletions"
-	completion_debug.log(
-		"remote",
-		"send",
-		string.format("line=%s", tostring(payload.line)),
-		string.format("char=%s", tostring(payload.character)),
-		tostring(payload.file_path or "")
-	)
 	M.query(project_root, payload, function(result, err)
-		if err then
-			completion_debug.log("remote", "error", tostring(err))
-			return callback(result, err)
-		end
-
-		local count = 0
-		if type(result) == "table" then
-			local items = result.items or result.completions or result
-			if type(items) == "table" then
-				count = #items
-			end
-		end
-		completion_debug.log("remote", "result", string.format("items=%s", count))
 		callback(result, err)
 	end)
 end

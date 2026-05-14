@@ -28,6 +28,7 @@ const SLOW_QUERY_WARN_MS: u128 = 150;
 
 static QUERY_PERF: OnceLock<Mutex<QueryPerfWindow>> = OnceLock::new();
 static FAST_FIND_LOG_ENABLED: OnceLock<bool> = OnceLock::new();
+static QUERY_LOG_ENABLED: OnceLock<bool> = OnceLock::new();
 
 #[derive(Default)]
 struct QueryPerfStat {
@@ -88,6 +89,14 @@ fn fast_find_log_enabled() -> bool {
     })
 }
 
+fn query_log_enabled() -> bool {
+    *QUERY_LOG_ENABLED.get_or_init(|| {
+        std::env::var("UCORE_QUERY_LOG")
+            .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "on" | "ON"))
+            .unwrap_or(false)
+    })
+}
+
 fn sample_fast_find_results(results: &[Value]) -> String {
     results
         .iter()
@@ -105,6 +114,78 @@ fn sample_fast_find_results(results: &[Value]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" | ")
+}
+
+fn sample_value_summary(value: &Value) -> String {
+    if value.is_null() {
+        return "null".to_string();
+    }
+
+    if let Some(items) = value.as_array() {
+        let sample = items
+            .first()
+            .map(sample_single_item)
+            .unwrap_or_else(|| "-".to_string());
+        return format!("array count={} sample={}", items.len(), sample);
+    }
+
+    if let Some(items) = value.get("items").and_then(Value::as_array) {
+        let sample = items
+            .first()
+            .map(sample_single_item)
+            .unwrap_or_else(|| "-".to_string());
+        return format!("items count={} sample={}", items.len(), sample);
+    }
+
+    if let Some(items) = value.get("results").and_then(Value::as_array) {
+        let sample = items
+            .first()
+            .map(sample_single_item)
+            .unwrap_or_else(|| "-".to_string());
+        return format!("results count={} sample={}", items.len(), sample);
+    }
+
+    if let Some(items) = value.get("signatures").and_then(Value::as_array) {
+        let sample = items
+            .first()
+            .map(sample_single_item)
+            .unwrap_or_else(|| "-".to_string());
+        return format!("signatures count={} sample={}", items.len(), sample);
+    }
+
+    if value.is_object() {
+        return format!("object {}", sample_single_item(value));
+    }
+
+    value.to_string()
+}
+
+fn sample_single_item(value: &Value) -> String {
+    let name = value
+        .get("name")
+        .or_else(|| value.get("label"))
+        .or_else(|| value.get("symbol_name"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let kind = value
+        .get("type")
+        .or_else(|| value.get("kind"))
+        .or_else(|| value.get("symbol_type"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let path = value
+        .get("path")
+        .or_else(|| value.get("file_path"))
+        .or_else(|| value.get("asset_path"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let line = value
+        .get("line")
+        .or_else(|| value.get("line_number"))
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+
+    format!("name={} kind={} path={} line={}", name, kind, path, line)
 }
 
 // -----------------------------------------------------------------------------
@@ -311,6 +392,19 @@ pub async fn handle_query(
     let root_key = normalize_path_key(&req.project_root);
     let query_label = query_request_label(&req.query);
     let query_detail = query_request_detail(&req.query);
+    let log_enabled = query_log_enabled();
+
+    if log_enabled {
+        info!(
+            target: "ucore::query",
+            "Query start: {}{}",
+            query_label,
+            query_detail
+                .as_deref()
+                .map(|detail| format!(" ({})", detail))
+                .unwrap_or_default()
+        );
+    }
 
     if is_refreshing(&state, &root_key) {
         return Ok(json!([]));
@@ -367,6 +461,33 @@ pub async fn handle_query(
             ),
             Err(err) => warn!(
                 "Slow query failed: {} took {} ms{}: {}",
+                query_label,
+                elapsed.as_millis(),
+                query_detail
+                    .as_deref()
+                    .map(|detail| format!(" ({})", detail))
+                    .unwrap_or_default(),
+                err
+            ),
+        }
+    }
+
+    if log_enabled {
+        match &result {
+            Ok(value) => info!(
+                target: "ucore::query",
+                "Query done: {} took {} ms{} -> {}",
+                query_label,
+                elapsed.as_millis(),
+                query_detail
+                    .as_deref()
+                    .map(|detail| format!(" ({})", detail))
+                    .unwrap_or_default(),
+                sample_value_summary(value)
+            ),
+            Err(err) => warn!(
+                target: "ucore::query",
+                "Query failed: {} took {} ms{} -> {}",
                 query_label,
                 elapsed.as_millis(),
                 query_detail
@@ -1828,17 +1949,46 @@ fn query_request_detail(request: &QueryRequest) -> Option<String> {
         QueryRequest::GotoImplementation { file_path, .. } => {
             Some(format!("file={}", short_path(file_path.as_deref())))
         }
+        QueryRequest::SearchSymbols { pattern, limit, offset } => Some(format!(
+            "pattern={} limit={} offset={}",
+            pattern, limit, offset
+        )),
+        QueryRequest::SearchClassSymbols { pattern, limit, offset } => Some(format!(
+            "pattern={} limit={} offset={}",
+            pattern, limit, offset
+        )),
         QueryRequest::FastFind { scope, .. } => Some(format!(
             "scope={}",
             scope.as_deref().unwrap_or("project")
         )),
-        QueryRequest::SearchCodeText { scope, .. } => Some(format!(
-            "scope={}",
+        QueryRequest::GlobalFind { pattern, limit, offset } => Some(format!(
+            "pattern={} limit={} offset={}",
+            pattern, limit, offset
+        )),
+        QueryRequest::SearchCodeText {
+            pattern,
+            limit,
+            offset,
+            scope,
+        } => Some(format!(
+            "pattern={} limit={} offset={} scope={}",
+            pattern,
+            limit,
+            offset,
             scope.as_deref().unwrap_or("project")
         )),
-        QueryRequest::GetAssetIndexStatus => Some("project".to_string()),
+        QueryRequest::FindSymbolUsages { symbol_name, .. } => {
+            Some(format!("symbol={}", symbol_name))
+        }
+        QueryRequest::FindDerivedClasses { base_class } => {
+            Some(format!("base_class={}", base_class))
+        }
+        QueryRequest::GetClassMembers { class_name } => {
+            Some(format!("class={}", class_name))
+        }
         QueryRequest::GetAssetUsages { asset_path } => Some(format!("asset={}", asset_path)),
         QueryRequest::GetAssetDependencies { asset_path } => Some(format!("asset={}", asset_path)),
+        QueryRequest::GetAssetIndexStatus => Some("project".to_string()),
         _ => None,
     }
 }

@@ -3,8 +3,10 @@ use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 use tree_sitter::{Node, Parser, Point};
+use tracing::info;
 
 use crate::server::state::CompletionCache;
 
@@ -16,6 +18,15 @@ const MIN_ENGINE_GLOBAL_PREFIX_LEN: usize = 4;
 const COMPLETION_MATCH_NONE: usize = usize::MAX;
 const STRONG_MATCH_SCORE_OFFSET: i64 = 10;
 const STRONG_MATCH_TARGET: usize = 24;
+static COMPLETION_LOG_ENABLED: OnceLock<bool> = OnceLock::new();
+
+fn completion_log_enabled() -> bool {
+    *COMPLETION_LOG_ENABLED.get_or_init(|| {
+        std::env::var("UCORE_QUERY_LOG")
+            .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "on" | "ON"))
+            .unwrap_or(false)
+    })
+}
 
 /// Per-request cache and lookup context.
 /// 单次补全请求里的缓存和查询上下文。
@@ -214,9 +225,24 @@ pub fn process_completion_with_engine(
     cache: Option<Arc<Mutex<CompletionCache>>>,
     persistent_cache: Option<Arc<Mutex<Connection>>>,
 ) -> Result<Value> {
+    let log_enabled = completion_log_enabled();
+    let started_at = Instant::now();
     let mut ctx = CompletionContext::new(conn, file_path.as_deref());
     let mut engine_ctx = engine_conn.map(|conn| CompletionContext::new(conn, file_path.as_deref()));
 
+    if log_enabled {
+        info!(
+            target: "ucore::completion",
+            "Completion start: file={} line={} char={} content_len={} engine_db={}",
+            file_path.as_deref().unwrap_or("-"),
+            line,
+            character,
+            content.len(),
+            engine_conn.is_some()
+        );
+    }
+
+    let parse_started_at = Instant::now();
     let mut parser = Parser::new();
     let language: tree_sitter::Language = tree_sitter_unreal_cpp::LANGUAGE.into();
     parser.set_language(&language)?;
@@ -229,24 +255,73 @@ pub fn process_completion_with_engine(
     let cursor_node = cursor_node(root, line, character)
         .ok_or_else(|| anyhow::anyhow!("no tree-sitter node at cursor"))?;
     let buffer_inheritance = build_buffer_inheritance_map(root, content);
+    if log_enabled {
+        info!(
+            target: "ucore::completion",
+            "Completion parse: file={} node_kind={} parse_ms={}",
+            file_path.as_deref().unwrap_or("-"),
+            cursor_node.kind(),
+            parse_started_at.elapsed().as_millis()
+        );
+    }
 
     if let Some(items) = complete_include_paths(&mut ctx, engine_ctx.as_mut(), content, line, character)? {
+        if log_enabled {
+            info!(
+                target: "ucore::completion",
+                "Completion include: file={} items={} total_ms={}",
+                file_path.as_deref().unwrap_or("-"),
+                items.len(),
+                started_at.elapsed().as_millis()
+            );
+        }
         return Ok(json!(items));
     }
 
     if let Some(items) = complete_preprocessor_directives(content, line, character) {
+        if log_enabled {
+            let count = items.as_array().map(|value| value.len()).unwrap_or_default();
+            info!(
+                target: "ucore::completion",
+                "Completion preprocessor: file={} items={} total_ms={}",
+                file_path.as_deref().unwrap_or("-"),
+                count,
+                started_at.elapsed().as_millis()
+            );
+        }
         return Ok(items);
     }
 
     if let Some(items) = complete_macro_specifiers_at(content, line, character) {
+        if log_enabled {
+            let count = items.as_array().map(|value| value.len()).unwrap_or_default();
+            info!(
+                target: "ucore::completion",
+                "Completion macro-at: file={} items={} total_ms={}",
+                file_path.as_deref().unwrap_or("-"),
+                count,
+                started_at.elapsed().as_millis()
+            );
+        }
         return Ok(items);
     }
 
     if let Some(items) = complete_macro_specifiers(cursor_node, content) {
+        if log_enabled {
+            let count = items.as_array().map(|value| value.len()).unwrap_or_default();
+            info!(
+                target: "ucore::completion",
+                "Completion macro-node: file={} items={} total_ms={}",
+                file_path.as_deref().unwrap_or("-"),
+                count,
+                started_at.elapsed().as_millis()
+            );
+        }
         return Ok(items);
     }
 
     if let Some(request) = member_completion_request(cursor_node, content) {
+        let member_started_at = Instant::now();
         let receiver_text = clean_type(node_text(request.receiver, content));
         let current_class = enclosing_class(cursor_node, content);
 
@@ -263,12 +338,25 @@ pub fn process_completion_with_engine(
                 )?;
 
                 let final_items = dedupe_completion_items(members);
+                if log_enabled {
+                    info!(
+                        target: "ucore::completion",
+                        "Completion member-super: file={} class={} prefix={} items={} total_ms={} member_ms={}",
+                        file_path.as_deref().unwrap_or("-"),
+                        current_class,
+                        request.prefix.as_deref().unwrap_or(""),
+                        final_items.len(),
+                        started_at.elapsed().as_millis(),
+                        member_started_at.elapsed().as_millis()
+                    );
+                }
                 return Ok(json!(final_items));
             }
 
             return Ok(json!([]));
         }
 
+        let resolve_started_at = Instant::now();
         let ty = resolve_expression_type_with_engine(
             &mut ctx,
             engine_ctx.as_mut(),
@@ -278,10 +366,22 @@ pub fn process_completion_with_engine(
             content,
             line as usize,
         )?;
+        if log_enabled {
+            info!(
+                target: "ucore::completion",
+                "Completion resolve-type: file={} receiver={} prefix={} resolved={} resolve_ms={}",
+                file_path.as_deref().unwrap_or("-"),
+                receiver_text,
+                request.prefix.as_deref().unwrap_or(""),
+                ty.as_deref().unwrap_or("-"),
+                resolve_started_at.elapsed().as_millis()
+            );
+        }
 
         if let Some(ty) = ty {
             let ty = resolve_typedef(&mut ctx, &ty)?;
 
+            let fetch_started_at = Instant::now();
             let members = fetch_members_with_engine(
                 &mut ctx,
                 engine_ctx.as_mut(),
@@ -296,8 +396,31 @@ pub fn process_completion_with_engine(
             )?;
 
             let final_items = dedupe_completion_items(members);
+            if log_enabled {
+                info!(
+                    target: "ucore::completion",
+                    "Completion member: file={} type={} prefix={} items={} total_ms={} fetch_ms={}",
+                    file_path.as_deref().unwrap_or("-"),
+                    ty,
+                    request.prefix.as_deref().unwrap_or(""),
+                    final_items.len(),
+                    started_at.elapsed().as_millis(),
+                    fetch_started_at.elapsed().as_millis()
+                );
+            }
 
             return Ok(json!(final_items));
+        }
+
+        if log_enabled {
+            info!(
+                target: "ucore::completion",
+                "Completion member-miss: file={} receiver={} prefix={} total_ms={}",
+                file_path.as_deref().unwrap_or("-"),
+                receiver_text,
+                request.prefix.as_deref().unwrap_or(""),
+                started_at.elapsed().as_millis()
+            );
         }
 
         return Ok(json!([]));
@@ -409,6 +532,18 @@ pub fn process_completion_with_engine(
     }
 
     let final_items = dedupe_completion_items(items);
+    if log_enabled {
+        info!(
+            target: "ucore::completion",
+            "Completion plain: file={} prefix={} current_class={} class_members={} final_items={} total_ms={}",
+            file_path.as_deref().unwrap_or("-"),
+            prefix,
+            current_class.as_deref().unwrap_or("-"),
+            class_member_count,
+            final_items.len(),
+            started_at.elapsed().as_millis()
+        );
+    }
     Ok(json!(final_items))
 }
 
@@ -2356,6 +2491,8 @@ fn fetch_members_recursive(
     include_impl_members: bool,
     declaration_context: bool,
 ) -> Result<Vec<Value>> {
+    let log_enabled = completion_log_enabled();
+    let started_at = Instant::now();
     let class_name = resolve_typedef(ctx, class_name)?;
     let prefix = prefix.unwrap_or_default();
     let accessor = accessor_class.unwrap_or("");
@@ -2370,6 +2507,17 @@ fn fetch_members_recursive(
     );
 
     if let Some(items) = read_completion_cache(&cache_key, &memory_cache, &persistent_cache)? {
+        if log_enabled {
+            info!(
+                target: "ucore::completion",
+                "Completion cache hit: class={} prefix={} accessor={} items={} total_ms={}",
+                class_name,
+                prefix,
+                accessor,
+                items.len(),
+                started_at.elapsed().as_millis()
+            );
+        }
         return Ok(items);
     }
 
@@ -2444,6 +2592,18 @@ fn fetch_members_recursive(
 
     write_completion_cache(&cache_key, &items, &memory_cache, &persistent_cache);
 
+    if log_enabled {
+        info!(
+            target: "ucore::completion",
+            "Completion cache miss: class={} prefix={} accessor={} items={} total_ms={}",
+            class_name,
+            prefix,
+            accessor,
+            items.len(),
+            started_at.elapsed().as_millis()
+        );
+    }
+
     Ok(items)
 }
 
@@ -2462,6 +2622,18 @@ fn append_members_for_class(
     seen: &mut HashSet<String>,
     items: &mut Vec<Value>,
 ) -> Result<()> {
+    struct MemberCompletionCandidate {
+        name: String,
+        member_type: String,
+        return_type: Option<String>,
+        detail: Option<String>,
+        line: Option<usize>,
+        file_path: Option<String>,
+        match_rank: usize,
+        kind: i64,
+        sort_text: String,
+    }
+
     let mut sql = String::from(
         r#"
         SELECT
@@ -2519,12 +2691,35 @@ fn append_members_for_class(
             continue;
         }
 
-        let signature_info = if member_type == "function" {
+        let kind = completion_kind(&member_type);
+        let sort_text = completion_sort_text(class_rank * 1000 + match_rank, kind, &name);
+
+        matched.push(MemberCompletionCandidate {
+            name,
+            member_type,
+            return_type,
+            detail,
+            line,
+            file_path,
+            match_rank,
+            kind,
+            sort_text,
+        });
+    }
+
+    matched.sort_by(|left, right| {
+        left.sort_text
+            .cmp(&right.sort_text)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+
+    for candidate in matched.into_iter().take(MAX_MEMBER_ITEMS_PER_CLASS) {
+        let signature_info = if candidate.member_type == "function" {
             resolve_function_signature_info(
-                detail.as_deref(),
-                file_path.as_deref(),
-                line,
-                &name,
+                candidate.detail.as_deref(),
+                candidate.file_path.as_deref(),
+                candidate.line,
+                &candidate.name,
                 &mut ctx.file_cache,
             )
         } else {
@@ -2533,33 +2728,39 @@ fn append_members_for_class(
         let function_detail = signature_info
             .as_ref()
             .map(|info| info.detail.as_str())
-            .or(detail.as_deref());
+            .or(candidate.detail.as_deref());
 
-        let detail_text = if member_type == "function" {
-            function_completion_detail(return_type.as_deref(), function_detail, Some(owner_class))
+        let detail_text = if candidate.member_type == "function" {
+            function_completion_detail(
+                candidate.return_type.as_deref(),
+                function_detail,
+                Some(owner_class),
+            )
         } else {
-            member_detail(return_type.as_deref(), owner_class)
+            member_detail(candidate.return_type.as_deref(), owner_class)
         };
-        let dedupe_key = format!("{}:{}", name, detail_text);
-
+        let dedupe_key = format!("{}:{}", candidate.name, detail_text);
         if !seen.insert(dedupe_key) {
             continue;
         }
 
-        let documentation = file_path
+        let documentation = candidate
+            .file_path
             .as_deref()
-            .and_then(|path| line.map(|line| extract_comment_from_file(path, line, &mut ctx.file_cache)))
+            .and_then(|path| {
+                candidate
+                    .line
+                    .map(|line| extract_comment_from_file(path, line, &mut ctx.file_cache))
+            })
             .unwrap_or_default();
 
         let documentation = merge_docs(
             documentation,
             function_detail
                 .map(|text| text.to_string())
-                .or(detail.clone()),
+                .or(candidate.detail.clone()),
         );
-        let kind = completion_kind(&member_type);
-        let sort_text = completion_sort_text(class_rank * 1000 + match_rank, kind, &name);
-        let insert_text = if member_type == "function" {
+        let insert_text = if candidate.member_type == "function" {
             if declaration_context {
                 let should_override = owner_class != accessor_class
                     && signature_info
@@ -2567,68 +2768,39 @@ fn append_members_for_class(
                         .map(|info| !info.is_static)
                         .unwrap_or(true);
                 function_declaration_insert_text(
-                    return_type.as_deref(),
-                    &name,
+                    candidate.return_type.as_deref(),
+                    &candidate.name,
                     function_detail,
                     should_override,
                 )
             } else {
-                function_snippet_text(&name, function_detail)
+                function_snippet_text(&candidate.name, function_detail)
             }
         } else {
-            name.clone()
+            candidate.name.clone()
         };
-        let insert_text_format = if member_type == "function" && !declaration_context {
+        let insert_text_format = if candidate.member_type == "function" && !declaration_context {
             2
         } else {
             1
         };
 
-        matched.push(json!({
-            "label": name,
-            "kind": kind,
+        items.push(json!({
+            "label": candidate.name,
+            "kind": candidate.kind,
             "detail": detail_text,
             "documentation": documentation,
             "insertText": insert_text,
             "insertTextFormat": insert_text_format,
-            "filterText": name,
-            "sortText": sort_text,
-            "score_offset": completion_score_offset(match_rank),
+            "filterText": candidate.name,
+            "sortText": candidate.sort_text,
+            "score_offset": completion_score_offset(candidate.match_rank),
             "labelDetails": {
                 "detail": format!(" {}", detail_text),
                 "description": owner_class,
             },
             "sourceClass": owner_class,
         }));
-    }
-
-    matched.sort_by(|left, right| {
-        let left_sort = left
-            .get("sortText")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let right_sort = right
-            .get("sortText")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-
-        left_sort
-            .cmp(right_sort)
-            .then_with(|| {
-                left.get("label")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .cmp(
-                        right
-                            .get("label")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default(),
-                    )
-            })
-    });
-
-    for item in matched.into_iter().take(MAX_MEMBER_ITEMS_PER_CLASS) {
-        items.push(item);
     }
 
     Ok(())
