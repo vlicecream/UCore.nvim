@@ -165,6 +165,13 @@ local function build_cmd(port, registry)
 	return cmd
 end
 
+local function build_server_env()
+	local env = vim.fn.environ()
+	local progress_config = config.values.progress or {}
+	env.UCORE_FAST_FIND_LOG = progress_config.log == true and "1" or "0"
+	return env
+end
+
 -- Append server output from vim.system callbacks safely.
 -- 安全地追加写入 vim.system 回调里的 server 输出。
 local function append_log(data)
@@ -214,6 +221,7 @@ function M.start(callback, opts)
 
 	job = vim.system(cmd, {
 		cwd = config.values.backend_cwd,
+		env = build_server_env(),
 		text = true,
 		stdout = function(_, data)
 			append_log(data)

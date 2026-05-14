@@ -28,10 +28,21 @@
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection};
 use serde_json::{json, Value};
 use std::fs;
+use std::sync::OnceLock;
+use tracing::info;
 
 use crate::db::project_path::PATH_CTE;
 
 const FIND_FUZZY_FALLBACK_LIMIT: usize = 256;
+static FAST_FIND_LOG_ENABLED: OnceLock<bool> = OnceLock::new();
+
+fn fast_find_log_enabled() -> bool {
+    *FAST_FIND_LOG_ENABLED.get_or_init(|| {
+        std::env::var("UCORE_FAST_FIND_LOG")
+            .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "on" | "ON"))
+            .unwrap_or(false)
+    })
+}
 
 /// Search indexed symbols with database-side ranking and pagination.
 /// 使用数据库侧排序和分页搜索已索引的 symbol。
@@ -311,6 +322,7 @@ pub fn fast_find(
     }
 
     dedupe_find_results(&mut results);
+    suppress_broad_class_contains_when_exact_type_exists(&mut results, pattern);
 
     let page = results
         .into_iter()
@@ -569,6 +581,83 @@ fn class_symbol_predicate(alias: &str) -> String {
     format!(
         "COALESCE({alias}.type, '') IN ('class', 'struct', 'enum', 'UCLASS', 'USTRUCT', 'UENUM', 'UINTERFACE')"
     )
+}
+
+fn is_class_like_symbol_type(symbol_type: &str) -> bool {
+    matches!(
+        symbol_type,
+        "class" | "struct" | "enum" | "UCLASS" | "USTRUCT" | "UENUM" | "UINTERFACE"
+    )
+}
+
+fn is_identifier_query(query: &str) -> bool {
+    let mut chars = query.chars();
+    match chars.next() {
+        Some(ch) if ch == '_' || ch.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+
+    chars.all(|ch| ch == '_' || ch == ':' || ch.is_ascii_alphanumeric())
+}
+
+fn is_explicit_type_query(query: &str) -> bool {
+    if !is_identifier_query(query) {
+        return false;
+    }
+
+    if query.contains("::") {
+        return true;
+    }
+
+    query.chars().next().map(|ch| ch.is_ascii_uppercase()).unwrap_or(false)
+}
+
+fn suppress_broad_class_contains_when_exact_type_exists(results: &mut Vec<Value>, pattern: &str) {
+    let query = pattern.trim().to_ascii_lowercase();
+    if query.is_empty() || !is_explicit_type_query(pattern.trim()) {
+        return;
+    }
+
+    let has_exact_type_match = results.iter().any(|item| {
+        let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+        let symbol_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+        is_class_like_symbol_type(symbol_type) && name.eq_ignore_ascii_case(&query)
+    });
+
+    if !has_exact_type_match {
+        return;
+    }
+
+    let before = results.len();
+    results.retain(|item| {
+        let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+        let symbol_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+        if is_class_like_symbol_type(symbol_type) {
+            return name.eq_ignore_ascii_case(&query);
+        }
+
+        if symbol_type.eq_ignore_ascii_case("file") {
+            return true;
+        }
+
+        let owner = item.get("class_name").and_then(Value::as_str).unwrap_or_default();
+        if owner.eq_ignore_ascii_case(&query) && !name.eq_ignore_ascii_case(&query) {
+            return false;
+        }
+
+        name.eq_ignore_ascii_case(&query)
+    });
+
+    if fast_find_log_enabled() {
+        let after = results.len();
+        info!(
+            target: "ucore::fast_find",
+            "FastFind exact-type filter pattern={:?} before={} after={}",
+            pattern,
+            before,
+            after
+        );
+    }
 }
 
 fn searchable_sql() -> &'static str {
@@ -1148,6 +1237,24 @@ mod tests {
         class_id
     }
 
+    fn insert_property_symbol(conn: &Connection, class_id: i64, file_id: i64, class_name: &str, name: &str) -> i64 {
+        let name_id = insert_string(conn, name);
+        let type_id = insert_string(conn, "property");
+        conn.execute(
+            "INSERT INTO members (class_id, name_id, type_id, flags, access, detail, return_type_id, is_static, line_number, file_id)
+             VALUES (?, ?, ?, 'UPROPERTY', 'private', NULL, NULL, 0, 2, ?)",
+            params![class_id, name_id, type_id, file_id],
+        )
+        .unwrap();
+        let member_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO symbols_fts (name, type, class_name, rowid_ref) VALUES (?, 'property', ?, ?)",
+            params![name, class_name, member_id],
+        )
+        .unwrap();
+        member_id
+    }
+
     #[test]
     fn fast_find_falls_back_to_subsequence_matches_for_symbols() {
         let conn = Connection::open_in_memory().unwrap();
@@ -1185,5 +1292,30 @@ mod tests {
             .unwrap();
 
         assert!(exact_index < fuzzy_index);
+    }
+
+    #[test]
+    fn fast_find_suppresses_broad_class_contains_when_exact_type_exists() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let exact_file_id = insert_project_header_file(&conn, "Game", "GameplayAbility.h");
+        let exact_class_id = insert_class_symbol(&conn, exact_file_id, "UGameplayAbility");
+        insert_property_symbol(
+            &conn,
+            exact_class_id,
+            exact_file_id,
+            "UGameplayAbility",
+            "AbilityTags",
+        );
+
+        let broad_file_id = insert_project_header_file(&conn, "Game", "GameplayAbilityStatics.h");
+        insert_class_symbol(&conn, broad_file_id, "UGameplayAbilityStatics");
+
+        let items = fast_find(&conn, "UGameplayAbility", 20, 0).unwrap();
+        let items = items.as_array().unwrap();
+
+        assert!(items.iter().any(|item| item["name"] == "UGameplayAbility"));
+        assert!(!items.iter().any(|item| item["name"] == "UGameplayAbilityStatics"));
     }
 }

@@ -27,6 +27,7 @@ const QUERY_PERF_WINDOW: Duration = Duration::from_secs(2);
 const SLOW_QUERY_WARN_MS: u128 = 150;
 
 static QUERY_PERF: OnceLock<Mutex<QueryPerfWindow>> = OnceLock::new();
+static FAST_FIND_LOG_ENABLED: OnceLock<bool> = OnceLock::new();
 
 #[derive(Default)]
 struct QueryPerfStat {
@@ -77,6 +78,33 @@ fn diagnostics_cache_key(
         hash_text(content),
         hash_open_files(open_files)
     )
+}
+
+fn fast_find_log_enabled() -> bool {
+    *FAST_FIND_LOG_ENABLED.get_or_init(|| {
+        std::env::var("UCORE_FAST_FIND_LOG")
+            .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "on" | "ON"))
+            .unwrap_or(false)
+    })
+}
+
+fn sample_fast_find_results(results: &[Value]) -> String {
+    results
+        .iter()
+        .take(6)
+        .map(|item| {
+            let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+            let kind = item.get("type").and_then(Value::as_str).unwrap_or_default();
+            let owner = item.get("class_name").and_then(Value::as_str).unwrap_or_default();
+            let path = item
+                .get("path")
+                .or_else(|| item.get("file_path"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            format!("{name}<{kind}> owner={owner} path={path}")
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
 }
 
 // -----------------------------------------------------------------------------
@@ -1243,8 +1271,27 @@ fn fast_find_with_scope(
     scope: Option<&str>,
 ) -> Result<Value> {
     let scope = scope.unwrap_or("both");
+    let log_enabled = fast_find_log_enabled();
+    if log_enabled {
+        info!(
+            target: "ucore::fast_find",
+            "FastFind request pattern={:?} scope={} limit={} offset={} engine_db={}",
+            pattern,
+            scope,
+            limit,
+            offset,
+            engine_db_path.as_deref().unwrap_or("")
+        );
+    }
     if scope == "engine" {
         let Some(engine_conn) = open_engine_query_connection(state, engine_db_path, "fast find")? else {
+            if log_enabled {
+                info!(
+                    target: "ucore::fast_find",
+                    "FastFind engine pattern={:?} -> no engine db connection",
+                    pattern
+                );
+            }
             return Ok(json!([]));
         };
         let mut results = {
@@ -1252,18 +1299,53 @@ fn fast_find_with_scope(
             value_array(query::search::fast_find(&engine_conn, pattern, limit, offset)?)
         };
         tag_source(&mut results, "engine");
+        if log_enabled {
+            info!(
+                target: "ucore::fast_find",
+                "FastFind engine pattern={:?} count={} sample={}",
+                pattern,
+                results.len(),
+                sample_fast_find_results(&results)
+            );
+        }
         return Ok(json!(results));
     }
 
     let mut results = value_array(query::search::fast_find(project_conn, pattern, limit, offset)?);
     tag_source(&mut results, "project");
+    if log_enabled {
+        info!(
+            target: "ucore::fast_find",
+            "FastFind project pattern={:?} count={} sample={}",
+            pattern,
+            results.len(),
+            sample_fast_find_results(&results)
+        );
+    }
 
     if scope == "project" || results.len() >= limit {
         results.truncate(limit);
+        if log_enabled {
+            info!(
+                target: "ucore::fast_find",
+                "FastFind project-final pattern={:?} count={} sample={}",
+                pattern,
+                results.len(),
+                sample_fast_find_results(&results)
+            );
+        }
         return Ok(json!(results));
     }
 
     let Some(engine_conn) = open_engine_query_connection(state, engine_db_path, "fast find")? else {
+        if log_enabled {
+            info!(
+                target: "ucore::fast_find",
+                "FastFind both pattern={:?} -> no engine db, returning project count={}",
+                pattern,
+                results.len()
+            );
+        }
         return Ok(json!(results));
     };
     let remaining = limit.saturating_sub(results.len()).max(1);
@@ -1272,7 +1354,25 @@ fn fast_find_with_scope(
         value_array(query::search::fast_find(&engine_conn, pattern, remaining, 0)?)
     };
     tag_source(&mut engine_results, "engine");
+    if log_enabled {
+        info!(
+            target: "ucore::fast_find",
+            "FastFind engine-append pattern={:?} count={} sample={}",
+            pattern,
+            engine_results.len(),
+            sample_fast_find_results(&engine_results)
+        );
+    }
     merge_query_results(&mut results, engine_results, limit);
+    if log_enabled {
+        info!(
+            target: "ucore::fast_find",
+            "FastFind merged pattern={:?} count={} sample={}",
+            pattern,
+            results.len(),
+            sample_fast_find_results(&results)
+        );
+    }
 
     Ok(json!(results))
 }
