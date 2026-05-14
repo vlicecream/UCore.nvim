@@ -64,6 +64,8 @@ function M.summarize_query(query)
 		scope = query.scope,
 		limit = query.limit,
 		offset = query.offset,
+		current_file = query.current_file,
+		repeated_query = query.repeated_query,
 		part = query.part,
 		class_name = query.class_name,
 		base_class = query.base_class,

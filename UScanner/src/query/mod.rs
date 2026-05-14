@@ -75,6 +75,12 @@ pub fn process_query(conn: &Connection, request: QueryRequest) -> Result<Value> 
             offset,
             ..
         } => search::search_code_text(conn, &pattern, limit, offset),
+        QueryRequest::UnifiedLiveFind {
+            pattern,
+            limit,
+            offset,
+            ..
+        } => search::fast_find(conn, &pattern, limit, offset),
         QueryRequest::GlobalFind {
             pattern,
             limit,

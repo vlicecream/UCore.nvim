@@ -4,13 +4,16 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
 use std::hash::{Hash, Hasher};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+use crate::db::project_path::PATH_CTE;
 use crate::server::asset;
 use crate::server::state::{AppState, ProjectContext, RpcProgressReporter};
 use crate::server::utils::{
@@ -569,6 +572,25 @@ fn handle_state_query(
                 limit,
                 offset,
                 scope.as_deref(),
+            )?;
+            Ok(Some(value))
+        }
+        QueryRequest::UnifiedLiveFind {
+            pattern,
+            limit,
+            offset,
+            current_file,
+            repeated_query,
+        } => {
+            let value = unified_live_find_with_engine(
+                state,
+                conn,
+                engine_db_path,
+                &pattern,
+                limit,
+                offset,
+                current_file.as_deref(),
+                repeated_query,
             )?;
             Ok(Some(value))
         }
@@ -1569,6 +1591,930 @@ fn search_code_text_with_scope(
     Ok(json!(results))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum MatchQuality {
+    ExactSymbol = 0,
+    PrefixSymbol = 1,
+    NormalizedSymbol = 2,
+    FileNameMatch = 3,
+    OwnerClassMatch = 4,
+    TextMatch = 5,
+    Other = 6,
+}
+
+impl MatchQuality {
+    fn label(self) -> &'static str {
+        match self {
+            MatchQuality::ExactSymbol => "exact_symbol",
+            MatchQuality::PrefixSymbol => "prefix_symbol",
+            MatchQuality::NormalizedSymbol => "normalized_symbol",
+            MatchQuality::FileNameMatch => "file_name_match",
+            MatchQuality::OwnerClassMatch => "owner_class_match",
+            MatchQuality::TextMatch => "text_match",
+            MatchQuality::Other => "other",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct LiveFindSortKey {
+    quality: MatchQuality,
+    source_rank: u8,
+    path_rank: u8,
+    kind_rank: u8,
+    name: String,
+    path: String,
+    line: i64,
+    original_index: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TextScanBudget {
+    max_files: usize,
+    max_bytes: usize,
+    max_results: usize,
+}
+
+#[derive(Clone, Debug)]
+struct TextScanPhaseReport {
+    name: &'static str,
+    files_scanned: usize,
+    bytes_scanned: usize,
+    results_found: usize,
+    elapsed_ms: u128,
+    stopped: bool,
+}
+
+struct LiveTextSearchState<'a> {
+    original_pattern: &'a str,
+    needle_lower: String,
+    source: &'static str,
+    total_result_limit: usize,
+    results: Vec<Value>,
+    seen_paths: HashSet<String>,
+    seen_matches: HashSet<String>,
+}
+
+impl<'a> LiveTextSearchState<'a> {
+    fn new(original_pattern: &'a str, source: &'static str, total_result_limit: usize) -> Self {
+        Self {
+            original_pattern,
+            needle_lower: original_pattern.to_ascii_lowercase(),
+            source,
+            total_result_limit,
+            results: Vec::new(),
+            seen_paths: HashSet::new(),
+            seen_matches: HashSet::new(),
+        }
+    }
+
+    fn remaining_results(&self) -> usize {
+        self.total_result_limit.saturating_sub(self.results.len())
+    }
+
+    fn is_done(&self) -> bool {
+        self.results.len() >= self.total_result_limit
+    }
+}
+
+fn unified_live_find_with_engine(
+    state: Arc<AppState>,
+    project_conn: &rusqlite::Connection,
+    engine_db_path: Option<String>,
+    pattern: &str,
+    limit: usize,
+    offset: usize,
+    current_file: Option<&str>,
+    repeated_query: bool,
+) -> Result<Value> {
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return Ok(json!([]));
+    }
+
+    let limit = limit.clamp(1, 500);
+    let offset = offset.min(1_000_000);
+    let target = offset.saturating_add(limit).clamp(1, 500);
+    let current_file = current_file
+        .filter(|path| !path.trim().is_empty())
+        .map(normalize_to_unix);
+    let current_module = current_file
+        .as_deref()
+        .and_then(|path| module_name_for_file(project_conn, path));
+    let log_enabled = fast_find_log_enabled() || query_log_enabled();
+
+    let mut results = value_array(query::search::fast_find(project_conn, pattern, target, 0)?);
+    tag_source(&mut results, "project");
+
+    if let Some(engine_conn) =
+        open_engine_query_connection(state.clone(), engine_db_path.clone(), "unified live find")?
+    {
+        let mut engine_results = {
+            let engine_conn = engine_conn.lock();
+            value_array(query::search::fast_find(&engine_conn, pattern, target, 0)?)
+        };
+        tag_source(&mut engine_results, "engine");
+        results.extend(engine_results);
+    }
+
+    rank_live_find_results(
+        &mut results,
+        pattern,
+        current_file.as_deref(),
+        current_module.as_deref(),
+    );
+    let phase0_hqh = live_find_hqh_count(&results);
+    let should_run_text_stage = should_run_live_find_text_stage(pattern, phase0_hqh, repeated_query);
+
+    let mut text_count = 0usize;
+    if should_run_text_stage {
+        let text_limit = live_find_text_limit(pattern, limit, repeated_query);
+        let mut phase_reports = Vec::new();
+        let mut text_state = LiveTextSearchState::new(pattern, "project", text_limit);
+        run_project_live_text_search(
+            project_conn,
+            &current_file,
+            current_module.as_deref(),
+            pattern,
+            repeated_query,
+            &mut text_state,
+            &mut phase_reports,
+        )?;
+        text_count = text_state.results.len();
+        results.extend(text_state.results);
+
+        if repeated_query
+            && text_count < text_limit
+            && (live_find_is_text_like_query(pattern) || live_find_is_literal_code_query(pattern))
+        {
+            if let Some(engine_conn) =
+                open_engine_query_connection(state.clone(), engine_db_path.clone(), "unified live text")?
+            {
+                let mut engine_text_state =
+                    LiveTextSearchState::new(pattern, "engine", text_limit.saturating_sub(text_count));
+                {
+                    let engine_conn = engine_conn.lock();
+                    run_engine_live_text_search(&engine_conn, pattern, &mut engine_text_state, &mut phase_reports)?;
+                }
+                text_count = text_count.saturating_add(engine_text_state.results.len());
+                results.extend(engine_text_state.results);
+            }
+        }
+
+        rank_live_find_results(
+            &mut results,
+            pattern,
+            current_file.as_deref(),
+            current_module.as_deref(),
+        );
+
+        if log_enabled && !phase_reports.is_empty() {
+            let summary = phase_reports
+                .iter()
+                .map(|phase| {
+                    format!(
+                        "{}:{}f/{}kb/{}r/{}ms{}",
+                        phase.name,
+                        phase.files_scanned,
+                        phase.bytes_scanned / 1024,
+                        phase.results_found,
+                        phase.elapsed_ms,
+                        if phase.stopped { ":stop" } else { "" }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            info!(
+                target: "ucore::fast_find",
+                "UnifiedLiveFind text phases pattern={:?} {}",
+                pattern,
+                summary
+            );
+        }
+    }
+
+    if log_enabled {
+        let phase0_count = results.len().saturating_sub(text_count);
+        let tag_summary = live_find_tag_summary(pattern);
+        info!(
+            target: "ucore::fast_find",
+            "UnifiedLiveFind pattern={:?} tags={} repeated={} phase0={} hqh={} text_stage={} text_count={} total={} sample={}",
+            pattern,
+            tag_summary,
+            repeated_query,
+            phase0_count,
+            phase0_hqh,
+            should_run_text_stage,
+            text_count,
+            results.len(),
+            sample_fast_find_results(&results)
+        );
+    }
+
+    let page = results
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
+    Ok(json!(page))
+}
+
+fn live_find_tag_summary(pattern: &str) -> String {
+    let mut tags = Vec::new();
+    if live_find_is_short_query(pattern) {
+        tags.push("SHORT");
+    }
+    if live_find_is_sym_strong_query(pattern) {
+        tags.push("SYM_STRONG");
+    }
+    if live_find_is_path_like_query(pattern) {
+        tags.push("PATH_LIKE");
+    }
+    if live_find_is_literal_code_query(pattern) {
+        tags.push("LITERAL_CODE");
+    }
+    if live_find_is_text_like_query(pattern) {
+        tags.push("TEXT_LIKE");
+    }
+    if tags.is_empty() {
+        return "GENERIC".to_string();
+    }
+    tags.join("|")
+}
+
+fn live_find_text_limit(pattern: &str, limit: usize, repeated_query: bool) -> usize {
+    if repeated_query && (live_find_is_text_like_query(pattern) || live_find_is_literal_code_query(pattern)) {
+        std::cmp::min(limit.max(40), 60)
+    } else {
+        std::cmp::min(limit.max(20), 30)
+    }
+}
+
+fn should_run_live_find_text_stage(pattern: &str, hqh: usize, repeated_query: bool) -> bool {
+    if live_find_is_short_query(pattern) || live_find_is_path_like_query(pattern) {
+        return false;
+    }
+
+    if hqh >= 10 {
+        return false;
+    }
+
+    if live_find_is_sym_strong_query(pattern) {
+        return repeated_query && hqh == 0;
+    }
+
+    if live_find_is_literal_code_query(pattern) || live_find_is_text_like_query(pattern) {
+        return true;
+    }
+
+    hqh < 4
+}
+
+fn live_find_is_identifier_query(query: &str) -> bool {
+    let mut chars = query.chars();
+    match chars.next() {
+        Some(ch) if ch == '_' || ch.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+
+    chars.all(|ch| ch == '_' || ch == ':' || ch.is_ascii_alphanumeric())
+}
+
+fn live_find_is_short_query(query: &str) -> bool {
+    query.trim().chars().count() < 4
+}
+
+fn live_find_is_sym_strong_query(query: &str) -> bool {
+    let query = query.trim();
+    if query.is_empty() || !live_find_is_identifier_query(query) {
+        return false;
+    }
+
+    if query.contains("::") {
+        return true;
+    }
+
+    query
+        .chars()
+        .next()
+        .map(|ch| ch.is_ascii_uppercase())
+        .unwrap_or(false)
+}
+
+fn live_find_is_path_like_query(query: &str) -> bool {
+    let lowered = query.trim().to_ascii_lowercase();
+    lowered.contains('/') || lowered.contains('\\') || lowered.ends_with(".h") || lowered.ends_with(".cpp")
+        || lowered.ends_with(".hpp") || lowered.ends_with(".inl")
+}
+
+fn live_find_is_literal_code_query(query: &str) -> bool {
+    let query = query.trim();
+    query.contains("->")
+        || query.contains('.')
+        || query.contains('(')
+        || query.contains(')')
+        || query.contains('=')
+        || query.contains("::")
+}
+
+fn live_find_is_text_like_query(query: &str) -> bool {
+    let query = query.trim();
+    if query.is_empty() || live_find_is_path_like_query(query) || live_find_is_sym_strong_query(query) {
+        return false;
+    }
+
+    query.contains(' ')
+        || query.contains('_')
+        || query
+            .chars()
+            .all(|ch| !ch.is_ascii_alphabetic() || ch.is_ascii_lowercase())
+}
+
+fn live_find_compact_identifier(input: &str) -> String {
+    input
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
+}
+
+fn live_find_source_rank(item: &Value) -> u8 {
+    match item.get("source").and_then(Value::as_str).unwrap_or_default() {
+        "project" => 0,
+        "engine" => 1,
+        _ => 2,
+    }
+}
+
+fn live_find_kind_rank(item: &Value) -> u8 {
+    let kind = item
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    if matches!(
+        kind.as_str(),
+        "class" | "struct" | "enum" | "uclass" | "ustruct" | "uenum" | "uinterface"
+    ) {
+        0
+    } else if kind == "define" || kind.contains("delegate") || kind.contains("event") {
+        1
+    } else if kind == "file" {
+        2
+    } else if kind.contains("function") || kind.contains("method") {
+        3
+    } else if kind == "text" {
+        5
+    } else {
+        4
+    }
+}
+
+fn live_find_path_rank(item: &Value, current_file: Option<&str>, current_module: Option<&str>) -> u8 {
+    let path = item
+        .get("path")
+        .or_else(|| item.get("file_path"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let path_key = normalize_path_key(path);
+    let path_lower = path.to_ascii_lowercase();
+    if current_file
+        .map(normalize_path_key)
+        .as_deref()
+        .is_some_and(|current| current == path_key)
+    {
+        return 0;
+    }
+
+    if let Some(module) = current_module {
+        if item
+            .get("module_name")
+            .and_then(Value::as_str)
+            .is_some_and(|item_module| item_module.eq_ignore_ascii_case(module))
+        {
+            return 1;
+        }
+    }
+
+    if path_lower.contains("/thirdparty/")
+        || path_lower.contains("/source/thirdparty/")
+        || path_lower.contains("/framework/libs/")
+        || path_lower.contains("/external/")
+    {
+        return 4;
+    }
+
+    2
+}
+
+fn live_find_filename(path: &str) -> String {
+    path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase()
+}
+
+fn live_find_match_quality(item: &Value, pattern: &str) -> MatchQuality {
+    let query = pattern.trim().to_ascii_lowercase();
+    let compact_query = live_find_compact_identifier(pattern.trim());
+    let kind = item
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let name = item
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let owner = item
+        .get("class_name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let path = item
+        .get("path")
+        .or_else(|| item.get("file_path"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let filename = live_find_filename(&path);
+
+    if kind == "text" {
+        return MatchQuality::TextMatch;
+    }
+
+    if name == query && kind != "file" {
+        return MatchQuality::ExactSymbol;
+    }
+    if !query.is_empty() && name.starts_with(&query) && kind != "file" {
+        return MatchQuality::PrefixSymbol;
+    }
+
+    if !compact_query.is_empty() && kind != "file" {
+        let compact_name = live_find_compact_identifier(&name);
+        if !compact_name.is_empty()
+            && (compact_name == compact_query
+                || compact_name.starts_with(&compact_query)
+                || compact_name.contains(&compact_query))
+        {
+            return MatchQuality::NormalizedSymbol;
+        }
+    } else if !query.is_empty() && name.contains(&query) && kind != "file" {
+        return MatchQuality::NormalizedSymbol;
+    }
+
+    if kind == "file"
+        || filename == query
+        || (!query.is_empty() && (filename.starts_with(&query) || filename.contains(&query)))
+    {
+        return MatchQuality::FileNameMatch;
+    }
+
+    if !query.is_empty() && owner.contains(&query) {
+        return MatchQuality::OwnerClassMatch;
+    }
+
+    if !query.is_empty() && path.contains(&query) {
+        return MatchQuality::FileNameMatch;
+    }
+
+    MatchQuality::Other
+}
+
+fn live_find_sort_key(
+    item: &Value,
+    pattern: &str,
+    current_file: Option<&str>,
+    current_module: Option<&str>,
+    original_index: usize,
+) -> LiveFindSortKey {
+    let quality = live_find_match_quality(item, pattern);
+    let name = item
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let path = item
+        .get("path")
+        .or_else(|| item.get("file_path"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let line = item.get("line").and_then(Value::as_i64).unwrap_or(1);
+
+    LiveFindSortKey {
+        quality,
+        source_rank: live_find_source_rank(item),
+        path_rank: live_find_path_rank(item, current_file, current_module),
+        kind_rank: live_find_kind_rank(item),
+        name,
+        path,
+        line,
+        original_index,
+    }
+}
+
+fn live_find_identity(item: &Value) -> String {
+    let name = item
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let path = item
+        .get("path")
+        .or_else(|| item.get("file_path"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let line = item
+        .get("line")
+        .or_else(|| item.get("line_number"))
+        .and_then(Value::as_i64)
+        .unwrap_or(1);
+    let kind = item
+        .get("type")
+        .or_else(|| item.get("symbol_type"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    format!("{kind}\t{name}\t{path}\t{line}")
+}
+
+fn rank_live_find_results(
+    results: &mut Vec<Value>,
+    pattern: &str,
+    current_file: Option<&str>,
+    current_module: Option<&str>,
+) {
+    let mut ranked = results
+        .drain(..)
+        .enumerate()
+        .map(|(index, item)| {
+            let key = live_find_sort_key(&item, pattern, current_file, current_module, index);
+            (key, item)
+        })
+        .collect::<Vec<_>>();
+
+    ranked.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for (backend_rank, (key, mut item)) in ranked.into_iter().enumerate() {
+        if !seen.insert(live_find_identity(&item)) {
+            continue;
+        }
+
+        if let Some(object) = item.as_object_mut() {
+            object.insert("match_quality".to_string(), json!(key.quality.label()));
+            object.insert("backend_rank".to_string(), json!(backend_rank as i64));
+        }
+        out.push(item);
+    }
+
+    *results = out;
+}
+
+fn live_find_hqh_count(results: &[Value]) -> usize {
+    results
+        .iter()
+        .filter(|item| {
+            let quality = item
+                .get("match_quality")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            matches!(quality, "exact_symbol" | "prefix_symbol" | "normalized_symbol")
+        })
+        .count()
+}
+
+fn module_name_for_file(conn: &rusqlite::Connection, path: &str) -> Option<String> {
+    conn.query_row(
+        r#"
+        SELECT sm.text
+        FROM files f
+        JOIN dir_paths dp ON f.directory_id = dp.id
+        JOIN strings sn ON f.filename_id = sn.id
+        LEFT JOIN modules m ON f.module_id = m.id
+        LEFT JOIN strings sm ON m.name_id = sm.id
+        WHERE lower(dp.full_path || '/' || sn.text) = lower(?)
+        LIMIT 1
+        "#,
+        [path],
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .ok()
+    .flatten()
+}
+
+fn run_project_live_text_search(
+    conn: &rusqlite::Connection,
+    current_file: &Option<String>,
+    current_module: Option<&str>,
+    pattern: &str,
+    repeated_query: bool,
+    state: &mut LiveTextSearchState<'_>,
+    reports: &mut Vec<TextScanPhaseReport>,
+) -> Result<()> {
+    let phase1_budget = TextScanBudget {
+        max_files: 50,
+        max_bytes: 8 * 1024 * 1024,
+        max_results: std::cmp::min(state.remaining_results(), 10),
+    };
+
+    if let Some(path) = current_file.as_deref() {
+        let report = scan_single_text_path("project_file", path, state, phase1_budget)?;
+        reports.push(report);
+    }
+
+    if !state.is_done() {
+        if let Some(module) = current_module.filter(|value| !value.trim().is_empty()) {
+            let report = scan_text_paths_query(
+                conn,
+                &text_paths_sql(Some("module")),
+                rusqlite::params![module],
+                state,
+                phase1_budget,
+                "project_module",
+                |_| true,
+            )?;
+            reports.push(report);
+        }
+    }
+
+    if state.is_done() {
+        return Ok(());
+    }
+
+    let should_expand_project =
+        live_find_is_text_like_query(pattern) || live_find_is_literal_code_query(pattern) || repeated_query;
+    if !should_expand_project {
+        return Ok(());
+    }
+
+    let plugin_root = current_file
+        .as_deref()
+        .and_then(live_find_plugin_root)
+        .map(|value| value.to_ascii_lowercase());
+    let phase2_budget = TextScanBudget {
+        max_files: 200,
+        max_bytes: 32 * 1024 * 1024,
+        max_results: std::cmp::min(state.remaining_results(), 30),
+    };
+
+    if let Some(plugin_root) = plugin_root.as_deref() {
+        if !state.is_done() {
+            let report = scan_text_paths_query(
+                conn,
+                &text_paths_sql(None),
+                [],
+                state,
+                phase2_budget,
+                "project_plugin",
+                |path| path.to_ascii_lowercase().starts_with(plugin_root),
+            )?;
+            reports.push(report);
+        }
+    }
+
+    if !state.is_done() {
+        let report = scan_text_paths_query(
+            conn,
+            &text_paths_sql(None),
+            [],
+            state,
+            phase2_budget,
+            "project_all",
+            |_| true,
+        )?;
+        reports.push(report);
+    }
+
+    Ok(())
+}
+
+fn run_engine_live_text_search(
+    conn: &rusqlite::Connection,
+    _pattern: &str,
+    state: &mut LiveTextSearchState<'_>,
+    reports: &mut Vec<TextScanPhaseReport>,
+) -> Result<()> {
+    if state.is_done() {
+        return Ok(());
+    }
+
+    let phase3_budget = TextScanBudget {
+        max_files: 1000,
+        max_bytes: 64 * 1024 * 1024,
+        max_results: std::cmp::min(state.remaining_results(), 50),
+    };
+    let report = scan_text_paths_query(
+        conn,
+        &text_paths_sql(None),
+        [],
+        state,
+        phase3_budget,
+        "engine_all",
+        |_| true,
+    )?;
+    reports.push(report);
+    Ok(())
+}
+
+fn scan_single_text_path(
+    phase_name: &'static str,
+    path: &str,
+    state: &mut LiveTextSearchState<'_>,
+    budget: TextScanBudget,
+) -> Result<TextScanPhaseReport> {
+    let started = Instant::now();
+    let mut files_scanned = 0usize;
+    let mut bytes_scanned = 0usize;
+    let before = state.results.len();
+    let mut stopped = false;
+
+    if is_live_text_searchable_path(path) && !state.is_done() && budget.max_results > 0 {
+        files_scanned += 1;
+        let continue_scan = scan_text_matches_in_file(path, state, &mut bytes_scanned, budget)?;
+        if !continue_scan {
+            stopped = true;
+        }
+    }
+
+    Ok(TextScanPhaseReport {
+        name: phase_name,
+        files_scanned,
+        bytes_scanned,
+        results_found: state.results.len().saturating_sub(before),
+        elapsed_ms: started.elapsed().as_millis(),
+        stopped,
+    })
+}
+
+fn scan_text_paths_query<P>(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+    state: &mut LiveTextSearchState<'_>,
+    budget: TextScanBudget,
+    phase_name: &'static str,
+    mut allow_path: P,
+) -> Result<TextScanPhaseReport>
+where
+    P: FnMut(&str) -> bool,
+{
+    let started = Instant::now();
+    let mut files_scanned = 0usize;
+    let mut bytes_scanned = 0usize;
+    let before = state.results.len();
+    let mut stopped = false;
+
+    if budget.max_results == 0 || state.is_done() {
+        return Ok(TextScanPhaseReport {
+            name: phase_name,
+            files_scanned,
+            bytes_scanned,
+            results_found: 0,
+            elapsed_ms: started.elapsed().as_millis(),
+            stopped: true,
+        });
+    }
+
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(params, |row| row.get::<_, String>(0))?;
+    for row in rows {
+        let path = normalize_to_unix(&row?);
+        if !allow_path(&path) || !is_live_text_searchable_path(&path) {
+            continue;
+        }
+        if state.seen_paths.contains(&path) {
+            continue;
+        }
+        if files_scanned >= budget.max_files || bytes_scanned >= budget.max_bytes || state.is_done() {
+            stopped = true;
+            break;
+        }
+
+        files_scanned += 1;
+        let continue_scan = scan_text_matches_in_file(&path, state, &mut bytes_scanned, budget)?;
+        if !continue_scan {
+            stopped = true;
+            break;
+        }
+    }
+
+    Ok(TextScanPhaseReport {
+        name: phase_name,
+        files_scanned,
+        bytes_scanned,
+        results_found: state.results.len().saturating_sub(before),
+        elapsed_ms: started.elapsed().as_millis(),
+        stopped,
+    })
+}
+
+fn scan_text_matches_in_file(
+    path: &str,
+    state: &mut LiveTextSearchState<'_>,
+    bytes_scanned: &mut usize,
+    budget: TextScanBudget,
+) -> Result<bool> {
+    state.seen_paths.insert(path.to_string());
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(_) => return Ok(true),
+    };
+
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    let normalized_path = normalize_to_unix(path);
+    let mut line_number = 0usize;
+
+    loop {
+        line.clear();
+        let read = reader.read_line(&mut line)?;
+        if read == 0 {
+            break;
+        }
+
+        line_number += 1;
+        *bytes_scanned = bytes_scanned.saturating_add(read);
+        if *bytes_scanned > budget.max_bytes {
+            return Ok(false);
+        }
+
+        if line.to_ascii_lowercase().contains(&state.needle_lower) {
+            let match_key = format!("{}\t{}", normalized_path, line_number);
+            if state.seen_matches.insert(match_key) {
+                state.results.push(json!({
+                    "name": state.original_pattern,
+                    "type": "text",
+                    "path": normalized_path,
+                    "line": line_number as i64,
+                    "text": line.trim(),
+                    "source": state.source,
+                }));
+            }
+            if state.is_done() || state.results.len() >= budget.max_results {
+                return Ok(false);
+            }
+        }
+    }
+
+    Ok(true)
+}
+
+fn text_paths_sql(module_filter: Option<&str>) -> String {
+    let module_where = if module_filter.is_some() {
+        "AND lower(COALESCE(sm.text, '')) = lower(?)"
+    } else {
+        ""
+    };
+
+    format!(
+        r#"
+        {}
+        SELECT dp.full_path || '/' || sn.text AS path
+        FROM files f
+        JOIN dir_paths dp ON f.directory_id = dp.id
+        JOIN strings sn ON f.filename_id = sn.id
+        LEFT JOIN modules m ON f.module_id = m.id
+        LEFT JOIN strings sm ON m.name_id = sm.id
+        WHERE lower(f.extension) IN (
+            'h', 'hh', 'hpp', 'hxx',
+            'c', 'cc', 'cpp', 'cxx',
+            'inl', 'ipp',
+            'cs', 'ini', 'json', 'uproject', 'uplugin'
+        )
+          AND lower(dp.full_path || '/' || sn.text) NOT LIKE '%/intermediate/%'
+          AND lower(dp.full_path || '/' || sn.text) NOT LIKE '%/binaries/%'
+          AND lower(dp.full_path || '/' || sn.text) NOT LIKE '%/deriveddatacache/%'
+          AND lower(dp.full_path || '/' || sn.text) NOT LIKE '%/thirdparty/%'
+          AND lower(dp.full_path || '/' || sn.text) NOT LIKE '%/source/thirdparty/%'
+          AND lower(dp.full_path || '/' || sn.text) NOT LIKE '%/framework/libs/%'
+          AND lower(dp.full_path || '/' || sn.text) NOT LIKE '%/external/%'
+          {}
+        ORDER BY lower(dp.full_path || '/' || sn.text) ASC
+        "#,
+        PATH_CTE, module_where
+    )
+}
+
+fn is_live_text_searchable_path(path: &str) -> bool {
+    let lowered = path.to_ascii_lowercase();
+    [
+        ".h", ".hh", ".hpp", ".hxx", ".c", ".cc", ".cpp", ".cxx", ".inl", ".ipp", ".cs", ".ini",
+        ".json", ".uproject", ".uplugin",
+    ]
+    .iter()
+    .any(|ext| lowered.ends_with(ext))
+}
+
+fn live_find_plugin_root(path: &str) -> Option<String> {
+    let normalized = normalize_to_unix(path);
+    let lowered = normalized.to_ascii_lowercase();
+    let plugin_index = lowered.find("/plugins/")?;
+    let after_plugins = plugin_index + "/plugins/".len();
+    let tail = &normalized[after_plugins..];
+    let next_sep = tail.find('/')?;
+    Some(normalized[..after_plugins + next_sep].to_string())
+}
+
 fn open_engine_query_connection(
     state: Arc<AppState>,
     engine_db_path: Option<String>,
@@ -1917,6 +2863,7 @@ fn query_request_label(request: &QueryRequest) -> &'static str {
         QueryRequest::GetAssetUsages { .. } => "GetAssetUsages",
         QueryRequest::GetAssetDependencies { .. } => "GetAssetDependencies",
         QueryRequest::FastFind { .. } => "FastFind",
+        QueryRequest::UnifiedLiveFind { .. } => "UnifiedLiveFind",
         QueryRequest::GlobalFind { .. } => "GlobalFind",
         QueryRequest::SearchCodeText { .. } => "SearchCodeText",
         QueryRequest::SearchSymbols { .. } => "SearchSymbols",
@@ -1960,6 +2907,20 @@ fn query_request_detail(request: &QueryRequest) -> Option<String> {
         QueryRequest::FastFind { scope, .. } => Some(format!(
             "scope={}",
             scope.as_deref().unwrap_or("project")
+        )),
+        QueryRequest::UnifiedLiveFind {
+            pattern,
+            limit,
+            offset,
+            current_file,
+            repeated_query,
+        } => Some(format!(
+            "pattern={} limit={} offset={} repeated={} file={}",
+            pattern,
+            limit,
+            offset,
+            repeated_query,
+            short_path(current_file.as_deref())
         )),
         QueryRequest::GlobalFind { pattern, limit, offset } => Some(format!(
             "pattern={} limit={} offset={}",

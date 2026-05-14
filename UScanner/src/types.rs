@@ -593,6 +593,16 @@ pub enum QueryRequest {
         #[serde(default)]
         scope: Option<String>,
     },
+    UnifiedLiveFind {
+        pattern: String,
+        limit: usize,
+        #[serde(default)]
+        offset: usize,
+        #[serde(default)]
+        current_file: Option<String>,
+        #[serde(default)]
+        repeated_query: bool,
+    },
     GlobalFind {
         pattern: String,
         limit: usize,

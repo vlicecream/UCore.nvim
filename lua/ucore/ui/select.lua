@@ -448,15 +448,31 @@ local function find_item_key(item)
 end
 
 local function find_item_score(item, current)
-	-- Lower score wins. Source priority is applied before bucket priority:
-	-- project results still come first by default, but Engine hits should be
-	-- able to surface when they are much stronger than weak project fuzzy
-	-- matches. The final per-query token score is applied later.
-	-- 分数越低越靠前。Project 默认优先，但不能重到把强 Engine 命中永远压没。
+	-- Lower score wins. UnifiedLiveFind may already return backend-ranked items;
+	-- when that metadata exists, keep picker-side reordering very light so the
+	-- server's relevance order remains stable.
+	-- 分数越低越靠前。若后端已给出统一排序，就尽量尊重后端顺序，只做很轻的前端微调。
 	local source = normalize_source(item.source)
 	local kind = normalize_kind(item.symbol_type or item.type):lower()
 	local path = normalize_path(item.path or item.file_path or item.asset_path or "")
 	local lowered_path = path:gsub("\\", "/"):lower()
+
+	local backend_rank = tonumber(item.backend_rank)
+	if backend_rank then
+		local score = backend_rank * 10000
+		if current ~= "" and path == current then
+			score = score - 200
+		end
+		if lowered_path:find("/thirdparty/", 1, true)
+			or lowered_path:find("/source/thirdparty/", 1, true)
+			or lowered_path:find("/framework/libs/", 1, true)
+			or lowered_path:find("/external/", 1, true)
+		then
+			score = score + 400
+		end
+		return score
+	end
+
 	local score = 0
 
 	if source == "project" then
@@ -606,12 +622,11 @@ end
 
 -- Prepare live search results for picker-side ranking.
 --
--- Backend stages provide candidates in this order: Project FastFind,
--- Project SearchCodeText, then Engine FastFind. This step dedupes candidates
--- and annotates each row with the current bucket/source score; filter_live_find_items()
--- then applies token matching and sorts by that score.
--- 后端分阶段给候选：Project FastFind、Project SearchCodeText、Engine FastFind。
--- 这里去重并记录桶/source 分数，后续过滤函数再按 query token 和分数排序。
+-- UnifiedLiveFind returns a backend-ranked list. This step dedupes candidates
+-- and annotates display metadata; filter_live_find_items() only applies light
+-- token matching on top of the backend order.
+-- UnifiedLiveFind 已在后端完成统一排序；这里主要做去重和展示字段整理，
+-- 后续过滤只做轻量 token 匹配。
 local function prepare_find_items_in_order(items)
 	local current = current_buffer_path()
 	local seen = {}
@@ -721,9 +736,9 @@ local function filter_live_find_items(items, query, limit)
 	-- - whitespace splits multiple required tokens;
 	-- - underscore stays literal, so `ability_death` searches the real `_`;
 	-- - continuous substring beats loose character-order fuzzy;
-	-- - bucket/source score keeps Classes > Files > Symbols > Text > Engine.
+	-- - backend_rank remains the primary order when present.
 	-- 匹配规则：空白分 token；`_` 是字面量；连续子串优先于字符级 fuzzy；
-	-- 最终排序保持 类 > 文件 > symbol > 正文 > Engine。
+	-- 若后端给了 backend_rank，则它仍然是主要排序依据。
 	local prepared = prepare_find_items_in_order(items or {})
 	query = vim.trim(tostring(query or ""))
 	limit = limit or FIND_PAGE_SIZE

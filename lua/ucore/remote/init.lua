@@ -301,6 +301,22 @@ function M.search_code_text(project_root, pattern, callback, opts)
 	}, callback)
 end
 
+function M.unified_live_find(project_root, pattern, callback, opts)
+	if type(opts) == "number" then
+		opts = { limit = opts }
+	end
+	opts = opts or {}
+
+	M.query(project_root, {
+		kind = "UnifiedLiveFind",
+		pattern = pattern or "",
+		limit = opts.limit or 50,
+		offset = opts.offset or 0,
+		current_file = opts.current_file,
+		repeated_query = opts.repeated_query == true,
+	}, callback)
+end
+
 -- Unified global find: symbols, files, and code text.
 -- 统一全局搜索：symbol、文件名/路径和代码文本。
 function M.global_find(project_root, pattern, callback, opts)

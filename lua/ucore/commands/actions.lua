@@ -140,192 +140,38 @@ local function live_find_backend_query(query)
 	return query
 end
 
-local function live_find_is_identifier_query(query)
-	query = tostring(query or "")
-	if query == "" then
-		return false
-	end
-
-	local first = query:sub(1, 1)
-	if not first:match("[%a_]") then
-		return false
-	end
-
-	return query:match("^[%a_][%w_:]*$") ~= nil
-end
-
-local function live_find_is_explicit_type_query(query)
-	query = vim.trim(tostring(query or ""))
-	if query == "" or not live_find_is_identifier_query(query) then
-		return false
-	end
-
-	if query:find("::", 1, true) then
-		return true
-	end
-
-	return query:sub(1, 1):match("%u") ~= nil
-end
-
-local function live_find_fallback_queries(query, scope)
-	query = live_find_backend_query(query)
-	local normalized = query:lower()
-	if normalized:find("%s") then
-		return {}
-	end
-
-	if scope == "engine" then
-		return {}
-	end
-
-	local results = {}
-	local seen = {}
-
-	local function add(value)
-		value = vim.trim(tostring(value or ""))
-		if value == "" then
-			return
-		end
-
-		local lowered = value:lower()
-		if lowered == normalized or seen[lowered] or #lowered < 4 then
-			return
-		end
-
-		seen[lowered] = true
-		table.insert(results, value)
-	end
-
-	if #normalized >= 4 then
-		add(query:sub(2))
-	end
-
-	if normalized:find("_", 1, true) then
-		local compact = query:gsub("_+", "")
-		add(compact)
-		add(compact:sub(2))
-	end
-
-	return results
-end
-
 local function fetch_live_find(root, query, request, callback)
 	local limit = request.limit or FIND_PAGE_SIZE
 	local offset = request.offset or 0
 	local query_limit = offset == 0 and math.max(limit, 120) or limit
-	local fallback_limit = math.min(query_limit, 40)
 	local primary = live_find_backend_query(query)
-	local code_limit = math.min(math.max(limit, 80), 120)
-	local should_run_text_stage = #primary >= 4 and not live_find_is_explicit_type_query(primary)
-
-	local function collect(values)
-		local results = {}
-		for _, item in ipairs(values or {}) do
-			table.insert(results, item)
-		end
-		return results
-	end
-
-	local stages = {
-		project = { append = false, done = false, emitted = false, results = {}, errors = {} },
-		engine = { append = true, done = false, emitted = false, results = {}, errors = {} },
+	M._live_find_state = M._live_find_state or {
+		last_query = "",
+		last_at = 0,
 	}
 
-	local function add_all(target, values)
-		for _, item in ipairs(values or {}) do
-			table.insert(target, item)
-		end
+	local state = M._live_find_state
+	local now = vim.loop.hrtime()
+	local repeated_query = false
+	if offset == 0 and state.last_query == primary and state.last_at > 0 then
+		repeated_query = (now - state.last_at) <= (1500 * 1000000)
+	end
+	if offset == 0 then
+		state.last_query = primary
+		state.last_at = now
 	end
 
-	local function emit_stage(name, done)
-		local stage = stages[name]
-		if not stage or stage.emitted then
-			return
-		end
-
-		stage.emitted = true
-		if vim.tbl_isempty(stage.results) and not vim.tbl_isempty(stage.errors) then
-			callback(nil, table.concat(stage.errors, "\n"), {
-				append = stage.append == true,
-				done = done == true,
-			})
-			return
-		end
-
-		callback(stage.results, nil, {
-			append = stage.append == true,
-			done = done == true,
+	remote.unified_live_find(root, primary, function(result, err)
+		callback(result, err, {
+			append = false,
+			done = true,
 		})
-	end
-
-	local function flush_stages()
-		if stages.project.done and not stages.project.emitted then
-			emit_stage("project", false)
-		end
-
-		if stages.project.emitted and stages.engine.done and not stages.engine.emitted then
-			emit_stage("engine", true)
-		end
-	end
-
-	local function run_fast(scope)
-		local stage = stages[scope]
-		local fallbacks = live_find_fallback_queries(query, scope)
-		local pending = 1 + #fallbacks
-
-		local function finish()
-			pending = pending - 1
-			if pending > 0 then
-				return
-			end
-
-			stage.done = true
-			flush_stages()
-		end
-
-		local function on_result(result, err)
-			if err then
-				table.insert(stage.errors, tostring(err))
-			else
-				add_all(stage.results, result)
-			end
-			finish()
-		end
-
-		remote.fast_find(root, primary, on_result, {
-			limit = query_limit,
-			offset = offset,
-			scope = scope,
-		})
-
-		for _, fallback in ipairs(fallbacks) do
-			remote.fast_find(root, fallback, on_result, {
-				limit = fallback_limit,
-				offset = offset,
-				scope = scope,
-			})
-		end
-	end
-
-	if should_run_text_stage then
-		remote.search_code_text(root, primary, function(result, err)
-			if err then
-				return callback(nil, err, { append = true, done = false })
-			end
-
-			callback(collect(result), nil, {
-				append = true,
-				done = false,
-			})
-		end, {
-			limit = code_limit,
-			offset = offset,
-			scope = "project",
-		})
-	end
-
-	run_fast("project")
-	run_fast("engine")
+	end, {
+		limit = query_limit,
+		offset = offset,
+		current_file = vim.api.nvim_buf_get_name(0),
+		repeated_query = repeated_query,
+	})
 end
 
 local function subscribe_find_cache(root, callback)
