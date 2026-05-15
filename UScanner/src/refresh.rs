@@ -271,16 +271,21 @@ fn report_plan(reporter: &dyn ProgressReporter) {
         PhaseInfo {
             name: "db_write".to_string(),
             label: "DB Write".to_string(),
-            weight: 0.25,
-        },
-        PhaseInfo {
-            name: "asset_index".to_string(),
-            label: "Asset Index".to_string(),
-            weight: 0.10,
+            weight: 0.20,
         },
         PhaseInfo {
             name: "finalizing".to_string(),
             label: "Finalizing".to_string(),
+            weight: 0.10,
+        },
+        PhaseInfo {
+            name: "text_write".to_string(),
+            label: "Text DB Write".to_string(),
+            weight: 0.05,
+        },
+        PhaseInfo {
+            name: "asset_index".to_string(),
+            label: "Asset Index".to_string(),
             weight: 0.10,
         },
     ]);

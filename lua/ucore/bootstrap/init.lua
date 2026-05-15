@@ -113,6 +113,7 @@ local function finish_project_skip_phases()
 		"UCore Project DB Prepare",
 		"UCore Project Analysis",
 		"UCore Project DB Write",
+		"UCore Project Text DB Write",
 		"UCore Project Asset Scan",
 		"UCore Project Asset Persist",
 	})
@@ -124,6 +125,7 @@ local function finish_engine_skip_phases()
 		"UCore Engine DB Prepare",
 		"UCore Engine Analysis",
 		"UCore Engine DB Write",
+		"UCore Engine Text DB Write",
 		"UCore Engine Finalize",
 		"UCore Engine Asset Scan",
 		"UCore Engine Asset Persist",

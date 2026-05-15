@@ -120,7 +120,7 @@ pub fn sync_text_files(
     let started_at = Instant::now();
     prepare_text_bulk_write(&conn)?;
     if let Some(reporter) = reporter {
-        reporter.report("text_index", 0, total.max(1), "Prepare");
+        reporter.report("text_write", 0, total.max(1), "Prepare");
     }
 
     for (chunk_index, chunk) in files.chunks(TEXT_INDEX_CHUNK_SIZE).enumerate() {
@@ -143,7 +143,7 @@ pub fn sync_text_files(
                 let current = chunk_index * TEXT_INDEX_CHUNK_SIZE + index + 1;
                 if let Some(reporter) = reporter {
                     if current == 1 || current == total || current % 200 == 0 {
-                        reporter.report("text_index", current, total, &format!("{}/{}", current, total));
+                        reporter.report("text_write", current, total, &format!("{}/{}", current, total));
                     }
                 }
 
@@ -188,7 +188,7 @@ pub fn sync_text_files(
 
     finalize_text_bulk_write(&conn)?;
     if let Some(reporter) = reporter {
-        reporter.report("text_index", total.max(1), total.max(1), "Complete");
+        reporter.report("text_write", total.max(1), total.max(1), "Complete");
     }
     info!(
         "Text index sync finished in {} ms ({} files)",

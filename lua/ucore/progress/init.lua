@@ -11,15 +11,17 @@ local default_phase_order = {
 	"db_prepare",
 	"analysis",
 	"db_write",
-	"asset_index",
 	"finalizing",
+	"text_write",
+	"asset_index",
 }
 
 local default_phases = {
 	discovery = { label = "Discovery", weight = 0.05 },
 	db_prepare = { label = "DB Prepare", weight = 0.05 },
 	analysis = { label = "Analysis", weight = 0.45 },
-	db_write = { label = "DB Write", weight = 0.25 },
+	db_write = { label = "DB Write", weight = 0.20 },
+	text_write = { label = "Text DB Write", weight = 0.05 },
 	asset_index = { label = "Asset Index", weight = 0.10 },
 	finalizing = { label = "Finalizing", weight = 0.10 },
 }
