@@ -199,6 +199,10 @@ end
 -- Build a lookup table from Rust's phase plan.
 -- 根据 Rust 传来的阶段计划构造查找表。
 function M.handle_plan(plan)
+	if not active then
+		return
+	end
+
 	local items = normalize_plan(plan)
 	if type(items) ~= "table" then
 		return
@@ -348,11 +352,11 @@ end
 -- Show user-facing progress notifications, throttled by overall percentage.
 -- 按整体百分比节流显示面向用户的进度通知。
 function M.handle_progress(event)
-	event = monotonic_event(normalize_event(event))
-
 	if not active then
-		reset()
+		return
 	end
+
+	event = monotonic_event(normalize_event(event))
 
 	if event.stage == "complete" then
 		active = false
