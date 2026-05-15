@@ -32,6 +32,7 @@ use tracing::info;
 
 use crate::db::ensure_search_projections;
 use crate::db::project_path::PATH_CTE;
+use crate::db::text;
 
 const FIND_FUZZY_FALLBACK_LIMIT: usize = 256;
 static FAST_FIND_LOG_ENABLED: OnceLock<bool> = OnceLock::new();
@@ -990,51 +991,21 @@ pub fn search_code_text(
     offset: usize,
 ) -> anyhow::Result<Value> {
     ensure_search_projections(conn)?;
-    let needle = pattern.to_ascii_lowercase();
-    if needle.is_empty() {
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
         return Ok(json!([]));
     }
 
-    let limit = limit.clamp(1, 500) as i64;
-    let offset = offset.min(1_000_000) as i64;
-    let prefix_query = format!("{}%", escape_like(&needle));
-    let contains_query = format!("%{}%", escape_like(&needle));
-    let sql = r#"
-        SELECT
-            path,
-            line_number,
-            line_text
-        FROM search_text_lines
-        WHERE instr(line_text_lc, ?) > 0
-        ORDER BY
-            CASE
-                WHEN line_text_lc = ? THEN 0
-                WHEN line_text_lc LIKE ? ESCAPE '\' THEN 1
-                WHEN line_text_lc LIKE ? ESCAPE '\' THEN 2
-                ELSE 9
-            END,
-            path_lc ASC,
-            line_number ASC
-        LIMIT ? OFFSET ?
-        "#;
-
-    let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map(
-        params![needle, needle, prefix_query, contains_query, limit, offset],
-        |row| {
-            Ok(json!({
-                "name": pattern,
-                "type": "text",
-                "path": normalize_path(&row.get::<_, String>(0)?),
-                "line": row.get::<_, i64>(1)?,
-                "text": row.get::<_, String>(2)?,
-            }))
-        },
-    )?;
-
-    let mut results = Vec::new();
-    for row in rows {
-        results.push(row?);
+    let matches = text::search_matching_lines(conn, pattern, limit.clamp(1, 500), offset.min(1_000_000))?;
+    let mut results = Vec::with_capacity(matches.len());
+    for item in matches {
+        results.push(json!({
+            "name": pattern,
+            "type": "text",
+            "path": normalize_path(&item.path),
+            "line": item.line_number,
+            "text": item.line_text,
+        }));
     }
 
     Ok(json!(results))
@@ -1162,6 +1133,8 @@ fn normalize_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn insert_string(conn: &Connection, text: &str) -> i64 {
         conn.execute("INSERT OR IGNORE INTO strings (text) VALUES (?)", [text])
@@ -1355,5 +1328,53 @@ mod tests {
         let items = items.as_array().unwrap();
 
         assert!(items.iter().all(|item| item["type"] != "file"));
+    }
+
+    #[test]
+    fn search_code_text_reads_from_dedicated_text_db() {
+        let base = std::env::temp_dir().join(format!(
+            "ucore-text-search-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&base).unwrap();
+
+        let source_path = base.join("GameplayAbility.cpp");
+        fs::write(
+            &source_path,
+            "void Test()\n{\n    UGameplayAbility::ActivateAbility();\n}\n",
+        )
+        .unwrap();
+
+        let db_path = base.join("ucore.db");
+        let conn = Connection::open(&db_path).unwrap();
+        crate::db::init_db(&conn).unwrap();
+        crate::db::text::sync_text_files(
+            db_path.to_string_lossy().as_ref(),
+            &[crate::db::text::TextIndexFile {
+                path: source_path.to_string_lossy().to_string(),
+                extension: "cpp".to_string(),
+                mtime: 0,
+            }],
+            None,
+        )
+        .unwrap();
+
+        let items = search_code_text(&conn, "GameplayAbility::ActivateAbility", 20, 0).unwrap();
+        let items = items.as_array().unwrap();
+        assert!(!items.is_empty());
+        assert!(items
+            .iter()
+            .any(|item| item["path"] == source_path.to_string_lossy().replace('\\', "/")));
+
+        let _ = fs::remove_file(crate::db::text::derived_text_db_path(
+            db_path.to_string_lossy().as_ref(),
+        ));
+        let _ = fs::remove_file(&db_path);
+        let _ = fs::remove_file(&source_path);
+        let _ = fs::remove_dir(&base);
     }
 }

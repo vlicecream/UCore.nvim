@@ -2,9 +2,12 @@ use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, ToSql};
 use serde_json::{json, Value};
 use std::collections::HashSet;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use tree_sitter::{Node, Parser, Point};
 
 use crate::db::ensure_search_projections;
+use crate::db::text;
 use crate::query::goto;
 
 const MAX_RESULTS: usize = 300;
@@ -543,24 +546,23 @@ fn is_type_like_symbol(conn: &Connection, symbol_name: &str) -> Result<bool> {
 }
 
 fn find_type_reference_file_ids(conn: &Connection, symbol_name: &str) -> Result<Vec<i64>> {
-    let mut stmt = conn.prepare(
-        r#"
-        SELECT DISTINCT file_id
-        FROM search_text_lines
-        WHERE instr(line_text_lc, lower(?1)) > 0
-        ORDER BY file_id
-        LIMIT ?2
-        "#,
-    )?;
-    let rows = stmt.query_map(rusqlite::params![symbol_name, MAX_FILES as i64], |row| {
-        row.get::<_, i64>(0)
-    })?;
+    let paths = text::search_matching_paths(conn, symbol_name, MAX_FILES)?;
     let mut ids = Vec::new();
-    for row in rows {
-        ids.push(row?);
+    let mut seen = HashSet::new();
+    for path in paths {
+        let Some(file_id) = find_file_id(conn, &path)? else {
+            continue;
+        };
+        if seen.insert(file_id) {
+            ids.push(file_id);
+        }
     }
 
     Ok(ids)
+}
+
+fn context_line_for_path(path: &str, line_number: i64) -> String {
+    text::read_line_at(path, line_number.max(1) as usize).unwrap_or_default()
 }
 
 /// Find definition file ids for a member owned by a specific class.
@@ -671,12 +673,8 @@ fn get_member_declaration_results(
         SELECT
             ss.path,
             ss.line_number,
-            ss.owner_name,
-            COALESCE(stl.line_text, '')
+            ss.owner_name
         FROM search_symbols ss
-        LEFT JOIN search_text_lines stl
-            ON stl.file_id = ss.file_id
-           AND stl.line_number = ss.line_number
         WHERE ss.name = ?
           AND ss.owner_name = ?
           AND ss.is_class_like = 0
@@ -688,7 +686,7 @@ fn get_member_declaration_results(
         let path = normalize_path(&row.get::<_, String>(0)?);
         let line = row.get::<_, i64>(1)?;
         let class_name = row.get::<_, String>(2)?;
-        let context = row.get::<_, String>(3)?;
+        let context = context_line_for_path(&path, line);
         let col = find_identifier_in_line(&context, symbol_name).unwrap_or(0);
         let kind = classify_member_location(&path, &context, symbol_name);
 
@@ -849,7 +847,7 @@ fn get_file_paths_by_ids(conn: &Connection, ids: &[i64]) -> Result<Vec<String>> 
 /// Search a single file line by line.
 /// 逐行搜索单个文件。
 fn search_in_file<F>(
-    conn: &Connection,
+    _conn: &Connection,
     path: &str,
     symbol_name: &str,
     remaining_limit: usize,
@@ -877,24 +875,21 @@ where
         _ => None,
     };
 
-    let mut stmt = conn.prepare(
-        r#"
-        SELECT line_number, line_text
-        FROM search_text_lines
-        WHERE path = ?1
-          AND instr(line_text_lc, lower(?2)) > 0
-        ORDER BY line_number
-        "#,
-    )?;
-    let mut rows = stmt.query(rusqlite::params![path, symbol_name])?;
-
-    while let Some(row) = rows.next()? {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(_) => return Ok(()),
+    };
+    let reader = BufReader::new(file);
+    for (index, line) in reader.lines().enumerate() {
         if emitted >= remaining_limit {
             break;
         }
 
-        let current_line = row.get::<_, i64>(0)? as usize;
-        let line = row.get::<_, String>(1)?;
+        let current_line = index + 1;
+        let line = match line {
+            Ok(line) => line,
+            Err(_) => continue,
+        };
 
         if let Some(UsageScope::Local(local_scope)) = scope {
             if current_line < local_scope.start_line || current_line > local_scope.end_line {

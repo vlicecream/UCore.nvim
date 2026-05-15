@@ -1,9 +1,10 @@
 pub mod project_path;
+pub mod asset;
+pub mod text;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -17,7 +18,7 @@ use crate::types::{ParseResult, ProgressReporter};
 ///
 /// Increment this when table structures, indexes, or stored data semantics change.
 /// 当表结构、索引或存储语义变化时递增。
-pub const DB_VERSION: i32 = 25;
+pub const DB_VERSION: i32 = 26;
 
 /// Completion cache version.
 /// 补全缓存版本。
@@ -33,36 +34,8 @@ const DB_BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
 /// SQLite busy timeout for bulk writes.
 /// 批量写入时的 busy timeout。
 const DB_BULK_BUSY_TIMEOUT: Duration = Duration::from_millis(60_000);
+const DB_BULK_CHUNK_SIZE: usize = 500;
 const ITEM_PROGRESS_EVERY: usize = 250;
-static BULK_WRITE_EXPERIMENTS: OnceLock<BulkWriteExperiments> = OnceLock::new();
-
-#[derive(Clone, Copy, Debug)]
-struct BulkWriteExperiments {
-    disable_fts: bool,
-    disable_text_lines: bool,
-    chunk_size: usize,
-}
-
-fn bulk_write_experiments() -> BulkWriteExperiments {
-    *BULK_WRITE_EXPERIMENTS.get_or_init(|| BulkWriteExperiments {
-        disable_fts: env_flag("UCORE_DB_DISABLE_FTS"),
-        disable_text_lines: env_flag("UCORE_DB_DISABLE_TEXT_LINES"),
-        chunk_size: env_usize("UCORE_DB_BULK_CHUNK_SIZE").unwrap_or(0),
-    })
-}
-
-fn env_flag(name: &str) -> bool {
-    std::env::var(name)
-        .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "on" | "ON"))
-        .unwrap_or(false)
-}
-
-fn env_usize(name: &str) -> Option<usize> {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-}
 
 /// Ensure the on-disk database matches the current schema version.
 /// 确保磁盘数据库版本和当前 schema 版本一致。
@@ -282,28 +255,6 @@ fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
             value TEXT NOT NULL
         );
 
-        CREATE TABLE IF NOT EXISTS assets (
-            asset_path TEXT PRIMARY KEY,
-            asset_key TEXT NOT NULL,
-            source_path TEXT NOT NULL UNIQUE,
-            source_path_key TEXT NOT NULL UNIQUE,
-            parent_class TEXT,
-            parent_class_key TEXT,
-            mtime INTEGER NOT NULL DEFAULT 0
-        );
-
-        CREATE TABLE IF NOT EXISTS asset_references (
-            asset_path TEXT NOT NULL,
-            reference_key TEXT NOT NULL,
-            FOREIGN KEY(asset_path) REFERENCES assets(asset_path) ON DELETE CASCADE
-        );
-
-        CREATE TABLE IF NOT EXISTS asset_functions (
-            asset_path TEXT NOT NULL,
-            function_key TEXT NOT NULL,
-            FOREIGN KEY(asset_path) REFERENCES assets(asset_path) ON DELETE CASCADE
-        );
-
         CREATE TABLE IF NOT EXISTS gameplay_tags (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             identifier TEXT NOT NULL,
@@ -365,20 +316,6 @@ fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
             FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
         );
 
-        CREATE TABLE IF NOT EXISTS search_text_lines (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            file_id INTEGER NOT NULL,
-            module_id INTEGER,
-            module_name TEXT,
-            module_name_lc TEXT,
-            path TEXT NOT NULL,
-            path_lc TEXT NOT NULL,
-            line_number INTEGER NOT NULL,
-            line_text TEXT NOT NULL,
-            line_text_lc TEXT NOT NULL,
-            FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
-        );
-
         CREATE TABLE IF NOT EXISTS search_symbol_calls (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             file_id INTEGER NOT NULL,
@@ -393,15 +330,6 @@ fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
             FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
         );
 
-        CREATE TABLE IF NOT EXISTS search_asset_usages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            lookup_key TEXT NOT NULL,
-            usage_kind TEXT NOT NULL,
-            asset_path TEXT NOT NULL,
-            asset_name TEXT NOT NULL,
-            asset_name_lc TEXT NOT NULL,
-            source_path TEXT NOT NULL
-        );
         "#,
     )?;
 
@@ -483,13 +411,6 @@ fn create_indices(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_file_includes_base_name ON file_includes(base_filename_id);
 
         CREATE INDEX IF NOT EXISTS idx_cache_last_used ON persistent_cache(last_used);
-        CREATE INDEX IF NOT EXISTS idx_assets_asset_key ON assets(asset_key);
-        CREATE INDEX IF NOT EXISTS idx_assets_source_path_key ON assets(source_path_key);
-        CREATE INDEX IF NOT EXISTS idx_assets_parent_class_key ON assets(parent_class_key);
-        CREATE INDEX IF NOT EXISTS idx_asset_references_asset_path ON asset_references(asset_path);
-        CREATE INDEX IF NOT EXISTS idx_asset_references_reference_key ON asset_references(reference_key);
-        CREATE INDEX IF NOT EXISTS idx_asset_functions_asset_path ON asset_functions(asset_path);
-        CREATE INDEX IF NOT EXISTS idx_asset_functions_function_key ON asset_functions(function_key);
         CREATE INDEX IF NOT EXISTS idx_gameplay_tags_identifier ON gameplay_tags(identifier);
         CREATE INDEX IF NOT EXISTS idx_gameplay_tags_tag_path ON gameplay_tags(tag_path);
         CREATE INDEX IF NOT EXISTS idx_gameplay_tags_file_id ON gameplay_tags(file_id);
@@ -509,18 +430,10 @@ fn create_indices(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_search_symbols_kind_rank_name ON search_symbols(kind_rank, name_lc);
         CREATE INDEX IF NOT EXISTS idx_search_symbols_file_id ON search_symbols(file_id);
 
-        CREATE INDEX IF NOT EXISTS idx_search_text_lines_file_line ON search_text_lines(file_id, line_number);
-        CREATE INDEX IF NOT EXISTS idx_search_text_lines_module_name_lc ON search_text_lines(module_name_lc);
-        CREATE INDEX IF NOT EXISTS idx_search_text_lines_path_lc ON search_text_lines(path_lc);
-
         CREATE INDEX IF NOT EXISTS idx_search_symbol_calls_name_lc ON search_symbol_calls(name_lc);
         CREATE INDEX IF NOT EXISTS idx_search_symbol_calls_file_id ON search_symbol_calls(file_id);
         CREATE INDEX IF NOT EXISTS idx_search_symbol_calls_path_lc ON search_symbol_calls(path_lc);
         CREATE INDEX IF NOT EXISTS idx_search_symbol_calls_module_name_lc ON search_symbol_calls(module_name_lc);
-
-        CREATE INDEX IF NOT EXISTS idx_search_asset_usages_lookup_kind ON search_asset_usages(lookup_key, usage_kind);
-        CREATE INDEX IF NOT EXISTS idx_search_asset_usages_asset_path ON search_asset_usages(asset_path);
-        CREATE INDEX IF NOT EXISTS idx_search_asset_usages_asset_name_lc ON search_asset_usages(asset_name_lc);
         "#,
     )?;
 
@@ -547,13 +460,6 @@ fn drop_indices(conn: &Connection) -> rusqlite::Result<()> {
         "idx_file_includes_resolved_id",
         "idx_file_includes_base_name",
         "idx_cache_last_used",
-        "idx_assets_asset_key",
-        "idx_assets_source_path_key",
-        "idx_assets_parent_class_key",
-        "idx_asset_references_asset_path",
-        "idx_asset_references_reference_key",
-        "idx_asset_functions_asset_path",
-        "idx_asset_functions_function_key",
         "idx_gameplay_tags_identifier",
         "idx_gameplay_tags_tag_path",
         "idx_gameplay_tags_file_id",
@@ -570,16 +476,10 @@ fn drop_indices(conn: &Connection) -> rusqlite::Result<()> {
         "idx_search_symbols_basename_lc",
         "idx_search_symbols_kind_rank_name",
         "idx_search_symbols_file_id",
-        "idx_search_text_lines_file_line",
-        "idx_search_text_lines_module_name_lc",
-        "idx_search_text_lines_path_lc",
         "idx_search_symbol_calls_name_lc",
         "idx_search_symbol_calls_file_id",
         "idx_search_symbol_calls_path_lc",
         "idx_search_symbol_calls_module_name_lc",
-        "idx_search_asset_usages_lookup_kind",
-        "idx_search_asset_usages_asset_path",
-        "idx_search_asset_usages_asset_name_lc",
     ];
 
     for index_name in indices {
@@ -633,15 +533,8 @@ pub fn save_to_db(
     init_db(conn)?;
     let total = results.len();
     let started_at = Instant::now();
-    let experiments = bulk_write_experiments();
 
-    info!(
-        "DB write start: {} parse results (disable_fts={} disable_text_lines={} chunk_size={})",
-        total,
-        experiments.disable_fts,
-        experiments.disable_text_lines,
-        experiments.chunk_size
-    );
+    info!("DB write start: {} parse results (chunk_size={})", total, DB_BULK_CHUNK_SIZE);
 
     prepare_bulk_write(conn)?;
     reporter.report("db_write", 0, total.max(1), "Prepare");
@@ -654,11 +547,7 @@ pub fn save_to_db(
     let mut dir_cache: HashMap<(Option<i64>, i64), i64> = HashMap::new();
     let mut module_name_cache: HashMap<Option<i64>, Option<String>> = HashMap::new();
     let mut last_reported_percent = 0usize;
-    let chunk_size = if experiments.chunk_size == 0 {
-        total.max(1)
-    } else {
-        experiments.chunk_size
-    };
+    let chunk_size = DB_BULK_CHUNK_SIZE.max(1);
 
     for (chunk_index, chunk) in results.chunks(chunk_size).enumerate() {
         let chunk_started_at = Instant::now();
@@ -790,26 +679,6 @@ fn save_to_db_bulk_chunk(
              WHERE file_id = ?9",
         )?;
 
-        let mut stmt_delete_search_text = tx.prepare(
-            "DELETE FROM search_text_lines WHERE file_id = ?1",
-        )?;
-
-        let mut stmt_insert_search_text = tx.prepare(
-            "INSERT INTO search_text_lines
-             (file_id, module_id, module_name, module_name_lc, path, path_lc, line_number, line_text, line_text_lc)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        )?;
-
-        let mut stmt_update_search_text_meta = tx.prepare(
-            "UPDATE search_text_lines
-             SET module_id = ?1,
-                 module_name = ?2,
-                 module_name_lc = ?3,
-                 path = ?4,
-                 path_lc = ?5
-             WHERE file_id = ?6",
-        )?;
-
         let mut stmt_search_call = tx.prepare(
             "INSERT INTO search_symbol_calls
              (file_id, module_id, module_name, module_name_lc, path, path_lc, line_number, name, name_lc)
@@ -902,15 +771,6 @@ fn save_to_db_bulk_chunk(
                         file_id,
                     ])?;
 
-                    stmt_update_search_text_meta.execute(params![
-                        result.module_id,
-                        module_name.as_deref(),
-                        module_name_lc.as_deref(),
-                        &path,
-                        &path_lc,
-                        file_id,
-                    ])?;
-
                     stmt_update_search_call_meta.execute(params![
                         result.module_id,
                         module_name.as_deref(),
@@ -988,16 +848,6 @@ fn save_to_db_bulk_chunk(
 
             save_gameplay_tags(&mut stmt_tag, file_id, &data.gameplay_tags)?;
             save_macro_definitions(&mut stmt_macro, file_id, &data.macro_definitions)?;
-            replace_search_text_lines_for_file_tx(
-                &tx,
-                module_name_cache,
-                &mut stmt_delete_search_text,
-                &mut stmt_insert_search_text,
-                file_id,
-                result.module_id,
-                path_obj,
-                &extension,
-            )?;
         }
     }
 
@@ -1365,26 +1215,6 @@ pub fn save_to_db_incremental(
          WHERE file_id = ?9",
     )?;
 
-    let mut stmt_delete_search_text = tx.prepare(
-        "DELETE FROM search_text_lines WHERE file_id = ?1",
-    )?;
-
-    let mut stmt_insert_search_text = tx.prepare(
-        "INSERT INTO search_text_lines
-         (file_id, module_id, module_name, module_name_lc, path, path_lc, line_number, line_text, line_text_lc)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-    )?;
-
-    let mut stmt_update_search_text_meta = tx.prepare(
-        "UPDATE search_text_lines
-         SET module_id = ?1,
-             module_name = ?2,
-             module_name_lc = ?3,
-             path = ?4,
-             path_lc = ?5
-         WHERE file_id = ?6",
-    )?;
-
     let mut stmt_search_call = tx.prepare(
         "INSERT INTO search_symbol_calls
          (file_id, module_id, module_name, module_name_lc, path, path_lc, line_number, name, name_lc)
@@ -1456,15 +1286,6 @@ pub fn save_to_db_incremental(
                     &basename,
                     &basename_lc,
                     &item.extension,
-                    existing_file_id,
-                ])?;
-
-                stmt_update_search_text_meta.execute(params![
-                    item.result.module_id,
-                    module_name.as_deref(),
-                    module_name_lc.as_deref(),
-                    &path,
-                    &path_lc,
                     existing_file_id,
                 ])?;
 
@@ -1556,21 +1377,8 @@ pub fn save_to_db_incremental(
 
         save_gameplay_tags(&mut stmt_tag, file_id, &data.gameplay_tags)?;
         save_macro_definitions(&mut stmt_macro, file_id, &data.macro_definitions)?;
-        replace_search_text_lines_for_file_tx(
-            &tx,
-            &mut module_name_cache,
-            &mut stmt_delete_search_text,
-            &mut stmt_insert_search_text,
-            file_id,
-            item.result.module_id,
-            Path::new(&item.result.path),
-            &item.extension,
-        )?;
     }
 
-    drop(stmt_update_search_text_meta);
-    drop(stmt_insert_search_text);
-    drop(stmt_delete_search_text);
     drop(stmt_update_search_call_meta);
     drop(stmt_search_call);
     drop(stmt_update_search_symbol_meta);
@@ -1601,6 +1409,7 @@ pub fn save_to_db_incremental(
 
     reporter.report("db_write", total.max(1), total.max(1), "Commit");
     tx.commit()?;
+    text::sync_text_files_for_results(conn, results)?;
     info!(
         "DB incremental write finished in {} ms ({} results)",
         started_at.elapsed().as_millis(),
@@ -1618,10 +1427,32 @@ pub fn delete_files_by_ids(conn: &mut Connection, file_ids: &[i64]) -> anyhow::R
     }
 
     init_db(conn)?;
+    let text_paths = collect_search_paths_for_file_ids(conn, file_ids)?;
+    let primary_db_path = text::current_primary_db_path(conn)?;
     let tx = conn.transaction()?;
     delete_files_by_ids_tx(&tx, file_ids)?;
     tx.commit()?;
+    if let Some(primary_db_path) = primary_db_path {
+        text::delete_text_files(&primary_db_path, &text_paths)?;
+    }
     Ok(())
+}
+
+fn collect_search_paths_for_file_ids(conn: &Connection, file_ids: &[i64]) -> anyhow::Result<Vec<String>> {
+    if file_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut stmt = conn.prepare("SELECT path FROM search_files WHERE file_id = ?1")?;
+    let mut paths = Vec::new();
+    for file_id in file_ids {
+        let rows = stmt.query_map(params![file_id], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            paths.push(row?);
+        }
+    }
+
+    Ok(paths)
 }
 
 fn lower_ascii(input: &str) -> String {
@@ -1741,57 +1572,6 @@ pub(crate) fn upsert_search_file_row_tx(
         is_header_extension(extension) as i32,
         is_search_text_extension(extension) as i32,
     ])?;
-
-    Ok(())
-}
-
-pub(crate) fn replace_search_text_lines_for_file_tx(
-    tx: &rusqlite::Transaction,
-    module_name_cache: &mut HashMap<Option<i64>, Option<String>>,
-    stmt_delete: &mut rusqlite::Statement,
-    stmt_insert: &mut rusqlite::Statement,
-    file_id: i64,
-    module_id: Option<i64>,
-    path: &Path,
-    extension: &str,
-) -> anyhow::Result<()> {
-    stmt_delete.execute(params![file_id])?;
-
-    if bulk_write_experiments().disable_text_lines {
-        return Ok(());
-    }
-
-    if !is_search_text_extension(extension) {
-        return Ok(());
-    }
-
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return Ok(());
-    };
-
-    let path = normalize_indexed_path(path);
-    let path_lc = lower_ascii(&path);
-    let module_name = module_name_for_id_tx(tx, module_name_cache, module_id)?;
-    let module_name_lc = module_name.as_deref().map(lower_ascii);
-
-    for (line_index, raw_line) in content.lines().enumerate() {
-        let line_text = raw_line.trim_end();
-        if line_text.trim().is_empty() {
-            continue;
-        }
-
-        stmt_insert.execute(params![
-            file_id,
-            module_id,
-            module_name,
-            module_name_lc,
-            path,
-            path_lc,
-            (line_index + 1) as i64,
-            line_text,
-            lower_ascii(line_text),
-        ])?;
-    }
 
     Ok(())
 }
@@ -2036,7 +1816,6 @@ pub(crate) fn delete_files_by_ids_tx(
     )?;
 
     for sql in [
-        "DELETE FROM search_text_lines WHERE file_id IN (SELECT id FROM temp_ucore_deleted_file_ids)",
         "DELETE FROM search_symbols WHERE file_id IN (SELECT id FROM temp_ucore_deleted_file_ids)",
         "DELETE FROM search_symbol_calls WHERE file_id IN (SELECT id FROM temp_ucore_deleted_file_ids)",
         "DELETE FROM search_files WHERE file_id IN (SELECT id FROM temp_ucore_deleted_file_ids)",
@@ -2169,8 +1948,6 @@ fn save_classes(
     extension: &str,
     classes: &[crate::types::ClassInfo],
 ) -> anyhow::Result<()> {
-    let write_fts = !bulk_write_experiments().disable_fts;
-
     for class_info in classes {
         let class_name_id = get_or_create_string(tx, string_cache, &class_info.class_name)?;
         let namespace_id = match &class_info.namespace {
@@ -2194,14 +1971,12 @@ fn save_classes(
 
         let class_row_id = tx.last_insert_rowid();
 
-        if write_fts {
-            stmt_fts.execute(params![
-                class_info.class_name,
-                class_info.symbol_type,
-                class_info.class_name,
-                class_row_id,
-            ])?;
-        }
+        stmt_fts.execute(params![
+            class_info.class_name,
+            class_info.symbol_type,
+            class_info.class_name,
+            class_row_id,
+        ])?;
 
         insert_search_symbol_row(
             stmt_search_symbol,
@@ -2261,8 +2036,6 @@ fn save_members(
     path: &Path,
     extension: &str,
 ) -> anyhow::Result<()> {
-    let write_fts = !bulk_write_experiments().disable_fts;
-
     for member in &class_info.members {
         let member_name_id = get_or_create_string(tx, string_cache, &member.name)?;
 
@@ -2297,14 +2070,12 @@ fn save_members(
 
         let member_row_id = tx.last_insert_rowid();
 
-        if write_fts {
-            stmt_fts.execute(params![
-                member.name,
-                member.mem_type,
-                class_info.class_name,
-                member_row_id,
-            ])?;
-        }
+        stmt_fts.execute(params![
+            member.name,
+            member.mem_type,
+            class_info.class_name,
+            member_row_id,
+        ])?;
 
         insert_search_symbol_row(
             stmt_search_symbol,

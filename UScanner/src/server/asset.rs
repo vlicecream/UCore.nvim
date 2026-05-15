@@ -11,6 +11,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
+use crate::db::asset as asset_db;
 use crate::server::state::{AppState, AssetGraph};
 use crate::server::utils::normalize_path_key;
 use crate::types::ProgressReporter;
@@ -193,25 +194,16 @@ impl Drop for ActiveAssetScanGuard {
 /// Return true when the persistent asset index has been initialized at least once.
 /// 判断持久化资产索引是否至少初始化过一次。
 pub fn asset_index_initialized(conn: &Connection) -> Result<bool> {
-    let initialized = conn
-        .query_row(
-            "SELECT value FROM project_meta WHERE key = 'asset_index_initialized'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
+    let Some(asset_conn) = asset_db::open_asset_db_read_only_for_primary(conn)? else {
+        return Ok(false);
+    };
 
+    let initialized = read_asset_meta(&asset_conn, "asset_index_initialized")?;
     if !matches!(initialized.as_deref(), Some("1")) {
         return Ok(false);
     }
 
-    let version = conn
-        .query_row(
-            "SELECT value FROM project_meta WHERE key = 'asset_index_version'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?
+    let version = read_asset_meta(&asset_conn, "asset_index_version")?
         .and_then(|value| value.parse::<i32>().ok());
 
     Ok(version == Some(ASSET_INDEX_VERSION))
@@ -226,6 +218,8 @@ pub fn refresh_asset_index(
 ) -> Result<()> {
     let overall_started_at = Instant::now();
     let initialized = asset_index_initialized(conn)?;
+    let mut asset_conn = asset_db::open_asset_db_for_primary(conn)?
+        .ok_or_else(|| anyhow::anyhow!("asset db path unavailable"))?;
     let content_dirs = discover_content_dirs(project_root);
     let asset_files = collect_candidate_assets(&content_dirs);
     info!(
@@ -256,7 +250,7 @@ pub fn refresh_asset_index(
             "Persist",
         );
         let persist_started_at = Instant::now();
-        replace_asset_index(conn, &report.parsed, Some(reporter.as_ref()))?;
+        replace_asset_index(&mut asset_conn, &report.parsed, Some(reporter.as_ref()))?;
         let persist_elapsed_ms = persist_started_at.elapsed().as_millis();
         reporter.report(
             "asset_index",
@@ -273,7 +267,7 @@ pub fn refresh_asset_index(
         return Ok(());
     }
 
-    let existing = load_existing_asset_mtimes(conn)?;
+    let existing = load_existing_asset_mtimes(&asset_conn)?;
     let mut changed_files = Vec::new();
     let mut on_disk = HashSet::new();
     let total_seen = asset_files.len().max(1);
@@ -317,7 +311,12 @@ pub fn refresh_asset_index(
 
     reporter.report("asset_index", 0, work_total, "Persist");
     let persist_started_at = Instant::now();
-    apply_asset_index_delta(conn, &report.parsed, &deleted_paths, Some(reporter.as_ref()))?;
+    apply_asset_index_delta(
+        &mut asset_conn,
+        &report.parsed,
+        &deleted_paths,
+        Some(reporter.as_ref()),
+    )?;
     reporter.report("asset_index", work_total, work_total, "Ready");
     info!(
         project_root = %project_root.display(),
@@ -461,9 +460,11 @@ fn apply_asset_index_delta(
 /// Upsert one asset file into the persistent asset index.
 /// 把单个资产文件写入持久化资产索引。
 pub fn upsert_asset_file(conn: &mut Connection, file_path: &Path) -> Result<()> {
+    let asset_conn = asset_db::open_asset_db_for_primary(conn)?
+        .ok_or_else(|| anyhow::anyhow!("asset db path unavailable"))?;
     let record = parse_asset_record(file_path)?;
     let source_path = normalize_path(file_path);
-    let tx = conn.unchecked_transaction()?;
+    let tx = asset_conn.unchecked_transaction()?;
 
     delete_asset_by_source_path_tx(&tx, &source_path)?;
 
@@ -502,7 +503,9 @@ pub fn upsert_asset_file(conn: &mut Connection, file_path: &Path) -> Result<()> 
 /// Delete one asset file from the persistent asset index.
 /// 从持久化资产索引删除单个资产文件。
 pub fn delete_asset_file(conn: &mut Connection, file_path: &Path) -> Result<()> {
-    let tx = conn.unchecked_transaction()?;
+    let asset_conn = asset_db::open_asset_db_for_primary(conn)?
+        .ok_or_else(|| anyhow::anyhow!("asset db path unavailable"))?;
+    let tx = asset_conn.unchecked_transaction()?;
     delete_asset_by_source_path_tx(&tx, &normalize_path(file_path))?;
     write_asset_index_initialized(&tx)?;
     tx.commit()?;
@@ -972,7 +975,10 @@ fn remove_asset_from_graph(graph: &mut AssetGraph, asset_path: &str) {
 /// Query all indexed assets from the persistent DB.
 /// 从持久化数据库获取全部已索引资产。
 pub fn get_assets(conn: &Connection) -> Result<Value> {
-    let mut stmt = conn.prepare("SELECT asset_path FROM assets ORDER BY asset_path COLLATE NOCASE")?;
+    let Some(asset_conn) = asset_db::open_asset_db_read_only_for_primary(conn)? else {
+        return Ok(json!([]));
+    };
+    let mut stmt = asset_conn.prepare("SELECT asset_path FROM assets ORDER BY asset_path COLLATE NOCASE")?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
     let assets = rows.collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(json!(assets))
@@ -981,15 +987,34 @@ pub fn get_assets(conn: &Connection) -> Result<Value> {
 /// Query integrity and summary status for the logical asset index.
 /// 查询逻辑资产索引的完整性和摘要状态。
 pub fn get_asset_index_status(conn: &Connection) -> Result<Value> {
-    let db_version = read_project_meta(conn, "db_version")?;
-    let asset_index_initialized = read_project_meta(conn, "asset_index_initialized")?;
-    let asset_index_version = read_project_meta(conn, "asset_index_version")?;
+    let Some(asset_conn) = asset_db::open_asset_db_read_only_for_primary(conn)? else {
+        return Ok(json!({
+            "ok": false,
+            "db_version": null,
+            "asset_index_initialized": null,
+            "asset_index_version": null,
+            "expected_asset_index_version": ASSET_INDEX_VERSION,
+            "counts": {
+                "assets": 0,
+                "asset_references": 0,
+                "asset_functions": 0,
+                "blueprint_like_assets": 0,
+                "orphan_asset_references": 0,
+                "orphan_asset_functions": 0,
+            },
+            "sample_assets": [],
+            "issues": ["asset database is missing"],
+        }));
+    };
+    let db_version = read_asset_meta(&asset_conn, "db_version")?;
+    let asset_index_initialized = read_asset_meta(&asset_conn, "asset_index_initialized")?;
+    let asset_index_version = read_asset_meta(&asset_conn, "asset_index_version")?;
 
-    let assets_count = query_count(conn, "SELECT COUNT(*) FROM assets")?;
-    let references_count = query_count(conn, "SELECT COUNT(*) FROM asset_references")?;
-    let functions_count = query_count(conn, "SELECT COUNT(*) FROM asset_functions")?;
+    let assets_count = query_count(&asset_conn, "SELECT COUNT(*) FROM assets")?;
+    let references_count = query_count(&asset_conn, "SELECT COUNT(*) FROM asset_references")?;
+    let functions_count = query_count(&asset_conn, "SELECT COUNT(*) FROM asset_functions")?;
     let blueprint_like_count = query_count(
-        conn,
+        &asset_conn,
         "SELECT COUNT(*) FROM assets
          WHERE parent_class IS NOT NULL
             OR asset_path LIKE '%.BP_%'
@@ -997,14 +1022,14 @@ pub fn get_asset_index_status(conn: &Connection) -> Result<Value> {
             OR asset_path LIKE '%/WB_%'",
     )?;
     let orphan_references = query_count(
-        conn,
+        &asset_conn,
         "SELECT COUNT(*)
          FROM asset_references ar
          LEFT JOIN assets a ON a.asset_path = ar.asset_path
          WHERE a.asset_path IS NULL",
     )?;
     let orphan_functions = query_count(
-        conn,
+        &asset_conn,
         "SELECT COUNT(*)
          FROM asset_functions af
          LEFT JOIN assets a ON a.asset_path = af.asset_path
@@ -1012,7 +1037,7 @@ pub fn get_asset_index_status(conn: &Connection) -> Result<Value> {
     )?;
 
     let sample_assets = query_single_column(
-        conn,
+        &asset_conn,
         "SELECT asset_path FROM assets ORDER BY asset_path COLLATE NOCASE LIMIT 8",
     )?;
 
@@ -1048,18 +1073,26 @@ pub fn get_asset_index_status(conn: &Connection) -> Result<Value> {
 /// Query asset usages from the persistent DB.
 /// 从持久化数据库查询资产引用和派生关系。
 pub fn get_asset_usages(conn: &Connection, asset_path: &str) -> Result<Value> {
+    let Some(asset_conn) = asset_db::open_asset_db_read_only_for_primary(conn)? else {
+        return Ok(json!({
+            "status": "ready",
+            "references": [],
+            "function_references": [],
+            "derived": [],
+        }));
+    };
     let names = make_asset_lookup_names(asset_path);
     let mut references = HashSet::new();
     let mut function_references = HashSet::new();
     let mut derived = HashSet::new();
 
-    let mut stmt_ref_or_derived = conn.prepare(
+    let mut stmt_ref_or_derived = asset_conn.prepare(
         "SELECT DISTINCT asset_path
          FROM search_asset_usages
          WHERE usage_kind = ?1
            AND (lookup_key = ?2 OR lookup_key LIKE ?3)",
     )?;
-    let mut stmt_func = conn.prepare(
+    let mut stmt_func = asset_conn.prepare(
         "SELECT DISTINCT asset_path
          FROM search_asset_usages
          WHERE usage_kind = 'function'
@@ -1095,8 +1128,11 @@ pub fn get_asset_usages(conn: &Connection, asset_path: &str) -> Result<Value> {
 /// Merge Blueprint-derived assets into a class query result from the persistent DB.
 /// 从持久化数据库把蓝图派生资产合并到 class 查询结果。
 pub fn merge_derived_classes(conn: &Connection, base_class: &str, results: &mut Vec<Value>) -> Result<()> {
+    let Some(asset_conn) = asset_db::open_asset_db_read_only_for_primary(conn)? else {
+        return Ok(());
+    };
     let names = make_asset_lookup_names(base_class);
-    let mut stmt = conn.prepare(
+    let mut stmt = asset_conn.prepare(
         "SELECT DISTINCT asset_path
          FROM search_asset_usages
          WHERE usage_kind = 'derived'
@@ -1449,22 +1485,22 @@ fn finalize_asset_bulk_write(conn: &Connection) -> Result<()> {
 
 fn write_asset_index_initialized(tx: &rusqlite::Transaction) -> Result<()> {
     tx.execute(
-        "INSERT OR REPLACE INTO project_meta (key, value)
+        "INSERT OR REPLACE INTO asset_meta (key, value)
          VALUES ('asset_index_initialized', '1')",
         [],
     )?;
     tx.execute(
-        "INSERT OR REPLACE INTO project_meta (key, value)
+        "INSERT OR REPLACE INTO asset_meta (key, value)
          VALUES ('asset_index_version', ?1)",
         [ASSET_INDEX_VERSION.to_string()],
     )?;
     Ok(())
 }
 
-fn read_project_meta(conn: &Connection, key: &str) -> Result<Option<String>> {
+fn read_asset_meta(conn: &Connection, key: &str) -> Result<Option<String>> {
     Ok(conn
         .query_row(
-            "SELECT value FROM project_meta WHERE key = ?1",
+            "SELECT value FROM asset_meta WHERE key = ?1",
             [key],
             |row| row.get::<_, String>(0),
         )

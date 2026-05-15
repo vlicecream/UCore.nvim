@@ -16,6 +16,7 @@ use tracing::info;
 
 use crate::db;
 use crate::db::project_path::get_or_create_directory;
+use crate::db::text::TextIndexFile;
 use crate::server::asset;
 use crate::types::{
     ComponentDef, InputFile, ModuleDef, ParseResult, PhaseInfo, ProgressReporter, RefreshRequest,
@@ -102,6 +103,11 @@ pub fn run_refresh(req: RefreshRequest, reporter: Arc<dyn ProgressReporter>) -> 
         reporter.clone(),
     )?;
     upsert_non_source_files(&mut conn, plan.other_files)?;
+    db::text::sync_text_files(
+        &ctx.db_path_native,
+        &plan.text_files_to_index,
+        Some(reporter.as_ref()),
+    )?;
 
     if should_index_assets(&ctx) {
         asset::refresh_asset_index(&mut conn, &ctx.project_root, reporter.clone())?;
@@ -148,6 +154,7 @@ struct DiscoveredFile {
 struct RefreshFilePlan {
     sources_to_parse: Vec<InputFile>,
     other_files: Vec<FileUpsert>,
+    text_files_to_index: Vec<TextIndexFile>,
     deleted: Vec<DeletedFileRef>,
     use_bulk_source_write: bool,
 }
@@ -746,6 +753,7 @@ fn build_file_plan(
     let mut on_disk = HashSet::new();
     let mut sources_to_parse = Vec::new();
     let mut other_files = Vec::new();
+    let mut text_files_to_index = Vec::new();
 
     let total_files = files.len().max(1);
 
@@ -774,6 +782,12 @@ fn build_file_plan(
         let changed = existing_meta.map(|meta| meta.mtime) != Some(mtime);
 
         if changed {
+            text_files_to_index.push(TextIndexFile {
+                path: file.path.clone(),
+                extension: file.extension.clone(),
+                mtime,
+            });
+
             if is_source_extension(&file.extension) {
                 sources_to_parse.push(InputFile {
                     path: file.path,
@@ -809,6 +823,7 @@ fn build_file_plan(
     RefreshFilePlan {
         sources_to_parse,
         other_files,
+        text_files_to_index,
         deleted,
         use_bulk_source_write,
     }
@@ -983,13 +998,6 @@ fn upsert_non_source_files(conn: &mut Connection, files: Vec<FileUpsert>) -> Res
          (file_id, module_id, module_name, module_name_lc, path, path_lc, basename, basename_lc, ext, is_source, is_header, is_searchable_text)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
     )?;
-    let mut stmt_delete_search_text =
-        tx.prepare("DELETE FROM search_text_lines WHERE file_id = ?1")?;
-    let mut stmt_insert_search_text = tx.prepare(
-        "INSERT INTO search_text_lines
-         (file_id, module_id, module_name, module_name_lc, path, path_lc, line_number, line_text, line_text_lc)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-    )?;
 
     for file in files {
         let path = Path::new(&file.path);
@@ -1028,20 +1036,8 @@ fn upsert_non_source_files(conn: &mut Connection, files: Vec<FileUpsert>) -> Res
             path,
             &file.extension,
         )?;
-        db::replace_search_text_lines_for_file_tx(
-            &tx,
-            &mut module_name_cache,
-            &mut stmt_delete_search_text,
-            &mut stmt_insert_search_text,
-            file_id,
-            Some(file.module_id),
-            path,
-            &file.extension,
-        )?;
     }
 
-    drop(stmt_insert_search_text);
-    drop(stmt_delete_search_text);
     drop(stmt_search_file);
     drop(stmt_insert_file);
     drop(stmt_select_file);

@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use crate::db::project_path::PATH_CTE;
+use crate::db::text;
 use crate::server::asset;
 use crate::server::state::{AppState, ProjectContext, RpcProgressReporter};
 use crate::server::utils::{
@@ -409,9 +409,9 @@ pub async fn handle_setup(state: Arc<AppState>, params: &Value) -> Result<Value>
     if !readiness.needs_full_refresh && readiness.needs_asset_index {
         info!(
             project_root = %req.project_root,
-            "setup scheduling background asset index"
+            "setup building asset index synchronously"
         );
-        schedule_asset_index_ready(state.clone(), db_path_native.clone(), req.project_root.clone());
+        ensure_asset_index_ready(&db_path_native, &req.project_root).await?;
     }
 
     let _ = state.save_registry();
@@ -2517,15 +2517,11 @@ fn run_project_live_text_search(
 
     if !state.is_done() {
         if let Some(module) = current_module.filter(|value| !value.trim().is_empty()) {
-            let report = scan_text_paths_query(
-                conn,
-                &text_paths_sql(Some("module")),
-                rusqlite::params![module],
-                state,
-                phase1_budget,
-                "project_module",
-                |_| true,
-            )?;
+            let report = scan_text_index_matches(conn, state, phase1_budget, "project_module", |path| {
+                module_name_for_file(conn, path)
+                    .as_deref()
+                    .is_some_and(|item_module| item_module.eq_ignore_ascii_case(module))
+            })?;
             reports.push(report);
         }
     }
@@ -2552,29 +2548,15 @@ fn run_project_live_text_search(
 
     if let Some(plugin_root) = plugin_root.as_deref() {
         if !state.is_done() {
-            let report = scan_text_paths_query(
-                conn,
-                &text_paths_sql(None),
-                [],
-                state,
-                phase2_budget,
-                "project_plugin",
-                |path| path.to_ascii_lowercase().starts_with(plugin_root),
-            )?;
+            let report = scan_text_index_matches(conn, state, phase2_budget, "project_plugin", |path| {
+                path.to_ascii_lowercase().starts_with(plugin_root)
+            })?;
             reports.push(report);
         }
     }
 
     if !state.is_done() {
-        let report = scan_text_paths_query(
-            conn,
-            &text_paths_sql(None),
-            [],
-            state,
-            phase2_budget,
-            "project_all",
-            |_| true,
-        )?;
+        let report = scan_text_index_matches(conn, state, phase2_budget, "project_all", |_| true)?;
         reports.push(report);
     }
 
@@ -2596,15 +2578,7 @@ fn run_engine_live_text_search(
         max_bytes: 64 * 1024 * 1024,
         max_results: std::cmp::min(state.remaining_results(), 50),
     };
-    let report = scan_text_paths_query(
-        conn,
-        &text_paths_sql(None),
-        [],
-        state,
-        phase3_budget,
-        "engine_all",
-        |_| true,
-    )?;
+    let report = scan_text_index_matches(conn, state, phase3_budget, "engine_all", |_| true)?;
     reports.push(report);
     Ok(())
 }
@@ -2639,10 +2613,8 @@ fn scan_single_text_path(
     })
 }
 
-fn scan_text_paths_query<P>(
+fn scan_text_index_matches<P>(
     conn: &rusqlite::Connection,
-    sql: &str,
-    params: impl rusqlite::Params,
     state: &mut LiveTextSearchState<'_>,
     budget: TextScanBudget,
     phase_name: &'static str,
@@ -2668,10 +2640,18 @@ where
         });
     }
 
-    let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map(params, |row| row.get::<_, String>(0))?;
-    for row in rows {
-        let path = normalize_to_unix(&row?);
+    let candidate_limit = std::cmp::max(
+        128,
+        std::cmp::max(
+            budget.max_files.saturating_mul(8),
+            budget.max_results.saturating_mul(16),
+        ),
+    )
+    .min(8192);
+    let candidate_paths = text::search_matching_paths(conn, state.original_pattern, candidate_limit)?;
+
+    for path in candidate_paths {
+        let path = normalize_to_unix(&path);
         if !allow_path(&path) || !is_live_text_searchable_path(&path) {
             continue;
         }
@@ -2750,42 +2730,6 @@ fn scan_text_matches_in_file(
     }
 
     Ok(true)
-}
-
-fn text_paths_sql(module_filter: Option<&str>) -> String {
-    let module_where = if module_filter.is_some() {
-        "AND lower(COALESCE(sm.text, '')) = lower(?)"
-    } else {
-        ""
-    };
-
-    format!(
-        r#"
-        {}
-        SELECT dp.full_path || '/' || sn.text AS path
-        FROM files f
-        JOIN dir_paths dp ON f.directory_id = dp.id
-        JOIN strings sn ON f.filename_id = sn.id
-        LEFT JOIN modules m ON f.module_id = m.id
-        LEFT JOIN strings sm ON m.name_id = sm.id
-        WHERE lower(f.extension) IN (
-            'h', 'hh', 'hpp', 'hxx',
-            'c', 'cc', 'cpp', 'cxx',
-            'inl', 'ipp',
-            'cs', 'ini', 'json', 'uproject', 'uplugin'
-        )
-          AND lower(dp.full_path || '/' || sn.text) NOT LIKE '%/intermediate/%'
-          AND lower(dp.full_path || '/' || sn.text) NOT LIKE '%/binaries/%'
-          AND lower(dp.full_path || '/' || sn.text) NOT LIKE '%/deriveddatacache/%'
-          AND lower(dp.full_path || '/' || sn.text) NOT LIKE '%/thirdparty/%'
-          AND lower(dp.full_path || '/' || sn.text) NOT LIKE '%/source/thirdparty/%'
-          AND lower(dp.full_path || '/' || sn.text) NOT LIKE '%/framework/libs/%'
-          AND lower(dp.full_path || '/' || sn.text) NOT LIKE '%/external/%'
-          {}
-        ORDER BY lower(dp.full_path || '/' || sn.text) ASC
-        "#,
-        PATH_CTE, module_where
-    )
 }
 
 fn is_live_text_searchable_path(path: &str) -> bool {
@@ -3359,50 +3303,6 @@ async fn ensure_asset_index_ready(db_path_native: &str, project_root: &str) -> R
 struct SetupReadiness {
     needs_full_refresh: bool,
     needs_asset_index: bool,
-}
-
-/// Schedule persistent asset index initialization in the background.
-/// 后台调度持久化资产索引初始化，不阻塞 setup 返回。
-fn schedule_asset_index_ready(state: Arc<AppState>, db_path_native: String, project_root: String) {
-    let root_key = normalize_path_key(&project_root);
-
-    {
-        let mut active = state.active_asset_scans.lock();
-        if active.contains(&root_key) {
-            info!(
-                project_root = %project_root,
-                root_key = %root_key,
-                "background asset index already active; skipping duplicate schedule"
-            );
-            return;
-        }
-        active.insert(root_key.clone());
-    }
-
-    info!(
-        project_root = %project_root,
-        root_key = %root_key,
-        db_path = %db_path_native,
-        "background asset index scheduled"
-    );
-
-    tokio::spawn(async move {
-        let result = ensure_asset_index_ready(&db_path_native, &project_root).await;
-
-        {
-            let mut active = state.active_asset_scans.lock();
-            active.remove(&root_key);
-        }
-
-        match result {
-            Ok(()) => {
-                info!("Background asset index ready: {}", project_root);
-            }
-            Err(err) => {
-                warn!("Background asset index failed for {}: {}", project_root, err);
-            }
-        }
-    });
 }
 
 /// Ensure SQLite database exists, version matches, and has required data.
