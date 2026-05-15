@@ -3,6 +3,7 @@ pub mod project_path;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -33,6 +34,35 @@ const DB_BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
 /// 批量写入时的 busy timeout。
 const DB_BULK_BUSY_TIMEOUT: Duration = Duration::from_millis(60_000);
 const ITEM_PROGRESS_EVERY: usize = 250;
+static BULK_WRITE_EXPERIMENTS: OnceLock<BulkWriteExperiments> = OnceLock::new();
+
+#[derive(Clone, Copy, Debug)]
+struct BulkWriteExperiments {
+    disable_fts: bool,
+    disable_text_lines: bool,
+    chunk_size: usize,
+}
+
+fn bulk_write_experiments() -> BulkWriteExperiments {
+    *BULK_WRITE_EXPERIMENTS.get_or_init(|| BulkWriteExperiments {
+        disable_fts: env_flag("UCORE_DB_DISABLE_FTS"),
+        disable_text_lines: env_flag("UCORE_DB_DISABLE_TEXT_LINES"),
+        chunk_size: env_usize("UCORE_DB_BULK_CHUNK_SIZE").unwrap_or(0),
+    })
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "on" | "ON"))
+        .unwrap_or(false)
+}
+
+fn env_usize(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+}
 
 /// Ensure the on-disk database matches the current schema version.
 /// 确保磁盘数据库版本和当前 schema 版本一致。
@@ -603,8 +633,15 @@ pub fn save_to_db(
     init_db(conn)?;
     let total = results.len();
     let started_at = Instant::now();
+    let experiments = bulk_write_experiments();
 
-    info!("DB write start: {} parse results", total);
+    info!(
+        "DB write start: {} parse results (disable_fts={} disable_text_lines={} chunk_size={})",
+        total,
+        experiments.disable_fts,
+        experiments.disable_text_lines,
+        experiments.chunk_size
+    );
 
     prepare_bulk_write(conn)?;
     reporter.report("db_write", 0, total.max(1), "Prepare");
@@ -613,11 +650,55 @@ pub fn save_to_db(
     info!("DB write drop indices finished in {} ms", started_at.elapsed().as_millis());
 
     reporter.report("db_write", 0, total.max(1), "Insert");
-
-    let tx = conn.transaction()?;
     let mut string_cache: HashMap<String, i64> = HashMap::new();
     let mut dir_cache: HashMap<(Option<i64>, i64), i64> = HashMap::new();
     let mut module_name_cache: HashMap<Option<i64>, Option<String>> = HashMap::new();
+    let mut last_reported_percent = 0usize;
+    let chunk_size = if experiments.chunk_size == 0 {
+        total.max(1)
+    } else {
+        experiments.chunk_size
+    };
+
+    for (chunk_index, chunk) in results.chunks(chunk_size).enumerate() {
+        let chunk_started_at = Instant::now();
+        save_to_db_bulk_chunk(
+            conn,
+            chunk,
+            reporter.as_ref(),
+            total,
+            chunk_index * chunk_size,
+            &mut string_cache,
+            &mut dir_cache,
+            &mut module_name_cache,
+            &mut last_reported_percent,
+        )?;
+        info!(
+            "DB write chunk {}/{} finished in {} ms ({} results)",
+            chunk_index + 1,
+            results.len().div_ceil(chunk_size),
+            chunk_started_at.elapsed().as_millis(),
+            chunk.len()
+        );
+    }
+
+    finalize_bulk_write(conn, reporter)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn save_to_db_bulk_chunk(
+    conn: &mut Connection,
+    results: &[ParseResult],
+    reporter: &dyn ProgressReporter,
+    total: usize,
+    global_offset: usize,
+    string_cache: &mut HashMap<String, i64>,
+    dir_cache: &mut HashMap<(Option<i64>, i64), i64>,
+    module_name_cache: &mut HashMap<Option<i64>, Option<String>>,
+    last_reported_percent: &mut usize,
+) -> anyhow::Result<()> {
+    let tx = conn.transaction()?;
 
     {
         let mut stmt_select_file =
@@ -745,20 +826,17 @@ pub fn save_to_db(
              WHERE file_id = ?6",
         )?;
 
-        let mut last_reported_percent = 0usize;
-
         for (index, result) in results.iter().enumerate() {
-            let current = index + 1;
+            let current = global_offset + index + 1;
             let percent = progress_percent(current, total);
 
-            if current == total || current == 1 || current % ITEM_PROGRESS_EVERY == 0 || percent > last_reported_percent {
-                last_reported_percent = percent;
-                reporter.report(
-                    "db_write",
-                    current,
-                    total,
-                    &format!("{}/{}", current, total),
-                );
+            if current == total
+                || current == 1
+                || current % ITEM_PROGRESS_EVERY == 0
+                || percent > *last_reported_percent
+            {
+                *last_reported_percent = percent;
+                reporter.report("db_write", current, total, &format!("{}/{}", current, total));
             }
 
             let path_obj = Path::new(&result.path);
@@ -775,11 +853,11 @@ pub fn save_to_db(
 
             let dir_id = project_path::get_or_create_directory(
                 &tx,
-                &mut string_cache,
-                &mut dir_cache,
+                string_cache,
+                dir_cache,
                 parent_dir,
             )?;
-            let filename_id = get_or_create_string(&tx, &mut string_cache, filename)?;
+            let filename_id = get_or_create_string(&tx, string_cache, filename)?;
             let existing_file_id = stmt_select_file
                 .query_row(params![dir_id, filename_id], |row| row.get::<_, i64>(0))
                 .optional()?;
@@ -797,7 +875,7 @@ pub fn save_to_db(
                 if let Some(file_id) = existing_file_id {
                     upsert_search_file_row_tx(
                         &tx,
-                        &mut module_name_cache,
+                        module_name_cache,
                         &mut stmt_search_file,
                         file_id,
                         result.module_id,
@@ -805,8 +883,7 @@ pub fn save_to_db(
                         &extension,
                     )?;
 
-                    let module_name =
-                        module_name_for_id_tx(&tx, &mut module_name_cache, result.module_id)?;
+                    let module_name = module_name_for_id_tx(&tx, module_name_cache, result.module_id)?;
                     let module_name_lc = module_name.as_deref().map(lower_ascii);
                     let path = normalize_indexed_path(path_obj);
                     let path_lc = lower_ascii(&path);
@@ -869,19 +946,18 @@ pub fn save_to_db(
             let file_id = tx.last_insert_rowid();
             upsert_search_file_row_tx(
                 &tx,
-                &mut module_name_cache,
+                module_name_cache,
                 &mut stmt_search_file,
                 file_id,
                 result.module_id,
                 path_obj,
                 &extension,
             )?;
-            let module_name =
-                module_name_for_id_tx(&tx, &mut module_name_cache, result.module_id)?;
+            let module_name = module_name_for_id_tx(&tx, module_name_cache, result.module_id)?;
 
             save_classes(
                 &tx,
-                &mut string_cache,
+                string_cache,
                 &mut stmt_class,
                 &mut stmt_inheritance,
                 &mut stmt_enum,
@@ -898,7 +974,7 @@ pub fn save_to_db(
 
             save_calls(
                 &tx,
-                &mut string_cache,
+                string_cache,
                 &mut stmt_call,
                 &mut stmt_search_call,
                 file_id,
@@ -908,19 +984,13 @@ pub fn save_to_db(
                 &data.calls,
             )?;
 
-            save_includes(
-                &tx,
-                &mut string_cache,
-                &mut stmt_include,
-                file_id,
-                &data.includes,
-            )?;
+            save_includes(&tx, string_cache, &mut stmt_include, file_id, &data.includes)?;
 
             save_gameplay_tags(&mut stmt_tag, file_id, &data.gameplay_tags)?;
             save_macro_definitions(&mut stmt_macro, file_id, &data.macro_definitions)?;
             replace_search_text_lines_for_file_tx(
                 &tx,
-                &mut module_name_cache,
+                module_name_cache,
                 &mut stmt_delete_search_text,
                 &mut stmt_insert_search_text,
                 file_id,
@@ -931,16 +1001,7 @@ pub fn save_to_db(
         }
     }
 
-    reporter.report("db_write", total.max(1), total.max(1), "Commit");
-    let commit_started_at = Instant::now();
     tx.commit()?;
-    info!(
-        "DB write commit finished in {} ms (total {} ms)",
-        commit_started_at.elapsed().as_millis(),
-        started_at.elapsed().as_millis()
-    );
-
-    finalize_bulk_write(conn, reporter)?;
     Ok(())
 }
 
@@ -1696,6 +1757,10 @@ pub(crate) fn replace_search_text_lines_for_file_tx(
 ) -> anyhow::Result<()> {
     stmt_delete.execute(params![file_id])?;
 
+    if bulk_write_experiments().disable_text_lines {
+        return Ok(());
+    }
+
     if !is_search_text_extension(extension) {
         return Ok(());
     }
@@ -2104,6 +2169,8 @@ fn save_classes(
     extension: &str,
     classes: &[crate::types::ClassInfo],
 ) -> anyhow::Result<()> {
+    let write_fts = !bulk_write_experiments().disable_fts;
+
     for class_info in classes {
         let class_name_id = get_or_create_string(tx, string_cache, &class_info.class_name)?;
         let namespace_id = match &class_info.namespace {
@@ -2127,12 +2194,14 @@ fn save_classes(
 
         let class_row_id = tx.last_insert_rowid();
 
-        stmt_fts.execute(params![
-            class_info.class_name,
-            class_info.symbol_type,
-            class_info.class_name,
-            class_row_id,
-        ])?;
+        if write_fts {
+            stmt_fts.execute(params![
+                class_info.class_name,
+                class_info.symbol_type,
+                class_info.class_name,
+                class_row_id,
+            ])?;
+        }
 
         insert_search_symbol_row(
             stmt_search_symbol,
@@ -2192,6 +2261,8 @@ fn save_members(
     path: &Path,
     extension: &str,
 ) -> anyhow::Result<()> {
+    let write_fts = !bulk_write_experiments().disable_fts;
+
     for member in &class_info.members {
         let member_name_id = get_or_create_string(tx, string_cache, &member.name)?;
 
@@ -2226,12 +2297,14 @@ fn save_members(
 
         let member_row_id = tx.last_insert_rowid();
 
-        stmt_fts.execute(params![
-            member.name,
-            member.mem_type,
-            class_info.class_name,
-            member_row_id,
-        ])?;
+        if write_fts {
+            stmt_fts.execute(params![
+                member.name,
+                member.mem_type,
+                class_info.class_name,
+                member_row_id,
+            ])?;
+        }
 
         insert_search_symbol_row(
             stmt_search_symbol,
