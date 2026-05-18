@@ -269,27 +269,6 @@ local function init_modal_width(lines)
 	return math.min(math.max(content_width, min_width), max_width)
 end
 
-local function default_progress_message(key)
-	if type(key) ~= "string" then
-		return nil
-	end
-
-	local title = key:match("^progress:(.+)$")
-	if not title or title == "" then
-		return nil
-	end
-
-	return string.format("%s 0%%", title)
-end
-
-local function seed_init_panel_items(panel)
-	for _, key in ipairs(panel.ordered_keys or {}) do
-		if key ~= "boot" and panel.items[key] == nil then
-			panel.items[key] = default_progress_message(key)
-		end
-	end
-end
-
 local function center_text(text, width)
 	local display_width = vim.fn.strdisplaywidth(text)
 	if display_width >= width then
@@ -657,7 +636,6 @@ function M.start(message)
 	panels.init.state = "running"
 	panels.init.spinner_active_keys.boot = true
 	panels.init.items.boot = message or "UCore Initializing..."
-	seed_init_panel_items(panels.init)
 	render()
 	schedule_spinner()
 end
