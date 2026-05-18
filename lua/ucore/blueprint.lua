@@ -110,14 +110,14 @@ end
 
 local function relation_label(target_kind, category)
 	if target_kind == "class" then
-		return "Derived Blueprint"
+		return "Derived Blueprints"
 	end
 
 	if category == "derived" then
-		return "Derived Blueprint"
+		return "Derived Blueprints"
 	end
 
-	return "Blueprint Call/Override"
+	return "Blueprint References"
 end
 
 local function asset_item(asset_path, category, target)
@@ -152,12 +152,12 @@ end
 
 local function class_hint_text(derived_count)
 	derived_count = tonumber(derived_count or 0) or 0
-	return string.format("Blueprint Derived %d", derived_count)
+	return string.format("Blueprint Derived: %d", derived_count)
 end
 
 local function member_hint_text(reference_count)
 	reference_count = tonumber(reference_count or 0) or 0
-	return string.format("Blueprint %d", reference_count)
+	return string.format("Blueprint Refs: %d", reference_count)
 end
 
 local function member_is_blueprint_candidate(member)
@@ -498,13 +498,48 @@ end
 
 local function show_target_picker(target, items)
 	if vim.tbl_isempty(items) then
-		vim.notify("UCore blueprint: no related Blueprint assets found for " .. target.name, vim.log.levels.INFO)
+		local label = target.kind == "class" and "derived Blueprints" or "Blueprint references"
+		vim.notify("UCore blueprint: no " .. label .. " found for " .. target.name, vim.log.levels.INFO)
 		return
 	end
 
 	ui.select.blueprint_assets(items, {
 		title = relation_label(target.kind, items[1] and items[1].blueprint_category or ""),
 	})
+end
+
+local function fetch_usage_hints_batch(root, targets, callback)
+	local names = {}
+	local order = {}
+	for _, target in ipairs(targets or {}) do
+		local name = text_value(target.name)
+		if name ~= "" and not order[name] then
+			order[name] = true
+			table.insert(names, name)
+		end
+	end
+
+	if vim.tbl_isempty(names) then
+		return callback({})
+	end
+
+	remote.get_asset_usage_hints(root, names, function(result, err)
+		if err or type(result) ~= "table" then
+			return callback({})
+		end
+
+		local map = {}
+		for _, item in ipairs(result) do
+			local name = text_value(item.name)
+			if name ~= "" then
+				map[name] = {
+					derived_count = tonumber(item.derived_count or 0) or 0,
+					reference_count = tonumber(item.reference_count or 0) or 0,
+				}
+			end
+		end
+		callback(map)
+	end)
 end
 
 local function collect_function_or_member_assets(ctx, target)
@@ -619,36 +654,33 @@ refresh_buffer = function(bufnr)
 			return
 		end
 
-		local remaining = #targets
-		local resolved = {}
-		local member_hints = 0
-
-		local function on_item_done(item)
+		fetch_usage_hints_batch(root, targets, function(hint_map)
 			if refresh_seq[bufnr] ~= seq or not vim.api.nvim_buf_is_valid(bufnr) then
 				return
 			end
 
-			table.insert(resolved, item)
-			remaining = remaining - 1
-			if remaining == 0 then
-				vim.schedule(function()
-					if refresh_seq[bufnr] == seq then
-						apply_hints(bufnr, resolved)
-					end
-				end)
+			local resolved = {}
+			local member_hints = 0
+			for _, target in ipairs(targets) do
+				local hint = hint_map[text_value(target.name)] or {}
+				local item = vim.deepcopy(target)
+				if target.kind == "class" then
+					item.derived_count = tonumber(hint.derived_count or 0) or 0
+					item.hint_text = class_hint_text(item.derived_count)
+				elseif member_hints < member_hint_limit() then
+					member_hints = member_hints + 1
+					item.reference_count = tonumber(hint.reference_count or 0) or 0
+					item.hint_text = member_hint_text(item.reference_count)
+				end
+				table.insert(resolved, item)
 			end
-		end
 
-		for _, target in ipairs(targets) do
-			if target.kind == "class" then
-				fetch_class_hint(root, target, bufnr, on_item_done)
-			elseif member_hints < member_hint_limit() then
-				member_hints = member_hints + 1
-				fetch_member_hint(root, target, bufnr, on_item_done)
-			else
-				on_item_done(target)
-			end
-		end
+			vim.schedule(function()
+				if refresh_seq[bufnr] == seq then
+					apply_hints(bufnr, resolved)
+				end
+			end)
+		end)
 	end)
 end
 

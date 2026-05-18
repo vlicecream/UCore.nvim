@@ -688,6 +688,7 @@ pub enum QueryRequest {
     GetAssets,
     GetAssetIndexStatus,
     GetAssetUsages { asset_path: String },
+    GetAssetUsageHints { names: Vec<String> },
     GetAssetDependencies { asset_path: String },
     GrepAssets { pattern: String },
 

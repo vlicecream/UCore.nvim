@@ -4,12 +4,12 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OpenFlags, OptionalExtension};
 use tracing::info;
 
 use crate::types::{ParseResult, ProgressReporter};
 
-pub const TEXT_DB_VERSION: i32 = 1;
+pub const TEXT_DB_VERSION: i32 = 2;
 
 const TEXT_DB_BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
 const TEXT_DB_BULK_BUSY_TIMEOUT: Duration = Duration::from_millis(60_000);
@@ -89,6 +89,13 @@ pub fn init_text_db(conn: &Connection) -> rusqlite::Result<()> {
             tokenize='trigram case_sensitive 0'
         );
 
+        CREATE VIRTUAL TABLE IF NOT EXISTS text_lines_fts USING fts5(
+            path UNINDEXED,
+            line_number UNINDEXED,
+            line_text,
+            tokenize='trigram case_sensitive 0'
+        );
+
         CREATE INDEX IF NOT EXISTS idx_text_files_path_lc ON text_files(path_lc);
         CREATE INDEX IF NOT EXISTS idx_text_files_ext ON text_files(ext);
         "#,
@@ -131,12 +138,16 @@ pub fn sync_text_files(
                 "DELETE FROM text_files_fts
                  WHERE rowid IN (SELECT rowid FROM text_files WHERE path = ?1)",
             )?;
+            let mut stmt_delete_lines = tx.prepare("DELETE FROM text_lines_fts WHERE path = ?1")?;
             let mut stmt_delete_file = tx.prepare("DELETE FROM text_files WHERE path = ?1")?;
             let mut stmt_insert_file = tx.prepare(
                 "INSERT INTO text_files (path, path_lc, ext, mtime) VALUES (?1, ?2, ?3, ?4)",
             )?;
             let mut stmt_insert_fts = tx.prepare(
                 "INSERT INTO text_files_fts (rowid, path, content) VALUES (?1, ?2, ?3)",
+            )?;
+            let mut stmt_insert_line = tx.prepare(
+                "INSERT INTO text_lines_fts (path, line_number, line_text) VALUES (?1, ?2, ?3)",
             )?;
 
             for (index, file) in chunk.iter().enumerate() {
@@ -149,6 +160,7 @@ pub fn sync_text_files(
 
                 let normalized_path = normalize_path(&file.path);
                 stmt_delete_fts.execute(params![normalized_path.as_str()])?;
+                stmt_delete_lines.execute(params![normalized_path.as_str()])?;
                 stmt_delete_file.execute(params![normalized_path.as_str()])?;
 
                 if !should_index_text_file(&normalized_path, &file.extension) {
@@ -173,6 +185,14 @@ pub fn sync_text_files(
 
                 let rowid = tx.last_insert_rowid();
                 stmt_insert_fts.execute(params![rowid, normalized_path.as_str(), content])?;
+
+                for (line_index, line_text) in content.lines().enumerate() {
+                    stmt_insert_line.execute(params![
+                        normalized_path.as_str(),
+                        (line_index + 1) as i64,
+                        line_text,
+                    ])?;
+                }
             }
         }
 
@@ -242,11 +262,13 @@ pub fn delete_text_files(primary_db_path: &str, paths: &[String]) -> Result<()> 
             "DELETE FROM text_files_fts
              WHERE rowid IN (SELECT rowid FROM text_files WHERE path = ?1)",
         )?;
+        let mut stmt_delete_lines = tx.prepare("DELETE FROM text_lines_fts WHERE path = ?1")?;
         let mut stmt_delete_file = tx.prepare("DELETE FROM text_files WHERE path = ?1")?;
 
         for path in paths {
             let normalized = normalize_path(path);
             stmt_delete_fts.execute(params![normalized.as_str()])?;
+            stmt_delete_lines.execute(params![normalized.as_str()])?;
             stmt_delete_file.execute(params![normalized.as_str()])?;
         }
     }
@@ -292,31 +314,87 @@ pub fn search_matching_lines(
     limit: usize,
     offset: usize,
 ) -> Result<Vec<TextLineMatch>> {
+    let Some(conn) = open_text_db_read_only_for_primary(primary_conn)? else {
+        return Ok(Vec::new());
+    };
     let needle = pattern.trim();
     if needle.is_empty() {
         return Ok(Vec::new());
     }
 
-    let target = limit.saturating_add(offset).clamp(1, 5_000);
-    let candidate_limit = target.saturating_mul(8).clamp(64, 4096);
-    let candidate_paths = search_matching_paths(primary_conn, needle, candidate_limit)?;
-    let needle_lower = needle.to_ascii_lowercase();
-    let mut skipped = 0usize;
-    let mut results = Vec::new();
+    search_matching_lines_from_conn(&conn, needle, limit, offset)
+}
 
-    for path in candidate_paths {
+pub fn search_matching_lines_in_paths(
+    primary_conn: &Connection,
+    pattern: &str,
+    allowed_paths: &[String],
+    limit: usize,
+    offset: usize,
+) -> Result<Vec<TextLineMatch>> {
+    let Some(conn) = open_text_db_read_only_for_primary(primary_conn)? else {
+        return Ok(Vec::new());
+    };
+
+    let needle = pattern.trim();
+    if needle.is_empty() || allowed_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if needle.len() < 3 {
+        return collect_line_matches_from_paths_fallback(allowed_paths, needle, limit, offset);
+    }
+
+    let mut results = Vec::new();
+    let mut skipped = 0usize;
+    for chunk in allowed_paths.chunks(200) {
         if results.len() >= limit {
             break;
         }
 
-        collect_line_matches_from_file(
-            &path,
-            &needle_lower,
-            offset,
-            &mut skipped,
-            limit,
-            &mut results,
-        )?;
+        let mut sql = String::from(
+            "SELECT path, line_number, line_text
+             FROM text_lines_fts
+             WHERE text_lines_fts MATCH ?1
+               AND path IN (",
+        );
+        for (index, _) in chunk.iter().enumerate() {
+            if index > 0 {
+                sql.push_str(", ");
+            }
+            sql.push('?');
+            sql.push_str(&(index + 2).to_string());
+        }
+        sql.push_str(
+            ")
+             ORDER BY bm25(text_lines_fts), path, CAST(line_number AS INTEGER)",
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        let mut params = Vec::with_capacity(chunk.len() + 1);
+        params.push(SqlValue::Text(quoted_match_query(needle)));
+        for path in chunk {
+            params.push(SqlValue::Text(normalize_path(path)));
+        }
+
+        let rows = stmt.query_map(params_from_iter(params), |row| {
+            Ok(TextLineMatch {
+                path: normalize_path(&row.get::<_, String>(0)?),
+                line_number: row.get::<_, i64>(1)?,
+                line_text: row.get::<_, String>(2)?,
+            })
+        })?;
+
+        for row in rows {
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            results.push(row?);
+            if results.len() >= limit {
+                break;
+            }
+        }
     }
 
     Ok(results)
@@ -402,6 +480,70 @@ fn collect_all_paths(conn: &Connection, limit: usize) -> Result<Vec<String>> {
         paths.push(normalize_path(&row?));
     }
     Ok(paths)
+}
+
+fn search_matching_lines_from_conn(
+    conn: &Connection,
+    needle: &str,
+    limit: usize,
+    offset: usize,
+) -> Result<Vec<TextLineMatch>> {
+    if needle.len() < 3 {
+        let target = limit.saturating_add(offset).clamp(1, 5_000);
+        let candidate_limit = target.saturating_mul(8).clamp(64, 4096);
+        let candidate_paths = collect_all_paths(conn, candidate_limit)?;
+        return collect_line_matches_from_paths_fallback(&candidate_paths, needle, limit, offset);
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT path, line_number, line_text
+         FROM text_lines_fts
+         WHERE text_lines_fts MATCH ?1
+         ORDER BY bm25(text_lines_fts), path, CAST(line_number AS INTEGER)
+         LIMIT ?2 OFFSET ?3",
+    )?;
+    let rows = stmt.query_map(
+        params![quoted_match_query(needle), limit.clamp(1, 5_000) as i64, offset.min(1_000_000) as i64],
+        |row| {
+            Ok(TextLineMatch {
+                path: normalize_path(&row.get::<_, String>(0)?),
+                line_number: row.get::<_, i64>(1)?,
+                line_text: row.get::<_, String>(2)?,
+            })
+        },
+    )?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+    Ok(results)
+}
+
+fn collect_line_matches_from_paths_fallback(
+    paths: &[String],
+    needle: &str,
+    limit: usize,
+    offset: usize,
+) -> Result<Vec<TextLineMatch>> {
+    let needle_lower = needle.to_ascii_lowercase();
+    let mut skipped = 0usize;
+    let mut results = Vec::new();
+    for path in paths {
+        if results.len() >= limit {
+            break;
+        }
+
+        collect_line_matches_from_file(
+            path,
+            &needle_lower,
+            offset,
+            &mut skipped,
+            limit,
+            &mut results,
+        )?;
+    }
+    Ok(results)
 }
 
 fn collect_line_matches_from_file(

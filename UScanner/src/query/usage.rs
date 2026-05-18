@@ -1,9 +1,10 @@
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, ToSql};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::path::Path;
 use tree_sitter::{Node, Parser, Point};
 
 use crate::db::ensure_search_projections;
@@ -73,15 +74,29 @@ fn find_symbol_usages_inner(
         _ => Vec::new(),
     };
 
-    for path in &candidates.file_paths {
-        if results.len() >= MAX_RESULTS {
-            break;
-        }
-
-        search_in_file(conn, path, symbol_name, MAX_RESULTS - results.len(), scope, |item| {
+    let indexed_search_used = search_indexed_candidate_lines(
+        conn,
+        &candidates.file_paths,
+        symbol_name,
+        MAX_RESULTS.saturating_sub(results.len()),
+        scope,
+        |item| {
             push_unique_result(&mut results, item);
             Ok(())
-        })?;
+        },
+    )?;
+
+    if !indexed_search_used {
+        for path in &candidates.file_paths {
+            if results.len() >= MAX_RESULTS {
+                break;
+            }
+
+            search_in_file(conn, path, symbol_name, MAX_RESULTS - results.len(), scope, |item| {
+                push_unique_result(&mut results, item);
+                Ok(())
+            })?;
+        }
     }
 
     Ok(json!({
@@ -345,12 +360,13 @@ where
     let mut total_results = 0usize;
     let mut batch = Vec::new();
 
-    for path in &candidates.file_paths {
-        if total_results >= MAX_RESULTS {
-            break;
-        }
-
-        search_in_file(conn, path, symbol_name, MAX_RESULTS - total_results, None, |item| {
+    let indexed_search_used = search_indexed_candidate_lines(
+        conn,
+        &candidates.file_paths,
+        symbol_name,
+        MAX_RESULTS.saturating_sub(total_results),
+        None,
+        |item| {
             batch.push(item);
             total_results += 1;
 
@@ -359,7 +375,26 @@ where
             }
 
             Ok(())
-        })?;
+        },
+    )?;
+
+    if !indexed_search_used {
+        for path in &candidates.file_paths {
+            if total_results >= MAX_RESULTS {
+                break;
+            }
+
+            search_in_file(conn, path, symbol_name, MAX_RESULTS - total_results, None, |item| {
+                batch.push(item);
+                total_results += 1;
+
+                if batch.len() >= STREAM_BATCH_SIZE {
+                    on_items(std::mem::take(&mut batch))?;
+                }
+
+                Ok(())
+            })?;
+        }
     }
 
     if !batch.is_empty() {
@@ -935,6 +970,138 @@ where
     }
 
     Ok(())
+}
+
+fn search_indexed_candidate_lines<F>(
+    conn: &Connection,
+    paths: &[String],
+    symbol_name: &str,
+    remaining_limit: usize,
+    scope: Option<&UsageScope>,
+    mut on_match: F,
+) -> Result<bool>
+where
+    F: FnMut(Value) -> Result<()>,
+{
+    if remaining_limit == 0 || paths.is_empty() || symbol_name.trim().len() < 3 {
+        return Ok(false);
+    }
+
+    let Some(primary_db_path) = text::current_primary_db_path(conn)? else {
+        return Ok(false);
+    };
+    if !Path::new(&text::derived_text_db_path(&primary_db_path)).is_file() {
+        return Ok(false);
+    }
+
+    let overscan_limit = remaining_limit.saturating_mul(24).clamp(96, 4096);
+    let matches = text::search_matching_lines_in_paths(conn, symbol_name, paths, overscan_limit, 0)?;
+    if matches.is_empty() {
+        return Ok(true);
+    }
+
+    let mut emitted = 0usize;
+    let mut content_cache = HashMap::<String, Option<String>>::new();
+    let mut member_context_cache = HashMap::<String, Option<FileMemberContext>>::new();
+
+    for item in matches {
+        if emitted >= remaining_limit {
+            break;
+        }
+
+        if process_indexed_line_match(
+            symbol_name,
+            &item,
+            scope,
+            &mut content_cache,
+            &mut member_context_cache,
+            &mut on_match,
+        )? {
+            emitted += 1;
+        }
+    }
+
+    Ok(true)
+}
+
+fn process_indexed_line_match<F>(
+    symbol_name: &str,
+    item: &text::TextLineMatch,
+    scope: Option<&UsageScope>,
+    content_cache: &mut HashMap<String, Option<String>>,
+    member_context_cache: &mut HashMap<String, Option<FileMemberContext>>,
+    on_match: &mut F,
+) -> Result<bool>
+where
+    F: FnMut(Value) -> Result<()>,
+{
+    let path = item.path.clone();
+    let line = item.line_text.as_str();
+    let current_line = item.line_number.max(1) as usize;
+
+    if let Some(UsageScope::Local(local_scope)) = scope {
+        if current_line < local_scope.start_line || current_line > local_scope.end_line {
+            return Ok(false);
+        }
+    }
+
+    let member_context = match scope {
+        Some(UsageScope::Member(member_scope)) => {
+            if !member_context_cache.contains_key(&path) {
+                let content = content_cache
+                    .entry(path.clone())
+                    .or_insert_with(|| std::fs::read_to_string(&path).ok());
+                let context = content
+                    .as_deref()
+                    .map(|content| FileMemberContext::new(content, member_scope));
+                member_context_cache.insert(path.clone(), context);
+            }
+            member_context_cache.get(&path).and_then(|value| value.as_ref())
+        }
+        _ => None,
+    };
+
+    let content = content_cache
+        .entry(path.clone())
+        .or_insert_with(|| match scope {
+            Some(UsageScope::Member(_)) => std::fs::read_to_string(&path).ok(),
+            _ => None,
+        })
+        .as_deref()
+        .unwrap_or("");
+
+    let mut search_start = 0usize;
+    let mut emitted = false;
+    while let Some(col) = find_word_in_line_from(line, symbol_name, search_start) {
+        if !is_code_occurrence(line, col) {
+            search_start = col + symbol_name.len();
+            continue;
+        }
+
+        if !should_emit_match(
+            content,
+            line,
+            current_line,
+            col,
+            scope,
+            member_context,
+        ) {
+            search_start = col + symbol_name.len();
+            continue;
+        }
+
+        on_match(json!({
+            "path": normalize_path(&path),
+            "line": current_line,
+            "col": col,
+            "context": line.trim(),
+            "kind": classify_usage_line(line, symbol_name, col),
+        }))?;
+        emitted = true;
+        search_start = col + symbol_name.len();
+    }
+
+    Ok(emitted)
 }
 
 /// Classify a reference usage line into a human-friendly kind.

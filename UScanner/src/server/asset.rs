@@ -1125,6 +1125,73 @@ pub fn get_asset_usages(conn: &Connection, asset_path: &str) -> Result<Value> {
     }))
 }
 
+pub fn get_asset_usage_hints(conn: &Connection, names: &[String]) -> Result<Value> {
+    let Some(asset_conn) = asset_db::open_asset_db_read_only_for_primary(conn)? else {
+        return Ok(json!([]));
+    };
+
+    let mut stmt_ref_or_derived = asset_conn.prepare(
+        "SELECT DISTINCT asset_path
+         FROM search_asset_usages
+         WHERE usage_kind = ?1
+           AND (lookup_key = ?2 OR lookup_key LIKE ?3)",
+    )?;
+    let mut stmt_func = asset_conn.prepare(
+        "SELECT DISTINCT asset_path
+         FROM search_asset_usages
+         WHERE usage_kind = 'function'
+           AND (lookup_key = ?1 OR lookup_key LIKE ?2 OR lookup_key LIKE ?3)",
+    )?;
+
+    let mut seen_names = HashSet::new();
+    let mut items = Vec::new();
+
+    for name in names {
+        let raw_name = name.trim();
+        if raw_name.is_empty() {
+            continue;
+        }
+        let normalized_name = raw_name.to_ascii_lowercase();
+        if !seen_names.insert(normalized_name) {
+            continue;
+        }
+
+        let mut references = HashSet::new();
+        let mut function_references = HashSet::new();
+        let mut derived = HashSet::new();
+
+        for lookup_name in make_asset_lookup_names(raw_name) {
+            collect_asset_rows(
+                &mut stmt_ref_or_derived,
+                params!["reference", lookup_name, format!("%.{}", lookup_name)],
+                &mut references,
+            )?;
+            collect_asset_rows(
+                &mut stmt_func,
+                params![
+                    lookup_name,
+                    format!("%.{}", lookup_name),
+                    format!("%:{}", lookup_name)
+                ],
+                &mut function_references,
+            )?;
+            collect_asset_rows(
+                &mut stmt_ref_or_derived,
+                params!["derived", lookup_name, format!("%.{}", lookup_name)],
+                &mut derived,
+            )?;
+        }
+
+        items.push(json!({
+            "name": raw_name,
+            "derived_count": derived.len(),
+            "reference_count": references.len() + function_references.len(),
+        }));
+    }
+
+    Ok(Value::Array(items))
+}
+
 /// Merge Blueprint-derived assets into a class query result from the persistent DB.
 /// 从持久化数据库把蓝图派生资产合并到 class 查询结果。
 pub fn merge_derived_classes(conn: &Connection, base_class: &str, results: &mut Vec<Value>) -> Result<()> {

@@ -4,9 +4,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
 use std::hash::{Hash, Hasher};
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -821,6 +819,10 @@ fn handle_state_query(
 
         QueryRequest::GetAssetUsages { asset_path } => {
             Ok(Some(asset::get_asset_usages(conn, &asset_path)?))
+        }
+
+        QueryRequest::GetAssetUsageHints { names } => {
+            Ok(Some(asset::get_asset_usage_hints(conn, &names)?))
         }
 
         QueryRequest::GetAssetIndexStatus => {
@@ -1810,7 +1812,6 @@ struct TextScanPhaseReport {
 
 struct LiveTextSearchState<'a> {
     original_pattern: &'a str,
-    needle_lower: String,
     source: &'static str,
     total_result_limit: usize,
     results: Vec<Value>,
@@ -1822,7 +1823,6 @@ impl<'a> LiveTextSearchState<'a> {
     fn new(original_pattern: &'a str, source: &'static str, total_result_limit: usize) -> Self {
         Self {
             original_pattern,
-            needle_lower: original_pattern.to_ascii_lowercase(),
             source,
             total_result_limit,
             results: Vec::new(),
@@ -2511,7 +2511,7 @@ fn run_project_live_text_search(
     };
 
     if let Some(path) = current_file.as_deref() {
-        let report = scan_single_text_path("project_file", path, state, phase1_budget)?;
+        let report = scan_single_text_path(conn, "project_file", path, state, phase1_budget)?;
         reports.push(report);
     }
 
@@ -2584,6 +2584,7 @@ fn run_engine_live_text_search(
 }
 
 fn scan_single_text_path(
+    conn: &rusqlite::Connection,
     phase_name: &'static str,
     path: &str,
     state: &mut LiveTextSearchState<'_>,
@@ -2596,10 +2597,25 @@ fn scan_single_text_path(
     let mut stopped = false;
 
     if is_live_text_searchable_path(path) && !state.is_done() && budget.max_results > 0 {
-        files_scanned += 1;
-        let continue_scan = scan_text_matches_in_file(path, state, &mut bytes_scanned, budget)?;
-        if !continue_scan {
-            stopped = true;
+        let matches = text::search_matching_lines_in_paths(
+            conn,
+            state.original_pattern,
+            &[path.to_string()],
+            budget.max_results.max(8),
+            0,
+        )?;
+        if !matches.is_empty() {
+            files_scanned = 1;
+        }
+        for item in matches {
+            bytes_scanned = bytes_scanned.saturating_add(item.line_text.len());
+            if !push_live_text_match(state, item) {
+                continue;
+            }
+            if bytes_scanned >= budget.max_bytes || state.is_done() || state.results.len() >= budget.max_results {
+                stopped = true;
+                break;
+            }
         }
     }
 
@@ -2641,31 +2657,32 @@ where
     }
 
     let candidate_limit = std::cmp::max(
-        128,
+        256,
         std::cmp::max(
-            budget.max_files.saturating_mul(8),
-            budget.max_results.saturating_mul(16),
+            budget.max_files.saturating_mul(24),
+            budget.max_results.saturating_mul(24),
         ),
     )
     .min(8192);
-    let candidate_paths = text::search_matching_paths(conn, state.original_pattern, candidate_limit)?;
+    let candidate_lines = text::search_matching_lines(conn, state.original_pattern, candidate_limit, 0)?;
+    let mut seen_phase_paths = HashSet::new();
 
-    for path in candidate_paths {
-        let path = normalize_to_unix(&path);
+    for item in candidate_lines {
+        let path = normalize_to_unix(&item.path);
         if !allow_path(&path) || !is_live_text_searchable_path(&path) {
             continue;
         }
-        if state.seen_paths.contains(&path) {
-            continue;
+        if seen_phase_paths.insert(path.clone()) {
+            files_scanned += 1;
         }
-        if files_scanned >= budget.max_files || bytes_scanned >= budget.max_bytes || state.is_done() {
+        if files_scanned > budget.max_files || bytes_scanned >= budget.max_bytes || state.is_done() {
             stopped = true;
             break;
         }
 
-        files_scanned += 1;
-        let continue_scan = scan_text_matches_in_file(&path, state, &mut bytes_scanned, budget)?;
-        if !continue_scan {
+        bytes_scanned = bytes_scanned.saturating_add(item.line_text.len());
+        let _ = push_live_text_match(state, item);
+        if bytes_scanned >= budget.max_bytes || state.is_done() || state.results.len() >= budget.max_results {
             stopped = true;
             break;
         }
@@ -2681,55 +2698,23 @@ where
     })
 }
 
-fn scan_text_matches_in_file(
-    path: &str,
-    state: &mut LiveTextSearchState<'_>,
-    bytes_scanned: &mut usize,
-    budget: TextScanBudget,
-) -> Result<bool> {
-    state.seen_paths.insert(path.to_string());
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(_) => return Ok(true),
-    };
-
-    let mut reader = BufReader::new(file);
-    let mut line = String::new();
-    let normalized_path = normalize_to_unix(path);
-    let mut line_number = 0usize;
-
-    loop {
-        line.clear();
-        let read = reader.read_line(&mut line)?;
-        if read == 0 {
-            break;
-        }
-
-        line_number += 1;
-        *bytes_scanned = bytes_scanned.saturating_add(read);
-        if *bytes_scanned > budget.max_bytes {
-            return Ok(false);
-        }
-
-        if line.to_ascii_lowercase().contains(&state.needle_lower) {
-            let match_key = format!("{}\t{}", normalized_path, line_number);
-            if state.seen_matches.insert(match_key) {
-                state.results.push(json!({
-                    "name": state.original_pattern,
-                    "type": "text",
-                    "path": normalized_path,
-                    "line": line_number as i64,
-                    "text": line.trim(),
-                    "source": state.source,
-                }));
-            }
-            if state.is_done() || state.results.len() >= budget.max_results {
-                return Ok(false);
-            }
-        }
+fn push_live_text_match(state: &mut LiveTextSearchState<'_>, item: text::TextLineMatch) -> bool {
+    let normalized_path = normalize_to_unix(&item.path);
+    let match_key = format!("{}\t{}", normalized_path, item.line_number);
+    if !state.seen_matches.insert(match_key) {
+        return false;
     }
 
-    Ok(true)
+    state.seen_paths.insert(normalized_path.clone());
+    state.results.push(json!({
+        "name": state.original_pattern,
+        "type": "text",
+        "path": normalized_path,
+        "line": item.line_number,
+        "text": item.line_text.trim(),
+        "source": state.source,
+    }));
+    true
 }
 
 fn is_live_text_searchable_path(path: &str) -> bool {
@@ -3098,6 +3083,7 @@ fn query_request_label(request: &QueryRequest) -> &'static str {
         QueryRequest::GetAssets => "GetAssets",
         QueryRequest::GetAssetIndexStatus => "GetAssetIndexStatus",
         QueryRequest::GetAssetUsages { .. } => "GetAssetUsages",
+        QueryRequest::GetAssetUsageHints { .. } => "GetAssetUsageHints",
         QueryRequest::GetAssetDependencies { .. } => "GetAssetDependencies",
         QueryRequest::FastFind { .. } => "FastFind",
         QueryRequest::UnifiedLiveFind { .. } => "UnifiedLiveFind",
@@ -3185,6 +3171,7 @@ fn query_request_detail(request: &QueryRequest) -> Option<String> {
             Some(format!("class={}", class_name))
         }
         QueryRequest::GetAssetUsages { asset_path } => Some(format!("asset={}", asset_path)),
+        QueryRequest::GetAssetUsageHints { names } => Some(format!("names={}", names.len())),
         QueryRequest::GetAssetDependencies { asset_path } => Some(format!("asset={}", asset_path)),
         QueryRequest::GetAssetIndexStatus => Some("project".to_string()),
         _ => None,

@@ -290,6 +290,13 @@ function M.get_asset_usages(project_root, asset_path, callback)
 	}, callback)
 end
 
+function M.get_asset_usage_hints(project_root, names, callback)
+	M.query(project_root, {
+		kind = "GetAssetUsageHints",
+		names = names or {},
+	}, callback)
+end
+
 function M.get_asset_dependencies(project_root, asset_path, callback)
 	M.query(project_root, {
 		kind = "GetAssetDependencies",

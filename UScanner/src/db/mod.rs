@@ -856,6 +856,22 @@ fn save_to_db_bulk_chunk(
 }
 
 pub fn ensure_search_projections(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS ucore_search_projection_ready(flag INTEGER PRIMARY KEY);",
+    )?;
+
+    let cached = conn
+        .query_row(
+            "SELECT 1 FROM temp.ucore_search_projection_ready WHERE flag = 1 LIMIT 1",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if cached {
+        return Ok(());
+    }
+
     let search_file_count: i64 =
         conn.query_row("SELECT COUNT(*) FROM search_files", [], |row| row.get(0))?;
     let search_symbol_count: i64 =
@@ -1045,6 +1061,10 @@ pub fn ensure_search_projections(conn: &Connection) -> anyhow::Result<()> {
         conn.execute_batch(&sql)?;
     }
 
+    conn.execute(
+        "INSERT OR IGNORE INTO temp.ucore_search_projection_ready(flag) VALUES (1)",
+        [],
+    )?;
     Ok(())
 }
 
