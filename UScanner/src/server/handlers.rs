@@ -409,7 +409,7 @@ pub async fn handle_setup(state: Arc<AppState>, params: &Value) -> Result<Value>
             project_root = %req.project_root,
             "setup building asset index synchronously"
         );
-        ensure_asset_index_ready(&db_path_native, &req.project_root).await?;
+        ensure_asset_index_ready(state.clone(), &db_path_native, &req.project_root).await?;
     }
 
     let _ = state.save_registry();
@@ -456,6 +456,7 @@ pub async fn handle_refresh(
 
     let reporter = Arc::new(RpcProgressReporter { tx });
 
+    let refresh_project_root = req.project_root.clone();
     tokio::task::spawn_blocking(move || refresh::run_refresh(req, reporter)).await??;
 
     info!(
@@ -465,7 +466,10 @@ pub async fn handle_refresh(
 
     clear_completion_cache(state, &root_key);
 
-    let _ = state.get_connection(&db_path_native);
+    if let Ok(conn) = state.get_connection(&db_path_native) {
+        let conn = conn.lock();
+        let _ = asset::populate_asset_graph_state(state, &refresh_project_root, &conn);
+    }
 
     Ok(Value::String("Refresh success".to_string()))
 }
@@ -817,13 +821,15 @@ fn handle_state_query(
             Ok(Some(value))
         }
 
-        QueryRequest::GetAssetUsages { asset_path } => {
-            Ok(Some(asset::get_asset_usages(conn, &asset_path)?))
-        }
+        QueryRequest::GetAssetUsages { asset_path } => Ok(Some(
+            asset::get_asset_usages_from_state(&state, project_root, &asset_path)
+                .unwrap_or(asset::get_asset_usages(conn, &asset_path)?),
+        )),
 
-        QueryRequest::GetAssetUsageHints { names } => {
-            Ok(Some(asset::get_asset_usage_hints(conn, &names)?))
-        }
+        QueryRequest::GetAssetUsageHints { names } => Ok(Some(
+            asset::get_asset_usage_hints_from_state(&state, project_root, &names)
+                .unwrap_or(asset::get_asset_usage_hints(conn, &names)?),
+        )),
 
         QueryRequest::GetAssetIndexStatus => {
             Ok(Some(asset::get_asset_index_status(conn)?))
@@ -844,7 +850,9 @@ fn handle_state_query(
             .cloned()
             .unwrap_or_default();
 
-            asset::merge_derived_classes(conn, &base_class, &mut db_results)?;
+            if !asset::merge_derived_classes_from_state(&state, project_root, &base_class, &mut db_results) {
+                asset::merge_derived_classes(conn, &base_class, &mut db_results)?;
+            }
 
             Ok(Some(json!(db_results)))
         }
@@ -3243,7 +3251,7 @@ fn flush_query_perf(window: &mut QueryPerfWindow) {
 
 /// Ensure the persistent asset index exists for this project.
 /// 确保当前项目的持久化资产索引已经初始化。
-async fn ensure_asset_index_ready(db_path_native: &str, project_root: &str) -> Result<()> {
+async fn ensure_asset_index_ready(state: Arc<AppState>, db_path_native: &str, project_root: &str) -> Result<()> {
     let db_path_native = db_path_native.to_string();
     let project_root = project_root.to_string();
 
@@ -3253,6 +3261,7 @@ async fn ensure_asset_index_ready(db_path_native: &str, project_root: &str) -> R
         db::init_db(&conn)?;
 
         if asset::asset_index_initialized(&conn)? {
+            let _ = asset::populate_asset_graph_state(&state, &project_root, &conn);
             info!(
                 project_root = %project_root,
                 db_path = %db_path_native,
@@ -3269,6 +3278,9 @@ async fn ensure_asset_index_ready(db_path_native: &str, project_root: &str) -> R
             "background asset index started"
         );
         let result = asset::refresh_asset_index(&mut conn, Path::new(&project_root), reporter);
+        if result.is_ok() {
+            let _ = asset::populate_asset_graph_state(&state, &project_root, &conn);
+        }
         match &result {
             Ok(()) => info!(
                 project_root = %project_root,

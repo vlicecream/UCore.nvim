@@ -191,6 +191,103 @@ impl Drop for ActiveAssetScanGuard {
     }
 }
 
+pub fn populate_asset_graph_state(
+    state: &AppState,
+    project_root: &str,
+    conn: &Connection,
+) -> Result<()> {
+    let graph = load_asset_graph_from_db(conn)?;
+    let root_key = normalize_path_key(project_root);
+    let mut graphs = state.asset_graphs.lock();
+    graphs.insert(root_key, graph);
+    Ok(())
+}
+
+pub fn get_asset_usages_from_state(
+    state: &AppState,
+    project_root: &str,
+    asset_path: &str,
+) -> Option<Value> {
+    let root_key = normalize_path_key(project_root);
+    let graphs = state.asset_graphs.lock();
+    let graph = graphs.get(&root_key)?;
+    Some(asset_usages_from_graph(graph, asset_path))
+}
+
+pub fn get_asset_usage_hints_from_state(
+    state: &AppState,
+    project_root: &str,
+    names: &[String],
+) -> Option<Value> {
+    let root_key = normalize_path_key(project_root);
+    let graphs = state.asset_graphs.lock();
+    let graph = graphs.get(&root_key)?;
+
+    let mut seen_names = HashSet::new();
+    let mut items = Vec::new();
+    for raw_name in names {
+        let name = raw_name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if !seen_names.insert(name.to_ascii_lowercase()) {
+            continue;
+        }
+
+        let usage = asset_usages_from_graph(graph, name);
+        items.push(json!({
+            "name": name,
+            "derived_count": usage.get("derived").and_then(Value::as_array).map(|v| v.len()).unwrap_or(0),
+            "reference_count":
+                usage.get("references").and_then(Value::as_array).map(|v| v.len()).unwrap_or(0)
+                + usage.get("function_references").and_then(Value::as_array).map(|v| v.len()).unwrap_or(0),
+        }));
+    }
+
+    Some(Value::Array(items))
+}
+
+pub fn merge_derived_classes_from_state(
+    state: &AppState,
+    project_root: &str,
+    base_class: &str,
+    results: &mut Vec<Value>,
+) -> bool {
+    let root_key = normalize_path_key(project_root);
+    let graphs = state.asset_graphs.lock();
+    let Some(graph) = graphs.get(&root_key) else {
+        return false;
+    };
+
+    let usage = asset_usages_from_graph(graph, base_class);
+    let derived = usage
+        .get("derived")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    for item in derived {
+        let Some(asset) = item.as_str() else {
+            continue;
+        };
+        let exists = results.iter().any(|entry| {
+            entry["path"]
+                .as_str()
+                .map(|path| path.eq_ignore_ascii_case(asset))
+                .unwrap_or(false)
+        });
+        if !exists {
+            results.push(json!({
+                "name": asset.rsplit('/').next().unwrap_or(asset),
+                "path": asset,
+                "symbol_type": "uasset",
+            }));
+        }
+    }
+
+    true
+}
+
 /// Return true when the persistent asset index has been initialized at least once.
 /// 判断持久化资产索引是否至少初始化过一次。
 pub fn asset_index_initialized(conn: &Connection) -> Result<bool> {
@@ -972,6 +1069,65 @@ fn remove_asset_from_graph(graph: &mut AssetGraph, asset_path: &str) {
     }
 }
 
+fn load_asset_graph_from_db(conn: &Connection) -> Result<AssetGraph> {
+    let Some(asset_conn) = asset_db::open_asset_db_read_only_for_primary(conn)? else {
+        return Ok(AssetGraph::default());
+    };
+
+    let mut graph = AssetGraph::default();
+
+    {
+        let mut stmt = asset_conn.prepare("SELECT reference_key, asset_path FROM asset_references")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (lookup, asset_path) = row?;
+            graph
+                .references
+                .entry(Arc::<str>::from(lookup))
+                .or_default()
+                .insert(Arc::<str>::from(asset_path));
+        }
+    }
+
+    {
+        let mut stmt = asset_conn.prepare("SELECT function_key, asset_path FROM asset_functions")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (lookup, asset_path) = row?;
+            graph
+                .functions
+                .entry(Arc::<str>::from(lookup))
+                .or_default()
+                .insert(Arc::<str>::from(asset_path));
+        }
+    }
+
+    {
+        let mut stmt = asset_conn.prepare(
+            "SELECT parent_class_key, asset_path
+             FROM assets
+             WHERE parent_class_key IS NOT NULL AND parent_class_key <> ''",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (lookup, asset_path) = row?;
+            graph
+                .derived
+                .entry(Arc::<str>::from(lookup))
+                .or_default()
+                .insert(Arc::<str>::from(asset_path));
+        }
+    }
+
+    Ok(graph)
+}
+
 /// Query all indexed assets from the persistent DB.
 /// 从持久化数据库获取全部已索引资产。
 pub fn get_assets(conn: &Connection) -> Result<Value> {
@@ -1123,6 +1279,38 @@ pub fn get_asset_usages(conn: &Connection, asset_path: &str) -> Result<Value> {
         "function_references": sorted_strings(function_references),
         "derived": sorted_strings(derived),
     }))
+}
+
+fn asset_usages_from_graph(graph: &AssetGraph, asset_path: &str) -> Value {
+    let names = make_asset_lookup_names(asset_path);
+    let mut references = HashSet::new();
+    let mut function_references = HashSet::new();
+    let mut derived = HashSet::new();
+
+    for name in names {
+        collect_asset_paths_from_map(&graph.references, &name, &mut references);
+        collect_asset_paths_from_map(&graph.functions, &name, &mut function_references);
+        collect_asset_paths_from_map(&graph.derived, &name, &mut derived);
+    }
+
+    json!({
+        "status": "ready",
+        "references": sorted_strings(references),
+        "function_references": sorted_strings(function_references),
+        "derived": sorted_strings(derived),
+    })
+}
+
+fn collect_asset_paths_from_map(
+    map: &HashMap<Arc<str>, HashSet<Arc<str>>>,
+    lookup_name: &str,
+    out: &mut HashSet<String>,
+) {
+    if let Some(items) = map.get(lookup_name) {
+        for item in items {
+            out.insert(item.to_string());
+        }
+    }
 }
 
 pub fn get_asset_usage_hints(conn: &Connection, names: &[String]) -> Result<Value> {
