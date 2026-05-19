@@ -796,6 +796,7 @@ fn handle_state_query(
             let value = find_references_with_engine(
                 state,
                 conn,
+                project_db_path,
                 engine_db_path,
                 &symbol_name,
                 file_path.as_deref(),
@@ -1426,6 +1427,7 @@ fn signature_help_with_engine(
 fn find_references_with_engine(
     state: Arc<AppState>,
     project_conn: &rusqlite::Connection,
+    project_db_path: &str,
     engine_db_path: Option<String>,
     symbol_name: &str,
     file_path: Option<&str>,
@@ -1435,8 +1437,11 @@ fn find_references_with_engine(
 ) -> Result<Value> {
     let log_enabled = fast_find_log_enabled() || query_log_enabled();
     let profile = SearchQueryProfile::classify(symbol_name);
-    let project_value = query::usage::find_symbol_usages_for_cursor(
+    let project_usage_hot_index =
+        load_usage_hot_index(&state, project_db_path, "references project");
+    let project_value = query::usage::find_symbol_usages_for_cursor_with_hot_index(
         project_conn,
+        project_usage_hot_index.as_deref(),
         symbol_name,
         file_path,
         content,
@@ -1528,8 +1533,10 @@ fn find_references_with_engine(
         }
     };
 
-    match query::usage::find_symbol_usages_for_cursor(
+    let engine_usage_hot_index = load_usage_hot_index(&state, &engine_db_path, "references engine");
+    match query::usage::find_symbol_usages_for_cursor_with_hot_index(
         &engine_conn,
+        engine_usage_hot_index.as_deref(),
         symbol_name,
         file_path,
         content,
@@ -3017,6 +3024,20 @@ fn load_search_hot_index(
     }
 }
 
+fn load_usage_hot_index(
+    state: &AppState,
+    db_path: &str,
+    label: &str,
+) -> Option<Arc<query::usage::UsageHotIndex>> {
+    match state.get_usage_hot_index(db_path) {
+        Ok(index) => Some(index),
+        Err(err) => {
+            warn!("Failed to open usage hot index for {} ({}): {}", db_path, label, err);
+            None
+        }
+    }
+}
+
 /// Convert a JSON array value into a Vec.
 /// 将 JSON array value 转成 Vec。
 fn value_array(value: Value) -> Vec<Value> {
@@ -3636,6 +3657,7 @@ fn drop_db_connections(state: &AppState, db_path_native: &str, cache_db_path_uni
     drop(conns);
     state.read_only_connections.lock().remove(db_path_native);
     state.invalidate_search_hot_index(db_path_native);
+    state.invalidate_usage_hot_index(db_path_native);
 
     if let Some(cache_path) = cache_db_path_unix {
         let mut cache_conns = state.persistent_cache_connections.lock();

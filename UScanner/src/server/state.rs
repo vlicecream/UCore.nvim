@@ -12,6 +12,7 @@ use tracing::{info, warn};
 
 use crate::db;
 use crate::query::search::{build_search_hot_index, SearchHotIndex};
+use crate::query::usage::{build_usage_hot_index, UsageHotIndex};
 use crate::types::{ConfigCache, PhaseInfo, Progress, ProgressPlan, ProgressReporter};
 
 const COMPLETION_CACHE_CAPACITY: usize = 50_000;
@@ -346,6 +347,7 @@ pub struct AppState {
     pub diagnostics_caches: Mutex<HashMap<String, Arc<Mutex<DiagnosticsCache>>>>,
     pub navigation_caches: Mutex<HashMap<String, Arc<Mutex<NavigationCache>>>>,
     pub search_hot_indexes: Mutex<HashMap<String, Arc<SearchHotIndex>>>,
+    pub usage_hot_indexes: Mutex<HashMap<String, Arc<UsageHotIndex>>>,
 }
 
 impl AppState {
@@ -560,12 +562,41 @@ impl AppState {
         self.search_hot_indexes.lock().remove(db_path);
     }
 
+    pub fn get_usage_hot_index(&self, db_path: &str) -> Result<Arc<UsageHotIndex>> {
+        {
+            let caches = self.usage_hot_indexes.lock();
+            if let Some(index) = caches.get(db_path) {
+                return Ok(Arc::clone(index));
+            }
+        }
+
+        let started_at = Instant::now();
+        let conn = open_read_only_connection(db_path)?;
+        let index = Arc::new(build_usage_hot_index(&conn)?);
+        info!(
+            "Usage hot index built: {} in {} ms",
+            db_path,
+            started_at.elapsed().as_millis()
+        );
+
+        let mut caches = self.usage_hot_indexes.lock();
+        let existing = caches
+            .entry(db_path.to_string())
+            .or_insert_with(|| Arc::clone(&index));
+        Ok(Arc::clone(existing))
+    }
+
+    pub fn invalidate_usage_hot_index(&self, db_path: &str) {
+        self.usage_hot_indexes.lock().remove(db_path);
+    }
+
     /// Drop cached DB connections for one project.
     /// 删除某个工程相关的缓存 DB 连接。
     pub fn drop_connections(&self, db_path: &str, cache_db_path: Option<&str>) {
         self.connections.lock().remove(db_path);
         self.read_only_connections.lock().remove(db_path);
         self.search_hot_indexes.lock().remove(db_path);
+        self.usage_hot_indexes.lock().remove(db_path);
 
         if let Some(cache_path) = cache_db_path {
             self.persistent_cache_connections.lock().remove(cache_path);

@@ -16,6 +16,25 @@ const MAX_FILES: usize = 2000;
 const SQL_CHUNK_SIZE: usize = 100;
 const STREAM_BATCH_SIZE: usize = 15;
 
+#[derive(Clone)]
+struct MemberDeclHotEntry {
+    path: String,
+    line: i64,
+    class_name: String,
+}
+
+pub struct UsageHotIndex {
+    file_paths_by_id: HashMap<i64, String>,
+    file_ids_by_path: HashMap<String, i64>,
+    all_file_ids: Vec<i64>,
+    defs_by_name: HashMap<String, Vec<i64>>,
+    calls_by_name_lc: HashMap<String, Vec<i64>>,
+    include_reverse: HashMap<i64, Vec<i64>>,
+    member_defs_by_key: HashMap<String, Vec<i64>>,
+    member_decls_by_key: HashMap<String, Vec<MemberDeclHotEntry>>,
+    class_like_names: HashSet<String>,
+}
+
 /// Find symbol usages and return all collected results at once.
 /// 查找 symbol 使用位置，并一次性返回结果。
 pub fn find_symbol_usages(
@@ -24,7 +43,7 @@ pub fn find_symbol_usages(
     current_file: Option<&str>,
 ) -> Result<Value> {
     ensure_search_projections(conn)?;
-    find_symbol_usages_inner(conn, symbol_name, current_file, None)
+    find_symbol_usages_inner(conn, None, symbol_name, current_file, None)
 }
 
 /// Find symbol usages with cursor context for member-aware filtering.
@@ -45,11 +64,155 @@ pub fn find_symbol_usages_for_cursor(
         _ => None,
     };
 
-    find_symbol_usages_inner(conn, symbol_name, current_file, scope.as_ref())
+    find_symbol_usages_inner(conn, None, symbol_name, current_file, scope.as_ref())
+}
+
+pub fn build_usage_hot_index(conn: &Connection) -> Result<UsageHotIndex> {
+    ensure_search_projections(conn)?;
+
+    let mut file_paths_by_id = HashMap::new();
+    let mut file_ids_by_path = HashMap::new();
+    let mut all_file_ids = Vec::new();
+    let mut stmt = conn.prepare(
+        "SELECT file_id, path FROM search_files ORDER BY file_id"
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, normalize_path(&row.get::<_, String>(1)?)))
+    })?;
+    for row in rows {
+        let (file_id, path) = row?;
+        file_ids_by_path.insert(path.clone(), file_id);
+        file_paths_by_id.insert(file_id, path);
+        all_file_ids.push(file_id);
+    }
+
+    let mut defs_by_name = HashMap::<String, Vec<i64>>::new();
+    let mut calls_by_name_lc = HashMap::<String, Vec<i64>>::new();
+    let mut include_reverse = HashMap::<i64, Vec<i64>>::new();
+    let mut member_defs_by_key = HashMap::<String, Vec<i64>>::new();
+    let mut member_decls_by_key = HashMap::<String, Vec<MemberDeclHotEntry>>::new();
+    let mut class_like_names = HashSet::<String>::new();
+
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT name, file_id, owner_name, path, line_number, is_class_like
+        FROM search_symbols
+        ORDER BY file_id, line_number
+        "#,
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            normalize_path(&row.get::<_, String>(3)?),
+            row.get::<_, Option<i64>>(4)?,
+            row.get::<_, i64>(5)? != 0,
+        ))
+    })?;
+    for row in rows {
+        let (name, file_id, owner_name, path, line_number, is_class_like) = row?;
+        defs_by_name.entry(name.clone()).or_default().push(file_id);
+        if is_class_like {
+            class_like_names.insert(name);
+        } else if let Some(owner_name) = owner_name {
+            let key = member_key(&name, &owner_name);
+            member_defs_by_key.entry(key.clone()).or_default().push(file_id);
+            if let Some(line) = line_number {
+                member_decls_by_key
+                    .entry(key)
+                    .or_default()
+                    .push(MemberDeclHotEntry {
+                        path,
+                        line,
+                        class_name: owner_name,
+                    });
+            }
+        }
+    }
+
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT se.text, ev.file_id
+        FROM enum_values ev
+        JOIN strings se ON ev.name_id = se.id
+        WHERE ev.file_id IS NOT NULL
+        "#,
+    )?;
+    let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
+    for row in rows {
+        let (name, file_id) = row?;
+        defs_by_name.entry(name).or_default().push(file_id);
+    }
+
+    let mut stmt = conn.prepare("SELECT name_lc, file_id FROM search_symbol_calls")?;
+    let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
+    for row in rows {
+        let (name_lc, file_id) = row?;
+        calls_by_name_lc.entry(name_lc).or_default().push(file_id);
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT resolved_file_id, file_id FROM file_includes WHERE resolved_file_id IS NOT NULL"
+    )?;
+    let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
+    for row in rows {
+        let (resolved_id, file_id) = row?;
+        include_reverse.entry(resolved_id).or_default().push(file_id);
+    }
+
+    dedupe_id_map(&mut defs_by_name);
+    dedupe_id_map(&mut calls_by_name_lc);
+    dedupe_i64_id_map(&mut include_reverse);
+    dedupe_id_map(&mut member_defs_by_key);
+    for items in member_decls_by_key.values_mut() {
+        items.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.line.cmp(&right.line))
+                .then_with(|| left.class_name.cmp(&right.class_name))
+        });
+        items.dedup_by(|left, right| {
+            left.path == right.path && left.line == right.line && left.class_name == right.class_name
+        });
+    }
+
+    Ok(UsageHotIndex {
+        file_paths_by_id,
+        file_ids_by_path,
+        all_file_ids,
+        defs_by_name,
+        calls_by_name_lc,
+        include_reverse,
+        member_defs_by_key,
+        member_decls_by_key,
+        class_like_names,
+    })
+}
+
+pub fn find_symbol_usages_for_cursor_with_hot_index(
+    conn: &Connection,
+    hot_index: Option<&UsageHotIndex>,
+    symbol_name: &str,
+    current_file: Option<&str>,
+    content: Option<&str>,
+    line: Option<u32>,
+    character: Option<u32>,
+) -> Result<Value> {
+    ensure_search_projections(conn)?;
+    let scope = match (content, line, character) {
+        (Some(content), Some(line), Some(character)) => {
+            resolve_usage_scope(conn, symbol_name, content, line, character)?
+        }
+        _ => None,
+    };
+
+    find_symbol_usages_inner(conn, hot_index, symbol_name, current_file, scope.as_ref())
 }
 
 fn find_symbol_usages_inner(
     conn: &Connection,
+    hot_index: Option<&UsageHotIndex>,
     symbol_name: &str,
     current_file: Option<&str>,
     scope: Option<&UsageScope>,
@@ -64,10 +227,11 @@ fn find_symbol_usages_inner(
         }));
     }
 
-    let candidates = collect_candidate_files(conn, symbol_name, current_file, scope)?;
+    let candidates = collect_candidate_files(conn, hot_index, symbol_name, current_file, scope)?;
     let mut results = match scope {
         Some(UsageScope::Member(member_scope)) => get_member_declaration_results(
             conn,
+            hot_index,
             symbol_name,
             &member_scope.member_owner_class,
         )?,
@@ -356,7 +520,7 @@ where
         }));
     }
 
-    let candidates = collect_candidate_files(conn, symbol_name, current_file, None)?;
+    let candidates = collect_candidate_files(conn, None, symbol_name, current_file, None)?;
     let mut total_results = 0usize;
     let mut batch = Vec::new();
 
@@ -421,6 +585,7 @@ struct CandidateFiles {
 /// 只收集精确作用域内 symbol 可能出现的候选文件。
 fn collect_candidate_files(
     conn: &Connection,
+    hot_index: Option<&UsageHotIndex>,
     symbol_name: &str,
     current_file: Option<&str>,
     scope: Option<&UsageScope>,
@@ -437,10 +602,12 @@ fn collect_candidate_files(
     }
 
     let Some(UsageScope::Member(member_scope)) = scope else {
-        return collect_unresolved_candidate_files(conn, symbol_name, current_file);
+        return collect_unresolved_candidate_files(conn, hot_index, symbol_name, current_file);
     };
 
-    let def_ids = find_member_definition_file_ids(conn, symbol_name, &member_scope.member_owner_class)?;
+    let def_ids = hot_index
+        .and_then(|index| index.find_member_definition_file_ids(symbol_name, &member_scope.member_owner_class))
+        .unwrap_or(find_member_definition_file_ids(conn, symbol_name, &member_scope.member_owner_class)?);
     let found_definition = !def_ids.is_empty();
 
     let mut candidate_ids = HashSet::new();
@@ -449,12 +616,18 @@ fn collect_candidate_files(
         candidate_ids.insert(*id);
     }
 
-    for id in find_including_file_ids(conn, &def_ids)? {
+    let include_ids = hot_index
+        .and_then(|index| index.find_including_file_ids(&def_ids))
+        .unwrap_or(find_including_file_ids(conn, &def_ids)?);
+    for id in include_ids {
         candidate_ids.insert(id);
     }
 
     if let Some(current) = current_file {
-        if let Some(id) = find_file_id(conn, current)? {
+        let current_id = hot_index
+            .and_then(|index| index.find_file_id(current))
+            .or(find_file_id(conn, current)?);
+        if let Some(id) = current_id {
             candidate_ids.insert(id);
         }
     }
@@ -477,38 +650,57 @@ fn collect_candidate_files(
 /// 当无法解析光标作用域时，回退收集一个可搜索的候选文件集合。
 fn collect_unresolved_candidate_files(
     conn: &Connection,
+    hot_index: Option<&UsageHotIndex>,
     symbol_name: &str,
     current_file: Option<&str>,
 ) -> Result<CandidateFiles> {
-    if is_type_like_symbol(conn, symbol_name)? {
-        return collect_type_candidate_files(conn, symbol_name, current_file);
+    let is_type_like = hot_index
+        .map(|index| index.is_type_like_symbol(symbol_name))
+        .unwrap_or(is_type_like_symbol(conn, symbol_name)?);
+    if is_type_like {
+        return collect_type_candidate_files(conn, hot_index, symbol_name, current_file);
     }
 
     let mut candidate_ids = HashSet::new();
     let mut found_definition = false;
 
-    for id in find_symbol_definition_file_ids(conn, symbol_name)? {
+    let definition_ids = hot_index
+        .and_then(|index| index.find_symbol_definition_file_ids(symbol_name))
+        .unwrap_or(find_symbol_definition_file_ids(conn, symbol_name)?);
+    for id in definition_ids {
         found_definition = true;
         candidate_ids.insert(id);
     }
 
-    for id in find_symbol_call_file_ids(conn, symbol_name)? {
+    let call_ids = hot_index
+        .and_then(|index| index.find_symbol_call_file_ids(symbol_name))
+        .unwrap_or(find_symbol_call_file_ids(conn, symbol_name)?);
+    for id in call_ids {
         candidate_ids.insert(id);
     }
 
     let seed_ids = candidate_ids.iter().copied().collect::<Vec<_>>();
-    for id in find_including_file_ids(conn, &seed_ids)? {
+    let include_ids = hot_index
+        .and_then(|index| index.find_including_file_ids(&seed_ids))
+        .unwrap_or(find_including_file_ids(conn, &seed_ids)?);
+    for id in include_ids {
         candidate_ids.insert(id);
     }
 
     if let Some(current) = current_file {
-        if let Some(id) = find_file_id(conn, current)? {
+        let current_id = hot_index
+            .and_then(|index| index.find_file_id(current))
+            .or(find_file_id(conn, current)?);
+        if let Some(id) = current_id {
             candidate_ids.insert(id);
         }
     }
 
     if candidate_ids.is_empty() {
-        for id in collect_all_file_ids(conn)? {
+        let all_file_ids = hot_index
+            .map(|index| index.collect_all_file_ids())
+            .unwrap_or(collect_all_file_ids(conn)?);
+        for id in all_file_ids {
             candidate_ids.insert(id);
             if candidate_ids.len() >= MAX_FILES {
                 break;
@@ -520,7 +712,9 @@ fn collect_unresolved_candidate_files(
     ids.sort_unstable();
     ids.truncate(MAX_FILES);
 
-    let mut file_paths = get_file_paths_by_ids(conn, &ids)?;
+    let mut file_paths = hot_index
+        .and_then(|index| index.get_file_paths_by_ids(&ids))
+        .unwrap_or(get_file_paths_by_ids(conn, &ids)?);
     file_paths.sort();
     file_paths.dedup();
 
@@ -532,23 +726,33 @@ fn collect_unresolved_candidate_files(
 
 fn collect_type_candidate_files(
     conn: &Connection,
+    hot_index: Option<&UsageHotIndex>,
     symbol_name: &str,
     current_file: Option<&str>,
 ) -> Result<CandidateFiles> {
     let mut candidate_ids = HashSet::new();
     let mut found_definition = false;
 
-    for id in find_symbol_definition_file_ids(conn, symbol_name)? {
+    let definition_ids = hot_index
+        .and_then(|index| index.find_symbol_definition_file_ids(symbol_name))
+        .unwrap_or(find_symbol_definition_file_ids(conn, symbol_name)?);
+    for id in definition_ids {
         found_definition = true;
         candidate_ids.insert(id);
     }
 
-    for id in find_type_reference_file_ids(conn, symbol_name)? {
+    let type_ref_ids = hot_index
+        .and_then(|index| index.find_type_reference_file_ids(symbol_name))
+        .unwrap_or(find_type_reference_file_ids(conn, symbol_name)?);
+    for id in type_ref_ids {
         candidate_ids.insert(id);
     }
 
     if let Some(current) = current_file {
-        if let Some(id) = find_file_id(conn, current)? {
+        let current_id = hot_index
+            .and_then(|index| index.find_file_id(current))
+            .or(find_file_id(conn, current)?);
+        if let Some(id) = current_id {
             candidate_ids.insert(id);
         }
     }
@@ -557,7 +761,9 @@ fn collect_type_candidate_files(
     ids.sort_unstable();
     ids.truncate(MAX_FILES);
 
-    let mut file_paths = get_file_paths_by_ids(conn, &ids)?;
+    let mut file_paths = hot_index
+        .and_then(|index| index.get_file_paths_by_ids(&ids))
+        .unwrap_or(get_file_paths_by_ids(conn, &ids)?);
     file_paths.sort();
     file_paths.dedup();
 
@@ -578,6 +784,114 @@ fn is_type_like_symbol(conn: &Connection, symbol_name: &str) -> Result<bool> {
         .is_some();
 
     Ok(exists)
+}
+
+impl UsageHotIndex {
+    fn find_member_definition_file_ids(&self, symbol_name: &str, owner_class: &str) -> Option<Vec<i64>> {
+        self.member_defs_by_key.get(&member_key(symbol_name, owner_class)).cloned()
+    }
+
+    fn find_symbol_definition_file_ids(&self, symbol_name: &str) -> Option<Vec<i64>> {
+        self.defs_by_name.get(symbol_name).cloned()
+    }
+
+    fn find_symbol_call_file_ids(&self, symbol_name: &str) -> Option<Vec<i64>> {
+        self.calls_by_name_lc.get(&symbol_name.to_ascii_lowercase()).cloned()
+    }
+
+    fn find_including_file_ids(&self, def_ids: &[i64]) -> Option<Vec<i64>> {
+        if def_ids.is_empty() {
+            return Some(Vec::new());
+        }
+
+        let mut seen = HashSet::new();
+        let mut ids = Vec::new();
+        for def_id in def_ids {
+            if let Some(include_ids) = self.include_reverse.get(def_id) {
+                for &id in include_ids {
+                    if seen.insert(id) {
+                        ids.push(id);
+                    }
+                }
+            }
+        }
+        Some(ids)
+    }
+
+    fn find_file_id(&self, file_path: &str) -> Option<i64> {
+        let normalized = normalize_path(file_path);
+        self.file_ids_by_path.get(&normalized).copied().or_else(|| {
+            let filename = Path::new(file_path).file_name()?.to_str()?;
+            self.file_paths_by_id.iter().find_map(|(file_id, path)| {
+                Path::new(path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .filter(|name| name.eq_ignore_ascii_case(filename))
+                    .map(|_| *file_id)
+            })
+        })
+    }
+
+    fn get_file_paths_by_ids(&self, ids: &[i64]) -> Option<Vec<String>> {
+        let mut paths = Vec::new();
+        for id in ids {
+            let path = self.file_paths_by_id.get(id)?;
+            paths.push(path.clone());
+        }
+        Some(paths)
+    }
+
+    fn collect_all_file_ids(&self) -> Vec<i64> {
+        self.all_file_ids.clone()
+    }
+
+    fn is_type_like_symbol(&self, symbol_name: &str) -> bool {
+        self.class_like_names.contains(symbol_name)
+    }
+
+    fn find_type_reference_file_ids(&self, symbol_name: &str) -> Option<Vec<i64>> {
+        self.find_symbol_call_file_ids(symbol_name)
+    }
+
+    fn get_member_declaration_results(&self, symbol_name: &str, owner_class: &str) -> Option<Vec<Value>> {
+        let entries = self.member_decls_by_key.get(&member_key(symbol_name, owner_class))?;
+        let mut results = Vec::new();
+        for entry in entries {
+            let context = context_line_for_path(&entry.path, entry.line);
+            let col = find_identifier_in_line(&context, symbol_name).unwrap_or(0);
+            let kind = classify_member_location(&entry.path, &context, symbol_name);
+            push_unique_result(
+                &mut results,
+                json!({
+                    "path": entry.path,
+                    "line": entry.line,
+                    "col": col,
+                    "context": context,
+                    "kind": kind,
+                    "class_name": entry.class_name,
+                }),
+            );
+        }
+        Some(results)
+    }
+}
+
+fn member_key(symbol_name: &str, owner_class: &str) -> String {
+    format!("{}\t{}", owner_class, symbol_name)
+}
+
+fn dedupe_id_map(map: &mut HashMap<String, Vec<i64>>) {
+    for ids in map.values_mut() {
+        ids.sort_unstable();
+        ids.dedup();
+    }
+}
+
+fn dedupe_i64_id_map(map: &mut HashMap<i64, Vec<i64>>) {
+    for ids in map.values_mut() {
+        ids.sort_unstable();
+        ids.dedup();
+    }
 }
 
 fn find_type_reference_file_ids(conn: &Connection, symbol_name: &str) -> Result<Vec<i64>> {
@@ -701,9 +1015,14 @@ fn collect_all_file_ids(conn: &Connection) -> Result<Vec<i64>> {
 /// 返回指定类成员的声明行。
 fn get_member_declaration_results(
     conn: &Connection,
+    hot_index: Option<&UsageHotIndex>,
     symbol_name: &str,
     owner_class: &str,
 ) -> Result<Vec<Value>> {
+    if let Some(results) = hot_index.and_then(|index| index.get_member_declaration_results(symbol_name, owner_class)) {
+        return Ok(results);
+    }
+
     let sql = r#"
         SELECT
             ss.path,
