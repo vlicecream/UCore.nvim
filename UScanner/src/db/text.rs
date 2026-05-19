@@ -9,11 +9,12 @@ use tracing::info;
 
 use crate::types::{ParseResult, ProgressReporter};
 
-pub const TEXT_DB_VERSION: i32 = 2;
+pub const TEXT_DB_VERSION: i32 = 3;
 
 const TEXT_DB_BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
 const TEXT_DB_BULK_BUSY_TIMEOUT: Duration = Duration::from_millis(60_000);
-const TEXT_INDEX_CHUNK_SIZE: usize = 250;
+const TEXT_INDEX_BULK_CHUNK_SIZE: usize = 500;
+const TEXT_INDEX_DELTA_CHUNK_SIZE: usize = 250;
 
 #[derive(Debug, Clone)]
 pub struct TextIndexFile {
@@ -83,23 +84,28 @@ pub fn init_text_db(conn: &Connection) -> rusqlite::Result<()> {
             mtime INTEGER
         );
 
-        CREATE VIRTUAL TABLE IF NOT EXISTS text_files_fts USING fts5(
-            path UNINDEXED,
-            content,
-            tokenize='trigram case_sensitive 0'
+        CREATE TABLE IF NOT EXISTS text_lines (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            path TEXT NOT NULL,
+            line_number INTEGER NOT NULL,
+            line_text TEXT NOT NULL
         );
 
         CREATE VIRTUAL TABLE IF NOT EXISTS text_lines_fts USING fts5(
-            path UNINDEXED,
-            line_number UNINDEXED,
             line_text,
+            content='text_lines',
+            content_rowid='id',
             tokenize='trigram case_sensitive 0'
         );
 
         CREATE INDEX IF NOT EXISTS idx_text_files_path_lc ON text_files(path_lc);
         CREATE INDEX IF NOT EXISTS idx_text_files_ext ON text_files(ext);
+        CREATE INDEX IF NOT EXISTS idx_text_lines_path ON text_lines(path);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_text_lines_path_line ON text_lines(path, line_number);
         "#,
     )?;
+
+    create_text_line_sync_triggers(conn)?;
 
     conn.execute(
         "INSERT OR REPLACE INTO text_meta (key, value) VALUES ('db_version', ?1)",
@@ -130,80 +136,11 @@ pub fn sync_text_files(
         reporter.report("text_write", 0, total.max(1), "Prepare");
     }
 
-    for (chunk_index, chunk) in files.chunks(TEXT_INDEX_CHUNK_SIZE).enumerate() {
-        let chunk_started_at = Instant::now();
-        let tx = conn.transaction()?;
-        {
-            let mut stmt_delete_fts = tx.prepare(
-                "DELETE FROM text_files_fts
-                 WHERE rowid IN (SELECT rowid FROM text_files WHERE path = ?1)",
-            )?;
-            let mut stmt_delete_lines = tx.prepare("DELETE FROM text_lines_fts WHERE path = ?1")?;
-            let mut stmt_delete_file = tx.prepare("DELETE FROM text_files WHERE path = ?1")?;
-            let mut stmt_insert_file = tx.prepare(
-                "INSERT INTO text_files (path, path_lc, ext, mtime) VALUES (?1, ?2, ?3, ?4)",
-            )?;
-            let mut stmt_insert_fts = tx.prepare(
-                "INSERT INTO text_files_fts (rowid, path, content) VALUES (?1, ?2, ?3)",
-            )?;
-            let mut stmt_insert_line = tx.prepare(
-                "INSERT INTO text_lines_fts (path, line_number, line_text) VALUES (?1, ?2, ?3)",
-            )?;
-
-            for (index, file) in chunk.iter().enumerate() {
-                let current = chunk_index * TEXT_INDEX_CHUNK_SIZE + index + 1;
-                if let Some(reporter) = reporter {
-                    if current == 1 || current == total || current % 200 == 0 {
-                        reporter.report("text_write", current, total, &format!("{}/{}", current, total));
-                    }
-                }
-
-                let normalized_path = normalize_path(&file.path);
-                stmt_delete_fts.execute(params![normalized_path.as_str()])?;
-                stmt_delete_lines.execute(params![normalized_path.as_str()])?;
-                stmt_delete_file.execute(params![normalized_path.as_str()])?;
-
-                if !should_index_text_file(&normalized_path, &file.extension) {
-                    continue;
-                }
-
-                let content = match std::fs::read_to_string(&normalized_path) {
-                    Ok(content) => content,
-                    Err(_) => continue,
-                };
-
-                if content.trim().is_empty() {
-                    continue;
-                }
-
-                stmt_insert_file.execute(params![
-                    normalized_path.as_str(),
-                    normalized_path.to_ascii_lowercase(),
-                    file.extension.to_ascii_lowercase(),
-                    file.mtime,
-                ])?;
-
-                let rowid = tx.last_insert_rowid();
-                stmt_insert_fts.execute(params![rowid, normalized_path.as_str(), content])?;
-
-                for (line_index, line_text) in content.lines().enumerate() {
-                    stmt_insert_line.execute(params![
-                        normalized_path.as_str(),
-                        (line_index + 1) as i64,
-                        line_text,
-                    ])?;
-                }
-            }
-        }
-
-        tx.commit()?;
-        info!(
-            "Text index chunk {}/{} finished in {} ms ({} files)",
-            chunk_index + 1,
-            files.len().div_ceil(TEXT_INDEX_CHUNK_SIZE),
-            chunk_started_at.elapsed().as_millis(),
-            chunk.len()
-        );
+    let existing_count = count_text_files(&conn)?;
+    if existing_count == 0 {
+        sync_text_files_full(&mut conn, files, reporter)?;
+    } else {
+        sync_text_files_delta(&mut conn, files, reporter)?;
     }
 
     finalize_text_bulk_write(&conn)?;
@@ -258,16 +195,11 @@ pub fn delete_text_files(primary_db_path: &str, paths: &[String]) -> Result<()> 
     init_text_db(&conn)?;
     let tx = conn.transaction()?;
     {
-        let mut stmt_delete_fts = tx.prepare(
-            "DELETE FROM text_files_fts
-             WHERE rowid IN (SELECT rowid FROM text_files WHERE path = ?1)",
-        )?;
-        let mut stmt_delete_lines = tx.prepare("DELETE FROM text_lines_fts WHERE path = ?1")?;
+        let mut stmt_delete_lines = tx.prepare("DELETE FROM text_lines WHERE path = ?1")?;
         let mut stmt_delete_file = tx.prepare("DELETE FROM text_files WHERE path = ?1")?;
 
         for path in paths {
             let normalized = normalize_path(path);
-            stmt_delete_fts.execute(params![normalized.as_str()])?;
             stmt_delete_lines.execute(params![normalized.as_str()])?;
             stmt_delete_file.execute(params![normalized.as_str()])?;
         }
@@ -275,6 +207,166 @@ pub fn delete_text_files(primary_db_path: &str, paths: &[String]) -> Result<()> 
 
     tx.commit()?;
     Ok(())
+}
+
+fn sync_text_files_full(
+    conn: &mut Connection,
+    files: &[TextIndexFile],
+    reporter: Option<&dyn ProgressReporter>,
+) -> Result<()> {
+    reset_text_index_storage(conn)?;
+
+    let total = files.len().max(1);
+    for (chunk_index, chunk) in files.chunks(TEXT_INDEX_BULK_CHUNK_SIZE).enumerate() {
+        let chunk_started_at = Instant::now();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt_insert_file = tx.prepare(
+                "INSERT INTO text_files (path, path_lc, ext, mtime) VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            let mut stmt_insert_line = tx.prepare(
+                "INSERT INTO text_lines (path, line_number, line_text) VALUES (?1, ?2, ?3)",
+            )?;
+
+            for (index, file) in chunk.iter().enumerate() {
+                let current = chunk_index * TEXT_INDEX_BULK_CHUNK_SIZE + index + 1;
+                if let Some(reporter) = reporter {
+                    if current == 1 || current == total || current % 200 == 0 {
+                        reporter.report("text_write", current.min(total.saturating_sub(1)), total, &format!("{}/{}", current, total));
+                    }
+                }
+
+                insert_text_file_records(&mut stmt_insert_file, &mut stmt_insert_line, file)?;
+            }
+        }
+        tx.commit()?;
+        info!(
+            "Text index bulk chunk {}/{} finished in {} ms ({} files)",
+            chunk_index + 1,
+            files.len().div_ceil(TEXT_INDEX_BULK_CHUNK_SIZE),
+            chunk_started_at.elapsed().as_millis(),
+            chunk.len()
+        );
+    }
+
+    if let Some(reporter) = reporter {
+        reporter.report("text_write", total.saturating_sub(1), total, "Build FTS");
+    }
+    let rebuild_started_at = Instant::now();
+    rebuild_text_line_fts(conn)?;
+    info!(
+        "Text index FTS rebuild finished in {} ms",
+        rebuild_started_at.elapsed().as_millis()
+    );
+    Ok(())
+}
+
+fn sync_text_files_delta(
+    conn: &mut Connection,
+    files: &[TextIndexFile],
+    reporter: Option<&dyn ProgressReporter>,
+) -> Result<()> {
+    let total = files.len();
+    for (chunk_index, chunk) in files.chunks(TEXT_INDEX_DELTA_CHUNK_SIZE).enumerate() {
+        let chunk_started_at = Instant::now();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt_delete_lines = tx.prepare("DELETE FROM text_lines WHERE path = ?1")?;
+            let mut stmt_delete_file = tx.prepare("DELETE FROM text_files WHERE path = ?1")?;
+            let mut stmt_insert_file = tx.prepare(
+                "INSERT INTO text_files (path, path_lc, ext, mtime) VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            let mut stmt_insert_line = tx.prepare(
+                "INSERT INTO text_lines (path, line_number, line_text) VALUES (?1, ?2, ?3)",
+            )?;
+
+            for (index, file) in chunk.iter().enumerate() {
+                let current = chunk_index * TEXT_INDEX_DELTA_CHUNK_SIZE + index + 1;
+                if let Some(reporter) = reporter {
+                    if current == 1 || current == total || current % 200 == 0 {
+                        reporter.report("text_write", current, total, &format!("{}/{}", current, total));
+                    }
+                }
+
+                let normalized_path = normalize_path(&file.path);
+                stmt_delete_lines.execute(params![normalized_path.as_str()])?;
+                stmt_delete_file.execute(params![normalized_path.as_str()])?;
+                insert_text_file_records(&mut stmt_insert_file, &mut stmt_insert_line, file)?;
+            }
+        }
+        tx.commit()?;
+        info!(
+            "Text index delta chunk {}/{} finished in {} ms ({} files)",
+            chunk_index + 1,
+            files.len().div_ceil(TEXT_INDEX_DELTA_CHUNK_SIZE),
+            chunk_started_at.elapsed().as_millis(),
+            chunk.len()
+        );
+    }
+
+    Ok(())
+}
+
+fn insert_text_file_records(
+    stmt_insert_file: &mut rusqlite::Statement<'_>,
+    stmt_insert_line: &mut rusqlite::Statement<'_>,
+    file: &TextIndexFile,
+) -> Result<()> {
+    let normalized_path = normalize_path(&file.path);
+    if !should_index_text_file(&normalized_path, &file.extension) {
+        return Ok(());
+    }
+
+    let file_handle = match File::open(&normalized_path) {
+        Ok(file_handle) => file_handle,
+        Err(_) => return Ok(()),
+    };
+
+    stmt_insert_file.execute(params![
+        normalized_path.as_str(),
+        normalized_path.to_ascii_lowercase(),
+        file.extension.to_ascii_lowercase(),
+        file.mtime,
+    ])?;
+
+    let mut reader = BufReader::new(file_handle);
+    let mut line = String::new();
+    let mut line_number = 0i64;
+
+    loop {
+        line.clear();
+        let read = reader.read_line(&mut line)?;
+        if read == 0 {
+            break;
+        }
+
+        line_number += 1;
+        stmt_insert_line.execute(params![
+            normalized_path.as_str(),
+            line_number,
+            trim_line_ending(&line),
+        ])?;
+    }
+
+    Ok(())
+}
+
+fn reset_text_index_storage(conn: &mut Connection) -> Result<()> {
+    drop_text_line_sync_triggers(conn)?;
+    let tx = conn.transaction()?;
+    tx.execute("DELETE FROM text_files", [])?;
+    tx.execute("DELETE FROM text_lines", [])?;
+    tx.commit()?;
+    recreate_text_lines_fts(conn)?;
+    Ok(())
+}
+
+fn count_text_files(conn: &Connection) -> Result<usize> {
+    Ok(conn.query_row("SELECT COUNT(1) FROM text_files", [], |row| row.get::<_, i64>(0))? as usize)
+}
+
+fn trim_line_ending(line: &str) -> &str {
+    line.trim_end_matches(['\r', '\n'])
 }
 
 pub fn search_matching_paths(primary_conn: &Connection, pattern: &str, limit: usize) -> Result<Vec<String>> {
@@ -293,17 +385,26 @@ pub fn search_matching_paths(primary_conn: &Connection, pattern: &str, limit: us
     }
 
     let query = quoted_match_query(needle);
+    let candidate_limit = limit.saturating_mul(32).clamp(64, 8192);
     let mut stmt = conn.prepare(
-        "SELECT path
-         FROM text_files_fts
-         WHERE text_files_fts MATCH ?1
-         ORDER BY bm25(text_files_fts), path
+        "SELECT tl.path
+         FROM text_lines_fts
+         JOIN text_lines tl ON tl.id = text_lines_fts.rowid
+         WHERE text_lines_fts MATCH ?1
+         ORDER BY bm25(text_lines_fts), tl.path, tl.line_number
          LIMIT ?2",
     )?;
-    let rows = stmt.query_map(params![query, limit as i64], |row| row.get::<_, String>(0))?;
+    let rows = stmt.query_map(params![query, candidate_limit as i64], |row| row.get::<_, String>(0))?;
     let mut paths = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for row in rows {
-        paths.push(normalize_path(&row?));
+        let path = normalize_path(&row?);
+        if seen.insert(path.clone()) {
+            paths.push(path);
+            if paths.len() >= limit {
+                break;
+            }
+        }
     }
     Ok(paths)
 }
@@ -353,10 +454,11 @@ pub fn search_matching_lines_in_paths(
         }
 
         let mut sql = String::from(
-            "SELECT path, line_number, line_text
+            "SELECT tl.path, tl.line_number, tl.line_text
              FROM text_lines_fts
+             JOIN text_lines tl ON tl.id = text_lines_fts.rowid
              WHERE text_lines_fts MATCH ?1
-               AND path IN (",
+               AND tl.path IN (",
         );
         for (index, _) in chunk.iter().enumerate() {
             if index > 0 {
@@ -367,7 +469,7 @@ pub fn search_matching_lines_in_paths(
         }
         sql.push_str(
             ")
-             ORDER BY bm25(text_lines_fts), path, CAST(line_number AS INTEGER)",
+             ORDER BY bm25(text_lines_fts), tl.path, tl.line_number",
         );
 
         let mut stmt = conn.prepare(&sql)?;
@@ -496,10 +598,11 @@ fn search_matching_lines_from_conn(
     }
 
     let mut stmt = conn.prepare(
-        "SELECT path, line_number, line_text
+        "SELECT tl.path, tl.line_number, tl.line_text
          FROM text_lines_fts
+         JOIN text_lines tl ON tl.id = text_lines_fts.rowid
          WHERE text_lines_fts MATCH ?1
-         ORDER BY bm25(text_lines_fts), path, CAST(line_number AS INTEGER)
+         ORDER BY bm25(text_lines_fts), tl.path, tl.line_number
          LIMIT ?2 OFFSET ?3",
     )?;
     let rows = stmt.query_map(
@@ -598,6 +701,71 @@ fn quoted_match_query(input: &str) -> String {
     format!("\"{}\"", input.replace('"', "\"\""))
 }
 
+fn create_text_lines_fts(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE VIRTUAL TABLE IF NOT EXISTS text_lines_fts USING fts5(
+            line_text,
+            content='text_lines',
+            content_rowid='id',
+            tokenize='trigram case_sensitive 0'
+        );
+        "#,
+    )?;
+    Ok(())
+}
+
+fn recreate_text_lines_fts(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        r#"
+        DROP TABLE IF EXISTS text_lines_fts;
+        "#,
+    )?;
+    create_text_lines_fts(conn)?;
+    Ok(())
+}
+
+fn create_text_line_sync_triggers(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TRIGGER IF NOT EXISTS text_lines_ai AFTER INSERT ON text_lines BEGIN
+            INSERT INTO text_lines_fts(rowid, line_text)
+            VALUES (new.id, new.line_text);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS text_lines_ad AFTER DELETE ON text_lines BEGIN
+            INSERT INTO text_lines_fts(text_lines_fts, rowid, line_text)
+            VALUES ('delete', old.id, old.line_text);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS text_lines_au AFTER UPDATE ON text_lines BEGIN
+            INSERT INTO text_lines_fts(text_lines_fts, rowid, line_text)
+            VALUES ('delete', old.id, old.line_text);
+            INSERT INTO text_lines_fts(rowid, line_text)
+            VALUES (new.id, new.line_text);
+        END;
+        "#,
+    )?;
+    Ok(())
+}
+
+fn drop_text_line_sync_triggers(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        r#"
+        DROP TRIGGER IF EXISTS text_lines_ai;
+        DROP TRIGGER IF EXISTS text_lines_ad;
+        DROP TRIGGER IF EXISTS text_lines_au;
+        "#,
+    )?;
+    Ok(())
+}
+
+fn rebuild_text_line_fts(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute("INSERT INTO text_lines_fts(text_lines_fts) VALUES('rebuild')", [])?;
+    create_text_line_sync_triggers(conn)?;
+    Ok(())
+}
+
 fn prepare_text_bulk_write(conn: &Connection) -> Result<()> {
     conn.busy_timeout(TEXT_DB_BULK_BUSY_TIMEOUT)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -608,6 +776,7 @@ fn prepare_text_bulk_write(conn: &Connection) -> Result<()> {
 }
 
 fn finalize_text_bulk_write(conn: &Connection) -> Result<()> {
+    conn.execute("INSERT INTO text_lines_fts(text_lines_fts) VALUES('optimize')", [])?;
     conn.execute("PRAGMA optimize", [])?;
     Ok(())
 }
@@ -637,4 +806,105 @@ fn is_search_text_extension(extension: &str) -> bool {
 
 fn normalize_path(path: &str) -> String {
     path.replace('\\', "/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_base(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "ucore-text-db-{}-{}-{}",
+            name,
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn create_primary_db(base: &Path) -> (Connection, PathBuf) {
+        fs::create_dir_all(base).unwrap();
+        let db_path = base.join("ucore.db");
+        let conn = Connection::open(&db_path).unwrap();
+        (conn, db_path)
+    }
+
+    #[test]
+    fn search_matching_paths_reads_from_line_index() {
+        let base = temp_base("paths");
+        let (conn, db_path) = create_primary_db(&base);
+        let source_path = base.join("GameplayAbility.cpp");
+        fs::write(&source_path, "void Test() {\n    GameplayCue();\n}\n").unwrap();
+
+        sync_text_files(
+            db_path.to_string_lossy().as_ref(),
+            &[TextIndexFile {
+                path: source_path.to_string_lossy().to_string(),
+                extension: "cpp".to_string(),
+                mtime: 1,
+            }],
+            None,
+        )
+        .unwrap();
+
+        let paths = search_matching_paths(&conn, "GameplayCue", 20).unwrap();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0], source_path.to_string_lossy().replace('\\', "/"));
+
+        let _ = fs::remove_file(derived_text_db_path(db_path.to_string_lossy().as_ref()));
+        let _ = fs::remove_file(&db_path);
+        let _ = fs::remove_file(&source_path);
+        let _ = fs::remove_dir(&base);
+    }
+
+    #[test]
+    fn sync_text_files_updates_and_deletes_line_hits() {
+        let base = temp_base("delta");
+        let (conn, db_path) = create_primary_db(&base);
+        let source_path = base.join("Widget.cpp");
+        let source_path_text = source_path.to_string_lossy().to_string();
+
+        fs::write(&source_path, "AlphaCall();\n").unwrap();
+        sync_text_files(
+            db_path.to_string_lossy().as_ref(),
+            &[TextIndexFile {
+                path: source_path_text.clone(),
+                extension: "cpp".to_string(),
+                mtime: 1,
+            }],
+            None,
+        )
+        .unwrap();
+
+        let alpha_hits = search_matching_lines(&conn, "AlphaCall", 20, 0).unwrap();
+        assert_eq!(alpha_hits.len(), 1);
+
+        fs::write(&source_path, "BetaCall();\n").unwrap();
+        sync_text_files(
+            db_path.to_string_lossy().as_ref(),
+            &[TextIndexFile {
+                path: source_path_text.clone(),
+                extension: "cpp".to_string(),
+                mtime: 2,
+            }],
+            None,
+        )
+        .unwrap();
+
+        assert!(search_matching_lines(&conn, "AlphaCall", 20, 0).unwrap().is_empty());
+        let beta_hits = search_matching_lines(&conn, "BetaCall", 20, 0).unwrap();
+        assert_eq!(beta_hits.len(), 1);
+
+        delete_text_files(db_path.to_string_lossy().as_ref(), &[source_path_text]).unwrap();
+        assert!(search_matching_lines(&conn, "BetaCall", 20, 0).unwrap().is_empty());
+
+        let _ = fs::remove_file(derived_text_db_path(db_path.to_string_lossy().as_ref()));
+        let _ = fs::remove_file(&db_path);
+        let _ = fs::remove_file(&source_path);
+        let _ = fs::remove_dir(&base);
+    }
 }
