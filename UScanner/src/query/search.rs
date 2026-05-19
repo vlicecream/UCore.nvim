@@ -73,125 +73,15 @@ pub fn search_symbols(
         return list_symbols(conn, limit, offset);
     }
 
-    let limit = limit.clamp(1, 10_000) as i64;
-    let offset = offset.min(1_000_000) as i64;
-    let query = pattern.to_ascii_lowercase();
-    let prefix_query = format!("{}%", escape_like(&query));
-    let contains_query = format!("%{}%", escape_like(&query));
-    let tokens = search_tokens(pattern);
-    let allow_owner_match = !is_identifier_query(pattern);
-    let candidate_ids =
-        search_symbol_candidate_ids(conn, pattern, (limit as usize).saturating_add(offset as usize).saturating_mul(8))?;
-    if matches!(candidate_ids.as_ref(), Some(ids) if ids.is_empty()) {
-        return Ok(json!([]));
-    }
-    let searchable = if allow_owner_match {
-        "lower(COALESCE(name, '') || ' ' || COALESCE(kind, '') || ' ' || COALESCE(owner_name, '') || ' ' || COALESCE(module_name, '') || ' ' || COALESCE(path, ''))"
-    } else {
-        "lower(COALESCE(name, '') || ' ' || COALESCE(kind, '') || ' ' || COALESCE(module_name, '') || ' ' || COALESCE(path, ''))"
-    };
-    let token_filter = tokens
-        .iter()
-        .map(|_| format!("{searchable} LIKE ? ESCAPE '\\'"))
-        .collect::<Vec<_>>()
-        .join(" AND ");
-    let where_clause = if token_filter.is_empty() {
-        "1 = 1".to_string()
-    } else {
-        token_filter
-    };
-    let candidate_clause = candidate_ids
-        .as_ref()
-        .map(|ids| format!(" AND id IN ({})", plain_placeholders(ids.len())))
-        .unwrap_or_default();
+    let target = offset.saturating_add(limit).clamp(1, 10_000);
+    let results = bucketed_symbol_results(conn, pattern, target, false)?;
+    let page = results
+        .into_iter()
+        .skip(offset.min(1_000_000))
+        .take(limit.clamp(1, 10_000))
+        .collect::<Vec<_>>();
 
-    let owner_rank_sql = if allow_owner_match {
-        "WHEN owner_name_lc LIKE ? ESCAPE '\\' THEN 3"
-    } else {
-        ""
-    };
-    let module_rank_sql = if allow_owner_match {
-        "WHEN module_name_lc LIKE ? ESCAPE '\\' THEN 4"
-    } else {
-        "WHEN module_name_lc LIKE ? ESCAPE '\\' THEN 3"
-    };
-    let path_rank_sql = if allow_owner_match {
-        "WHEN path_lc LIKE ? ESCAPE '\\' THEN 5"
-    } else {
-        "WHEN path_lc LIKE ? ESCAPE '\\' THEN 4"
-    };
-
-    let sql = format!(
-        r#"
-        SELECT
-            name,
-            kind,
-            owner_name,
-            path,
-            line_number,
-            module_name
-        FROM search_symbols
-        WHERE {}{}
-        ORDER BY
-            CASE
-                WHEN name_lc = ? THEN 0
-                WHEN name_lc LIKE ? ESCAPE '\' THEN 1
-                WHEN name_lc LIKE ? ESCAPE '\' THEN 2
-                {}
-                {}
-                {}
-                ELSE 9
-            END,
-            kind_rank ASC,
-            name_lc ASC,
-            path_lc ASC
-        LIMIT ? OFFSET ?
-        "#,
-        where_clause,
-        candidate_clause,
-        owner_rank_sql,
-        module_rank_sql,
-        path_rank_sql
-    );
-
-    let mut stmt = conn.prepare(&sql)?;
-    let mut params = Vec::new();
-    for token in &tokens {
-        params.push(SqlValue::Text(format!("%{}%", escape_like(token))));
-    }
-    if let Some(ids) = candidate_ids.as_ref() {
-        for id in ids {
-            params.push(SqlValue::Integer(*id));
-        }
-    }
-    params.push(SqlValue::Text(query));
-    params.push(SqlValue::Text(prefix_query));
-    params.push(SqlValue::Text(contains_query.clone()));
-    if allow_owner_match {
-        params.push(SqlValue::Text(contains_query.clone()));
-    }
-    params.push(SqlValue::Text(contains_query.clone()));
-    params.push(SqlValue::Text(contains_query));
-    params.push(SqlValue::Integer(limit));
-    params.push(SqlValue::Integer(offset));
-
-    let rows = stmt.query_map(params_from_iter(params), |row| {
-        Ok(json!({
-            "name": row.get::<_, String>(0)?,
-            "type": row.get::<_, String>(1)?,
-            "class_name": row.get::<_, Option<String>>(2)?,
-            "path": normalize_path(&row.get::<_, String>(3)?),
-            "line": row.get::<_, Option<i64>>(4)?,
-            "module_name": row.get::<_, Option<String>>(5)?,
-        }))
-    })?;
-
-    let mut results = Vec::new();
-    for row in rows {
-        results.push(row?);
-    }
-
-    Ok(json!(results))
+    Ok(json!(page))
 }
 
 /// Return indexed symbols for interactive picker-side fuzzy filtering.
@@ -259,26 +149,44 @@ pub fn global_find(
 
     let target = offset.saturating_add(limit);
     let mut results = Vec::new();
+    let mut seen = std::collections::HashSet::new();
 
-    extend_json_array(&mut results, search_symbols(conn, pattern, target.max(limit), 0)?);
-    extend_json_array(&mut results, search_files_for_global(conn, pattern, target.max(limit))?);
+    merge_bucket_results(
+        &mut results,
+        &mut seen,
+        bucketed_symbol_results(conn, pattern, target.max(limit), false)?,
+        target.max(limit),
+    );
+    merge_bucket_results(
+        &mut results,
+        &mut seen,
+        search_files_for_global(conn, pattern, target.max(limit))?,
+        target.max(limit),
+    );
 
     if results.len() < target {
-        extend_json_array(
+        merge_bucket_results_value(
             &mut results,
+            &mut seen,
             search_symbols_fuzzy_fallback(conn, pattern, FIND_FUZZY_FALLBACK_LIMIT)?,
+            target,
         );
-        extend_json_array(
+        merge_bucket_results_value(
             &mut results,
+            &mut seen,
             search_files_fuzzy_fallback(conn, pattern, FIND_FUZZY_FALLBACK_LIMIT)?,
+            target,
         );
     }
 
     if results.len() < target {
-        extend_json_array(&mut results, search_text_for_global(conn, pattern, target)?);
+        merge_bucket_results_value(
+            &mut results,
+            &mut seen,
+            search_text_for_global(conn, pattern, target)?,
+            target,
+        );
     }
-
-    dedupe_find_results(&mut results);
 
     let page = results
         .into_iter()
@@ -313,29 +221,44 @@ pub fn fast_find(
     }
 
     let target = offset.saturating_add(limit);
-    let mut results = Vec::new();
+    let mut results = bucketed_symbol_results(conn, pattern, target.max(limit), false)?;
     let identifier_query = is_identifier_query(pattern);
 
-    extend_json_array(&mut results, fast_find_symbols(conn, pattern, target.max(limit))?);
     if !identifier_query {
-        extend_json_array(&mut results, search_files_for_global(conn, pattern, target.max(limit))?);
+        let mut seen = results
+            .iter()
+            .map(find_result_identity)
+            .collect::<std::collections::HashSet<_>>();
+        merge_bucket_results(
+            &mut results,
+            &mut seen,
+            search_files_for_global(conn, pattern, target.max(limit))?,
+            target.max(limit),
+        );
     }
 
     let should_run_fallback = results.len() < target && !has_strong_explicit_type_match(&results, pattern);
     if should_run_fallback {
-        extend_json_array(
+        let mut seen = results
+            .iter()
+            .map(find_result_identity)
+            .collect::<std::collections::HashSet<_>>();
+        merge_bucket_results_value(
             &mut results,
+            &mut seen,
             search_symbols_fuzzy_fallback(conn, pattern, FIND_FUZZY_FALLBACK_LIMIT)?,
+            target.max(limit),
         );
         if !identifier_query {
-            extend_json_array(
+            merge_bucket_results_value(
                 &mut results,
+                &mut seen,
                 search_files_fuzzy_fallback(conn, pattern, FIND_FUZZY_FALLBACK_LIMIT)?,
+                target.max(limit),
             );
         }
     }
 
-    dedupe_find_results(&mut results);
     suppress_broad_class_contains_when_exact_type_exists(&mut results, pattern);
 
     let page = results
@@ -345,141 +268,6 @@ pub fn fast_find(
         .collect::<Vec<_>>();
 
     Ok(json!(page))
-}
-
-fn fast_find_symbols(conn: &Connection, pattern: &str, limit: usize) -> anyhow::Result<Value> {
-    let limit = limit.clamp(1, 500) as i64;
-    let query_text = pattern.trim();
-    let query = query_text.to_ascii_lowercase();
-    let prefix_query = format!("{}%", escape_like(&query));
-    let contains_query = format!("%{}%", escape_like(&query));
-    let identifier_query = is_identifier_query(query_text);
-    let allow_owner_match = !identifier_query;
-    let allow_compact_name_match = identifier_query;
-    let candidate_ids = search_symbol_candidate_ids(conn, query_text, limit as usize * 8)?;
-    if matches!(candidate_ids.as_ref(), Some(ids) if ids.is_empty()) {
-        return Ok(json!([]));
-    }
-    let compact_query = compact_identifier(query_text);
-    let compact_prefix_query = format!("{}%", escape_like(&compact_query));
-    let compact_contains_query = format!("%{}%", escape_like(&compact_query));
-    let owner_rank_sql = if allow_owner_match {
-        "WHEN owner_name_lc LIKE ? ESCAPE '\\' THEN 3"
-    } else {
-        ""
-    };
-    let owner_where_sql = if allow_owner_match {
-        " OR owner_name_lc LIKE ? ESCAPE '\\'"
-    } else {
-        ""
-    };
-    let compact_rank_sql = if allow_compact_name_match {
-        r#"
-                    WHEN compact_name = ? THEN 3
-                    WHEN compact_name LIKE ? ESCAPE '\' THEN 4
-                    WHEN compact_name LIKE ? ESCAPE '\' THEN 5
-        "#
-    } else {
-        ""
-    };
-    let compact_where_sql = if allow_compact_name_match {
-        " OR compact_name LIKE ? ESCAPE '\\'"
-    } else {
-        ""
-    };
-    let candidate_where_sql = candidate_ids
-        .as_ref()
-        .map(|ids| format!(" AND id IN ({})", plain_placeholders(ids.len())))
-        .unwrap_or_default();
-
-    let sql = format!(
-        r#"
-        WITH matched AS (
-            SELECT
-                name,
-                kind,
-                owner_name,
-                path,
-                line_number,
-                module_name,
-                CASE
-                    WHEN name_lc = ? THEN 0
-                    WHEN name_lc LIKE ? ESCAPE '\' THEN 1
-                    WHEN name_lc LIKE ? ESCAPE '\' THEN 2
-                    {}
-                    {}
-                    ELSE 9
-                END AS rank
-            FROM search_symbols
-            WHERE name_lc LIKE ? ESCAPE '\'
-               {}
-               {}
-               {}
-            ORDER BY rank, kind_rank ASC, name_lc ASC, path_lc ASC
-            LIMIT ?
-        )
-        SELECT
-            name,
-            kind,
-            owner_name,
-            path,
-            line_number,
-            module_name
-        FROM matched
-        ORDER BY rank, lower(name) ASC, path ASC
-        "#,
-        compact_rank_sql,
-        owner_rank_sql,
-        compact_where_sql,
-        owner_where_sql,
-        candidate_where_sql
-    );
-
-    let mut stmt = conn.prepare(&sql)?;
-    let mut params = vec![
-        SqlValue::Text(query),
-        SqlValue::Text(prefix_query),
-        SqlValue::Text(contains_query.clone()),
-    ];
-    if allow_compact_name_match {
-        params.push(SqlValue::Text(compact_query.clone()));
-        params.push(SqlValue::Text(compact_prefix_query));
-        params.push(SqlValue::Text(compact_contains_query.clone()));
-    }
-    if allow_owner_match {
-        params.push(SqlValue::Text(contains_query.clone()));
-    }
-    params.push(SqlValue::Text(contains_query.clone()));
-    if allow_compact_name_match {
-        params.push(SqlValue::Text(compact_contains_query));
-    }
-    if allow_owner_match {
-        params.push(SqlValue::Text(contains_query));
-    }
-    if let Some(ids) = candidate_ids.as_ref() {
-        for id in ids {
-            params.push(SqlValue::Integer(*id));
-        }
-    }
-    params.push(SqlValue::Integer(limit));
-
-    let rows = stmt.query_map(params_from_iter(params), |row| {
-        Ok(json!({
-            "name": row.get::<_, String>(0)?,
-            "type": row.get::<_, String>(1)?,
-            "class_name": row.get::<_, Option<String>>(2)?,
-            "path": normalize_path(&row.get::<_, String>(3)?),
-            "line": row.get::<_, Option<i64>>(4)?,
-            "module_name": row.get::<_, Option<String>>(5)?,
-        }))
-    })?;
-
-    let mut results = Vec::new();
-    for row in rows {
-        results.push(row?);
-    }
-
-    Ok(json!(results))
 }
 
 fn list_class_symbols(conn: &Connection, limit: usize, offset: usize) -> anyhow::Result<Value> {
@@ -534,100 +322,15 @@ pub fn search_class_symbols(
         return list_class_symbols(conn, limit, offset);
     }
 
-    let limit = limit.clamp(1, 10_000) as i64;
-    let offset = offset.min(1_000_000) as i64;
-    let query = pattern.to_ascii_lowercase();
-    let prefix_query = format!("{}%", escape_like(&query));
-    let contains_query = format!("%{}%", escape_like(&query));
-    let tokens = search_tokens(pattern);
-    let candidate_ids =
-        search_symbol_candidate_ids(conn, pattern, (limit as usize).saturating_add(offset as usize).saturating_mul(8))?;
-    if matches!(candidate_ids.as_ref(), Some(ids) if ids.is_empty()) {
-        return Ok(json!([]));
-    }
-    let searchable =
-        "lower(COALESCE(name, '') || ' ' || COALESCE(kind, '') || ' ' || COALESCE(owner_name, '') || ' ' || COALESCE(module_name, '') || ' ' || COALESCE(path, ''))";
-    let token_filter = tokens
-        .iter()
-        .map(|_| format!("{searchable} LIKE ? ESCAPE '\\'"))
-        .collect::<Vec<_>>()
-        .join(" AND ");
-    let where_clause = if token_filter.is_empty() {
-        "1 = 1".to_string()
-    } else {
-        token_filter
-    };
-    let candidate_clause = candidate_ids
-        .as_ref()
-        .map(|ids| format!(" AND id IN ({})", plain_placeholders(ids.len())))
-        .unwrap_or_default();
+    let target = offset.saturating_add(limit).clamp(1, 10_000);
+    let results = bucketed_symbol_results(conn, pattern, target, true)?;
+    let page = results
+        .into_iter()
+        .skip(offset.min(1_000_000))
+        .take(limit.clamp(1, 10_000))
+        .collect::<Vec<_>>();
 
-    let sql = format!(
-        r#"
-        SELECT
-            name,
-            kind,
-            owner_name,
-            path,
-            line_number,
-            module_name
-        FROM search_symbols
-        WHERE ({}{})
-          AND is_class_like = 1
-        ORDER BY
-            CASE
-                WHEN name_lc = ? THEN 0
-                WHEN name_lc LIKE ? ESCAPE '\' THEN 1
-                WHEN name_lc LIKE ? ESCAPE '\' THEN 2
-                WHEN owner_name_lc LIKE ? ESCAPE '\' THEN 3
-                WHEN module_name_lc LIKE ? ESCAPE '\' THEN 4
-                WHEN path_lc LIKE ? ESCAPE '\' THEN 5
-                ELSE 9
-            END,
-            name_lc ASC,
-            path_lc ASC
-        LIMIT ? OFFSET ?
-        "#,
-        where_clause,
-        candidate_clause
-    );
-
-    let mut stmt = conn.prepare(&sql)?;
-    let mut params = Vec::new();
-    for token in &tokens {
-        params.push(SqlValue::Text(format!("%{}%", escape_like(token))));
-    }
-    if let Some(ids) = candidate_ids.as_ref() {
-        for id in ids {
-            params.push(SqlValue::Integer(*id));
-        }
-    }
-    params.push(SqlValue::Text(query));
-    params.push(SqlValue::Text(prefix_query));
-    params.push(SqlValue::Text(contains_query.clone()));
-    params.push(SqlValue::Text(contains_query.clone()));
-    params.push(SqlValue::Text(contains_query.clone()));
-    params.push(SqlValue::Text(contains_query));
-    params.push(SqlValue::Integer(limit));
-    params.push(SqlValue::Integer(offset));
-
-    let rows = stmt.query_map(params_from_iter(params), |row| {
-        Ok(json!({
-            "name": row.get::<_, String>(0)?,
-            "type": row.get::<_, String>(1)?,
-            "class_name": row.get::<_, Option<String>>(2)?,
-            "path": normalize_path(&row.get::<_, String>(3)?),
-            "line": row.get::<_, Option<i64>>(4)?,
-            "module_name": row.get::<_, Option<String>>(5)?,
-        }))
-    })?;
-
-    let mut results = Vec::new();
-    for row in rows {
-        results.push(row?);
-    }
-
-    Ok(json!(results))
+    Ok(json!(page))
 }
 
 fn is_class_like_symbol_type(symbol_type: &str) -> bool {
@@ -823,8 +526,11 @@ fn build_file_fts_query(pattern: &str) -> Option<String> {
     }
 }
 
-fn plain_placeholders(count: usize) -> String {
-    (0..count).map(|_| "?").collect::<Vec<_>>().join(", ")
+fn candidate_values_clause(count: usize) -> String {
+    (0..count)
+        .map(|index| format!("(?, {index})"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn search_symbol_candidate_ids(
@@ -887,125 +593,448 @@ fn search_file_candidate_ids(
     Ok(Some(ids))
 }
 
-fn extend_json_array(target: &mut Vec<Value>, value: Value) {
-    if let Some(values) = value.as_array() {
-        target.extend(values.iter().cloned());
+fn find_result_identity(item: &Value) -> String {
+    let path = item
+        .get("path")
+        .or_else(|| item.get("file_path"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let line = item
+        .get("line")
+        .or_else(|| item.get("line_number"))
+        .and_then(Value::as_i64)
+        .unwrap_or(1);
+    let name = item
+        .get("name")
+        .or_else(|| item.get("symbol_name"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let kind = item
+        .get("type")
+        .or_else(|| item.get("symbol_type"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    format!("{kind}\t{path}\t{line}\t{name}")
+}
+
+fn merge_bucket_results(
+    target: &mut Vec<Value>,
+    seen: &mut std::collections::HashSet<String>,
+    items: Vec<Value>,
+    limit: usize,
+) {
+    for item in items {
+        if target.len() >= limit {
+            break;
+        }
+        let key = find_result_identity(&item);
+        if seen.insert(key) {
+            target.push(item);
+        }
     }
 }
 
-fn dedupe_find_results(results: &mut Vec<Value>) {
-    let mut seen = std::collections::HashSet::new();
-    results.retain(|item| {
-        let path = item
-            .get("path")
-            .or_else(|| item.get("file_path"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let line = item
-            .get("line")
-            .or_else(|| item.get("line_number"))
-            .and_then(Value::as_i64)
-            .unwrap_or(1);
-        let name = item
-            .get("name")
-            .or_else(|| item.get("symbol_name"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let kind = item
-            .get("type")
-            .or_else(|| item.get("symbol_type"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-
-        seen.insert(format!("{kind}\t{path}\t{line}\t{name}"))
-    });
+fn merge_bucket_results_value(
+    target: &mut Vec<Value>,
+    seen: &mut std::collections::HashSet<String>,
+    value: Value,
+    limit: usize,
+) {
+    if let Some(items) = value.as_array() {
+        merge_bucket_results(target, seen, items.clone(), limit);
+    }
 }
 
 fn search_files_for_global(
     conn: &Connection,
     pattern: &str,
     limit: usize,
-) -> anyhow::Result<Value> {
-    let limit = limit.clamp(1, 500) as i64;
-    let query = pattern.to_ascii_lowercase();
-    let prefix_query = format!("{}%", escape_like(&query));
-    let contains_query = format!("%{}%", escape_like(&query));
-    let candidate_ids = search_file_candidate_ids(conn, pattern, limit as usize * 8)?;
-    if matches!(candidate_ids.as_ref(), Some(ids) if ids.is_empty()) {
-        return Ok(json!([]));
-    }
-    let candidate_clause = candidate_ids
-        .as_ref()
-        .map(|ids| format!(" AND sf.file_id IN ({})", plain_placeholders(ids.len())))
-        .unwrap_or_default();
+) -> anyhow::Result<Vec<Value>> {
+    bucketed_file_results(conn, pattern, limit)
+}
 
-    let sql = format!(
-        r#"
-        {}
-        SELECT
-            sf.basename AS filename,
-            sf.path,
-            sf.module_name,
-            rd.full_path AS module_root
-        FROM search_files sf
-        LEFT JOIN modules m ON sf.module_id = m.id
-        LEFT JOIN dir_paths rd ON m.root_directory_id = rd.id
-        WHERE (sf.basename_lc LIKE ? ESCAPE '\'
-           OR sf.path_lc LIKE ? ESCAPE '\')
-          {}
-          AND lower(COALESCE(sf.ext, '')) NOT IN ('uasset', 'umap')
-        ORDER BY
-            CASE
-                WHEN sf.basename_lc = ? THEN 0
-                WHEN sf.basename_lc LIKE ? ESCAPE '\' THEN 1
-                WHEN sf.basename_lc LIKE ? ESCAPE '\' THEN 2
-                WHEN sf.path_lc LIKE ? ESCAPE '\' THEN 3
-                ELSE 9
-            END,
-            sf.basename_lc ASC,
-            sf.path_lc ASC
-        LIMIT ?
-        "#,
-        PATH_CTE,
-        candidate_clause
-    );
+fn symbol_row_to_value(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
+    Ok(json!({
+        "name": row.get::<_, String>(0)?,
+        "type": row.get::<_, String>(1)?,
+        "class_name": row.get::<_, Option<String>>(2)?,
+        "path": normalize_path(&row.get::<_, String>(3)?),
+        "line": row.get::<_, Option<i64>>(4)?,
+        "module_name": row.get::<_, Option<String>>(5)?,
+    }))
+}
 
-    let mut stmt = conn.prepare(&sql)?;
-    let mut params = vec![
-        SqlValue::Text(contains_query.clone()),
-        SqlValue::Text(contains_query.clone()),
-    ];
-    if let Some(ids) = candidate_ids.as_ref() {
-        for id in ids {
-            params.push(SqlValue::Integer(*id));
-        }
-    }
-    params.push(SqlValue::Text(query));
-    params.push(SqlValue::Text(prefix_query));
-    params.push(SqlValue::Text(contains_query.clone()));
-    params.push(SqlValue::Text(contains_query));
-    params.push(SqlValue::Integer(limit));
+fn file_row_to_value(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
+    Ok(json!({
+        "name": row.get::<_, String>(0)?,
+        "type": "file",
+        "path": normalize_path(&row.get::<_, String>(1)?),
+        "line": 1,
+        "module_name": row.get::<_, Option<String>>(2)?,
+        "module_root": row.get::<_, Option<String>>(3)?.map(|p| normalize_path(&p)),
+    }))
+}
 
-    let rows = stmt.query_map(
-        params_from_iter(params),
-        |row| {
-            Ok(json!({
-                "name": row.get::<_, String>(0)?,
-                "type": "file",
-                "path": normalize_path(&row.get::<_, String>(1)?),
-                "line": 1,
-                "module_name": row.get::<_, Option<String>>(2)?,
-                "module_root": row.get::<_, Option<String>>(3)?.map(|p| normalize_path(&p)),
-            }))
-        },
-    )?;
-
+fn fetch_values_with_params<F>(
+    conn: &Connection,
+    sql: &str,
+    params: Vec<SqlValue>,
+    mut map_row: F,
+) -> anyhow::Result<Vec<Value>>
+where
+    F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<Value>,
+{
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(params_from_iter(params), |row| map_row(row))?;
     let mut results = Vec::new();
     for row in rows {
         results.push(row?);
     }
+    Ok(results)
+}
 
-    Ok(json!(results))
+fn bucketed_symbol_results(
+    conn: &Connection,
+    pattern: &str,
+    limit: usize,
+    class_only: bool,
+) -> anyhow::Result<Vec<Value>> {
+    let limit = limit.clamp(1, 10_000);
+    let query_text = pattern.trim();
+    if query_text.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let query = query_text.to_ascii_lowercase();
+    let prefix_query = format!("{}%", escape_like(&query));
+    let identifier_query = is_identifier_query(query_text);
+    let compact_query = if identifier_query {
+        compact_identifier(query_text)
+    } else {
+        String::new()
+    };
+    let compact_prefix_query = if compact_query.is_empty() {
+        String::new()
+    } else {
+        format!("{}%", escape_like(&compact_query))
+    };
+    let class_filter = if class_only { " AND is_class_like = 1" } else { "" };
+    let mut results = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    let exact_sql = if identifier_query {
+        format!(
+            r#"
+            SELECT name, kind, owner_name, path, line_number, module_name
+            FROM search_symbols
+            WHERE (name_lc = ? OR compact_name = ?){class_filter}
+            ORDER BY kind_rank ASC, name_lc ASC, path_lc ASC
+            LIMIT ?
+            "#
+        )
+    } else {
+        format!(
+            r#"
+            SELECT name, kind, owner_name, path, line_number, module_name
+            FROM search_symbols
+            WHERE name_lc = ?{class_filter}
+            ORDER BY kind_rank ASC, name_lc ASC, path_lc ASC
+            LIMIT ?
+            "#
+        )
+    };
+    let mut exact_params = vec![SqlValue::Text(query.clone())];
+    if identifier_query {
+        exact_params.push(SqlValue::Text(compact_query.clone()));
+    }
+    exact_params.push(SqlValue::Integer(limit as i64));
+    merge_bucket_results(
+        &mut results,
+        &mut seen,
+        fetch_values_with_params(conn, &exact_sql, exact_params, symbol_row_to_value)?,
+        limit,
+    );
+
+    if results.len() < limit {
+        let remaining = limit.saturating_sub(results.len());
+        let prefix_sql = if identifier_query {
+            format!(
+                r#"
+                SELECT name, kind, owner_name, path, line_number, module_name
+                FROM search_symbols
+                WHERE (
+                    (name_lc LIKE ? ESCAPE '\' AND name_lc <> ?)
+                    OR (compact_name LIKE ? ESCAPE '\' AND compact_name <> ?)
+                ){class_filter}
+                ORDER BY
+                    CASE
+                        WHEN name_lc LIKE ? ESCAPE '\' THEN 0
+                        WHEN compact_name LIKE ? ESCAPE '\' THEN 1
+                        ELSE 2
+                    END,
+                    kind_rank ASC,
+                    name_lc ASC,
+                    path_lc ASC
+                LIMIT ?
+                "#
+            )
+        } else {
+            format!(
+                r#"
+                SELECT name, kind, owner_name, path, line_number, module_name
+                FROM search_symbols
+                WHERE name_lc LIKE ? ESCAPE '\'
+                  AND name_lc <> ?{class_filter}
+                ORDER BY kind_rank ASC, name_lc ASC, path_lc ASC
+                LIMIT ?
+                "#
+            )
+        };
+        let mut prefix_params = vec![
+            SqlValue::Text(prefix_query.clone()),
+            SqlValue::Text(query.clone()),
+        ];
+        if identifier_query {
+            prefix_params.push(SqlValue::Text(compact_prefix_query.clone()));
+            prefix_params.push(SqlValue::Text(compact_query.clone()));
+            prefix_params.push(SqlValue::Text(prefix_query.clone()));
+            prefix_params.push(SqlValue::Text(compact_prefix_query.clone()));
+        }
+        prefix_params.push(SqlValue::Integer(remaining as i64));
+        merge_bucket_results(
+            &mut results,
+            &mut seen,
+            fetch_values_with_params(conn, &prefix_sql, prefix_params, symbol_row_to_value)?,
+            limit,
+        );
+    }
+
+    if results.len() < limit {
+        let remaining = limit.saturating_sub(results.len());
+        let candidate_limit = limit.saturating_mul(12);
+        if let Some(candidate_ids) = search_symbol_candidate_ids(conn, query_text, candidate_limit)? {
+            if !candidate_ids.is_empty() {
+                let values_clause = candidate_values_clause(candidate_ids.len());
+                let fts_sql = if identifier_query {
+                    format!(
+                        r#"
+                        WITH candidates(id, ord) AS (VALUES {values_clause})
+                        SELECT s.name, s.kind, s.owner_name, s.path, s.line_number, s.module_name
+                        FROM candidates c
+                        JOIN search_symbols s ON s.id = c.id
+                        WHERE 1 = 1{class_filter}
+                        ORDER BY
+                            CASE
+                                WHEN s.name_lc = ? THEN 0
+                                WHEN s.name_lc LIKE ? ESCAPE '\' THEN 1
+                                WHEN s.compact_name = ? THEN 2
+                                WHEN s.compact_name LIKE ? ESCAPE '\' THEN 3
+                                ELSE 4
+                            END,
+                            s.kind_rank ASC,
+                            c.ord ASC,
+                            s.name_lc ASC,
+                            s.path_lc ASC
+                        LIMIT ?
+                        "#
+                    )
+                } else {
+                    format!(
+                        r#"
+                        WITH candidates(id, ord) AS (VALUES {values_clause})
+                        SELECT s.name, s.kind, s.owner_name, s.path, s.line_number, s.module_name
+                        FROM candidates c
+                        JOIN search_symbols s ON s.id = c.id
+                        WHERE 1 = 1{class_filter}
+                        ORDER BY
+                            CASE
+                                WHEN s.name_lc = ? THEN 0
+                                WHEN s.name_lc LIKE ? ESCAPE '\' THEN 1
+                                WHEN s.owner_name_lc = ? THEN 2
+                                WHEN s.owner_name_lc LIKE ? ESCAPE '\' THEN 3
+                                WHEN s.module_name_lc = ? THEN 4
+                                WHEN s.module_name_lc LIKE ? ESCAPE '\' THEN 5
+                                ELSE 6
+                            END,
+                            s.kind_rank ASC,
+                            c.ord ASC,
+                            s.name_lc ASC,
+                            s.path_lc ASC
+                        LIMIT ?
+                        "#
+                    )
+                };
+
+                let mut fts_params = candidate_ids
+                    .into_iter()
+                    .map(SqlValue::Integer)
+                    .collect::<Vec<_>>();
+                fts_params.push(SqlValue::Text(query.clone()));
+                fts_params.push(SqlValue::Text(prefix_query.clone()));
+                if identifier_query {
+                    fts_params.push(SqlValue::Text(compact_query));
+                    fts_params.push(SqlValue::Text(compact_prefix_query));
+                } else {
+                    fts_params.push(SqlValue::Text(query.clone()));
+                    fts_params.push(SqlValue::Text(prefix_query.clone()));
+                    fts_params.push(SqlValue::Text(query));
+                    fts_params.push(SqlValue::Text(prefix_query));
+                }
+                fts_params.push(SqlValue::Integer(remaining as i64));
+                merge_bucket_results(
+                    &mut results,
+                    &mut seen,
+                    fetch_values_with_params(conn, &fts_sql, fts_params, symbol_row_to_value)?,
+                    limit,
+                );
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+fn bucketed_file_results(conn: &Connection, pattern: &str, limit: usize) -> anyhow::Result<Vec<Value>> {
+    let limit = limit.clamp(1, 10_000);
+    let query_text = pattern.trim();
+    if query_text.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let query = query_text.to_ascii_lowercase();
+    let prefix_query = format!("{}%", escape_like(&query));
+    let mut results = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    let exact_sql = format!(
+        r#"
+        {}
+        SELECT sf.basename, sf.path, sf.module_name, rd.full_path AS module_root
+        FROM search_files sf
+        LEFT JOIN modules m ON sf.module_id = m.id
+        LEFT JOIN dir_paths rd ON m.root_directory_id = rd.id
+        WHERE (sf.basename_lc = ? OR sf.path_lc = ?)
+          AND lower(COALESCE(sf.ext, '')) NOT IN ('uasset', 'umap')
+        ORDER BY sf.basename_lc ASC, sf.path_lc ASC
+        LIMIT ?
+        "#,
+        PATH_CTE
+    );
+    merge_bucket_results(
+        &mut results,
+        &mut seen,
+        fetch_values_with_params(
+            conn,
+            &exact_sql,
+            vec![
+                SqlValue::Text(query.clone()),
+                SqlValue::Text(query.clone()),
+                SqlValue::Integer(limit as i64),
+            ],
+            file_row_to_value,
+        )?,
+        limit,
+    );
+
+    if results.len() < limit {
+        let remaining = limit.saturating_sub(results.len());
+        let prefix_sql = format!(
+            r#"
+            {}
+            SELECT sf.basename, sf.path, sf.module_name, rd.full_path AS module_root
+            FROM search_files sf
+            LEFT JOIN modules m ON sf.module_id = m.id
+            LEFT JOIN dir_paths rd ON m.root_directory_id = rd.id
+            WHERE (
+                (sf.basename_lc LIKE ? ESCAPE '\' AND sf.basename_lc <> ?)
+                OR (sf.path_lc LIKE ? ESCAPE '\' AND sf.path_lc <> ?)
+            )
+              AND lower(COALESCE(sf.ext, '')) NOT IN ('uasset', 'umap')
+            ORDER BY
+                CASE
+                    WHEN sf.basename_lc LIKE ? ESCAPE '\' THEN 0
+                    WHEN sf.path_lc LIKE ? ESCAPE '\' THEN 1
+                    ELSE 2
+                END,
+                sf.basename_lc ASC,
+                sf.path_lc ASC
+            LIMIT ?
+            "#,
+            PATH_CTE
+        );
+        merge_bucket_results(
+            &mut results,
+            &mut seen,
+            fetch_values_with_params(
+                conn,
+                &prefix_sql,
+                vec![
+                    SqlValue::Text(prefix_query.clone()),
+                    SqlValue::Text(query.clone()),
+                    SqlValue::Text(prefix_query.clone()),
+                    SqlValue::Text(query.clone()),
+                    SqlValue::Text(prefix_query.clone()),
+                    SqlValue::Text(prefix_query.clone()),
+                    SqlValue::Integer(remaining as i64),
+                ],
+                file_row_to_value,
+            )?,
+            limit,
+        );
+    }
+
+    if results.len() < limit {
+        let remaining = limit.saturating_sub(results.len());
+        let candidate_limit = limit.saturating_mul(12);
+        if let Some(candidate_ids) = search_file_candidate_ids(conn, query_text, candidate_limit)? {
+            if !candidate_ids.is_empty() {
+                let values_clause = candidate_values_clause(candidate_ids.len());
+                let fts_sql = format!(
+                    r#"
+                    {}
+                    WITH candidates(id, ord) AS (VALUES {values_clause})
+                    SELECT sf.basename, sf.path, sf.module_name, rd.full_path AS module_root
+                    FROM candidates c
+                    JOIN search_files sf ON sf.file_id = c.id
+                    LEFT JOIN modules m ON sf.module_id = m.id
+                    LEFT JOIN dir_paths rd ON m.root_directory_id = rd.id
+                    WHERE lower(COALESCE(sf.ext, '')) NOT IN ('uasset', 'umap')
+                    ORDER BY
+                        CASE
+                            WHEN sf.basename_lc = ? THEN 0
+                            WHEN sf.basename_lc LIKE ? ESCAPE '\' THEN 1
+                            WHEN sf.path_lc = ? THEN 2
+                            WHEN sf.path_lc LIKE ? ESCAPE '\' THEN 3
+                            ELSE 4
+                        END,
+                        c.ord ASC,
+                        sf.basename_lc ASC,
+                        sf.path_lc ASC
+                    LIMIT ?
+                    "#,
+                    PATH_CTE
+                );
+                let mut fts_params = candidate_ids
+                    .into_iter()
+                    .map(SqlValue::Integer)
+                    .collect::<Vec<_>>();
+                fts_params.push(SqlValue::Text(query.clone()));
+                fts_params.push(SqlValue::Text(prefix_query.clone()));
+                fts_params.push(SqlValue::Text(query));
+                fts_params.push(SqlValue::Text(prefix_query));
+                fts_params.push(SqlValue::Integer(remaining as i64));
+                merge_bucket_results(
+                    &mut results,
+                    &mut seen,
+                    fetch_values_with_params(conn, &fts_sql, fts_params, file_row_to_value)?,
+                    limit,
+                );
+            }
+        }
+    }
+
+    Ok(results)
 }
 
 fn search_symbols_fuzzy_fallback(
