@@ -702,7 +702,7 @@ fn handle_state_query(
             offset,
         } => {
             let value =
-                search_symbols_with_engine(state, conn, engine_db_path, &pattern, limit, offset)?;
+                search_symbols_with_engine(state, conn, project_db_path, engine_db_path, &pattern, limit, offset)?;
             Ok(Some(value))
         }
         QueryRequest::SearchClassSymbols {
@@ -781,7 +781,8 @@ fn handle_state_query(
             limit,
             offset,
         } => {
-            let value = global_find_with_engine(state, conn, engine_db_path, &pattern, limit, offset)?;
+            let value =
+                global_find_with_engine(state, conn, project_db_path, engine_db_path, &pattern, limit, offset)?;
             Ok(Some(value))
         }
 
@@ -1592,14 +1593,21 @@ fn tag_value_source(value: &mut Value, source: &str) {
 fn search_symbols_with_engine(
     state: Arc<AppState>,
     project_conn: &rusqlite::Connection,
+    project_db_path: &str,
     engine_db_path: Option<String>,
     pattern: &str,
     limit: usize,
     offset: usize,
 ) -> Result<Value> {
     let limit = limit.clamp(1, 10_000);
-    let mut results =
-        value_array(query::search::search_symbols(project_conn, pattern, limit, offset)?);
+    let project_hot_index = load_search_hot_index(&state, project_db_path, "symbol search project");
+    let mut results = value_array(query::search::search_symbols_with_hot_index(
+        project_conn,
+        project_hot_index.as_deref(),
+        pattern,
+        limit,
+        offset,
+    )?);
     tag_source(&mut results, "project");
 
     if results.len() >= limit {
@@ -1625,8 +1633,14 @@ fn search_symbols_with_engine(
     };
 
     let remaining = limit.saturating_sub(results.len()).max(1);
-    let mut engine_results =
-        match query::search::search_symbols(&engine_conn, pattern, remaining, 0) {
+    let engine_hot_index = load_search_hot_index(&state, &engine_db_path, "symbol search engine");
+    let mut engine_results = match query::search::search_symbols_with_hot_index(
+        &engine_conn,
+        engine_hot_index.as_deref(),
+        pattern,
+        remaining,
+        0,
+    ) {
             Ok(value) => value_array(value),
             Err(err) => {
                 warn!("Failed to query Engine DB symbols: {}", err);
@@ -1643,13 +1657,21 @@ fn search_symbols_with_engine(
 fn global_find_with_engine(
     state: Arc<AppState>,
     project_conn: &rusqlite::Connection,
+    project_db_path: &str,
     engine_db_path: Option<String>,
     pattern: &str,
     limit: usize,
     offset: usize,
 ) -> Result<Value> {
     let limit = limit.clamp(1, 10_000);
-    let mut results = value_array(query::search::global_find(project_conn, pattern, limit, offset)?);
+    let project_hot_index = load_search_hot_index(&state, project_db_path, "global find project");
+    let mut results = value_array(query::search::global_find_with_hot_index(
+        project_conn,
+        project_hot_index.as_deref(),
+        pattern,
+        limit,
+        offset,
+    )?);
     tag_source(&mut results, "project");
 
     if results.len() >= limit {
@@ -1673,7 +1695,14 @@ fn global_find_with_engine(
         }
     };
     let remaining = limit.saturating_sub(results.len()).max(1);
-    let mut engine_results = match query::search::global_find(&engine_conn, pattern, remaining, 0) {
+    let engine_hot_index = load_search_hot_index(&state, &engine_db_path, "global find engine");
+    let mut engine_results = match query::search::global_find_with_hot_index(
+        &engine_conn,
+        engine_hot_index.as_deref(),
+        pattern,
+        remaining,
+        0,
+    ) {
         Ok(value) => value_array(value),
         Err(err) => {
             warn!("Failed to query Engine DB global find: {}", err);
