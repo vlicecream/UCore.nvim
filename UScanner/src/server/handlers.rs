@@ -713,6 +713,7 @@ fn handle_state_query(
             let value = search_class_symbols_with_engine(
                 state,
                 conn,
+                project_db_path,
                 engine_db_path,
                 &pattern,
                 limit,
@@ -729,6 +730,7 @@ fn handle_state_query(
             let value = fast_find_with_scope(
                 state,
                 conn,
+                project_db_path,
                 engine_db_path,
                 &pattern,
                 limit,
@@ -1689,6 +1691,7 @@ fn global_find_with_engine(
 fn fast_find_with_scope(
     state: Arc<AppState>,
     project_conn: &rusqlite::Connection,
+    project_db_path: &str,
     engine_db_path: Option<String>,
     pattern: &str,
     limit: usize,
@@ -1709,7 +1712,15 @@ fn fast_find_with_scope(
         );
     }
     if scope == "engine" {
-        let Some(engine_conn) = open_engine_query_connection(state, engine_db_path, "fast find")? else {
+        let engine_db_path_native = engine_db_path
+            .as_deref()
+            .map(normalize_to_native);
+        let engine_hot_index = engine_db_path_native
+            .as_deref()
+            .and_then(|path| load_search_hot_index(&state, path, "fast find engine"));
+        let Some(engine_conn) =
+            open_engine_query_connection(state.clone(), engine_db_path, "fast find")?
+        else {
             if log_enabled {
                 info!(
                     target: "ucore::fast_find",
@@ -1721,7 +1732,13 @@ fn fast_find_with_scope(
         };
         let mut results = {
             let engine_conn = engine_conn.lock();
-            value_array(query::search::fast_find(&engine_conn, pattern, limit, offset)?)
+            value_array(query::search::fast_find_with_hot_index(
+                &engine_conn,
+                engine_hot_index.as_deref(),
+                pattern,
+                limit,
+                offset,
+            )?)
         };
         tag_source(&mut results, "engine");
         if log_enabled {
@@ -1736,7 +1753,14 @@ fn fast_find_with_scope(
         return Ok(json!(results));
     }
 
-    let mut results = value_array(query::search::fast_find(project_conn, pattern, limit, offset)?);
+    let project_hot_index = load_search_hot_index(&state, project_db_path, "fast find project");
+    let mut results = value_array(query::search::fast_find_with_hot_index(
+        project_conn,
+        project_hot_index.as_deref(),
+        pattern,
+        limit,
+        offset,
+    )?);
     tag_source(&mut results, "project");
     if log_enabled {
         info!(
@@ -1762,7 +1786,10 @@ fn fast_find_with_scope(
         return Ok(json!(results));
     }
 
-    let Some(engine_conn) = open_engine_query_connection(state, engine_db_path, "fast find")? else {
+    let engine_db_path_native = engine_db_path.as_deref().map(normalize_to_native);
+    let Some(engine_conn) =
+        open_engine_query_connection(state.clone(), engine_db_path, "fast find")?
+    else {
         if log_enabled {
             info!(
                 target: "ucore::fast_find",
@@ -1774,9 +1801,18 @@ fn fast_find_with_scope(
         return Ok(json!(results));
     };
     let remaining = limit.saturating_sub(results.len()).max(1);
+    let engine_hot_index = engine_db_path_native
+        .as_deref()
+        .and_then(|path| load_search_hot_index(&state, path, "fast find append"));
     let mut engine_results = {
         let engine_conn = engine_conn.lock();
-        value_array(query::search::fast_find(&engine_conn, pattern, remaining, 0)?)
+        value_array(query::search::fast_find_with_hot_index(
+            &engine_conn,
+            engine_hot_index.as_deref(),
+            pattern,
+            remaining,
+            0,
+        )?)
     };
     tag_source(&mut engine_results, "engine");
     if log_enabled {
@@ -1805,21 +1841,37 @@ fn fast_find_with_scope(
 fn search_class_symbols_with_engine(
     state: Arc<AppState>,
     project_conn: &rusqlite::Connection,
+    project_db_path: &str,
     engine_db_path: Option<String>,
     pattern: &str,
     limit: usize,
     offset: usize,
 ) -> Result<Value> {
     let limit = limit.clamp(1, 10_000);
-    let mut results =
-        value_array(query::search::search_class_symbols(project_conn, pattern, limit, 0)?);
+    let project_hot_index =
+        load_search_hot_index(&state, project_db_path, "class symbol search project");
+    let mut results = value_array(query::search::search_class_symbols_with_hot_index(
+        project_conn,
+        project_hot_index.as_deref(),
+        pattern,
+        limit,
+        0,
+    )?);
     tag_source(&mut results, "project");
 
     if let Some(engine_db_path) = engine_db_path {
         let engine_db_path = normalize_to_native(&engine_db_path);
         if Path::new(&engine_db_path).is_file() {
+            let engine_hot_index =
+                load_search_hot_index(&state, &engine_db_path, "class symbol search engine");
             match state.get_read_only_connection(&engine_db_path) {
-                Ok(engine_conn) => match query::search::search_class_symbols(&engine_conn, pattern, limit, 0) {
+                Ok(engine_conn) => match query::search::search_class_symbols_with_hot_index(
+                    &engine_conn,
+                    engine_hot_index.as_deref(),
+                    pattern,
+                    limit,
+                    0,
+                ) {
                     Ok(value) => {
                         let mut engine_results = value_array(value);
                         tag_source(&mut engine_results, "engine");
@@ -1988,8 +2040,16 @@ fn unified_live_find_with_engine(
         .as_deref()
         .map(|path| file_exists_in_index(project_conn, path))
         .unwrap_or(false);
+    let project_hot_index =
+        load_search_hot_index(&state, _project_db_path, "unified live find project");
 
-    let mut project_results = value_array(query::search::fast_find(project_conn, pattern, target, 0)?);
+    let mut project_results = value_array(query::search::fast_find_with_hot_index(
+        project_conn,
+        project_hot_index.as_deref(),
+        pattern,
+        target,
+        0,
+    )?);
     tag_source(&mut project_results, "project");
     rank_live_find_results(
         &mut project_results,
@@ -2029,12 +2089,22 @@ fn unified_live_find_with_engine(
     if skip_reason.is_none() {
         let remaining = target.saturating_sub(results.len());
         let engine_target = remaining.max(limit.min(64)).clamp(1, target);
+        let engine_db_path_native = engine_db_path.as_deref().map(normalize_to_native);
+        let engine_hot_index = engine_db_path_native
+            .as_deref()
+            .and_then(|path| load_search_hot_index(&state, path, "unified live find engine"));
         if let Some(engine_conn) =
             open_engine_query_connection(state.clone(), engine_db_path.clone(), "unified live find")?
         {
             let mut engine_results = {
                 let engine_conn = engine_conn.lock();
-                value_array(query::search::fast_find(&engine_conn, pattern, engine_target, 0)?)
+                value_array(query::search::fast_find_with_hot_index(
+                    &engine_conn,
+                    engine_hot_index.as_deref(),
+                    pattern,
+                    engine_target,
+                    0,
+                )?)
             };
             tag_source(&mut engine_results, "engine");
             results.extend(engine_results);
@@ -2904,6 +2974,20 @@ fn open_engine_query_connection(
     }
 }
 
+fn load_search_hot_index(
+    state: &AppState,
+    db_path: &str,
+    label: &str,
+) -> Option<Arc<query::search::SearchHotIndex>> {
+    match state.get_search_hot_index(db_path) {
+        Ok(index) => Some(index),
+        Err(err) => {
+            warn!("Failed to open search hot index for {} ({}): {}", db_path, label, err);
+            None
+        }
+    }
+}
+
 /// Convert a JSON array value into a Vec.
 /// 将 JSON array value 转成 Vec。
 fn value_array(value: Value) -> Vec<Value> {
@@ -3521,6 +3605,8 @@ fn drop_db_connections(state: &AppState, db_path_native: &str, cache_db_path_uni
     let mut conns = state.connections.lock();
     conns.remove(db_path_native);
     drop(conns);
+    state.read_only_connections.lock().remove(db_path_native);
+    state.invalidate_search_hot_index(db_path_native);
 
     if let Some(cache_path) = cache_db_path_unix {
         let mut cache_conns = state.persistent_cache_connections.lock();

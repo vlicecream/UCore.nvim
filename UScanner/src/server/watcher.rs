@@ -247,6 +247,7 @@ async fn handle_source_change(
             }
         };
 
+        let db_path_for_cache = db_path_native.clone();
         let input = crate::types::InputFile {
             path: path_str_unix.clone(),
             mtime: file_mtime_seconds(&path_str_unix),
@@ -282,6 +283,8 @@ async fn handle_source_change(
             error!("Watcher failed to save scan result: {}", err);
             return;
         }
+
+        state.invalidate_search_hot_index(&db_path_for_cache);
 
         let cache = state.get_completion_cache(&project.root_key);
         let mut cache = cache.lock();

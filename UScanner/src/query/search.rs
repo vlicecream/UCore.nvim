@@ -27,6 +27,7 @@
 
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection};
 use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use tracing::info;
 
@@ -37,12 +38,528 @@ use crate::db::text;
 const FIND_FUZZY_FALLBACK_LIMIT: usize = 256;
 static FAST_FIND_LOG_ENABLED: OnceLock<bool> = OnceLock::new();
 
+#[derive(Clone)]
+struct SymbolHotEntry {
+    name: String,
+    kind: String,
+    owner_name: Option<String>,
+    path: String,
+    line_number: Option<i64>,
+    module_name: Option<String>,
+    name_lc: String,
+    compact_name: String,
+    kind_rank: i64,
+    is_class_like: bool,
+}
+
+#[derive(Clone)]
+struct FileHotEntry {
+    basename: String,
+    path: String,
+    module_name: Option<String>,
+    module_root: Option<String>,
+    basename_lc: String,
+    path_lc: String,
+}
+
+pub struct SearchHotIndex {
+    symbols: Vec<SymbolHotEntry>,
+    files: Vec<FileHotEntry>,
+    symbol_exact: HashMap<String, Vec<usize>>,
+    symbol_compact_exact: HashMap<String, Vec<usize>>,
+    symbol_name_prefix: Vec<(String, usize)>,
+    symbol_compact_prefix: Vec<(String, usize)>,
+    file_basename_exact: HashMap<String, Vec<usize>>,
+    file_path_exact: HashMap<String, Vec<usize>>,
+    file_basename_prefix: Vec<(String, usize)>,
+    file_path_prefix: Vec<(String, usize)>,
+}
+
 fn fast_find_log_enabled() -> bool {
     *FAST_FIND_LOG_ENABLED.get_or_init(|| {
         std::env::var("UCORE_FAST_FIND_LOG")
             .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "on" | "ON"))
             .unwrap_or(false)
     })
+}
+
+impl SearchHotIndex {
+    fn query(&self, pattern: &str, limit: usize, offset: usize, class_only: bool) -> Vec<Value> {
+        let target = offset.saturating_add(limit).clamp(1, 10_000);
+        let query_text = pattern.trim();
+        if query_text.is_empty() {
+            return Vec::new();
+        }
+
+        let mut results = Vec::new();
+        let mut seen = HashSet::new();
+        let query = query_text.to_ascii_lowercase();
+        let prefix = query.clone();
+        let identifier_query = is_identifier_query(query_text);
+
+        self.merge_symbol_exact(&mut results, &mut seen, &query, class_only, target);
+        if identifier_query {
+            let compact = compact_identifier(query_text);
+            self.merge_symbol_compact_exact(&mut results, &mut seen, &compact, class_only, target);
+            self.merge_symbol_prefix(
+                &mut results,
+                &mut seen,
+                &self.symbol_compact_prefix,
+                &compact,
+                class_only,
+                target,
+            );
+        }
+        self.merge_symbol_prefix(
+            &mut results,
+            &mut seen,
+            &self.symbol_name_prefix,
+            &prefix,
+            class_only,
+            target,
+        );
+
+        if !class_only && !identifier_query {
+            self.merge_file_exact(&mut results, &mut seen, &query, target);
+            self.merge_file_path_exact(&mut results, &mut seen, &query, target);
+            self.merge_file_prefix(
+                &mut results,
+                &mut seen,
+                &self.file_basename_prefix,
+                &prefix,
+                target,
+            );
+            self.merge_file_prefix(
+                &mut results,
+                &mut seen,
+                &self.file_path_prefix,
+                &prefix,
+                target,
+            );
+        }
+
+        results.into_iter().skip(offset).take(limit).collect()
+    }
+
+    fn merge_symbol_exact(
+        &self,
+        out: &mut Vec<Value>,
+        seen: &mut HashSet<String>,
+        key: &str,
+        class_only: bool,
+        limit: usize,
+    ) {
+        if let Some(indices) = self.symbol_exact.get(key) {
+            self.merge_symbol_indices(out, seen, indices, class_only, limit);
+        }
+    }
+
+    fn merge_symbol_compact_exact(
+        &self,
+        out: &mut Vec<Value>,
+        seen: &mut HashSet<String>,
+        key: &str,
+        class_only: bool,
+        limit: usize,
+    ) {
+        if let Some(indices) = self.symbol_compact_exact.get(key) {
+            self.merge_symbol_indices(out, seen, indices, class_only, limit);
+        }
+    }
+
+    fn merge_symbol_indices(
+        &self,
+        out: &mut Vec<Value>,
+        seen: &mut HashSet<String>,
+        indices: &[usize],
+        class_only: bool,
+        limit: usize,
+    ) {
+        for &index in indices {
+            if out.len() >= limit {
+                break;
+            }
+            let entry = &self.symbols[index];
+            if class_only && !entry.is_class_like {
+                continue;
+            }
+            let value = symbol_hot_entry_to_value(entry);
+            let key = find_result_identity(&value);
+            if seen.insert(key) {
+                out.push(value);
+            }
+        }
+    }
+
+    fn merge_symbol_prefix(
+        &self,
+        out: &mut Vec<Value>,
+        seen: &mut HashSet<String>,
+        sorted: &[(String, usize)],
+        prefix: &str,
+        class_only: bool,
+        limit: usize,
+    ) {
+        if prefix.is_empty() || out.len() >= limit {
+            return;
+        }
+
+        let mut index = lower_bound_prefix(sorted, prefix);
+        while index < sorted.len() && sorted[index].0.starts_with(prefix) {
+            if out.len() >= limit {
+                break;
+            }
+            let entry = &self.symbols[sorted[index].1];
+            if !class_only || entry.is_class_like {
+                let value = symbol_hot_entry_to_value(entry);
+                let key = find_result_identity(&value);
+                if seen.insert(key) {
+                    out.push(value);
+                }
+            }
+            index += 1;
+        }
+    }
+
+    fn merge_file_exact(
+        &self,
+        out: &mut Vec<Value>,
+        seen: &mut HashSet<String>,
+        key: &str,
+        limit: usize,
+    ) {
+        if let Some(indices) = self.file_basename_exact.get(key) {
+            self.merge_file_indices(out, seen, indices, limit);
+        }
+    }
+
+    fn merge_file_path_exact(
+        &self,
+        out: &mut Vec<Value>,
+        seen: &mut HashSet<String>,
+        key: &str,
+        limit: usize,
+    ) {
+        if let Some(indices) = self.file_path_exact.get(key) {
+            self.merge_file_indices(out, seen, indices, limit);
+        }
+    }
+
+    fn merge_file_indices(
+        &self,
+        out: &mut Vec<Value>,
+        seen: &mut HashSet<String>,
+        indices: &[usize],
+        limit: usize,
+    ) {
+        for &index in indices {
+            if out.len() >= limit {
+                break;
+            }
+            let value = file_hot_entry_to_value(&self.files[index]);
+            let key = find_result_identity(&value);
+            if seen.insert(key) {
+                out.push(value);
+            }
+        }
+    }
+
+    fn merge_file_prefix(
+        &self,
+        out: &mut Vec<Value>,
+        seen: &mut HashSet<String>,
+        sorted: &[(String, usize)],
+        prefix: &str,
+        limit: usize,
+    ) {
+        if prefix.is_empty() || out.len() >= limit {
+            return;
+        }
+
+        let mut index = lower_bound_prefix(sorted, prefix);
+        while index < sorted.len() && sorted[index].0.starts_with(prefix) {
+            if out.len() >= limit {
+                break;
+            }
+            let value = file_hot_entry_to_value(&self.files[sorted[index].1]);
+            let key = find_result_identity(&value);
+            if seen.insert(key) {
+                out.push(value);
+            }
+            index += 1;
+        }
+    }
+}
+
+fn lower_bound_prefix(sorted: &[(String, usize)], prefix: &str) -> usize {
+    let mut left = 0usize;
+    let mut right = sorted.len();
+    while left < right {
+        let mid = (left + right) / 2;
+        if sorted[mid].0.as_str() < prefix {
+            left = mid + 1;
+        } else {
+            right = mid;
+        }
+    }
+    left
+}
+
+fn symbol_hot_entry_to_value(entry: &SymbolHotEntry) -> Value {
+    json!({
+        "name": entry.name,
+        "type": entry.kind,
+        "class_name": entry.owner_name,
+        "path": entry.path,
+        "line": entry.line_number,
+        "module_name": entry.module_name,
+    })
+}
+
+fn file_hot_entry_to_value(entry: &FileHotEntry) -> Value {
+    json!({
+        "name": entry.basename,
+        "type": "file",
+        "path": entry.path,
+        "line": 1,
+        "module_name": entry.module_name,
+        "module_root": entry.module_root,
+    })
+}
+
+pub fn build_search_hot_index(conn: &Connection) -> anyhow::Result<SearchHotIndex> {
+    ensure_search_projections(conn)?;
+
+    let mut symbols = Vec::new();
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT
+            name,
+            kind,
+            owner_name,
+            path,
+            line_number,
+            module_name,
+            name_lc,
+            compact_name,
+            kind_rank,
+            is_class_like
+        FROM search_symbols
+        ORDER BY kind_rank ASC, name_lc ASC, path_lc ASC
+        "#,
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(SymbolHotEntry {
+            name: row.get(0)?,
+            kind: row.get(1)?,
+            owner_name: row.get(2)?,
+            path: normalize_path(&row.get::<_, String>(3)?),
+            line_number: row.get(4)?,
+            module_name: row.get(5)?,
+            name_lc: row.get(6)?,
+            compact_name: row.get(7)?,
+            kind_rank: row.get(8)?,
+            is_class_like: row.get::<_, i64>(9)? != 0,
+        })
+    })?;
+    for row in rows {
+        symbols.push(row?);
+    }
+
+    let mut files = Vec::new();
+    let mut stmt = conn.prepare(&format!(
+        r#"
+        {}
+        SELECT
+            sf.basename,
+            sf.path,
+            sf.module_name,
+            rd.full_path AS module_root,
+            sf.basename_lc,
+            sf.path_lc
+        FROM search_files sf
+        LEFT JOIN modules m ON sf.module_id = m.id
+        LEFT JOIN dir_paths rd ON m.root_directory_id = rd.id
+        WHERE lower(COALESCE(sf.ext, '')) NOT IN ('uasset', 'umap')
+        ORDER BY sf.basename_lc ASC, sf.path_lc ASC
+        "#,
+        PATH_CTE
+    ))?;
+    let rows = stmt.query_map([], |row| {
+        Ok(FileHotEntry {
+            basename: row.get(0)?,
+            path: normalize_path(&row.get::<_, String>(1)?),
+            module_name: row.get(2)?,
+            module_root: row.get::<_, Option<String>>(3)?.map(|p| normalize_path(&p)),
+            basename_lc: row.get(4)?,
+            path_lc: row.get(5)?,
+        })
+    })?;
+    for row in rows {
+        files.push(row?);
+    }
+
+    let mut symbol_exact = HashMap::<String, Vec<usize>>::new();
+    let mut symbol_compact_exact = HashMap::<String, Vec<usize>>::new();
+    let mut symbol_name_prefix = Vec::with_capacity(symbols.len());
+    let mut symbol_compact_prefix = Vec::with_capacity(symbols.len());
+    for (index, entry) in symbols.iter().enumerate() {
+        symbol_exact.entry(entry.name_lc.clone()).or_default().push(index);
+        if !entry.compact_name.is_empty() {
+            symbol_compact_exact
+                .entry(entry.compact_name.clone())
+                .or_default()
+                .push(index);
+            symbol_compact_prefix.push((entry.compact_name.clone(), index));
+        }
+        symbol_name_prefix.push((entry.name_lc.clone(), index));
+    }
+    symbol_name_prefix.sort_unstable_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| symbols[left.1].kind_rank.cmp(&symbols[right.1].kind_rank))
+            .then_with(|| symbols[left.1].path.cmp(&symbols[right.1].path))
+    });
+    symbol_compact_prefix.sort_unstable_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| symbols[left.1].kind_rank.cmp(&symbols[right.1].kind_rank))
+            .then_with(|| symbols[left.1].path.cmp(&symbols[right.1].path))
+    });
+
+    let mut file_basename_exact = HashMap::<String, Vec<usize>>::new();
+    let mut file_path_exact = HashMap::<String, Vec<usize>>::new();
+    let mut file_basename_prefix = Vec::with_capacity(files.len());
+    let mut file_path_prefix = Vec::with_capacity(files.len());
+    for (index, entry) in files.iter().enumerate() {
+        file_basename_exact
+            .entry(entry.basename_lc.clone())
+            .or_default()
+            .push(index);
+        file_path_exact.entry(entry.path_lc.clone()).or_default().push(index);
+        file_basename_prefix.push((entry.basename_lc.clone(), index));
+        file_path_prefix.push((entry.path_lc.clone(), index));
+    }
+    file_basename_prefix.sort_unstable_by(|left, right| {
+        left.0.cmp(&right.0).then_with(|| files[left.1].path.cmp(&files[right.1].path))
+    });
+    file_path_prefix.sort_unstable_by(|left, right| {
+        left.0.cmp(&right.0).then_with(|| files[left.1].basename.cmp(&files[right.1].basename))
+    });
+
+    Ok(SearchHotIndex {
+        symbols,
+        files,
+        symbol_exact,
+        symbol_compact_exact,
+        symbol_name_prefix,
+        symbol_compact_prefix,
+        file_basename_exact,
+        file_path_exact,
+        file_basename_prefix,
+        file_path_prefix,
+    })
+}
+
+pub fn fast_find_with_hot_index(
+    conn: &Connection,
+    hot_index: Option<&SearchHotIndex>,
+    pattern: &str,
+    limit: usize,
+    offset: usize,
+) -> anyhow::Result<Value> {
+    hybrid_fast_find(conn, hot_index, pattern, limit, offset, false)
+}
+
+pub fn search_class_symbols_with_hot_index(
+    conn: &Connection,
+    hot_index: Option<&SearchHotIndex>,
+    pattern: &str,
+    limit: usize,
+    offset: usize,
+) -> anyhow::Result<Value> {
+    hybrid_fast_find(conn, hot_index, pattern, limit, offset, true)
+}
+
+fn hybrid_fast_find(
+    conn: &Connection,
+    hot_index: Option<&SearchHotIndex>,
+    pattern: &str,
+    limit: usize,
+    offset: usize,
+    class_only: bool,
+) -> anyhow::Result<Value> {
+    let pattern = pattern.trim();
+    let limit = limit.clamp(1, if class_only { 10_000 } else { 500 });
+    let offset = offset.min(1_000_000);
+
+    if pattern.is_empty() {
+        return if class_only {
+            list_class_symbols(conn, limit, offset)
+        } else {
+            list_symbols(conn, limit, offset)
+        };
+    }
+
+    let target = offset.saturating_add(limit);
+    let mut results = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Some(index) = hot_index {
+        merge_bucket_results(&mut results, &mut seen, index.query(pattern, target, 0, class_only), target);
+    }
+
+    if results.len() < target {
+        let db_results = if class_only {
+            bucketed_symbol_results(conn, pattern, target, true)?
+        } else {
+            let mut db_results = bucketed_symbol_results(conn, pattern, target, false)?;
+            let identifier_query = is_identifier_query(pattern);
+            if !identifier_query {
+                let mut seen_db = db_results
+                    .iter()
+                    .map(find_result_identity)
+                    .collect::<HashSet<_>>();
+                merge_bucket_results(
+                    &mut db_results,
+                    &mut seen_db,
+                    bucketed_file_results(conn, pattern, target)?,
+                    target,
+                );
+            }
+            let should_run_fallback =
+                db_results.len() < target && !has_strong_explicit_type_match(&db_results, pattern);
+            if should_run_fallback {
+                let mut seen_db = db_results
+                    .iter()
+                    .map(find_result_identity)
+                    .collect::<HashSet<_>>();
+                merge_bucket_results_value(
+                    &mut db_results,
+                    &mut seen_db,
+                    search_symbols_fuzzy_fallback(conn, pattern, FIND_FUZZY_FALLBACK_LIMIT)?,
+                    target,
+                );
+                if !identifier_query {
+                    merge_bucket_results_value(
+                        &mut db_results,
+                        &mut seen_db,
+                        search_files_fuzzy_fallback(conn, pattern, FIND_FUZZY_FALLBACK_LIMIT)?,
+                        target,
+                    );
+                }
+            }
+            db_results
+        };
+        merge_bucket_results(&mut results, &mut seen, db_results, target);
+    }
+
+    if !class_only {
+        suppress_broad_class_contains_when_exact_type_exists(&mut results, pattern);
+    }
+
+    let page = results.into_iter().skip(offset).take(limit).collect::<Vec<_>>();
+    Ok(json!(page))
 }
 
 /// Search indexed symbols with database-side ranking and pagination.
@@ -1541,6 +2058,40 @@ mod tests {
         let items = items.as_array().unwrap();
 
         assert!(items.iter().all(|item| item["type"] != "file"));
+    }
+
+    #[test]
+    fn hot_index_fast_find_returns_exact_and_prefix_matches() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let file_id = insert_project_header_file(&conn, "Game", "GameplayAbility.h");
+        insert_class_symbol(&conn, file_id, "UGameplayAbility");
+
+        let hot_index = build_search_hot_index(&conn).unwrap();
+        let items = fast_find_with_hot_index(&conn, Some(&hot_index), "UGameplayAbility", 20, 0).unwrap();
+        let items = items.as_array().unwrap();
+
+        assert!(items.iter().any(|item| item["name"] == "UGameplayAbility"));
+        assert!(items.iter().all(|item| item["type"] != "file"));
+    }
+
+    #[test]
+    fn hot_index_matches_unreal_type_without_underscores() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let file_id = insert_project_header_file(&conn, "Game", "GameplayCueNotify_Actor.h");
+        insert_class_symbol(&conn, file_id, "AGameplayCueNotify_Actor");
+
+        let hot_index = build_search_hot_index(&conn).unwrap();
+        let items =
+            fast_find_with_hot_index(&conn, Some(&hot_index), "GameplayCueNotifyActor", 20, 0).unwrap();
+        let items = items.as_array().unwrap();
+
+        assert!(items
+            .iter()
+            .any(|item| item["name"] == "AGameplayCueNotify_Actor"));
     }
 
     #[test]
