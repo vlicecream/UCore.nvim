@@ -119,45 +119,6 @@ impl SearchQueryProfile {
         hqh == 0 && (self.is_literal_code || self.is_text_like)
     }
 
-    fn live_find_engine_skip_reason(
-        &self,
-        target: usize,
-        project_result_count: usize,
-        project_path_count: usize,
-        project_hqh: usize,
-        current_file_in_project: bool,
-    ) -> Option<&'static str> {
-        if project_result_count == 0 {
-            return None;
-        }
-
-        if project_result_count >= target && project_hqh >= target.saturating_div(2).max(8) {
-            return Some("project_saturated_hqh");
-        }
-
-        if self.is_sym_strong && project_result_count >= 24 {
-            return Some("sym_strong_project_dense");
-        }
-
-        if self.is_identifier && !self.is_text_like && project_result_count >= 48 {
-            return Some("identifier_project_dense");
-        }
-
-        if self.is_text_like && project_hqh >= 24 {
-            return Some("text_like_project_hqh");
-        }
-
-        if current_file_in_project && project_result_count >= 24 && project_path_count >= 4 {
-            return Some("current_project_dense");
-        }
-
-        if project_result_count >= 80 || project_path_count >= 12 {
-            return Some("project_dense");
-        }
-
-        None
-    }
-
     fn reference_engine_skip_reason(
         &self,
         scope: &str,
@@ -1105,7 +1066,6 @@ fn goto_definition_with_engine(
 
     if !project_result.is_null() {
         tag_value_source(&mut project_result, "project");
-        navigation_cache.lock().put(cache_key, project_result.clone());
         return Ok(project_result);
     }
 
@@ -1140,8 +1100,6 @@ fn goto_definition_with_engine(
     if !engine_result.is_null() {
         tag_value_source(&mut engine_result, "engine");
     }
-
-    navigation_cache.lock().put(cache_key, engine_result.clone());
 
     Ok(engine_result)
 }
@@ -1270,7 +1228,7 @@ fn hover_with_engine(
         return Ok(Value::Null);
     }
 
-    let engine_conn = match state.get_shared_read_only_connection(&engine_db_path) {
+    let engine_conn = match state.get_read_only_connection(&engine_db_path) {
         Ok(conn) => conn,
         Err(err) => {
             warn!("Failed to open Engine DB for hover: {}", err);
@@ -1278,10 +1236,13 @@ fn hover_with_engine(
         }
     };
 
-    let mut engine_result = match {
-        let engine_conn = engine_conn.lock();
-        query::goto::get_hover(&engine_conn, content, line, character, file_path)
-    } {
+    let mut engine_result = match query::goto::get_hover(
+        &engine_conn,
+        content,
+        line,
+        character,
+        file_path,
+    ) {
         Ok(value) => value,
         Err(err) => {
             warn!("Failed to query Engine DB hover: {}", err);
@@ -1960,7 +1921,7 @@ impl<'a> LiveTextSearchState<'a> {
 fn unified_live_find_with_engine(
     state: Arc<AppState>,
     project_conn: &rusqlite::Connection,
-    _project_db_path: &str,
+    project_db_path: &str,
     engine_db_path: Option<String>,
     pattern: &str,
     limit: usize,
@@ -1984,69 +1945,42 @@ fn unified_live_find_with_engine(
         .and_then(|path| module_name_for_file(project_conn, path));
     let log_enabled = fast_find_log_enabled() || query_log_enabled();
     let profile = SearchQueryProfile::classify(pattern);
-    let current_file_in_project = current_file
-        .as_deref()
-        .map(|path| file_exists_in_index(project_conn, path))
-        .unwrap_or(false);
+    let project_db_path = project_db_path.to_string();
+    let pattern_owned = pattern.to_string();
+    let engine_db_path_owned = engine_db_path.clone();
+    let project_state = state.clone();
+    let engine_state = state.clone();
+    let (project_result, engine_result) = rayon::join(
+        move || -> Result<Vec<Value>> {
+            let conn = project_state.get_read_only_connection(&project_db_path)?;
+            let mut results = value_array(query::search::fast_find(&conn, &pattern_owned, target, 0)?);
+            tag_source(&mut results, "project");
+            Ok(results)
+        },
+        move || -> Result<Vec<Value>> {
+            let Some(engine_conn) =
+                open_engine_query_connection(engine_state, engine_db_path_owned, "unified live find")?
+            else {
+                return Ok(Vec::new());
+            };
+            let mut results = {
+                let engine_conn = engine_conn.lock();
+                value_array(query::search::fast_find(&engine_conn, pattern, target, 0)?)
+            };
+            tag_source(&mut results, "engine");
+            Ok(results)
+        },
+    );
 
-    let mut project_results = value_array(query::search::fast_find(project_conn, pattern, target, 0)?);
-    tag_source(&mut project_results, "project");
+    let mut results = project_result?;
+    results.extend(engine_result?);
+
     rank_live_find_results(
-        &mut project_results,
+        &mut results,
         pattern,
         current_file.as_deref(),
         current_module.as_deref(),
     );
-
-    let project_result_count = project_results.len();
-    let project_path_count = result_path_count(&project_results);
-    let project_hqh = live_find_hqh_count(&project_results);
-    let skip_reason = profile.live_find_engine_skip_reason(
-        target,
-        project_result_count,
-        project_path_count,
-        project_hqh,
-        current_file_in_project,
-    );
-
-    if log_enabled {
-        info!(
-            target: "ucore::fast_find",
-            "UnifiedLiveFind project pattern={:?} tags={} repeated={} project={} hqh={} files={} current_file_in_project={} engine_merge={} reason={}",
-            pattern,
-            profile.tag_summary(),
-            repeated_query,
-            project_result_count,
-            project_hqh,
-            project_path_count,
-            current_file_in_project,
-            skip_reason.is_none(),
-            skip_reason.unwrap_or("eligible")
-        );
-    }
-
-    let mut results = project_results;
-    if skip_reason.is_none() {
-        let remaining = target.saturating_sub(results.len());
-        let engine_target = remaining.max(limit.min(64)).clamp(1, target);
-        if let Some(engine_conn) =
-            open_engine_query_connection(state.clone(), engine_db_path.clone(), "unified live find")?
-        {
-            let mut engine_results = {
-                let engine_conn = engine_conn.lock();
-                value_array(query::search::fast_find(&engine_conn, pattern, engine_target, 0)?)
-            };
-            tag_source(&mut engine_results, "engine");
-            results.extend(engine_results);
-            rank_live_find_results(
-                &mut results,
-                pattern,
-                current_file.as_deref(),
-                current_module.as_deref(),
-            );
-        }
-    }
-
     let phase0_hqh = live_find_hqh_count(&results);
     let forced_reliable_text = profile.should_force_reliable_text_search(phase0_hqh);
     let should_run_text_stage = forced_reliable_text
