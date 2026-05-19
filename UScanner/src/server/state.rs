@@ -16,6 +16,8 @@ use crate::types::{ConfigCache, PhaseInfo, Progress, ProgressPlan, ProgressRepor
 const COMPLETION_CACHE_CAPACITY: usize = 50_000;
 const DIAGNOSTICS_CACHE_CAPACITY: usize = 512;
 const DIAGNOSTICS_CACHE_TTL: Duration = Duration::from_millis(1500);
+const NAVIGATION_CACHE_CAPACITY: usize = 1024;
+const NAVIGATION_CACHE_TTL: Duration = Duration::from_millis(2000);
 const PRIMARY_DB_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_ONLY_DB_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const CACHE_DB_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -270,6 +272,50 @@ impl DiagnosticsCache {
     }
 }
 
+/// In-memory navigation cache keyed by request signature.
+/// 内存导航缓存，key 是请求签名。
+pub struct NavigationCache {
+    lru: LruCache<String, NavigationCacheEntry>,
+}
+
+struct NavigationCacheEntry {
+    value: serde_json::Value,
+    created_at: Instant,
+}
+
+impl NavigationCache {
+    pub fn new() -> Self {
+        Self {
+            lru: LruCache::new(NonZeroUsize::new(NAVIGATION_CACHE_CAPACITY).unwrap()),
+        }
+    }
+
+    pub fn get(&mut self, key: &str) -> Option<serde_json::Value> {
+        let is_fresh = self
+            .lru
+            .peek(key)
+            .map(|entry| entry.created_at.elapsed() <= NAVIGATION_CACHE_TTL)
+            .unwrap_or(false);
+
+        if !is_fresh {
+            self.lru.pop(key);
+            return None;
+        }
+
+        self.lru.get(key).map(|entry| entry.value.clone())
+    }
+
+    pub fn put(&mut self, key: String, value: serde_json::Value) {
+        self.lru.put(
+            key,
+            NavigationCacheEntry {
+                value,
+                created_at: Instant::now(),
+            },
+        );
+    }
+}
+
 /// Build normalized completion cache key.
 /// 构造规范化补全缓存 key。
 fn make_completion_key(class_name: &str, prefix: &str) -> (String, String) {
@@ -297,6 +343,7 @@ pub struct AppState {
     pub config_caches: Mutex<HashMap<String, ConfigCache>>,
     pub completion_caches: Mutex<HashMap<String, Arc<Mutex<CompletionCache>>>>,
     pub diagnostics_caches: Mutex<HashMap<String, Arc<Mutex<DiagnosticsCache>>>>,
+    pub navigation_caches: Mutex<HashMap<String, Arc<Mutex<NavigationCache>>>>,
 }
 
 impl AppState {
@@ -458,6 +505,24 @@ impl AppState {
         let cache = Arc::new(Mutex::new(DiagnosticsCache::new()));
 
         let mut caches = self.diagnostics_caches.lock();
+        let existing = caches
+            .entry(project_root.to_string())
+            .or_insert_with(|| Arc::clone(&cache));
+
+        Arc::clone(existing)
+    }
+
+    pub fn get_navigation_cache(&self, project_root: &str) -> Arc<Mutex<NavigationCache>> {
+        {
+            let caches = self.navigation_caches.lock();
+            if let Some(cache) = caches.get(project_root) {
+                return Arc::clone(cache);
+            }
+        }
+
+        let cache = Arc::new(Mutex::new(NavigationCache::new()));
+
+        let mut caches = self.navigation_caches.lock();
         let existing = caches
             .entry(project_root.to_string())
             .or_insert_with(|| Arc::clone(&cache));

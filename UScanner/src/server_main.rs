@@ -48,6 +48,7 @@ async fn main() -> Result<()> {
         config_caches: Mutex::new(HashMap::new()),
         completion_caches: Mutex::new(HashMap::new()),
         diagnostics_caches: Mutex::new(HashMap::new()),
+        navigation_caches: Mutex::new(HashMap::new()),
     });
 
     spawn_watch_event_loop(state.clone(), watch_rx);

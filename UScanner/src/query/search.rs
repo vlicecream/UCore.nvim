@@ -80,6 +80,11 @@ pub fn search_symbols(
     let contains_query = format!("%{}%", escape_like(&query));
     let tokens = search_tokens(pattern);
     let allow_owner_match = !is_identifier_query(pattern);
+    let candidate_ids =
+        search_symbol_candidate_ids(conn, pattern, (limit as usize).saturating_add(offset as usize).saturating_mul(8))?;
+    if matches!(candidate_ids.as_ref(), Some(ids) if ids.is_empty()) {
+        return Ok(json!([]));
+    }
     let searchable = if allow_owner_match {
         "lower(COALESCE(name, '') || ' ' || COALESCE(kind, '') || ' ' || COALESCE(owner_name, '') || ' ' || COALESCE(module_name, '') || ' ' || COALESCE(path, ''))"
     } else {
@@ -95,6 +100,10 @@ pub fn search_symbols(
     } else {
         token_filter
     };
+    let candidate_clause = candidate_ids
+        .as_ref()
+        .map(|ids| format!(" AND id IN ({})", plain_placeholders(ids.len())))
+        .unwrap_or_default();
 
     let owner_rank_sql = if allow_owner_match {
         "WHEN owner_name_lc LIKE ? ESCAPE '\\' THEN 3"
@@ -122,7 +131,7 @@ pub fn search_symbols(
             line_number,
             module_name
         FROM search_symbols
-        WHERE {}
+        WHERE {}{}
         ORDER BY
             CASE
                 WHEN name_lc = ? THEN 0
@@ -139,6 +148,7 @@ pub fn search_symbols(
         LIMIT ? OFFSET ?
         "#,
         where_clause,
+        candidate_clause,
         owner_rank_sql,
         module_rank_sql,
         path_rank_sql
@@ -148,6 +158,11 @@ pub fn search_symbols(
     let mut params = Vec::new();
     for token in &tokens {
         params.push(SqlValue::Text(format!("%{}%", escape_like(token))));
+    }
+    if let Some(ids) = candidate_ids.as_ref() {
+        for id in ids {
+            params.push(SqlValue::Integer(*id));
+        }
     }
     params.push(SqlValue::Text(query));
     params.push(SqlValue::Text(prefix_query));
@@ -341,6 +356,10 @@ fn fast_find_symbols(conn: &Connection, pattern: &str, limit: usize) -> anyhow::
     let identifier_query = is_identifier_query(query_text);
     let allow_owner_match = !identifier_query;
     let allow_compact_name_match = identifier_query;
+    let candidate_ids = search_symbol_candidate_ids(conn, query_text, limit as usize * 8)?;
+    if matches!(candidate_ids.as_ref(), Some(ids) if ids.is_empty()) {
+        return Ok(json!([]));
+    }
     let compact_query = compact_identifier(query_text);
     let compact_prefix_query = format!("{}%", escape_like(&compact_query));
     let compact_contains_query = format!("%{}%", escape_like(&compact_query));
@@ -368,6 +387,10 @@ fn fast_find_symbols(conn: &Connection, pattern: &str, limit: usize) -> anyhow::
     } else {
         ""
     };
+    let candidate_where_sql = candidate_ids
+        .as_ref()
+        .map(|ids| format!(" AND id IN ({})", plain_placeholders(ids.len())))
+        .unwrap_or_default();
 
     let sql = format!(
         r#"
@@ -391,6 +414,7 @@ fn fast_find_symbols(conn: &Connection, pattern: &str, limit: usize) -> anyhow::
             WHERE name_lc LIKE ? ESCAPE '\'
                {}
                {}
+               {}
             ORDER BY rank, kind_rank ASC, name_lc ASC, path_lc ASC
             LIMIT ?
         )
@@ -407,7 +431,8 @@ fn fast_find_symbols(conn: &Connection, pattern: &str, limit: usize) -> anyhow::
         compact_rank_sql,
         owner_rank_sql,
         compact_where_sql,
-        owner_where_sql
+        owner_where_sql,
+        candidate_where_sql
     );
 
     let mut stmt = conn.prepare(&sql)?;
@@ -430,6 +455,11 @@ fn fast_find_symbols(conn: &Connection, pattern: &str, limit: usize) -> anyhow::
     }
     if allow_owner_match {
         params.push(SqlValue::Text(contains_query));
+    }
+    if let Some(ids) = candidate_ids.as_ref() {
+        for id in ids {
+            params.push(SqlValue::Integer(*id));
+        }
     }
     params.push(SqlValue::Integer(limit));
 
@@ -510,6 +540,11 @@ pub fn search_class_symbols(
     let prefix_query = format!("{}%", escape_like(&query));
     let contains_query = format!("%{}%", escape_like(&query));
     let tokens = search_tokens(pattern);
+    let candidate_ids =
+        search_symbol_candidate_ids(conn, pattern, (limit as usize).saturating_add(offset as usize).saturating_mul(8))?;
+    if matches!(candidate_ids.as_ref(), Some(ids) if ids.is_empty()) {
+        return Ok(json!([]));
+    }
     let searchable =
         "lower(COALESCE(name, '') || ' ' || COALESCE(kind, '') || ' ' || COALESCE(owner_name, '') || ' ' || COALESCE(module_name, '') || ' ' || COALESCE(path, ''))";
     let token_filter = tokens
@@ -522,6 +557,10 @@ pub fn search_class_symbols(
     } else {
         token_filter
     };
+    let candidate_clause = candidate_ids
+        .as_ref()
+        .map(|ids| format!(" AND id IN ({})", plain_placeholders(ids.len())))
+        .unwrap_or_default();
 
     let sql = format!(
         r#"
@@ -533,7 +572,7 @@ pub fn search_class_symbols(
             line_number,
             module_name
         FROM search_symbols
-        WHERE ({})
+        WHERE ({}{})
           AND is_class_like = 1
         ORDER BY
             CASE
@@ -549,13 +588,19 @@ pub fn search_class_symbols(
             path_lc ASC
         LIMIT ? OFFSET ?
         "#,
-        where_clause
+        where_clause,
+        candidate_clause
     );
 
     let mut stmt = conn.prepare(&sql)?;
     let mut params = Vec::new();
     for token in &tokens {
         params.push(SqlValue::Text(format!("%{}%", escape_like(token))));
+    }
+    if let Some(ids) = candidate_ids.as_ref() {
+        for id in ids {
+            params.push(SqlValue::Integer(*id));
+        }
     }
     params.push(SqlValue::Text(query));
     params.push(SqlValue::Text(prefix_query));
@@ -720,6 +765,128 @@ fn escape_like(input: &str) -> String {
         .replace('_', "\\_")
 }
 
+fn should_use_symbol_fts(pattern: &str) -> bool {
+    let compact = compact_identifier(pattern.trim());
+    compact.len() >= 3
+}
+
+fn should_use_file_fts(pattern: &str) -> bool {
+    pattern.trim().chars().count() >= 3
+}
+
+fn quoted_fts_term(input: &str) -> String {
+    format!("\"{}\"", input.replace('"', "\"\""))
+}
+
+fn build_symbol_fts_query(pattern: &str) -> Option<String> {
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return None;
+    }
+
+    if is_identifier_query(pattern) {
+        let compact = compact_identifier(pattern);
+        if compact.len() >= 3 {
+            return Some(quoted_fts_term(&compact));
+        }
+    }
+
+    let terms = search_tokens(pattern)
+        .into_iter()
+        .filter(|token| token.chars().count() >= 3)
+        .map(|token| quoted_fts_term(&token))
+        .collect::<Vec<_>>();
+
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join(" "))
+    }
+}
+
+fn build_file_fts_query(pattern: &str) -> Option<String> {
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return None;
+    }
+
+    let terms = search_tokens(pattern)
+        .into_iter()
+        .filter(|token| token.chars().count() >= 3)
+        .map(|token| quoted_fts_term(&token))
+        .collect::<Vec<_>>();
+
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join(" "))
+    }
+}
+
+fn plain_placeholders(count: usize) -> String {
+    (0..count).map(|_| "?").collect::<Vec<_>>().join(", ")
+}
+
+fn search_symbol_candidate_ids(
+    conn: &Connection,
+    pattern: &str,
+    limit: usize,
+) -> anyhow::Result<Option<Vec<i64>>> {
+    if !should_use_symbol_fts(pattern) {
+        return Ok(None);
+    }
+
+    let Some(query) = build_symbol_fts_query(pattern) else {
+        return Ok(None);
+    };
+
+    let candidate_limit = limit.clamp(64, 8192) as i64;
+    let mut stmt = conn.prepare(
+        "SELECT rowid
+         FROM search_symbols_fts
+         WHERE search_symbols_fts MATCH ?1
+         ORDER BY bm25(search_symbols_fts), rowid
+         LIMIT ?2",
+    )?;
+
+    let rows = stmt.query_map(params![query, candidate_limit], |row| row.get::<_, i64>(0))?;
+    let mut ids = Vec::new();
+    for row in rows {
+        ids.push(row?);
+    }
+    Ok(Some(ids))
+}
+
+fn search_file_candidate_ids(
+    conn: &Connection,
+    pattern: &str,
+    limit: usize,
+) -> anyhow::Result<Option<Vec<i64>>> {
+    if !should_use_file_fts(pattern) {
+        return Ok(None);
+    }
+
+    let Some(query) = build_file_fts_query(pattern) else {
+        return Ok(None);
+    };
+
+    let candidate_limit = limit.clamp(64, 8192) as i64;
+    let mut stmt = conn.prepare(
+        "SELECT rowid
+         FROM search_files_fts
+         WHERE search_files_fts MATCH ?1
+         ORDER BY bm25(search_files_fts), rowid
+         LIMIT ?2",
+    )?;
+
+    let rows = stmt.query_map(params![query, candidate_limit], |row| row.get::<_, i64>(0))?;
+    let mut ids = Vec::new();
+    for row in rows {
+        ids.push(row?);
+    }
+    Ok(Some(ids))
+}
+
 fn extend_json_array(target: &mut Vec<Value>, value: Value) {
     if let Some(values) = value.as_array() {
         target.extend(values.iter().cloned());
@@ -763,6 +930,14 @@ fn search_files_for_global(
     let query = pattern.to_ascii_lowercase();
     let prefix_query = format!("{}%", escape_like(&query));
     let contains_query = format!("%{}%", escape_like(&query));
+    let candidate_ids = search_file_candidate_ids(conn, pattern, limit as usize * 8)?;
+    if matches!(candidate_ids.as_ref(), Some(ids) if ids.is_empty()) {
+        return Ok(json!([]));
+    }
+    let candidate_clause = candidate_ids
+        .as_ref()
+        .map(|ids| format!(" AND sf.file_id IN ({})", plain_placeholders(ids.len())))
+        .unwrap_or_default();
 
     let sql = format!(
         r#"
@@ -777,6 +952,7 @@ fn search_files_for_global(
         LEFT JOIN dir_paths rd ON m.root_directory_id = rd.id
         WHERE (sf.basename_lc LIKE ? ESCAPE '\'
            OR sf.path_lc LIKE ? ESCAPE '\')
+          {}
           AND lower(COALESCE(sf.ext, '')) NOT IN ('uasset', 'umap')
         ORDER BY
             CASE
@@ -790,20 +966,28 @@ fn search_files_for_global(
             sf.path_lc ASC
         LIMIT ?
         "#,
-        PATH_CTE
+        PATH_CTE,
+        candidate_clause
     );
 
     let mut stmt = conn.prepare(&sql)?;
+    let mut params = vec![
+        SqlValue::Text(contains_query.clone()),
+        SqlValue::Text(contains_query.clone()),
+    ];
+    if let Some(ids) = candidate_ids.as_ref() {
+        for id in ids {
+            params.push(SqlValue::Integer(*id));
+        }
+    }
+    params.push(SqlValue::Text(query));
+    params.push(SqlValue::Text(prefix_query));
+    params.push(SqlValue::Text(contains_query.clone()));
+    params.push(SqlValue::Text(contains_query));
+    params.push(SqlValue::Integer(limit));
+
     let rows = stmt.query_map(
-        params![
-            contains_query,
-            contains_query,
-            query,
-            prefix_query,
-            contains_query,
-            contains_query,
-            limit
-        ],
+        params_from_iter(params),
         |row| {
             Ok(json!({
                 "name": row.get::<_, String>(0)?,

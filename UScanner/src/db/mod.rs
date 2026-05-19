@@ -18,7 +18,7 @@ use crate::types::{ParseResult, ProgressReporter};
 ///
 /// Increment this when table structures, indexes, or stored data semantics change.
 /// 当表结构、索引或存储语义变化时递增。
-pub const DB_VERSION: i32 = 26;
+pub const DB_VERSION: i32 = 27;
 
 /// Completion cache version.
 /// 补全缓存版本。
@@ -93,6 +93,7 @@ pub fn init_db(conn: &Connection) -> rusqlite::Result<()> {
     create_tables(conn)?;
     create_views(conn)?;
     create_indices(conn)?;
+    create_search_fts_triggers(conn)?;
 
     conn.execute(
         "INSERT OR REPLACE INTO project_meta (key, value) VALUES ('db_version', ?1)",
@@ -343,6 +344,33 @@ fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
         [],
     );
 
+    let _ = conn.execute(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS search_files_fts USING fts5(
+            basename,
+            module_name,
+            path,
+            content='search_files',
+            content_rowid='file_id',
+            tokenize='trigram case_sensitive 0'
+        )",
+        [],
+    );
+
+    let _ = conn.execute(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS search_symbols_fts USING fts5(
+            name,
+            compact_name,
+            owner_name,
+            module_name,
+            basename,
+            path,
+            content='search_symbols',
+            content_rowid='id',
+            tokenize='trigram case_sensitive 0'
+        )",
+        [],
+    );
+
     Ok(())
 }
 
@@ -572,6 +600,104 @@ pub fn save_to_db(
     }
 
     finalize_bulk_write(conn, reporter)?;
+    Ok(())
+}
+
+fn create_search_fts_triggers(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TRIGGER IF NOT EXISTS search_files_ai AFTER INSERT ON search_files BEGIN
+            INSERT INTO search_files_fts(rowid, basename, module_name, path)
+            VALUES (new.file_id, new.basename, COALESCE(new.module_name, ''), new.path);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS search_files_ad AFTER DELETE ON search_files BEGIN
+            INSERT INTO search_files_fts(search_files_fts, rowid, basename, module_name, path)
+            VALUES ('delete', old.file_id, old.basename, COALESCE(old.module_name, ''), old.path);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS search_files_au AFTER UPDATE ON search_files BEGIN
+            INSERT INTO search_files_fts(search_files_fts, rowid, basename, module_name, path)
+            VALUES ('delete', old.file_id, old.basename, COALESCE(old.module_name, ''), old.path);
+            INSERT INTO search_files_fts(rowid, basename, module_name, path)
+            VALUES (new.file_id, new.basename, COALESCE(new.module_name, ''), new.path);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS search_symbols_ai AFTER INSERT ON search_symbols BEGIN
+            INSERT INTO search_symbols_fts(rowid, name, compact_name, owner_name, module_name, basename, path)
+            VALUES (
+                new.id,
+                new.name,
+                new.compact_name,
+                COALESCE(new.owner_name, ''),
+                COALESCE(new.module_name, ''),
+                new.basename,
+                new.path
+            );
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS search_symbols_ad AFTER DELETE ON search_symbols BEGIN
+            INSERT INTO search_symbols_fts(search_symbols_fts, rowid, name, compact_name, owner_name, module_name, basename, path)
+            VALUES (
+                'delete',
+                old.id,
+                old.name,
+                old.compact_name,
+                COALESCE(old.owner_name, ''),
+                COALESCE(old.module_name, ''),
+                old.basename,
+                old.path
+            );
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS search_symbols_au AFTER UPDATE ON search_symbols BEGIN
+            INSERT INTO search_symbols_fts(search_symbols_fts, rowid, name, compact_name, owner_name, module_name, basename, path)
+            VALUES (
+                'delete',
+                old.id,
+                old.name,
+                old.compact_name,
+                COALESCE(old.owner_name, ''),
+                COALESCE(old.module_name, ''),
+                old.basename,
+                old.path
+            );
+            INSERT INTO search_symbols_fts(rowid, name, compact_name, owner_name, module_name, basename, path)
+            VALUES (
+                new.id,
+                new.name,
+                new.compact_name,
+                COALESCE(new.owner_name, ''),
+                COALESCE(new.module_name, ''),
+                new.basename,
+                new.path
+            );
+        END;
+        "#,
+    )?;
+
+    Ok(())
+}
+
+fn drop_search_fts_triggers(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        r#"
+        DROP TRIGGER IF EXISTS search_files_ai;
+        DROP TRIGGER IF EXISTS search_files_ad;
+        DROP TRIGGER IF EXISTS search_files_au;
+        DROP TRIGGER IF EXISTS search_symbols_ai;
+        DROP TRIGGER IF EXISTS search_symbols_ad;
+        DROP TRIGGER IF EXISTS search_symbols_au;
+        "#,
+    )?;
+
+    Ok(())
+}
+
+fn rebuild_search_fts(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute("INSERT INTO search_files_fts(search_files_fts) VALUES('rebuild')", [])?;
+    conn.execute("INSERT INTO search_symbols_fts(search_symbols_fts) VALUES('rebuild')", [])?;
+    create_search_fts_triggers(conn)?;
     Ok(())
 }
 
@@ -1708,6 +1834,7 @@ fn prepare_bulk_write(conn: &Connection) -> anyhow::Result<()> {
     conn.pragma_update(None, "cache_size", "-800000")?;
     conn.pragma_update(None, "temp_store", "MEMORY")?;
     conn.execute("PRAGMA foreign_keys = OFF", [])?;
+    drop_search_fts_triggers(conn)?;
     Ok(())
 }
 
@@ -1726,6 +1853,7 @@ fn finalize_bulk_write(
         "Indices",
     );
     create_indices(conn)?;
+    rebuild_search_fts(conn)?;
 
     conn.execute("PRAGMA foreign_keys = ON", [])?;
 
@@ -1736,6 +1864,8 @@ fn finalize_bulk_write(
     resolve_file_includes_by_path(conn)?;
 
     reporter.report("finalizing", 95, 100, "Optimize");
+    conn.execute("INSERT INTO search_files_fts(search_files_fts) VALUES('optimize')", [])?;
+    conn.execute("INSERT INTO search_symbols_fts(search_symbols_fts) VALUES('optimize')", [])?;
     conn.execute("PRAGMA optimize", [])?;
     info!("DB finalize finished in {} ms", started_at.elapsed().as_millis());
 

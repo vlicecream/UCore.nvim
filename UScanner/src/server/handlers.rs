@@ -199,6 +199,25 @@ fn diagnostics_cache_key(
     )
 }
 
+fn navigation_cache_key(
+    kind: &str,
+    file_path: Option<&str>,
+    content: &str,
+    line: u32,
+    character: u32,
+    engine_db_path: Option<&str>,
+) -> String {
+    format!(
+        "{}:{}:{}:{}:{}:{}",
+        kind,
+        file_path.unwrap_or("-"),
+        hash_text(content),
+        line,
+        character,
+        engine_db_path.unwrap_or("-")
+    )
+}
+
 fn fast_find_log_enabled() -> bool {
     *FAST_FIND_LOG_ENABLED.get_or_init(|| {
         std::env::var("UCORE_FAST_FIND_LOG")
@@ -753,6 +772,7 @@ fn handle_state_query(
         } => {
             let value = goto_definition_with_engine(
                 state,
+                project_root,
                 conn,
                 engine_db_path,
                 content,
@@ -772,6 +792,7 @@ fn handle_state_query(
         } => {
             let value = goto_implementation_with_engine(
                 state,
+                project_root,
                 conn,
                 engine_db_path,
                 content,
@@ -791,6 +812,7 @@ fn handle_state_query(
         } => {
             let value = hover_with_engine(
                 state,
+                project_root,
                 conn,
                 engine_db_path,
                 content,
@@ -1013,6 +1035,7 @@ fn send_query_partial(tx: &mpsc::Sender<Vec<u8>>, msgid: u64, items: Vec<Value>)
 /// 先在项目 DB 里跳转定义，找不到时回退到共享 Engine DB。
 fn goto_definition_with_engine(
     state: Arc<AppState>,
+    project_root: &str,
     project_conn: &rusqlite::Connection,
     engine_db_path: Option<String>,
     content: String,
@@ -1020,6 +1043,19 @@ fn goto_definition_with_engine(
     character: u32,
     file_path: Option<String>,
 ) -> Result<Value> {
+    let cache_key = navigation_cache_key(
+        "goto_definition",
+        file_path.as_deref(),
+        &content,
+        line,
+        character,
+        engine_db_path.as_deref(),
+    );
+    let navigation_cache = state.get_navigation_cache(project_root);
+    if let Some(value) = navigation_cache.lock().get(&cache_key) {
+        return Ok(value);
+    }
+
     let mut project_result = query::goto::goto_definition(
         project_conn,
         content.clone(),
@@ -1072,6 +1108,7 @@ fn goto_definition_with_engine(
 /// 先在项目 DB 里跳转实现，找不到时回退到共享 Engine DB。
 fn goto_implementation_with_engine(
     state: Arc<AppState>,
+    project_root: &str,
     project_conn: &rusqlite::Connection,
     engine_db_path: Option<String>,
     content: String,
@@ -1079,6 +1116,19 @@ fn goto_implementation_with_engine(
     character: u32,
     file_path: Option<String>,
 ) -> Result<Value> {
+    let cache_key = navigation_cache_key(
+        "goto_implementation",
+        file_path.as_deref(),
+        &content,
+        line,
+        character,
+        engine_db_path.as_deref(),
+    );
+    let navigation_cache = state.get_navigation_cache(project_root);
+    if let Some(value) = navigation_cache.lock().get(&cache_key) {
+        return Ok(value);
+    }
+
     let mut project_result = query::goto::goto_implementation(
         project_conn,
         content.clone(),
@@ -1089,6 +1139,7 @@ fn goto_implementation_with_engine(
 
     if !project_result.is_null() {
         tag_value_source(&mut project_result, "project");
+        navigation_cache.lock().put(cache_key, project_result.clone());
         return Ok(project_result);
     }
 
@@ -1124,6 +1175,8 @@ fn goto_implementation_with_engine(
         tag_value_source(&mut engine_result, "engine");
     }
 
+    navigation_cache.lock().put(cache_key, engine_result.clone());
+
     Ok(engine_result)
 }
 
@@ -1131,6 +1184,7 @@ fn goto_implementation_with_engine(
 /// 先在项目 DB 里解析 hover，再回退到共享 Engine DB。
 fn hover_with_engine(
     state: Arc<AppState>,
+    project_root: &str,
     project_conn: &rusqlite::Connection,
     engine_db_path: Option<String>,
     content: String,
@@ -1138,6 +1192,19 @@ fn hover_with_engine(
     character: u32,
     file_path: Option<String>,
 ) -> Result<Value> {
+    let cache_key = navigation_cache_key(
+        "hover",
+        file_path.as_deref(),
+        &content,
+        line,
+        character,
+        engine_db_path.as_deref(),
+    );
+    let navigation_cache = state.get_navigation_cache(project_root);
+    if let Some(value) = navigation_cache.lock().get(&cache_key) {
+        return Ok(value);
+    }
+
     let mut project_result = query::goto::get_hover(
         project_conn,
         content.clone(),
@@ -1148,6 +1215,7 @@ fn hover_with_engine(
 
     if !project_result.is_null() {
         tag_value_source(&mut project_result, "project");
+        navigation_cache.lock().put(cache_key, project_result.clone());
         return Ok(project_result);
     }
 
@@ -1185,6 +1253,8 @@ fn hover_with_engine(
     if !engine_result.is_null() {
         tag_value_source(&mut engine_result, "engine");
     }
+
+    navigation_cache.lock().put(cache_key, engine_result.clone());
 
     Ok(engine_result)
 }
