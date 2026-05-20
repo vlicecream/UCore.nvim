@@ -1162,6 +1162,28 @@ fn goto_definition_with_engine(
             return Ok(Value::Null);
         }
     };
+    let prefer_direct_engine_lookup =
+        should_try_direct_engine_definition_lookup(&content, line, character);
+
+    if prefer_direct_engine_lookup {
+        let mut direct_result = match {
+            let engine_conn = engine_conn.lock();
+            query::goto::goto_definition(&engine_conn, content.clone(), line, character, file_path.clone())
+        } {
+            Ok(value) => value,
+            Err(err) => {
+                warn!("Failed to query Engine DB direct goto definition: {}", err);
+                Value::Null
+            }
+        };
+
+        if !direct_result.is_null() {
+            tag_value_source(&mut direct_result, "engine");
+            navigation_cache.lock().put(cache_key, direct_result.clone());
+            return Ok(direct_result);
+        }
+    }
+
     let engine_nav_hot_index =
         load_navigation_hot_index(&state, &engine_db_path, "goto definition engine");
 
@@ -1190,6 +1212,23 @@ fn goto_definition_with_engine(
     navigation_cache.lock().put(cache_key, engine_result.clone());
 
     Ok(engine_result)
+}
+
+fn should_try_direct_engine_definition_lookup(content: &str, line: u32, character: u32) -> bool {
+    let Some(ctx) = query::goto::extract_cursor_context(content, line, character) else {
+        return false;
+    };
+
+    if ctx.qualifier.is_some() {
+        return false;
+    }
+
+    let symbol = ctx.symbol.trim();
+    symbol
+        .chars()
+        .next()
+        .map(|ch| ch.is_ascii_uppercase())
+        .unwrap_or(false)
 }
 
 /// Go to implementation in the project DB, then fall back to the shared Engine DB.
