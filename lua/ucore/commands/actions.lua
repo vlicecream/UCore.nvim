@@ -161,8 +161,8 @@ local function fetch_live_find(root, query, request, callback)
 		state.last_at = now
 	end
 
-	remote.unified_live_find(root, primary, function(result, err)
-		callback(result, err, {
+	remote.unified_live_find(root, primary, function(result, err, meta)
+		callback(result, err, meta or {
 			append = false,
 			done = true,
 		})

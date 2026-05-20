@@ -1347,10 +1347,14 @@ local function pick_telescope_find_live(initial_symbols, opts)
 
 				meta = type(meta) == "table" and meta or {}
 				local done = meta.done ~= false
-				state.loading = false
+				if done then
+					state.loading = false
+				end
 				local pending_reset_query = state.pending_reset_query
-				state.pending_reset_query = nil
-				if pending_reset_query and pending_reset_query ~= query then
+				if done then
+					state.pending_reset_query = nil
+				end
+				if done and pending_reset_query and pending_reset_query ~= query then
 					request_symbols(pending_reset_query, true)
 					return
 				end
@@ -1377,7 +1381,7 @@ local function pick_telescope_find_live(initial_symbols, opts)
 					state.offset = state.offset + #values
 				end
 
-				state.has_more = #values >= state.limit
+				state.has_more = (#values >= state.limit) or (meta.append == true and state.has_more)
 				refresh_picker()
 			end)
 		end)

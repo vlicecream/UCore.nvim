@@ -199,6 +199,17 @@ impl SearchHotIndex {
             class_only,
             target,
         );
+        if identifier_query && out.len() < target {
+            let compact = compact_identifier(query_text);
+            self.merge_symbol_identifier_infix(
+                out,
+                seen,
+                &query,
+                &compact,
+                class_only,
+                target,
+            );
+        }
 
         if !identifier_query {
             self.merge_symbol_exact_map(
@@ -327,6 +338,45 @@ impl SearchHotIndex {
                 }
             }
             index += 1;
+        }
+    }
+
+    fn merge_symbol_identifier_infix(
+        &self,
+        out: &mut Vec<Value>,
+        seen: &mut HashSet<String>,
+        query: &str,
+        compact_query: &str,
+        class_only: bool,
+        limit: usize,
+    ) {
+        if query.len() < 4 || out.len() >= limit {
+            return;
+        }
+
+        let raw_contains_only = query.contains('_') || query.contains("::");
+        for entry in &self.symbols {
+            if out.len() >= limit {
+                break;
+            }
+            if class_only && !entry.is_class_like {
+                continue;
+            }
+
+            let raw_match = entry.name_lc.contains(query);
+            let compact_match = !raw_contains_only
+                && !compact_query.is_empty()
+                && compact_query.len() >= 4
+                && entry.compact_name.contains(compact_query);
+            if !raw_match && !compact_match {
+                continue;
+            }
+
+            let value = symbol_hot_entry_to_value(entry);
+            let key = find_result_identity(&value);
+            if seen.insert(key) {
+                out.push(value);
+            }
         }
     }
 
@@ -2354,6 +2404,23 @@ mod tests {
         let items = items.as_array().unwrap();
 
         assert!(items.iter().any(|item| item["name"] == "UGameplayAbility"));
+    }
+
+    #[test]
+    fn hot_index_fast_find_matches_identifier_infix_queries() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let file_id = insert_project_header_file(&conn, "Gameplay", "SGameplayAbility_Block.h");
+        insert_class_symbol(&conn, file_id, "USGameplayAbility_Block");
+
+        let hot_index = build_search_hot_index(&conn).unwrap();
+        let items = fast_find_with_hot_index(&conn, Some(&hot_index), "ability_", 20, 0).unwrap();
+        let items = items.as_array().unwrap();
+
+        assert!(items
+            .iter()
+            .any(|item| item["name"] == "USGameplayAbility_Block"));
     }
 
     #[test]

@@ -53,14 +53,15 @@ end
 
 -- Send a typed query with the current project root attached.
 -- 发送带 project_root 的类型化查询。
-function M.query(project_root, query, callback)
+function M.query(project_root, query, callback, opts)
+	opts = opts or {}
 	if bootstrap.is_query_blocked(project_root) then
 		completion_debug.log(
 			"query",
 			"blocked",
 			completion_debug.summarize_query(query)
 		)
-		return callback(blocked_query_result(query and query.kind), nil)
+		return callback(blocked_query_result(query and query.kind), nil, opts.final_meta)
 	end
 
 	query.project_root = project_root
@@ -72,7 +73,7 @@ function M.query(project_root, query, callback)
 	rpc.request("query", query, function(result, err)
 		if not err then
 			completion_debug.log("query", "result", query.kind or "unknown", completion_debug.summarize_result(result))
-			return callback(result, nil)
+			return callback(result, nil, opts.final_meta)
 		end
 		completion_debug.log("query", "rpc-error", query.kind or "unknown", tostring(err))
 
@@ -90,7 +91,7 @@ function M.query(project_root, query, callback)
 				end)
 			end
 			completion_debug.log("query", "project-not-ready", query.kind or "unknown")
-			return callback(blocked_query_result(query and query.kind), nil)
+			return callback(blocked_query_result(query and query.kind), nil, opts.final_meta)
 		end
 
 		-- Fall back to the CLI bridge so early development stays forgiving.
@@ -101,9 +102,11 @@ function M.query(project_root, query, callback)
 			else
 				completion_debug.log("query", "cli-result", query.kind or "unknown", completion_debug.summarize_result(cli_result))
 			end
-			callback(cli_result, cli_err)
+			callback(cli_result, cli_err, opts.final_meta)
 		end)
-	end)
+	end, {
+		partial_callback = opts.partial_callback,
+	})
 end
 
 -- Fetch project components such as Game, Engine, and plugins.
@@ -339,15 +342,31 @@ function M.unified_live_find(project_root, pattern, callback, opts)
 		opts = { limit = opts }
 	end
 	opts = opts or {}
-
-	M.query(project_root, {
+	local query = {
 		kind = "UnifiedLiveFind",
 		pattern = pattern or "",
 		limit = opts.limit or 50,
 		offset = opts.offset or 0,
 		current_file = opts.current_file,
 		repeated_query = opts.repeated_query == true,
-	}, callback)
+	}
+
+	if (opts.offset or 0) == 0 then
+		return M.query(project_root, query, callback, {
+			final_meta = {
+				append = true,
+				done = true,
+			},
+			partial_callback = function(result, err, meta)
+				callback(result, err, {
+					append = meta and meta.append == true,
+					done = meta and meta.done == true,
+				})
+			end,
+		})
+	end
+
+	M.query(project_root, query, callback)
 end
 
 -- Unified global find: symbols, files, and code text.

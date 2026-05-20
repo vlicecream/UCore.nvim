@@ -198,6 +198,15 @@ local function handle_frame(frame)
 			end
 
 			if method == "query/partial" then
+				local msgid = params and decode_integer(params.msgid)
+				local pending_entry = msgid and pending[msgid] or nil
+				local partial_cb = pending_entry and pending_entry.partial_callback
+				if partial_cb then
+					partial_cb(params.items, nil, {
+						append = params.append == true,
+						done = params.done == true,
+					})
+				end
 				return
 			end
 		end)
@@ -280,8 +289,9 @@ end
 
 -- Send one RPC request over the persistent TCP connection.
 -- 通过持久 TCP 连接发送一次 RPC 请求。
-function M.request(method, params, callback)
+function M.request(method, params, callback, opts)
 	callback = callback or function() end
+	opts = opts or {}
 
 	M.connect(function(ok, err)
 		if not ok then
@@ -292,6 +302,7 @@ function M.request(method, params, callback)
 		next_msgid = next_msgid + 1
 		pending[msgid] = {
 			callback = callback,
+			partial_callback = opts.partial_callback,
 		}
 
 		-- Request: [0, msgid, method, params]

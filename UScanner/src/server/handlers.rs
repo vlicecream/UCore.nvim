@@ -44,6 +44,12 @@ struct QueryPerfWindow {
     stats: HashMap<&'static str, QueryPerfStat>,
 }
 
+#[derive(Clone)]
+struct PartialQuerySender {
+    tx: mpsc::Sender<Vec<u8>>,
+    msgid: u64,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct SearchQueryProfile {
     is_identifier: bool,
@@ -117,6 +123,19 @@ impl SearchQueryProfile {
         }
 
         hqh == 0 && (self.is_literal_code || self.is_text_like)
+    }
+
+    fn should_use_text_only_path(&self, query: &str) -> bool {
+        if self.is_short || self.is_path_like || self.is_sym_strong {
+            return false;
+        }
+
+        let query = query.trim();
+        self.is_literal_code
+            || query.contains(' ')
+            || query.contains(';')
+            || query.contains('"')
+            || query.contains('#')
     }
 
     fn live_find_engine_skip_reason(
@@ -610,6 +629,10 @@ pub async fn handle_query(
             &req.project_root,
             req.engine_db_path.clone(),
             req.query.clone(),
+            Some(PartialQuerySender {
+                tx: tx.clone(),
+                msgid,
+            }),
             persistent_cache_conn,
         )? {
             return Ok(value);
@@ -617,7 +640,7 @@ pub async fn handle_query(
 
         if is_streaming_query(&req.query) {
             query::process_query_streaming(&conn, req.query, move |items| {
-                send_query_partial(&tx, msgid, items)?;
+                send_query_partial(&tx, msgid, items, true, false)?;
                 Ok(())
             })
         } else {
@@ -693,6 +716,7 @@ fn handle_state_query(
     project_root: &str,
     engine_db_path: Option<String>,
     request: QueryRequest,
+    partial: Option<PartialQuerySender>,
     persistent_cache_conn: Option<Arc<parking_lot::Mutex<rusqlite::Connection>>>,
 ) -> Result<Option<Value>> {
     match request {
@@ -773,6 +797,7 @@ fn handle_state_query(
                 offset,
                 current_file.as_deref(),
                 repeated_query,
+                partial.as_ref().filter(|_| offset == 0),
             )?;
             Ok(Some(value))
         }
@@ -1057,10 +1082,18 @@ fn is_streaming_query(request: &QueryRequest) -> bool {
 
 /// Send one query partial notification through MessagePack RPC channel.
 /// 通过 MessagePack RPC 通道发送一批 query partial 数据。
-fn send_query_partial(tx: &mpsc::Sender<Vec<u8>>, msgid: u64, items: Vec<Value>) -> Result<()> {
+fn send_query_partial(
+    tx: &mpsc::Sender<Vec<u8>>,
+    msgid: u64,
+    items: Vec<Value>,
+    append: bool,
+    done: bool,
+) -> Result<()> {
     let notification = (2, "query/partial", json!({
         "msgid": msgid,
         "items": items,
+        "append": append,
+        "done": done,
     }));
 
     let payload = rmp_serde::to_vec(&notification)?;
@@ -1109,6 +1142,7 @@ fn goto_definition_with_engine(
 
     if !project_result.is_null() {
         tag_value_source(&mut project_result, "project");
+        navigation_cache.lock().put(cache_key, project_result.clone());
         return Ok(project_result);
     }
 
@@ -1143,6 +1177,8 @@ fn goto_definition_with_engine(
     if !engine_result.is_null() {
         tag_value_source(&mut engine_result, "engine");
     }
+
+    navigation_cache.lock().put(cache_key, engine_result.clone());
 
     Ok(engine_result)
 }
@@ -1271,7 +1307,7 @@ fn hover_with_engine(
         return Ok(Value::Null);
     }
 
-    let engine_conn = match state.get_read_only_connection(&engine_db_path) {
+    let engine_conn = match state.get_shared_read_only_connection(&engine_db_path) {
         Ok(conn) => conn,
         Err(err) => {
             warn!("Failed to open Engine DB for hover: {}", err);
@@ -1279,13 +1315,10 @@ fn hover_with_engine(
         }
     };
 
-    let mut engine_result = match query::goto::get_hover(
-        &engine_conn,
-        content,
-        line,
-        character,
-        file_path,
-    ) {
+    let mut engine_result = match {
+        let engine_conn = engine_conn.lock();
+        query::goto::get_hover(&engine_conn, content, line, character, file_path)
+    } {
         Ok(value) => value,
         Err(err) => {
             warn!("Failed to query Engine DB hover: {}", err);
@@ -2055,6 +2088,7 @@ fn unified_live_find_with_engine(
     offset: usize,
     current_file: Option<&str>,
     repeated_query: bool,
+    partial: Option<&PartialQuerySender>,
 ) -> Result<Value> {
     let pattern = pattern.trim();
     if pattern.is_empty() {
@@ -2076,6 +2110,61 @@ fn unified_live_find_with_engine(
         .as_deref()
         .map(|path| file_exists_in_index(project_conn, path))
         .unwrap_or(false);
+    let send_partial = |items: &[Value], append: bool| -> Result<()> {
+        if let Some(partial) = partial {
+            send_query_partial(&partial.tx, partial.msgid, items.to_vec(), append, false)?;
+        }
+        Ok(())
+    };
+
+    if profile.should_use_text_only_path(pattern) {
+        let mut results = value_array(query::search::search_code_text(project_conn, pattern, target, 0)?);
+        tag_source(&mut results, "project");
+        rank_live_find_results(
+            &mut results,
+            pattern,
+            current_file.as_deref(),
+            current_module.as_deref(),
+        );
+
+        let project_page = results
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .cloned()
+            .collect::<Vec<_>>();
+        send_partial(&project_page, false)?;
+
+        if repeated_query && results.len() < target {
+            if let Some(engine_conn) =
+                open_engine_query_connection(state.clone(), engine_db_path.clone(), "unified text-only live find")?
+            {
+                let mut engine_results = {
+                    let engine_conn = engine_conn.lock();
+                    value_array(query::search::search_code_text(&engine_conn, pattern, target, 0)?)
+                };
+                tag_source(&mut engine_results, "engine");
+                merge_query_results(&mut results, engine_results, target);
+                rank_live_find_results(
+                    &mut results,
+                    pattern,
+                    current_file.as_deref(),
+                    current_module.as_deref(),
+                );
+            }
+        }
+
+        let page = results
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .collect::<Vec<_>>();
+        if partial.is_some() {
+            return Ok(json!(live_find_append_delta(&page, &project_page)));
+        }
+        return Ok(json!(page));
+    }
+
     let project_hot_index =
         load_search_hot_index(&state, _project_db_path, "unified live find project");
 
@@ -2122,7 +2211,53 @@ fn unified_live_find_with_engine(
     }
 
     let mut results = project_results;
-    if skip_reason.is_none() {
+    let phase0_hqh = live_find_hqh_count(&results);
+    let forced_reliable_text = profile.should_force_reliable_text_search(phase0_hqh);
+    let should_run_text_stage = forced_reliable_text
+        || should_run_live_find_text_stage(pattern, phase0_hqh, repeated_query);
+
+    let mut text_count = 0usize;
+    let mut phase_reports = Vec::new();
+    if forced_reliable_text {
+        let mut text_results =
+            value_array(query::search::search_code_text(project_conn, pattern, target, 0)?);
+        tag_source(&mut text_results, "project");
+        text_count = text_results.len();
+        if !text_results.is_empty() {
+            results = text_results;
+        }
+    } else if should_run_text_stage {
+        let text_limit = live_find_text_limit(pattern, limit, repeated_query);
+        let mut text_state = LiveTextSearchState::new(pattern, "project", text_limit);
+        run_project_live_text_search(
+            project_conn,
+            &current_file,
+            current_module.as_deref(),
+            pattern,
+            repeated_query,
+            &mut text_state,
+            &mut phase_reports,
+        )?;
+        text_count = text_state.results.len();
+        results.extend(text_state.results);
+    }
+
+    rank_live_find_results(
+        &mut results,
+        pattern,
+        current_file.as_deref(),
+        current_module.as_deref(),
+    );
+
+    let project_page = results
+        .iter()
+        .skip(offset)
+        .take(limit)
+        .cloned()
+        .collect::<Vec<_>>();
+    send_partial(&project_page, false)?;
+
+    if skip_reason.is_none() && results.len() < target {
         let remaining = target.saturating_sub(results.len());
         let engine_target = remaining.max(limit.min(64)).clamp(1, target);
         let engine_db_path_native = engine_db_path.as_deref().map(normalize_to_native);
@@ -2143,7 +2278,7 @@ fn unified_live_find_with_engine(
                 )?)
             };
             tag_source(&mut engine_results, "engine");
-            results.extend(engine_results);
+            merge_query_results(&mut results, engine_results, target);
             rank_live_find_results(
                 &mut results,
                 pattern,
@@ -2153,40 +2288,13 @@ fn unified_live_find_with_engine(
         }
     }
 
-    let phase0_hqh = live_find_hqh_count(&results);
-    let forced_reliable_text = profile.should_force_reliable_text_search(phase0_hqh);
-    let should_run_text_stage = forced_reliable_text
-        || should_run_live_find_text_stage(pattern, phase0_hqh, repeated_query);
-
-    let mut text_count = 0usize;
-    if forced_reliable_text {
-        let mut text_results =
-            value_array(query::search::search_code_text(project_conn, pattern, target, 0)?);
-        tag_source(&mut text_results, "project");
-        text_count = text_results.len();
-        if !text_results.is_empty() {
-            results = text_results;
-        }
-    } else if should_run_text_stage {
+    if should_run_text_stage
+        && repeated_query
+        && results.len() < target
+        && (live_find_is_text_like_query(pattern) || live_find_is_literal_code_query(pattern))
+    {
         let text_limit = live_find_text_limit(pattern, limit, repeated_query);
-        let mut phase_reports = Vec::new();
-        let mut text_state = LiveTextSearchState::new(pattern, "project", text_limit);
-        run_project_live_text_search(
-            project_conn,
-            &current_file,
-            current_module.as_deref(),
-            pattern,
-            repeated_query,
-            &mut text_state,
-            &mut phase_reports,
-        )?;
-        text_count = text_state.results.len();
-        results.extend(text_state.results);
-
-        if repeated_query
-            && text_count < text_limit
-            && (live_find_is_text_like_query(pattern) || live_find_is_literal_code_query(pattern))
-        {
+        if text_count < text_limit {
             if let Some(engine_conn) =
                 open_engine_query_connection(state.clone(), engine_db_path.clone(), "unified live text")?
             {
@@ -2197,40 +2305,39 @@ fn unified_live_find_with_engine(
                     run_engine_live_text_search(&engine_conn, pattern, &mut engine_text_state, &mut phase_reports)?;
                 }
                 text_count = text_count.saturating_add(engine_text_state.results.len());
-                results.extend(engine_text_state.results);
+                merge_query_results(&mut results, engine_text_state.results, target);
+                rank_live_find_results(
+                    &mut results,
+                    pattern,
+                    current_file.as_deref(),
+                    current_module.as_deref(),
+                );
             }
         }
+    }
 
-        rank_live_find_results(
-            &mut results,
+    if log_enabled && !phase_reports.is_empty() {
+        let summary = phase_reports
+            .iter()
+            .map(|phase| {
+                format!(
+                    "{}:{}f/{}kb/{}r/{}ms{}",
+                    phase.name,
+                    phase.files_scanned,
+                    phase.bytes_scanned / 1024,
+                    phase.results_found,
+                    phase.elapsed_ms,
+                    if phase.stopped { ":stop" } else { "" }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        info!(
+            target: "ucore::fast_find",
+            "UnifiedLiveFind text phases pattern={:?} {}",
             pattern,
-            current_file.as_deref(),
-            current_module.as_deref(),
+            summary
         );
-
-        if log_enabled && !phase_reports.is_empty() {
-            let summary = phase_reports
-                .iter()
-                .map(|phase| {
-                    format!(
-                        "{}:{}f/{}kb/{}r/{}ms{}",
-                        phase.name,
-                        phase.files_scanned,
-                        phase.bytes_scanned / 1024,
-                        phase.results_found,
-                        phase.elapsed_ms,
-                        if phase.stopped { ":stop" } else { "" }
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(" | ");
-            info!(
-                target: "ucore::fast_find",
-                "UnifiedLiveFind text phases pattern={:?} {}",
-                pattern,
-                summary
-            );
-        }
     }
 
     if log_enabled {
@@ -2260,7 +2367,22 @@ fn unified_live_find_with_engine(
         .skip(offset)
         .take(limit)
         .collect::<Vec<_>>();
+    if partial.is_some() {
+        return Ok(json!(live_find_append_delta(&page, &project_page)));
+    }
     Ok(json!(page))
+}
+
+fn live_find_append_delta(final_page: &[Value], already_sent: &[Value]) -> Vec<Value> {
+    let seen = already_sent
+        .iter()
+        .map(result_identity)
+        .collect::<HashSet<_>>();
+    final_page
+        .iter()
+        .filter(|item| !seen.contains(&result_identity(item)))
+        .cloned()
+        .collect()
 }
 
 fn live_find_tag_summary(pattern: &str) -> String {
