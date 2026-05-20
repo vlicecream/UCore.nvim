@@ -179,7 +179,7 @@ pub fn process_query(conn: &Connection, request: QueryRequest) -> Result<Value> 
             class_name,
             symbol_name,
             ..
-        } => Ok(goto::find_symbol_in_inheritance_chain(conn, &class_name, &symbol_name)?
+        } => Ok(goto::find_symbol_in_inheritance_chain(conn, None, &class_name, &symbol_name)?
             .unwrap_or(Value::Null)),
 
         QueryRequest::FindSymbolInModule { module, symbol } => {

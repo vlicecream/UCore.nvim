@@ -1162,10 +1162,19 @@ fn goto_definition_with_engine(
             return Ok(Value::Null);
         }
     };
+    let engine_nav_hot_index =
+        load_navigation_hot_index(&state, &engine_db_path, "goto definition engine");
 
     let mut engine_result = match {
         let engine_conn = engine_conn.lock();
-        query::goto::goto_definition(&engine_conn, content, line, character, file_path)
+        query::goto::goto_definition_with_hot_index(
+            &engine_conn,
+            engine_nav_hot_index.as_deref(),
+            content,
+            line,
+            character,
+            file_path,
+        )
     } {
         Ok(value) => value,
         Err(err) => {
@@ -1238,10 +1247,19 @@ fn goto_implementation_with_engine(
             return Ok(Value::Null);
         }
     };
+    let engine_nav_hot_index =
+        load_navigation_hot_index(&state, &engine_db_path, "goto implementation engine");
 
     let mut engine_result = match {
         let engine_conn = engine_conn.lock();
-        query::goto::goto_implementation(&engine_conn, content, line, character, file_path)
+        query::goto::goto_implementation_with_hot_index(
+            &engine_conn,
+            engine_nav_hot_index.as_deref(),
+            content,
+            line,
+            character,
+            file_path,
+        )
     } {
         Ok(value) => value,
         Err(err) => {
@@ -3146,6 +3164,23 @@ fn load_search_hot_index(
     }
 }
 
+fn load_navigation_hot_index(
+    state: &AppState,
+    db_path: &str,
+    label: &str,
+) -> Option<Arc<query::goto::NavigationHotIndex>> {
+    match state.get_navigation_hot_index(db_path) {
+        Ok(index) => Some(index),
+        Err(err) => {
+            warn!(
+                "Failed to open navigation hot index for {} ({}): {}",
+                db_path, label, err
+            );
+            None
+        }
+    }
+}
+
 fn load_usage_hot_index(
     state: &AppState,
     db_path: &str,
@@ -3779,6 +3814,7 @@ fn drop_db_connections(state: &AppState, db_path_native: &str, cache_db_path_uni
     drop(conns);
     state.read_only_connections.lock().remove(db_path_native);
     state.invalidate_search_hot_index(db_path_native);
+    state.invalidate_navigation_hot_index(db_path_native);
     state.invalidate_usage_hot_index(db_path_native);
 
     if let Some(cache_path) = cache_db_path_unix {

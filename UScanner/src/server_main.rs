@@ -50,6 +50,7 @@ async fn main() -> Result<()> {
         diagnostics_caches: Mutex::new(HashMap::new()),
         navigation_caches: Mutex::new(HashMap::new()),
         search_hot_indexes: Mutex::new(HashMap::new()),
+        navigation_hot_indexes: Mutex::new(HashMap::new()),
         usage_hot_indexes: Mutex::new(HashMap::new()),
     });
 

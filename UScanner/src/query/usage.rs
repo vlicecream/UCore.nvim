@@ -355,7 +355,9 @@ fn resolve_usage_scope(
         return Ok(None);
     };
 
-    let Some(member) = goto::find_symbol_in_inheritance_chain(conn, &target_class, symbol)? else {
+    let Some(member) =
+        goto::find_symbol_in_inheritance_chain(conn, None, &target_class, symbol)?
+    else {
         return Ok(None);
     };
 

@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::db;
+use crate::query::goto::{build_navigation_hot_index, NavigationHotIndex};
 use crate::query::search::{build_search_hot_index, SearchHotIndex};
 use crate::query::usage::{build_usage_hot_index, UsageHotIndex};
 use crate::types::{ConfigCache, PhaseInfo, Progress, ProgressPlan, ProgressReporter};
@@ -347,6 +348,7 @@ pub struct AppState {
     pub diagnostics_caches: Mutex<HashMap<String, Arc<Mutex<DiagnosticsCache>>>>,
     pub navigation_caches: Mutex<HashMap<String, Arc<Mutex<NavigationCache>>>>,
     pub search_hot_indexes: Mutex<HashMap<String, Arc<SearchHotIndex>>>,
+    pub navigation_hot_indexes: Mutex<HashMap<String, Arc<NavigationHotIndex>>>,
     pub usage_hot_indexes: Mutex<HashMap<String, Arc<UsageHotIndex>>>,
 }
 
@@ -562,6 +564,34 @@ impl AppState {
         self.search_hot_indexes.lock().remove(db_path);
     }
 
+    pub fn get_navigation_hot_index(&self, db_path: &str) -> Result<Arc<NavigationHotIndex>> {
+        {
+            let caches = self.navigation_hot_indexes.lock();
+            if let Some(index) = caches.get(db_path) {
+                return Ok(Arc::clone(index));
+            }
+        }
+
+        let started_at = Instant::now();
+        let conn = open_read_only_connection(db_path)?;
+        let index = Arc::new(build_navigation_hot_index(&conn)?);
+        info!(
+            "Navigation hot index built: {} in {} ms",
+            db_path,
+            started_at.elapsed().as_millis()
+        );
+
+        let mut caches = self.navigation_hot_indexes.lock();
+        let existing = caches
+            .entry(db_path.to_string())
+            .or_insert_with(|| Arc::clone(&index));
+        Ok(Arc::clone(existing))
+    }
+
+    pub fn invalidate_navigation_hot_index(&self, db_path: &str) {
+        self.navigation_hot_indexes.lock().remove(db_path);
+    }
+
     pub fn get_usage_hot_index(&self, db_path: &str) -> Result<Arc<UsageHotIndex>> {
         {
             let caches = self.usage_hot_indexes.lock();
@@ -596,6 +626,7 @@ impl AppState {
         self.connections.lock().remove(db_path);
         self.read_only_connections.lock().remove(db_path);
         self.search_hot_indexes.lock().remove(db_path);
+        self.navigation_hot_indexes.lock().remove(db_path);
         self.usage_hot_indexes.lock().remove(db_path);
 
         if let Some(cache_path) = cache_db_path {

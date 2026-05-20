@@ -8,6 +8,33 @@ use tree_sitter::{Node, Parser, Point};
 use crate::db::ensure_search_projections;
 use crate::db::project_path::PATH_CTE;
 
+#[derive(Clone)]
+struct TypeNavEntry {
+    symbol_name: String,
+    line_number: i64,
+    file_path: String,
+    kind: String,
+    sort_rank: (u8, u8, i64),
+}
+
+#[derive(Clone)]
+struct MemberNavEntry {
+    symbol_name: String,
+    line_number: i64,
+    file_path: String,
+    class_name: String,
+    prefer_def_rank: (u8, u8, i64),
+    prefer_impl_rank: (u8, u8, i64),
+}
+
+pub struct NavigationHotIndex {
+    class_ids_by_name: HashMap<String, Vec<i64>>,
+    parent_ids_by_child: HashMap<i64, Vec<i64>>,
+    type_defs_by_name: HashMap<String, Vec<TypeNavEntry>>,
+    members_by_class_and_name: HashMap<String, Vec<MemberNavEntry>>,
+    members_anywhere_by_name: HashMap<String, Vec<MemberNavEntry>>,
+}
+
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
@@ -737,20 +764,47 @@ fn find_member_in_class(
 /// 用 BFS 遍历继承链，并查找成员定义。
 pub fn find_symbol_in_inheritance_chain(
     conn: &Connection,
+    hot_index: Option<&NavigationHotIndex>,
     class_name: &str,
     symbol_name: &str,
 ) -> Result<Option<Value>> {
-    find_symbol_in_inheritance_chain_inner(conn, class_name, symbol_name, false)
+    find_symbol_in_inheritance_chain_inner(conn, hot_index, class_name, symbol_name, false)
 }
 
 /// Same as find_symbol_in_inheritance_chain but with configurable direction.
 /// 同上，但可配置跳转方向。
 fn find_symbol_in_inheritance_chain_inner(
     conn: &Connection,
+    hot_index: Option<&NavigationHotIndex>,
     class_name: &str,
     symbol_name: &str,
     prefer_impl: bool,
 ) -> Result<Option<Value>> {
+    if let Some(hot_index) = hot_index {
+        let start_ids = hot_index.get_class_ids(class_name);
+        if start_ids.is_empty() {
+            return Ok(None);
+        }
+
+        let mut queue = VecDeque::from(start_ids);
+        let mut visited = HashSet::new();
+        while let Some(class_id) = queue.pop_front() {
+            if !visited.insert(class_id) {
+                continue;
+            }
+            if let Some(result) = hot_index.find_member_in_class(class_id, symbol_name, prefer_impl) {
+                return Ok(Some(result));
+            }
+            for parent_id in hot_index.get_parent_ids(class_id) {
+                if !visited.contains(&parent_id) {
+                    queue.push_back(parent_id);
+                }
+            }
+        }
+
+        return Ok(None);
+    }
+
     let mut ctx = GotoCtx::new(conn);
     let start_ids = ctx.get_class_ids(class_name)?;
 
@@ -782,11 +836,21 @@ fn find_symbol_in_inheritance_chain_inner(
 
 /// Find a class, struct, or enum definition.
 /// 查找 class、struct 或 enum 的定义位置。
-fn find_type_definition(conn: &Connection, name: &str) -> Result<Option<Value>> {
+fn find_type_definition(
+    conn: &Connection,
+    hot_index: Option<&NavigationHotIndex>,
+    name: &str,
+) -> Result<Option<Value>> {
     let name = strip_namespace(name);
 
     if name.is_empty() {
         return Ok(None);
+    }
+
+    if let Some(hot_index) = hot_index {
+        if let Some(value) = hot_index.find_type_definition(&name) {
+            return Ok(Some(value));
+        }
     }
 
     let sql = r#"
@@ -952,7 +1016,18 @@ fn find_member_in_module(
 
 /// Final fallback: find a member by name anywhere.
 /// 最终兜底：在全工程按成员名查找。
-fn find_member_anywhere(conn: &Connection, symbol_name: &str, prefer_impl: bool) -> Result<Option<Value>> {
+fn find_member_anywhere(
+    conn: &Connection,
+    hot_index: Option<&NavigationHotIndex>,
+    symbol_name: &str,
+    prefer_impl: bool,
+) -> Result<Option<Value>> {
+    if let Some(hot_index) = hot_index {
+        if let Some(value) = hot_index.find_member_anywhere(symbol_name, prefer_impl) {
+            return Ok(Some(value));
+        }
+    }
+
     let sql = if prefer_impl {
         r#"
         SELECT name, line_number, path, owner_name
@@ -1066,6 +1141,308 @@ fn resolve_impl_class(ctx: &CursorCtx, content: &str, cursor_line: u32) -> Optio
         }
     }
     ctx.enclosing_class.clone()
+}
+
+fn type_sort_rank(path: &str, line_number: i64) -> (u8, u8, i64) {
+    let lowered = path.to_ascii_lowercase();
+    let generated_rank = if lowered.ends_with(".generated.h") { 1 } else { 0 };
+    let ext_rank = if lowered.ends_with(".h") {
+        0
+    } else if lowered.ends_with(".hpp") {
+        1
+    } else if lowered.ends_with(".inl") {
+        2
+    } else {
+        3
+    };
+    (generated_rank, ext_rank, line_number)
+}
+
+fn member_def_sort_rank(path: &str, line_number: i64) -> (u8, u8, i64) {
+    let lowered = path.to_ascii_lowercase();
+    let generated_rank = if lowered.ends_with(".generated.h") { 1 } else { 0 };
+    let ext_rank = if lowered.ends_with(".h") {
+        0
+    } else if lowered.ends_with(".hpp") {
+        1
+    } else if lowered.ends_with(".inl") {
+        2
+    } else if lowered.ends_with(".cpp") {
+        3
+    } else if lowered.ends_with(".cc") {
+        4
+    } else if lowered.ends_with(".cxx") {
+        5
+    } else {
+        6
+    };
+    (generated_rank, ext_rank, line_number)
+}
+
+fn member_impl_sort_rank(path: &str, access: &str, line_number: i64) -> (u8, u8, i64) {
+    let lowered = path.to_ascii_lowercase();
+    let access_rank = if access == "impl" { 0 } else { 1 };
+    let ext_rank = if lowered.ends_with(".cpp") {
+        0
+    } else if lowered.ends_with(".cc") {
+        1
+    } else if lowered.ends_with(".cxx") {
+        2
+    } else {
+        3
+    };
+    (access_rank, ext_rank, line_number)
+}
+
+fn class_member_key(class_id: i64, symbol_name: &str) -> String {
+    format!("{}\n{}", class_id, symbol_name)
+}
+
+fn member_entry_to_value(entry: &MemberNavEntry) -> Value {
+    json!({
+        "symbol_name": entry.symbol_name,
+        "line_number": entry.line_number,
+        "file_path": entry.file_path,
+        "class_name": entry.class_name,
+    })
+}
+
+fn type_entry_to_value(entry: &TypeNavEntry) -> Value {
+    json!({
+        "symbol_name": entry.symbol_name,
+        "line_number": entry.line_number,
+        "file_path": entry.file_path,
+        "class_name": entry.symbol_name,
+        "kind": entry.kind,
+    })
+}
+
+pub fn build_navigation_hot_index(conn: &Connection) -> Result<NavigationHotIndex> {
+    ensure_search_projections(conn)?;
+
+    let mut class_ids_by_name = HashMap::<String, Vec<i64>>::new();
+    let mut type_defs_by_name = HashMap::<String, Vec<TypeNavEntry>>::new();
+    let mut stmt = conn.prepare(&format!(
+        r#"
+        {}
+        SELECT
+            c.id,
+            sc.text,
+            c.line_number,
+            dp.full_path || '/' || sf.text,
+            c.symbol_type
+        FROM classes c
+        JOIN strings sc ON c.name_id = sc.id
+        JOIN files f ON c.file_id = f.id
+        JOIN dir_paths dp ON f.directory_id = dp.id
+        JOIN strings sf ON f.filename_id = sf.id
+        ORDER BY c.id
+        "#,
+        PATH_CTE
+    ))?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            normalize_path(&row.get::<_, String>(3)?),
+            row.get::<_, String>(4)?,
+        ))
+    })?;
+    for row in rows {
+        let (class_id, class_name, line_number, file_path, kind) = row?;
+        class_ids_by_name
+            .entry(strip_namespace(&class_name))
+            .or_default()
+            .push(class_id);
+        type_defs_by_name
+            .entry(strip_namespace(&class_name))
+            .or_default()
+            .push(TypeNavEntry {
+                symbol_name: class_name,
+                line_number,
+                file_path: file_path.clone(),
+                kind,
+                sort_rank: type_sort_rank(&file_path, line_number),
+            });
+    }
+    for ids in class_ids_by_name.values_mut() {
+        ids.sort_unstable();
+        ids.dedup();
+    }
+    for entries in type_defs_by_name.values_mut() {
+        entries.sort_by(|left, right| left.sort_rank.cmp(&right.sort_rank));
+    }
+
+    let mut parent_ids_by_child = HashMap::<i64, Vec<i64>>::new();
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT i.child_id, i.parent_class_id, sp.text
+        FROM inheritance i
+        JOIN strings sp ON i.parent_name_id = sp.id
+        "#,
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, Option<i64>>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (child_id, maybe_parent_id, parent_name) = row?;
+        let parents = parent_ids_by_child.entry(child_id).or_default();
+        if let Some(parent_id) = maybe_parent_id {
+            parents.push(parent_id);
+        } else {
+            for parent_id in class_ids_by_name
+                .get(&strip_namespace(&parent_name))
+                .cloned()
+                .unwrap_or_default()
+            {
+                parents.push(parent_id);
+            }
+        }
+    }
+    for ids in parent_ids_by_child.values_mut() {
+        ids.sort_unstable();
+        ids.dedup();
+    }
+
+    let mut members_by_class_and_name = HashMap::<String, Vec<MemberNavEntry>>::new();
+    let mut members_anywhere_by_name = HashMap::<String, Vec<MemberNavEntry>>::new();
+    let mut stmt = conn.prepare(&format!(
+        r#"
+        {}
+        SELECT
+            c.id,
+            sc.text,
+            sm.text,
+            m.line_number,
+            dp.full_path || '/' || sf.text,
+            COALESCE(m.access, '')
+        FROM members m
+        JOIN strings sm ON m.name_id = sm.id
+        JOIN classes c ON m.class_id = c.id
+        JOIN strings sc ON c.name_id = sc.id
+        JOIN files f ON COALESCE(m.file_id, c.file_id) = f.id
+        JOIN dir_paths dp ON f.directory_id = dp.id
+        JOIN strings sf ON f.filename_id = sf.id
+        ORDER BY c.id, m.line_number
+        "#,
+        PATH_CTE
+    ))?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+            normalize_path(&row.get::<_, String>(4)?),
+            row.get::<_, String>(5)?,
+        ))
+    })?;
+    for row in rows {
+        let (class_id, class_name, symbol_name, line_number, file_path, access) = row?;
+        let entry = MemberNavEntry {
+            symbol_name: symbol_name.clone(),
+            line_number,
+            file_path: file_path.clone(),
+            class_name,
+            prefer_def_rank: member_def_sort_rank(&file_path, line_number),
+            prefer_impl_rank: member_impl_sort_rank(&file_path, &access, line_number),
+        };
+        members_by_class_and_name
+            .entry(class_member_key(class_id, &symbol_name))
+            .or_default()
+            .push(entry.clone());
+        members_anywhere_by_name
+            .entry(symbol_name)
+            .or_default()
+            .push(entry);
+    }
+    for entries in members_by_class_and_name.values_mut() {
+        entries.sort_by(|left, right| {
+            left.prefer_def_rank
+                .cmp(&right.prefer_def_rank)
+                .then_with(|| left.file_path.cmp(&right.file_path))
+        });
+    }
+    for entries in members_anywhere_by_name.values_mut() {
+        entries.sort_by(|left, right| {
+            left.prefer_def_rank
+                .cmp(&right.prefer_def_rank)
+                .then_with(|| left.file_path.cmp(&right.file_path))
+        });
+    }
+
+    Ok(NavigationHotIndex {
+        class_ids_by_name,
+        parent_ids_by_child,
+        type_defs_by_name,
+        members_by_class_and_name,
+        members_anywhere_by_name,
+    })
+}
+
+impl NavigationHotIndex {
+    fn get_class_ids(&self, name: &str) -> Vec<i64> {
+        self.class_ids_by_name
+            .get(&strip_namespace(name))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn get_parent_ids(&self, class_id: i64) -> Vec<i64> {
+        self.parent_ids_by_child
+            .get(&class_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn find_member_in_class(
+        &self,
+        class_id: i64,
+        symbol_name: &str,
+        prefer_impl: bool,
+    ) -> Option<Value> {
+        let entries = self
+            .members_by_class_and_name
+            .get(&class_member_key(class_id, symbol_name))?;
+        let mut selected = entries.first()?.clone();
+        if prefer_impl {
+            if let Some(best) = entries
+                .iter()
+                .min_by(|left, right| left.prefer_impl_rank.cmp(&right.prefer_impl_rank))
+            {
+                selected = best.clone();
+            }
+        }
+        Some(member_entry_to_value(&selected))
+    }
+
+    fn find_member_anywhere(&self, symbol_name: &str, prefer_impl: bool) -> Option<Value> {
+        let entries = self.members_anywhere_by_name.get(symbol_name)?;
+        let mut selected = entries.first()?.clone();
+        if prefer_impl {
+            if let Some(best) = entries
+                .iter()
+                .min_by(|left, right| left.prefer_impl_rank.cmp(&right.prefer_impl_rank))
+            {
+                selected = best.clone();
+            }
+        }
+        Some(member_entry_to_value(&selected))
+    }
+
+    fn find_type_definition(&self, name: &str) -> Option<Value> {
+        let entry = self
+            .type_defs_by_name
+            .get(&strip_namespace(name))?
+            .first()?
+            .clone();
+        Some(type_entry_to_value(&entry))
+    }
 }
 
 fn resolve_lookup_class(ctx: &CursorCtx, content: &str, cursor_line: u32) -> Option<String> {
@@ -2046,12 +2423,22 @@ fn scan_local_declarations(
 /// 按类名查找成员（非 class_id），同时命中 .h 和 .cpp 记录。
 fn find_member_by_class_name(
     conn: &Connection,
+    hot_index: Option<&NavigationHotIndex>,
     class_name: &str,
     symbol_name: &str,
     prefer_impl: bool,
 ) -> Result<Option<Value>> {
     let name = strip_namespace(class_name);
     if name.is_empty() {
+        return Ok(None);
+    }
+
+    if let Some(hot_index) = hot_index {
+        for class_id in hot_index.get_class_ids(&name) {
+            if let Some(value) = hot_index.find_member_in_class(class_id, symbol_name, prefer_impl) {
+                return Ok(Some(value));
+            }
+        }
         return Ok(None);
     }
 
@@ -2108,6 +2495,7 @@ fn get_class_name_by_id(conn: &Connection, class_id: i64) -> Result<String> {
 /// 遍历继承链，按类名查找实现。
 fn find_impl_in_inheritance(
     conn: &Connection,
+    hot_index: Option<&NavigationHotIndex>,
     class_name: &str,
     symbol_name: &str,
 ) -> Result<Option<Value>> {
@@ -2116,7 +2504,11 @@ fn find_impl_in_inheritance(
         return Ok(None);
     }
 
-    if let Some(result) = find_member_by_class_name(conn, &name, symbol_name, true)? {
+    if let Some(hot_index) = hot_index {
+        return find_symbol_in_inheritance_chain_inner(conn, Some(hot_index), &name, symbol_name, true);
+    }
+
+    if let Some(result) = find_member_by_class_name(conn, None, &name, symbol_name, true)? {
         return Ok(Some(result));
     }
 
@@ -2137,7 +2529,7 @@ fn find_impl_in_inheritance(
                 let parent_short = strip_namespace(&parent_name);
                 if !parent_short.is_empty() && tried_names.insert(parent_short.clone()) {
                     if let Some(result) =
-                        find_member_by_class_name(conn, &parent_short, symbol_name, true)?
+                        find_member_by_class_name(conn, None, &parent_short, symbol_name, true)?
                     {
                         return Ok(Some(result));
                     }
@@ -2167,7 +2559,7 @@ pub fn goto_definition(
     file_path: Option<String>,
 ) -> Result<Value> {
     ensure_search_projections(conn)?;
-    goto_definition_inner(conn, content, line, character, file_path, false)
+    goto_definition_inner(conn, None, content, line, character, file_path, false)
 }
 
 /// Go to Implementation entry point (prefers .cpp definitions).
@@ -2180,7 +2572,31 @@ pub fn goto_implementation(
     file_path: Option<String>,
 ) -> Result<Value> {
     ensure_search_projections(conn)?;
-    goto_definition_inner(conn, content, line, character, file_path, true)
+    goto_definition_inner(conn, None, content, line, character, file_path, true)
+}
+
+pub fn goto_definition_with_hot_index(
+    conn: &Connection,
+    hot_index: Option<&NavigationHotIndex>,
+    content: String,
+    line: u32,
+    character: u32,
+    file_path: Option<String>,
+) -> Result<Value> {
+    ensure_search_projections(conn)?;
+    goto_definition_inner(conn, hot_index, content, line, character, file_path, false)
+}
+
+pub fn goto_implementation_with_hot_index(
+    conn: &Connection,
+    hot_index: Option<&NavigationHotIndex>,
+    content: String,
+    line: u32,
+    character: u32,
+    file_path: Option<String>,
+) -> Result<Value> {
+    ensure_search_projections(conn)?;
+    goto_definition_inner(conn, hot_index, content, line, character, file_path, true)
 }
 
 /// Resolve hover information for the symbol under cursor.
@@ -2276,6 +2692,7 @@ pub fn get_signature_help(
 
 fn goto_definition_inner(
     conn: &Connection,
+    hot_index: Option<&NavigationHotIndex>,
     content: String,
     line: u32,
     character: u32,
@@ -2355,7 +2772,7 @@ fn goto_definition_inner(
     // 实现模式：按类名搜。不全局兜底，避免跳到无关类的同名成员。
     if prefer_impl {
         if let Some(ref name) = resolve_impl_class(&ctx, &content, line) {
-            if let Some(result) = find_impl_in_inheritance(conn, name, &ctx.symbol)? {
+            if let Some(result) = find_impl_in_inheritance(conn, hot_index, name, &ctx.symbol)? {
                 tracing::debug!(
                     "goto_{}: resolved '{}' through impl class '{}'",
                     mode,
@@ -2364,7 +2781,7 @@ fn goto_definition_inner(
                 );
                 return Ok(result);
             }
-            if let Some(result) = find_member_by_class_name(conn, name, &ctx.symbol, false)? {
+            if let Some(result) = find_member_by_class_name(conn, hot_index, name, &ctx.symbol, false)? {
                 tracing::debug!(
                     "goto_{}: fell back to class member '{}' on '{}'",
                     mode,
@@ -2375,7 +2792,7 @@ fn goto_definition_inner(
             }
         }
         if matches!(ctx.qualifier_op.as_deref(), Some("::")) || ctx.enclosing_class.is_none() {
-            if let Some(result) = find_member_anywhere(conn, &ctx.symbol, false)? {
+            if let Some(result) = find_member_anywhere(conn, hot_index, &ctx.symbol, false)? {
                 tracing::debug!(
                     "goto_{}: resolved '{}' via global static/member fallback",
                     mode,
@@ -2412,8 +2829,7 @@ fn goto_definition_inner(
             _ => qualifier.clone(),
         };
 
-        if let Some(result) =
-            find_symbol_in_inheritance_chain(conn, &resolved_class, &ctx.symbol)?
+        if let Some(result) = find_symbol_in_inheritance_chain(conn, hot_index, &resolved_class, &ctx.symbol)?
         {
             tracing::debug!(
                 "goto_{}: resolved '{}' via qualifier class '{}'",
@@ -2439,8 +2855,7 @@ fn goto_definition_inner(
     // 2. Try member lookup from the enclosing class.
     // 2. 尝试从当前所在类里查成员。
     if let Some(ref enclosing_class) = ctx.enclosing_class {
-        if let Some(result) =
-            find_symbol_in_inheritance_chain(conn, enclosing_class, &ctx.symbol)?
+        if let Some(result) = find_symbol_in_inheritance_chain(conn, hot_index, enclosing_class, &ctx.symbol)?
         {
             tracing::debug!(
                 "goto_{}: resolved '{}' via enclosing class '{}'",
@@ -2454,7 +2869,7 @@ fn goto_definition_inner(
 
     // 3. Try type definition lookup.
     // 3. 尝试按类型定义查找。
-    if let Some(result) = find_type_definition(conn, &ctx.symbol)? {
+    if let Some(result) = find_type_definition(conn, hot_index, &ctx.symbol)? {
         tracing::debug!(
             "goto_{}: resolved '{}' as type definition",
             mode,
@@ -2466,7 +2881,7 @@ fn goto_definition_inner(
     // 4. Final fallback: member search across the whole project.
     // 4. 最终兜底：全工程成员名搜索。
     if !has_explicit_qualifier(&ctx) {
-        if let Some(result) = find_member_anywhere(conn, &ctx.symbol, false)? {
+        if let Some(result) = find_member_anywhere(conn, hot_index, &ctx.symbol, false)? {
             tracing::debug!(
                 "goto_{}: resolved '{}' via global member fallback",
                 mode,
