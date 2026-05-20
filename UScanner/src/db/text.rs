@@ -330,21 +330,22 @@ fn insert_text_file_records(
     ])?;
 
     let mut reader = BufReader::new(file_handle);
-    let mut line = String::new();
+    let mut line = Vec::new();
     let mut line_number = 0i64;
 
     loop {
         line.clear();
-        let read = reader.read_line(&mut line)?;
+        let read = reader.read_until(b'\n', &mut line)?;
         if read == 0 {
             break;
         }
 
         line_number += 1;
+        let line_text = decode_text_line_lossy(&line);
         stmt_insert_line.execute(params![
             normalized_path.as_str(),
             line_number,
-            trim_line_ending(&line),
+            trim_line_ending(&line_text),
         ])?;
     }
 
@@ -508,10 +509,18 @@ pub fn read_line_at(path: &str, line_number: usize) -> Option<String> {
     }
 
     let file = File::open(path).ok()?;
-    let reader = BufReader::new(file);
-    for (index, line) in reader.lines().enumerate() {
-        if index + 1 == line_number {
-            return line.ok();
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut index = 0usize;
+    loop {
+        line.clear();
+        let read = reader.read_until(b'\n', &mut line).ok()?;
+        if read == 0 {
+            break;
+        }
+        index += 1;
+        if index == line_number {
+            return Some(trim_line_ending(&decode_text_line_lossy(&line)).to_string());
         }
     }
 
@@ -662,19 +671,20 @@ fn collect_line_matches_from_file(
         Err(_) => return Ok(()),
     };
     let mut reader = BufReader::new(file);
-    let mut line = String::new();
+    let mut line = Vec::new();
     let normalized_path = normalize_path(path);
     let mut line_number = 0usize;
 
     loop {
         line.clear();
-        let read = reader.read_line(&mut line)?;
+        let read = reader.read_until(b'\n', &mut line)?;
         if read == 0 {
             break;
         }
 
         line_number += 1;
-        if !line.to_ascii_lowercase().contains(needle_lower) {
+        let line_text = decode_text_line_lossy(&line);
+        if !line_text.to_ascii_lowercase().contains(needle_lower) {
             continue;
         }
 
@@ -686,7 +696,7 @@ fn collect_line_matches_from_file(
         results.push(TextLineMatch {
             path: normalized_path.clone(),
             line_number: line_number as i64,
-            line_text: line.trim_end().to_string(),
+            line_text: trim_line_ending(&line_text).to_string(),
         });
 
         if results.len() >= limit {
@@ -695,6 +705,10 @@ fn collect_line_matches_from_file(
     }
 
     Ok(())
+}
+
+fn decode_text_line_lossy(line: &[u8]) -> String {
+    String::from_utf8_lossy(line).into_owned()
 }
 
 fn quoted_match_query(input: &str) -> String {
@@ -901,6 +915,36 @@ mod tests {
 
         delete_text_files(db_path.to_string_lossy().as_ref(), &[source_path_text]).unwrap();
         assert!(search_matching_lines(&conn, "BetaCall", 20, 0).unwrap().is_empty());
+
+        let _ = fs::remove_file(derived_text_db_path(db_path.to_string_lossy().as_ref()));
+        let _ = fs::remove_file(&db_path);
+        let _ = fs::remove_file(&source_path);
+        let _ = fs::remove_dir(&base);
+    }
+
+    #[test]
+    fn sync_text_files_tolerates_non_utf8_lines() {
+        let base = temp_base("nonutf8");
+        let (conn, db_path) = create_primary_db(&base);
+        let source_path = base.join("AnsiLike.cpp");
+        let source_path_text = source_path.to_string_lossy().to_string();
+
+        fs::write(&source_path, b"AlphaCall();\nBeta:\xFF\xFE\x80\n").unwrap();
+        sync_text_files(
+            db_path.to_string_lossy().as_ref(),
+            &[TextIndexFile {
+                path: source_path_text.clone(),
+                extension: "cpp".to_string(),
+                mtime: 1,
+            }],
+            None,
+        )
+        .unwrap();
+
+        let alpha_hits = search_matching_lines(&conn, "AlphaCall", 20, 0).unwrap();
+        assert_eq!(alpha_hits.len(), 1);
+        let beta_line = read_line_at(&source_path_text, 2).unwrap();
+        assert!(beta_line.contains("Beta:"));
 
         let _ = fs::remove_file(derived_text_db_path(db_path.to_string_lossy().as_ref()));
         let _ = fs::remove_file(&db_path);
