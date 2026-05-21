@@ -1113,11 +1113,12 @@ fn find_member_in_module(
 
     let mut result = conn
         .query_row(&sql, params![module_name, symbol_name], |row| {
+            let class_name = row.get::<_, Option<String>>(3)?.unwrap_or_default();
             Ok(json!({
                 "symbol_name": row.get::<_, String>(0)?,
                 "line_number": row.get::<_, i64>(1)?,
                 "file_path": normalize_path(&row.get::<_, String>(2)?),
-                "class_name": row.get::<_, String>(3)?,
+                "class_name": class_name,
             }))
         })
         .optional()?;
@@ -1183,11 +1184,12 @@ fn find_member_anywhere(
 
     let mut result = conn
         .query_row(&sql, [symbol_name], |row| {
+            let class_name = row.get::<_, Option<String>>(3)?.unwrap_or_default();
             Ok(json!({
                 "symbol_name": row.get::<_, String>(0)?,
                 "line_number": row.get::<_, i64>(1)?,
                 "file_path": normalize_path(&row.get::<_, String>(2)?),
-                "class_name": row.get::<_, String>(3)?,
+                "class_name": class_name,
             }))
         })
         .optional()?;
@@ -3373,7 +3375,7 @@ fn goto_definition_inner(
             }
         }
         if matches!(ctx.qualifier_op.as_deref(), Some("::")) || ctx.enclosing_class.is_none() {
-            if let Some(result) = find_member_anywhere(conn, hot_index, &ctx.symbol, false)? {
+            if let Some(result) = find_member_anywhere(conn, hot_index, &ctx.symbol, true)? {
                 tracing::debug!(
                     "goto_{}: resolved '{}' via global static/member fallback",
                     mode,
@@ -3994,6 +3996,52 @@ public:
         .unwrap();
     }
 
+    fn insert_search_symbol(
+        conn: &Connection,
+        file_id: i64,
+        symbol_rowid: i64,
+        kind: &str,
+        name: &str,
+        owner_name: Option<&str>,
+        path: &str,
+        line_number: i64,
+        is_function_like: bool,
+        is_member_like: bool,
+    ) {
+        let basename = Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(path);
+        let ext = Path::new(path)
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        conn.execute(
+            "INSERT INTO search_symbols
+             (file_id, symbol_rowid, symbol_table, kind, kind_rank, name, name_lc, compact_name, owner_name, owner_name_lc, module_id, module_name, module_name_lc, path, path_lc, basename, basename_lc, ext, line_number, is_class_like, is_function_like, is_member_like)
+             VALUES (?, ?, 'members', ?, 0, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+            rusqlite::params![
+                file_id,
+                symbol_rowid,
+                kind,
+                name,
+                name.to_ascii_lowercase(),
+                name.to_ascii_lowercase(),
+                owner_name,
+                owner_name.map(|value| value.to_ascii_lowercase()),
+                path,
+                path.to_ascii_lowercase(),
+                basename,
+                basename.to_ascii_lowercase(),
+                ext,
+                line_number,
+                if is_function_like { 1 } else { 0 },
+                if is_member_like { 1 } else { 0 },
+            ],
+        )
+        .unwrap();
+    }
+
     fn line_and_col(content: &str, needle: &str, occurrence: usize) -> (u32, u32) {
         let mut found = 0usize;
 
@@ -4206,5 +4254,58 @@ public:
         );
         assert_eq!(value["kind"].as_str(), Some("include"));
         assert_eq!(value["line_number"].as_i64(), Some(1));
+    }
+
+    #[test]
+    fn goto_implementation_prefers_cpp_for_file_static_function() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let header_path = "C:/Project/Source/Game/Public/MyStatics.h";
+        let cpp_path = "C:/Project/Source/Game/Private/MyStatics.cpp";
+        let header_file_id = insert_file_at_path(&conn, header_path, true);
+        let cpp_file_id = insert_file_at_path(&conn, cpp_path, false);
+
+        insert_search_symbol(
+            &conn,
+            header_file_id,
+            1,
+            "function",
+            "StartThing",
+            None,
+            header_path,
+            8,
+            true,
+            false,
+        );
+        insert_search_symbol(
+            &conn,
+            cpp_file_id,
+            2,
+            "function",
+            "StartThing",
+            None,
+            cpp_path,
+            42,
+            true,
+            false,
+        );
+
+        let content = "static void StartThing();\n";
+        let (line, col) = line_and_col(content, "StartThing", 0);
+        let value = goto_implementation(
+            &conn,
+            content.to_string(),
+            line,
+            col,
+            Some(header_path.to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            value["file_path"].as_str(),
+            Some("C:/Project/Source/Game/Private/MyStatics.cpp")
+        );
+        assert_eq!(value["line_number"].as_i64(), Some(42));
     }
 }
