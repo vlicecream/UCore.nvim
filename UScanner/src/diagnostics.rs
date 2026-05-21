@@ -380,6 +380,8 @@ fn missing_visible_type_diagnostics(
     let mut engine_lookup_cache = HashMap::new();
     let mut project_text_visibility_cache = HashMap::new();
     let mut engine_text_visibility_cache = HashMap::new();
+    let mut project_text_forward_decl_cache = HashMap::new();
+    let mut engine_text_forward_decl_cache = HashMap::new();
     let mut items = Vec::new();
 
     collect_missing_visible_type_items(
@@ -397,6 +399,8 @@ fn missing_visible_type_diagnostics(
         &mut engine_lookup_cache,
         &mut project_text_visibility_cache,
         &mut engine_text_visibility_cache,
+        &mut project_text_forward_decl_cache,
+        &mut engine_text_forward_decl_cache,
         &mut seen,
         &mut items,
     )?;
@@ -419,6 +423,8 @@ fn collect_missing_visible_type_items(
     engine_lookup_cache: &mut HashMap<String, TypeVisibilityMatch>,
     project_text_visibility_cache: &mut HashMap<String, bool>,
     engine_text_visibility_cache: &mut HashMap<String, bool>,
+    project_text_forward_decl_cache: &mut HashMap<String, bool>,
+    engine_text_forward_decl_cache: &mut HashMap<String, bool>,
     seen: &mut HashSet<(u32, u32, String)>,
     items: &mut Vec<DiagnosticItem>,
 ) -> Result<()> {
@@ -483,7 +489,16 @@ fn collect_missing_visible_type_items(
                     PROJECT_TEXT_VISIBILITY_SCAN_LIMIT,
                 )?);
 
-        if project_visible {
+        let project_forward_declared = !reference.requires_complete
+            && visible_type_forward_declared_in_files(
+                conn,
+                &reference.name,
+                project_visible_file_ids,
+                project_text_forward_decl_cache,
+                PROJECT_TEXT_VISIBILITY_SCAN_LIMIT,
+            )?;
+
+        if project_visible || project_forward_declared {
             continue;
         }
 
@@ -513,7 +528,20 @@ fn collect_missing_visible_type_items(
             false
         };
 
-        if engine_visible {
+        let engine_forward_declared = if let Some(engine_conn) = engine_conn {
+            !reference.requires_complete
+                && visible_type_forward_declared_in_files(
+                    engine_conn,
+                    &reference.name,
+                    engine_visible_file_ids,
+                    engine_text_forward_decl_cache,
+                    ENGINE_TEXT_VISIBILITY_SCAN_LIMIT,
+                )?
+        } else {
+            false
+        };
+
+        if engine_visible || engine_forward_declared {
             continue;
         }
 
@@ -553,6 +581,8 @@ fn collect_missing_visible_type_items(
             engine_lookup_cache,
             project_text_visibility_cache,
             engine_text_visibility_cache,
+            project_text_forward_decl_cache,
+            engine_text_forward_decl_cache,
             seen,
             items,
         )?;
@@ -1741,6 +1771,22 @@ fn visible_type_declared_in_files(
     Ok(declared)
 }
 
+fn visible_type_forward_declared_in_files(
+    conn: &Connection,
+    type_name: &str,
+    visible_file_ids: &HashSet<i64>,
+    cache: &mut HashMap<String, bool>,
+    scan_limit: usize,
+) -> Result<bool> {
+    if let Some(cached) = cache.get(type_name) {
+        return Ok(*cached);
+    }
+
+    let declared = type_forward_declared_in_file_set(conn, type_name, visible_file_ids, scan_limit)?;
+    cache.insert(type_name.to_string(), declared);
+    Ok(declared)
+}
+
 fn type_declared_in_file_set(
     conn: &Connection,
     type_name: &str,
@@ -1785,6 +1831,57 @@ fn type_declared_in_file_set(
         };
 
         if declaration_pattern.is_match(&text) {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn type_forward_declared_in_file_set(
+    conn: &Connection,
+    type_name: &str,
+    visible_file_ids: &HashSet<i64>,
+    scan_limit: usize,
+) -> Result<bool> {
+    if visible_file_ids.is_empty() || type_name.trim().is_empty() || scan_limit == 0 {
+        return Ok(false);
+    }
+
+    let forward_decl_pattern = Regex::new(&format!(
+        r"\b(?:class|struct|enum(?:\s+class)?)\s+{}\b(?:\s*:\s*[A-Za-z_][A-Za-z0-9_:<>]*)?\s*;",
+        regex::escape(type_name)
+    ))?;
+
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT
+            CASE
+                WHEN dp.full_path IS NULL OR sf.text IS NULL THEN ''
+                ELSE dp.full_path || '/' || sf.text
+            END
+        FROM files f
+        LEFT JOIN dir_paths dp ON f.directory_id = dp.id
+        LEFT JOIN strings sf ON f.filename_id = sf.id
+        WHERE f.id = ?1
+        "#,
+    )?;
+
+    for file_id in visible_file_ids.iter().take(scan_limit) {
+        let full_path: String = match stmt.query_row([file_id], |row| row.get(0)) {
+            Ok(path) => path,
+            Err(_) => continue,
+        };
+
+        if full_path.is_empty() {
+            continue;
+        }
+
+        let Ok(text) = fs::read_to_string(&full_path) else {
+            continue;
+        };
+
+        if forward_decl_pattern.is_match(&text) {
             return Ok(true);
         }
     }
@@ -3312,6 +3409,45 @@ mod tests {
 
         let items = value["items"].as_array().unwrap();
         assert!(!items.iter().any(|item| item["code"] == "UECPP004"));
+    }
+
+    #[test]
+    fn does_not_warn_when_type_is_forward_declared_via_included_header() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let class_id = insert_class(&conn, "UMyDependency");
+        insert_impl_member(&conn, class_id, "DoThing", "()", Some("void"));
+
+        let root = temp_project_path("forward_declared_via_include");
+        let public_dir = root.join("Source/Game/Public");
+        std::fs::create_dir_all(&public_dir).unwrap();
+        let shared_header = public_dir.join("SharedTypes.h");
+        let actor_header = public_dir.join("MyActor.h");
+        std::fs::write(&shared_header, "class UMyDependency;\n").unwrap();
+        std::fs::write(
+            &actor_header,
+            "#include \"SharedTypes.h\"\n\nclass UMyActor\n{\npublic:\n    UMyDependency* Value;\n};\n",
+        )
+        .unwrap();
+
+        let current_file_id = insert_file_at_path(&conn, &actor_header, true);
+        let shared_file_id = insert_file_at_path(&conn, &shared_header, true);
+        insert_include_edge(&conn, current_file_id, "SharedTypes.h", shared_file_id);
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "#include \"SharedTypes.h\"\n\nclass UMyActor\n{\npublic:\n    UMyDependency* Value;\n};\n",
+            Some(actor_header.to_string_lossy().to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP004"));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
