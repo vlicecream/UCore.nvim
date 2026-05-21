@@ -262,6 +262,85 @@ fn is_current_class_alias(name: &str) -> bool {
     matches!(name.trim(), "ThisClass" | "Super")
 }
 
+fn resolve_super_class_name(
+    conn: &Connection,
+    content: &str,
+    line: u32,
+    character: u32,
+    enclosing_class: Option<&str>,
+) -> Option<String> {
+    let buffer_bases = extract_enclosing_class_base_names(content, line, character);
+    if let Some(base_name) = buffer_bases.into_iter().next() {
+        return Some(clean_type(&base_name));
+    }
+
+    let enclosing_class = enclosing_class?;
+    direct_parent_class_name(conn, enclosing_class).ok().flatten()
+}
+
+fn extract_enclosing_class_base_names(content: &str, line: u32, character: u32) -> Vec<String> {
+    let language: tree_sitter::Language = tree_sitter_unreal_cpp::LANGUAGE.into();
+    let mut parser = Parser::new();
+    if parser.set_language(&language).is_err() {
+        return Vec::new();
+    }
+
+    let Some(tree) = parser.parse(content, None) else {
+        return Vec::new();
+    };
+    let Some(node) = cursor_node_at(tree.root_node(), line as usize, character as usize) else {
+        return Vec::new();
+    };
+
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(
+            parent.kind(),
+            "class_specifier"
+                | "struct_specifier"
+                | "unreal_reflected_class_declaration"
+                | "unreal_reflected_struct_declaration"
+        ) {
+            return extract_base_names_from_class_text(node_text(&parent, content.as_bytes()));
+        }
+        current = parent.parent();
+    }
+
+    Vec::new()
+}
+
+fn extract_base_names_from_class_text(text: &str) -> Vec<String> {
+    let head = text.split('{').next().unwrap_or(text);
+    let Some((_, bases)) = head.split_once(':') else {
+        return Vec::new();
+    };
+
+    bases
+        .split(',')
+        .filter_map(|segment| {
+            segment
+                .split_whitespace()
+                .rev()
+                .find(|token| !matches!(*token, "public" | "protected" | "private" | "virtual" | "final"))
+                .map(|token| token.trim_matches(|ch: char| ch == ',' || ch == ':'))
+                .filter(|token| !token.is_empty())
+                .map(|token| token.to_string())
+        })
+        .collect()
+}
+
+fn direct_parent_class_name(conn: &Connection, class_name: &str) -> Result<Option<String>> {
+    let mut ctx = GotoCtx::new(conn);
+    let start_ids = ctx.get_class_ids(class_name)?;
+    let Some(class_id) = start_ids.into_iter().next() else {
+        return Ok(None);
+    };
+    let Some(parent_id) = ctx.get_parent_ids(class_id)?.into_iter().next() else {
+        return Ok(None);
+    };
+    Ok(Some(get_class_name_by_id(conn, parent_id)?))
+}
+
 // -----------------------------------------------------------------------------
 // Cursor context extraction
 // -----------------------------------------------------------------------------
@@ -2899,7 +2978,16 @@ fn goto_definition_inner(
     if let Some(ref qualifier) = ctx.qualifier {
         let resolved_class = match ctx.qualifier_op.as_deref() {
             Some("::") => {
-                if is_current_class_alias(qualifier) {
+                if qualifier.trim() == "Super" {
+                    resolve_super_class_name(
+                        conn,
+                        &content,
+                        line,
+                        character,
+                        ctx.enclosing_class.as_deref(),
+                    )
+                    .unwrap_or_else(|| qualifier.clone())
+                } else if is_current_class_alias(qualifier) {
                     ctx.enclosing_class.clone().unwrap_or_else(|| qualifier.clone())
                 } else {
                     qualifier.clone()

@@ -308,6 +308,23 @@ fn find_symbol_usages_inner(
         _ => Vec::new(),
     };
 
+    if let Some(UsageScope::Member(member_scope)) = scope {
+        if short_circuit_text_search {
+            let override_results = get_override_results(
+                conn,
+                symbol_name,
+                &member_scope.member_owner_class,
+                MAX_RESULTS.saturating_sub(results.len()),
+            )?;
+            for item in override_results {
+                push_unique_result(&mut results, item);
+                if results.len() >= MAX_RESULTS {
+                    break;
+                }
+            }
+        }
+    }
+
     if scope.is_none() && short_circuit_text_search {
         let definition_results = get_function_definition_results(conn, hot_index, symbol_name)?;
         for item in definition_results {
@@ -1043,6 +1060,10 @@ fn member_key(symbol_name: &str, owner_class: &str) -> String {
     format!("{}\t{}", owner_class, symbol_name)
 }
 
+fn strip_namespace(name: &str) -> &str {
+    name.rsplit("::").next().unwrap_or(name).trim()
+}
+
 fn dedupe_id_map(map: &mut HashMap<String, Vec<i64>>) {
     for ids in map.values_mut() {
         ids.sort_unstable();
@@ -1332,6 +1353,192 @@ fn get_function_definition_results(
         push_unique_result(&mut results, row?);
     }
     Ok(results)
+}
+
+fn get_override_results(
+    conn: &Connection,
+    symbol_name: &str,
+    owner_class: &str,
+    limit: usize,
+) -> Result<Vec<Value>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let descendant_classes = collect_descendant_class_names(conn, owner_class)?;
+    if descendant_classes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut results = Vec::new();
+    for chunk in descendant_classes.chunks(SQL_CHUNK_SIZE) {
+        let mut sql = String::from(
+            "SELECT path, line_number, owner_name
+             FROM search_symbols
+             WHERE name = ?
+               AND is_function_like = 1
+               AND owner_name IN (",
+        );
+        for (index, _) in chunk.iter().enumerate() {
+            if index > 0 {
+                sql.push_str(", ");
+            }
+            sql.push('?');
+            sql.push_str(&(index + 2).to_string());
+        }
+        sql.push_str(
+            ")
+             ORDER BY owner_name, path_lc, line_number",
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        let mut params = vec![symbol_name];
+        params.extend(chunk.iter().map(|value| value.as_str()));
+        let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
+            let path = normalize_path(&row.get::<_, String>(0)?);
+            let line = row.get::<_, i64>(1)?;
+            let class_name = row.get::<_, Option<String>>(2)?.unwrap_or_default();
+            let context = context_line_for_path(&path, line);
+            let col = find_identifier_in_line(&context, symbol_name).unwrap_or(0);
+            Ok(json!({
+                "path": path,
+                "line": line,
+                "col": col,
+                "context": context,
+                "kind": "override",
+                "class_name": class_name,
+            }))
+        })?;
+
+        for row in rows {
+            push_unique_result(&mut results, row?);
+            if results.len() >= limit {
+                return Ok(results);
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+fn collect_descendant_class_names(conn: &Connection, owner_class: &str) -> Result<Vec<String>> {
+    let mut ctx = GotoDescendantCtx::new(conn);
+    let start_ids = ctx.get_class_ids(owner_class)?;
+    if start_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut queue = std::collections::VecDeque::from(start_ids);
+    let mut visited = HashSet::new();
+    let mut names = Vec::new();
+    let mut seen_names = HashSet::new();
+    let owner_short = strip_namespace(owner_class).to_string();
+
+    while let Some(parent_id) = queue.pop_front() {
+        if !visited.insert(parent_id) {
+            continue;
+        }
+
+        let parent_name = ctx.get_class_name(parent_id)?.unwrap_or_default();
+        for (child_id, child_name) in ctx.get_child_entries(parent_id, &parent_name)? {
+            let child_short = strip_namespace(&child_name).to_string();
+            if !child_short.is_empty() && child_short != owner_short && seen_names.insert(child_short.clone()) {
+                names.push(child_short);
+            }
+            if !visited.contains(&child_id) {
+                queue.push_back(child_id);
+            }
+        }
+    }
+
+    names.sort();
+    Ok(names)
+}
+
+struct GotoDescendantCtx<'a> {
+    conn: &'a Connection,
+    class_id_cache: HashMap<String, Vec<i64>>,
+    class_name_cache: HashMap<i64, Option<String>>,
+    child_cache: HashMap<(i64, String), Vec<(i64, String)>>,
+}
+
+impl<'a> GotoDescendantCtx<'a> {
+    fn new(conn: &'a Connection) -> Self {
+        Self {
+            conn,
+            class_id_cache: HashMap::new(),
+            class_name_cache: HashMap::new(),
+            child_cache: HashMap::new(),
+        }
+    }
+
+    fn get_class_ids(&mut self, name: &str) -> Result<Vec<i64>> {
+        let key = strip_namespace(name).to_string();
+        if key.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Some(ids) = self.class_id_cache.get(&key) {
+            return Ok(ids.clone());
+        }
+
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id
+             FROM classes c
+             JOIN strings s ON c.name_id = s.id
+             WHERE s.text = ?",
+        )?;
+        let ids = stmt
+            .query_map([key.as_str()], |row| row.get::<_, i64>(0))?
+            .filter_map(|row| row.ok())
+            .collect::<Vec<_>>();
+        self.class_id_cache.insert(key, ids.clone());
+        Ok(ids)
+    }
+
+    fn get_class_name(&mut self, class_id: i64) -> Result<Option<String>> {
+        if let Some(name) = self.class_name_cache.get(&class_id) {
+            return Ok(name.clone());
+        }
+
+        let name = self
+            .conn
+            .query_row(
+                "SELECT s.text FROM classes c JOIN strings s ON c.name_id = s.id WHERE c.id = ?",
+                [class_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        self.class_name_cache.insert(class_id, name.clone());
+        Ok(name)
+    }
+
+    fn get_child_entries(&mut self, parent_id: i64, parent_name: &str) -> Result<Vec<(i64, String)>> {
+        let cache_key = (parent_id, strip_namespace(parent_name).to_string());
+        if let Some(entries) = self.child_cache.get(&cache_key) {
+            return Ok(entries.clone());
+        }
+
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT i.child_id, sc.text
+             FROM inheritance i
+             JOIN classes c ON i.child_id = c.id
+             JOIN strings sc ON c.name_id = sc.id
+             JOIN strings sp ON i.parent_name_id = sp.id
+             WHERE i.parent_class_id = ?1 OR sp.text = ?2",
+        )?;
+        let rows = stmt.query_map(params![parent_id, cache_key.1.as_str()], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+
+        let mut entries = Vec::new();
+        for row in rows {
+            entries.push(row?);
+        }
+        entries.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+        entries.dedup_by(|left, right| left.0 == right.0 && left.1 == right.1);
+        self.child_cache.insert(cache_key, entries.clone());
+        Ok(entries)
+    }
 }
 
 /// Collect all indexed file ids as a last-resort unresolved usage scope fallback.
