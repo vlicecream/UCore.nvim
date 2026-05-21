@@ -11,9 +11,9 @@ local default_phase_order = {
 	"db_prepare",
 	"analysis",
 	"db_write",
-	"finalizing",
 	"text_write",
 	"asset_index",
+	"finalizing",
 }
 
 local default_phases = {
@@ -309,7 +309,10 @@ end
 
 local function asset_stage_label(detail)
 	local normalized = normalize_detail(detail):lower()
-	if normalized:find("persist", 1, true) or normalized:find("ready", 1, true) then
+	if normalized:find("persist", 1, true)
+		or normalized:find("ready", 1, true)
+		or normalized:find("runtime", 1, true)
+	then
 		return "Asset Persist"
 	end
 	return "Asset Scan"

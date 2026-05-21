@@ -24,6 +24,9 @@ const LOG_EVERY: usize = 1000;
 const ASSET_INDEX_VERSION: i32 = 4;
 const ASSET_PROGRESS_EVERY: usize = 100;
 const ASSET_BULK_BUSY_TIMEOUT: Duration = Duration::from_millis(60_000);
+const ASSET_STAGE_TOTAL_UNITS: usize = 1000;
+const ASSET_SCAN_UNITS: usize = 700;
+const ASSET_PERSIST_UNITS: usize = 250;
 const LOGICAL_ASSET_CLASS_SUFFIXES: &[&str] = &[
     "Blueprint",
     "WidgetBlueprint",
@@ -368,7 +371,7 @@ pub fn refresh_asset_index(
 
     if !initialized {
         let parse_started_at = Instant::now();
-        let report = parse_asset_files(&asset_files, Some(reporter.as_ref()))?;
+        let report = parse_asset_files(&asset_files, Some(reporter.as_ref()), 0, ASSET_SCAN_UNITS)?;
         let parse_elapsed_ms = parse_started_at.elapsed().as_millis();
         info!(
             project_root = %project_root.display(),
@@ -379,28 +382,32 @@ pub fn refresh_asset_index(
             report.skipped,
             report.errors
         );
-        reporter.report(
-            "asset_index",
-            0,
-            report.parsed.len().max(1),
-            "Persist",
-        );
+        reporter.report("asset_index", ASSET_SCAN_UNITS, ASSET_STAGE_TOTAL_UNITS, "Persist");
         let persist_started_at = Instant::now();
-        replace_asset_index(&mut asset_conn, &report.parsed, Some(reporter.as_ref()))?;
+        replace_asset_index(
+            &mut asset_conn,
+            &report.parsed,
+            Some(reporter.as_ref()),
+            ASSET_SCAN_UNITS,
+            ASSET_PERSIST_UNITS,
+        )?;
         let persist_elapsed_ms = persist_started_at.elapsed().as_millis();
         reporter.report(
             "asset_index",
-            report.parsed.len().max(1),
-            report.parsed.len().max(1),
-            "Ready",
+            ASSET_SCAN_UNITS + ASSET_PERSIST_UNITS,
+            ASSET_STAGE_TOTAL_UNITS,
+            "Build Runtime",
         );
+        let runtime_started_at = Instant::now();
+        persist_asset_runtime_index(conn)?;
+        reporter.report("asset_index", ASSET_STAGE_TOTAL_UNITS, ASSET_STAGE_TOTAL_UNITS, "Ready");
         info!(
             project_root = %project_root.display(),
             persist_elapsed_ms = persist_elapsed_ms,
+            runtime_elapsed_ms = runtime_started_at.elapsed().as_millis(),
             total_elapsed_ms = overall_started_at.elapsed().as_millis(),
             "Asset index full refresh finished"
         );
-        let _ = persist_asset_runtime_index(conn);
         return Ok(());
     }
 
@@ -412,7 +419,12 @@ pub fn refresh_asset_index(
     for (index, path) in asset_files.iter().enumerate() {
         let current = index + 1;
         if current == asset_files.len() || current == 1 || current % ASSET_PROGRESS_EVERY == 0 {
-            reporter.report("asset_index", current, total_seen, "Scan");
+            reporter.report(
+                "asset_index",
+                scale_progress(current, total_seen, 0, ASSET_SCAN_UNITS),
+                ASSET_STAGE_TOTAL_UNITS,
+                "Scan",
+            );
         }
 
         let source_path = normalize_path(path);
@@ -430,9 +442,8 @@ pub fn refresh_asset_index(
         .collect::<Vec<_>>();
 
     let parse_started_at = Instant::now();
-    let report = parse_asset_files(&changed_files, None)?;
+    let report = parse_asset_files(&changed_files, None, ASSET_SCAN_UNITS, 0)?;
     let parse_elapsed_ms = parse_started_at.elapsed().as_millis();
-    let work_total = (deleted_paths.len() + report.parsed.len()).max(1);
     info!(
         project_root = %project_root.display(),
         elapsed_ms = parse_elapsed_ms,
@@ -446,22 +457,32 @@ pub fn refresh_asset_index(
         report.errors
     );
 
-    reporter.report("asset_index", 0, work_total, "Persist");
+    reporter.report("asset_index", ASSET_SCAN_UNITS, ASSET_STAGE_TOTAL_UNITS, "Persist");
     let persist_started_at = Instant::now();
     apply_asset_index_delta(
         &mut asset_conn,
         &report.parsed,
         &deleted_paths,
         Some(reporter.as_ref()),
+        ASSET_SCAN_UNITS,
+        ASSET_PERSIST_UNITS,
     )?;
-    reporter.report("asset_index", work_total, work_total, "Ready");
+    reporter.report(
+        "asset_index",
+        ASSET_SCAN_UNITS + ASSET_PERSIST_UNITS,
+        ASSET_STAGE_TOTAL_UNITS,
+        "Build Runtime",
+    );
+    let runtime_started_at = Instant::now();
+    persist_asset_runtime_index(conn)?;
+    reporter.report("asset_index", ASSET_STAGE_TOTAL_UNITS, ASSET_STAGE_TOTAL_UNITS, "Ready");
     info!(
         project_root = %project_root.display(),
         persist_elapsed_ms = persist_started_at.elapsed().as_millis(),
+        runtime_elapsed_ms = runtime_started_at.elapsed().as_millis(),
         total_elapsed_ms = overall_started_at.elapsed().as_millis(),
         "Asset index delta refresh finished"
     );
-    let _ = persist_asset_runtime_index(conn);
     Ok(())
 }
 
@@ -471,6 +492,8 @@ pub fn replace_asset_index(
     conn: &mut Connection,
     records: &[AssetRecord],
     reporter: Option<&dyn ProgressReporter>,
+    progress_start: usize,
+    progress_span: usize,
 ) -> Result<()> {
     with_asset_bulk_write(conn, |conn| {
         let tx = conn.transaction()?;
@@ -503,7 +526,12 @@ pub fn replace_asset_index(
                 let current = index + 1;
                 if let Some(reporter) = reporter {
                     if current == total || current == 1 || current % ASSET_PROGRESS_EVERY == 0 {
-                        reporter.report("asset_index", current, total, "Persist");
+                        reporter.report(
+                            "asset_index",
+                            scale_progress(current, total, progress_start, progress_span),
+                            ASSET_STAGE_TOTAL_UNITS,
+                            "Persist",
+                        );
                     }
                 }
 
@@ -528,6 +556,8 @@ fn apply_asset_index_delta(
     records: &[AssetRecord],
     deleted_paths: &[String],
     reporter: Option<&dyn ProgressReporter>,
+    progress_start: usize,
+    progress_span: usize,
 ) -> Result<()> {
     with_asset_bulk_write(conn, |conn| {
         let tx = conn.transaction()?;
@@ -561,7 +591,12 @@ fn apply_asset_index_delta(
                 current += 1;
                 if let Some(reporter) = reporter {
                     if current == total || current == 1 || current % ASSET_PROGRESS_EVERY == 0 {
-                        reporter.report("asset_index", current, total, "Persist");
+                        reporter.report(
+                            "asset_index",
+                            scale_progress(current, total, progress_start, progress_span),
+                            ASSET_STAGE_TOTAL_UNITS,
+                            "Persist",
+                        );
                     }
                 }
             }
@@ -570,7 +605,12 @@ fn apply_asset_index_delta(
                 current += 1;
                 if let Some(reporter) = reporter {
                     if current == total || current == 1 || current % ASSET_PROGRESS_EVERY == 0 {
-                        reporter.report("asset_index", current, total, "Persist");
+                        reporter.report(
+                            "asset_index",
+                            scale_progress(current, total, progress_start, progress_span),
+                            ASSET_STAGE_TOTAL_UNITS,
+                            "Persist",
+                        );
                     }
                 }
                 delete_keys.push(record.source_path.to_ascii_lowercase());
@@ -702,19 +742,21 @@ pub fn scan_project_assets(
 ) -> Result<AssetScanReport> {
     let content_dirs = discover_content_dirs(project_root);
     let asset_files = collect_candidate_assets(&content_dirs);
-    parse_asset_files(&asset_files, reporter)
+    parse_asset_files(&asset_files, reporter, 0, ASSET_STAGE_TOTAL_UNITS)
 }
 
 fn parse_asset_files(
     asset_files: &[PathBuf],
     reporter: Option<&dyn ProgressReporter>,
+    progress_start: usize,
+    progress_span: usize,
 ) -> Result<AssetScanReport> {
     let started_at = Instant::now();
     let total_seen = asset_files.len();
     let completed = AtomicUsize::new(0);
     let reported_bucket = AtomicUsize::new(0);
     if let Some(reporter) = reporter {
-        reporter.report("asset_index", 0, total_seen.max(1), "Scan");
+        reporter.report("asset_index", progress_start, ASSET_STAGE_TOTAL_UNITS, "Scan");
     }
 
     let parsed_results = asset_files
@@ -753,7 +795,12 @@ fn parse_asset_files(
                             .compare_exchange(previous, bucket, Ordering::Relaxed, Ordering::Relaxed)
                             .is_ok())
                 {
-                    reporter.report("asset_index", current, total_seen.max(1), "Scan");
+                    reporter.report(
+                        "asset_index",
+                        scale_progress(current, total_seen.max(1), progress_start, progress_span),
+                        ASSET_STAGE_TOTAL_UNITS,
+                        "Scan",
+                    );
                 }
             }
 
@@ -835,6 +882,16 @@ fn parse_asset_files(
         );
         report
     })
+}
+
+fn scale_progress(current: usize, total: usize, start: usize, span: usize) -> usize {
+    if span == 0 {
+        return start;
+    }
+
+    let total = total.max(1);
+    let current = current.min(total);
+    start + current.saturating_mul(span) / total
 }
 
 /// Find Content directories under the project root.

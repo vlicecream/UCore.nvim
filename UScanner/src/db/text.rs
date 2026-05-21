@@ -132,20 +132,21 @@ pub fn sync_text_files(
     let total = files.len();
     let started_at = Instant::now();
     prepare_text_bulk_write(&conn)?;
+    let existing_count = count_text_files(&conn)?;
+    let progress_total = total.max(1) + if existing_count == 0 { 2 } else { 1 };
     if let Some(reporter) = reporter {
-        reporter.report("text_write", 0, total.max(1), "Prepare");
+        reporter.report("text_write", 0, progress_total, "Prepare");
     }
 
-    let existing_count = count_text_files(&conn)?;
     if existing_count == 0 {
-        sync_text_files_full(&mut conn, files, reporter)?;
+        sync_text_files_full(&mut conn, files, progress_total, reporter)?;
     } else {
-        sync_text_files_delta(&mut conn, files, reporter)?;
+        sync_text_files_delta(&mut conn, files, progress_total, reporter)?;
     }
 
     finalize_text_bulk_write(&conn)?;
     if let Some(reporter) = reporter {
-        reporter.report("text_write", total.max(1), total.max(1), "Complete");
+        reporter.report("text_write", progress_total, progress_total, "Complete");
     }
     info!(
         "Text index sync finished in {} ms ({} files)",
@@ -212,11 +213,12 @@ pub fn delete_text_files(primary_db_path: &str, paths: &[String]) -> Result<()> 
 fn sync_text_files_full(
     conn: &mut Connection,
     files: &[TextIndexFile],
+    progress_total: usize,
     reporter: Option<&dyn ProgressReporter>,
 ) -> Result<()> {
     reset_text_index_storage(conn)?;
 
-    let total = files.len().max(1);
+    let file_total = files.len().max(1);
     for (chunk_index, chunk) in files.chunks(TEXT_INDEX_BULK_CHUNK_SIZE).enumerate() {
         let chunk_started_at = Instant::now();
         let tx = conn.transaction()?;
@@ -231,8 +233,8 @@ fn sync_text_files_full(
             for (index, file) in chunk.iter().enumerate() {
                 let current = chunk_index * TEXT_INDEX_BULK_CHUNK_SIZE + index + 1;
                 if let Some(reporter) = reporter {
-                    if current == 1 || current == total || current % 200 == 0 {
-                        reporter.report("text_write", current.min(total.saturating_sub(1)), total, &format!("{}/{}", current, total));
+                    if current == 1 || current == file_total || current % 200 == 0 {
+                        reporter.report("text_write", current, progress_total, &format!("{}/{}", current, file_total));
                     }
                 }
 
@@ -250,10 +252,13 @@ fn sync_text_files_full(
     }
 
     if let Some(reporter) = reporter {
-        reporter.report("text_write", total.saturating_sub(1), total, "Build FTS");
+        reporter.report("text_write", file_total, progress_total, "Build FTS");
     }
     let rebuild_started_at = Instant::now();
     rebuild_text_line_fts(conn)?;
+    if let Some(reporter) = reporter {
+        reporter.report("text_write", file_total + 1, progress_total, "Optimize");
+    }
     info!(
         "Text index FTS rebuild finished in {} ms",
         rebuild_started_at.elapsed().as_millis()
@@ -264,9 +269,10 @@ fn sync_text_files_full(
 fn sync_text_files_delta(
     conn: &mut Connection,
     files: &[TextIndexFile],
+    progress_total: usize,
     reporter: Option<&dyn ProgressReporter>,
 ) -> Result<()> {
-    let total = files.len();
+    let file_total = files.len().max(1);
     for (chunk_index, chunk) in files.chunks(TEXT_INDEX_DELTA_CHUNK_SIZE).enumerate() {
         let chunk_started_at = Instant::now();
         let tx = conn.transaction()?;
@@ -283,8 +289,8 @@ fn sync_text_files_delta(
             for (index, file) in chunk.iter().enumerate() {
                 let current = chunk_index * TEXT_INDEX_DELTA_CHUNK_SIZE + index + 1;
                 if let Some(reporter) = reporter {
-                    if current == 1 || current == total || current % 200 == 0 {
-                        reporter.report("text_write", current, total, &format!("{}/{}", current, total));
+                    if current == 1 || current == file_total || current % 200 == 0 {
+                        reporter.report("text_write", current, progress_total, &format!("{}/{}", current, file_total));
                     }
                 }
 
@@ -302,6 +308,10 @@ fn sync_text_files_delta(
             chunk_started_at.elapsed().as_millis(),
             chunk.len()
         );
+    }
+
+    if let Some(reporter) = reporter {
+        reporter.report("text_write", file_total, progress_total, "Optimize");
     }
 
     Ok(())

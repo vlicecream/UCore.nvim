@@ -55,18 +55,18 @@ local panels = {
 		"progress:UCore Project DB Prepare",
 		"progress:UCore Project Analysis",
 		"progress:UCore Project DB Write",
-		"progress:UCore Project Finalize",
 		"progress:UCore Project Text DB Write",
 		"progress:UCore Project Asset Scan",
 		"progress:UCore Project Asset Persist",
+		"progress:UCore Project Finalize",
 		"progress:UCore Engine Discovery",
 		"progress:UCore Engine DB Prepare",
 		"progress:UCore Engine Analysis",
 		"progress:UCore Engine DB Write",
-		"progress:UCore Engine Finalize",
 		"progress:UCore Engine Text DB Write",
 		"progress:UCore Engine Asset Scan",
 		"progress:UCore Engine Asset Persist",
+		"progress:UCore Engine Finalize",
 	}),
 }
 
@@ -120,6 +120,15 @@ end
 local function compact_message(message)
 	local lines = split_message_lines(message)
 	return lines[1] or ""
+end
+
+local function initialize_progress_placeholders(panel)
+	for _, key in ipairs(panel.ordered_keys or {}) do
+		if key:match("^progress:") and not panel.items[key] then
+			local title = key:gsub("^progress:", "")
+			panel.items[key] = string.format("%s 0%%", title)
+		end
+	end
 end
 
 local function render_message_lines(panel, key, message)
@@ -636,6 +645,7 @@ function M.start(message)
 	panels.init.state = "running"
 	panels.init.spinner_active_keys.boot = true
 	panels.init.items.boot = message or "UCore Initializing..."
+	initialize_progress_placeholders(panels.init)
 	render()
 	schedule_spinner()
 end
