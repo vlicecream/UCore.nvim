@@ -71,8 +71,11 @@ pub struct SearchHotIndex {
     files: Vec<FileHotEntry>,
     symbol_exact: HashMap<String, Vec<usize>>,
     symbol_compact_exact: HashMap<String, Vec<usize>>,
+    symbol_qualified_exact: HashMap<String, Vec<usize>>,
     symbol_name_prefix: Vec<(String, usize)>,
     symbol_compact_prefix: Vec<(String, usize)>,
+    symbol_token_exact: HashMap<String, Vec<usize>>,
+    symbol_token_prefix: Vec<(String, usize)>,
     symbol_owner_exact: HashMap<String, Vec<usize>>,
     symbol_owner_prefix: Vec<(String, usize)>,
     symbol_module_exact: HashMap<String, Vec<usize>>,
@@ -92,13 +95,36 @@ fn fast_find_log_enabled() -> bool {
 }
 
 impl SearchHotIndex {
+    fn query_plan(
+        &self,
+        pattern: &str,
+        limit: usize,
+        offset: usize,
+        class_only: bool,
+    ) -> HotQueryPlan {
+        self.query_internal(pattern, limit, offset, class_only, false)
+    }
+
+    fn query_symbols_only_plan(
+        &self,
+        pattern: &str,
+        limit: usize,
+        offset: usize,
+        class_only: bool,
+    ) -> HotQueryPlan {
+        self.query_internal(pattern, limit, offset, class_only, true)
+    }
+
     pub fn size_hint(&self) -> usize {
         self.symbols.len()
             + self.files.len()
             + self.symbol_exact.len()
             + self.symbol_compact_exact.len()
+            + self.symbol_qualified_exact.len()
             + self.symbol_name_prefix.len()
             + self.symbol_compact_prefix.len()
+            + self.symbol_token_exact.len()
+            + self.symbol_token_prefix.len()
             + self.symbol_owner_exact.len()
             + self.symbol_owner_prefix.len()
             + self.symbol_module_exact.len()
@@ -109,11 +135,24 @@ impl SearchHotIndex {
             + self.file_path_prefix.len()
     }
 
-    fn query(&self, pattern: &str, limit: usize, offset: usize, class_only: bool) -> Vec<Value> {
+    fn query_internal(
+        &self,
+        pattern: &str,
+        limit: usize,
+        offset: usize,
+        class_only: bool,
+        symbols_only: bool,
+    ) -> HotQueryPlan {
         let target = offset.saturating_add(limit).clamp(1, 10_000);
         let query_text = pattern.trim();
         if query_text.is_empty() {
-            return Vec::new();
+            return HotQueryPlan::default();
+        }
+
+        if !symbols_only {
+            if let Some(plan) = self.query_priority_lanes(query_text, limit, offset, class_only) {
+                return plan;
+            }
         }
 
         let mut results = Vec::new();
@@ -133,7 +172,7 @@ impl SearchHotIndex {
             target,
         );
 
-        if !class_only && !identifier_query {
+        if !symbols_only && !class_only && !identifier_query {
             self.merge_file_exact(&mut results, &mut seen, &query, target);
             self.merge_file_path_exact(&mut results, &mut seen, &query, target);
             self.merge_file_prefix(
@@ -152,38 +191,10 @@ impl SearchHotIndex {
             );
         }
 
-        results.into_iter().skip(offset).take(limit).collect()
-    }
-
-    fn query_symbols_only(
-        &self,
-        pattern: &str,
-        limit: usize,
-        offset: usize,
-        class_only: bool,
-    ) -> Vec<Value> {
-        let target = offset.saturating_add(limit).clamp(1, 10_000);
-        let query_text = pattern.trim();
-        if query_text.is_empty() {
-            return Vec::new();
+        HotQueryPlan {
+            results: results.into_iter().skip(offset).take(limit).collect(),
+            terminal: false,
         }
-
-        let mut results = Vec::new();
-        let mut seen = HashSet::new();
-        let query = query_text.to_ascii_lowercase();
-        let prefix = query.clone();
-        let identifier_query = is_identifier_query(query_text);
-        self.query_symbols_into(
-            &mut results,
-            &mut seen,
-            query_text,
-            &query,
-            &prefix,
-            identifier_query,
-            class_only,
-            target,
-        );
-        results.into_iter().skip(offset).take(limit).collect()
     }
 
     fn query_symbols_into(
@@ -264,6 +275,103 @@ impl SearchHotIndex {
                 target,
             );
         }
+    }
+
+    fn query_priority_lanes(
+        &self,
+        pattern: &str,
+        limit: usize,
+        offset: usize,
+        class_only: bool,
+    ) -> Option<HotQueryPlan> {
+        let target = offset.saturating_add(limit).clamp(1, 10_000);
+        let query = pattern.trim().to_ascii_lowercase();
+        let mut results = Vec::new();
+        let mut seen = HashSet::new();
+
+        if let Some((owner, member)) = split_qualified_query(pattern) {
+            let qualified = format!(
+                "{}::{}",
+                owner.trim().to_ascii_lowercase(),
+                member.trim().to_ascii_lowercase()
+            );
+            self.merge_symbol_exact_map(
+                &mut results,
+                &mut seen,
+                &self.symbol_qualified_exact,
+                &qualified,
+                class_only,
+                target,
+            );
+            if !results.is_empty() {
+                return Some(HotQueryPlan::terminal(results, limit, offset));
+            }
+        }
+
+        if is_explicit_type_query(pattern) {
+            self.merge_symbol_exact(&mut results, &mut seen, &query, class_only, target);
+            let compact = compact_identifier(pattern);
+            if !compact.is_empty() {
+                self.merge_symbol_compact_exact(
+                    &mut results,
+                    &mut seen,
+                    &compact,
+                    class_only,
+                    target,
+                );
+            }
+            if has_strong_explicit_type_match(&results, pattern) {
+                suppress_broad_class_contains_when_exact_type_exists(&mut results, pattern);
+                return Some(HotQueryPlan::terminal(results, limit, offset));
+            }
+
+            self.merge_symbol_prefix(
+                &mut results,
+                &mut seen,
+                &self.symbol_name_prefix,
+                &query,
+                true,
+                target,
+            );
+            if !compact.is_empty() {
+                self.merge_symbol_prefix(
+                    &mut results,
+                    &mut seen,
+                    &self.symbol_compact_prefix,
+                    &compact,
+                    true,
+                    target,
+                );
+            }
+            if !results.is_empty() {
+                suppress_broad_class_contains_when_exact_type_exists(&mut results, pattern);
+                return Some(HotQueryPlan::terminal(results, limit, offset));
+            }
+        }
+
+        if let Some(token) = preferred_identifier_token(pattern) {
+            self.merge_symbol_exact_map(
+                &mut results,
+                &mut seen,
+                &self.symbol_token_exact,
+                &token,
+                class_only,
+                target,
+            );
+            self.merge_symbol_prefix(
+                &mut results,
+                &mut seen,
+                &self.symbol_token_prefix,
+                &token,
+                class_only,
+                target,
+            );
+            if !results.is_empty() {
+                return Some(HotQueryPlan::terminal(results, limit, offset));
+            }
+        }
+
+        None
     }
 
     fn merge_symbol_exact(
@@ -483,6 +591,21 @@ fn lower_bound_prefix(sorted: &[(String, usize)], prefix: &str) -> usize {
     left
 }
 
+#[derive(Default)]
+struct HotQueryPlan {
+    results: Vec<Value>,
+    terminal: bool,
+}
+
+impl HotQueryPlan {
+    fn terminal(results: Vec<Value>, limit: usize, offset: usize) -> Self {
+        Self {
+            results: results.into_iter().skip(offset).take(limit).collect(),
+            terminal: true,
+        }
+    }
+}
+
 fn symbol_hot_entry_to_value(entry: &SymbolHotEntry) -> Value {
     json!({
         "name": entry.name,
@@ -583,8 +706,11 @@ pub fn build_search_hot_index(conn: &Connection) -> anyhow::Result<SearchHotInde
 
     let mut symbol_exact = HashMap::<String, Vec<usize>>::new();
     let mut symbol_compact_exact = HashMap::<String, Vec<usize>>::new();
+    let mut symbol_qualified_exact = HashMap::<String, Vec<usize>>::new();
     let mut symbol_name_prefix = Vec::with_capacity(symbols.len());
     let mut symbol_compact_prefix = Vec::with_capacity(symbols.len());
+    let mut symbol_token_exact = HashMap::<String, Vec<usize>>::new();
+    let mut symbol_token_prefix = Vec::new();
     let mut symbol_owner_exact = HashMap::<String, Vec<usize>>::new();
     let mut symbol_owner_prefix = Vec::new();
     let mut symbol_module_exact = HashMap::<String, Vec<usize>>::new();
@@ -612,6 +738,16 @@ pub fn build_search_hot_index(conn: &Connection) -> anyhow::Result<SearchHotInde
                 .push(index);
             symbol_module_prefix.push((entry.module_name_lc.clone(), index));
         }
+        if !entry.owner_name_lc.is_empty() {
+            symbol_qualified_exact
+                .entry(format!("{}::{}", entry.owner_name_lc, entry.name_lc))
+                .or_default()
+                .push(index);
+        }
+        for token in identifier_search_tokens(&entry.name) {
+            symbol_token_exact.entry(token.clone()).or_default().push(index);
+            symbol_token_prefix.push((token, index));
+        }
         symbol_name_prefix.push((entry.name_lc.clone(), index));
     }
     symbol_name_prefix.sort_unstable_by(|left, right| {
@@ -621,6 +757,12 @@ pub fn build_search_hot_index(conn: &Connection) -> anyhow::Result<SearchHotInde
             .then_with(|| symbols[left.1].path.cmp(&symbols[right.1].path))
     });
     symbol_compact_prefix.sort_unstable_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| symbols[left.1].kind_rank.cmp(&symbols[right.1].kind_rank))
+            .then_with(|| symbols[left.1].path.cmp(&symbols[right.1].path))
+    });
+    symbol_token_prefix.sort_unstable_by(|left, right| {
         left.0
             .cmp(&right.0)
             .then_with(|| symbols[left.1].kind_rank.cmp(&symbols[right.1].kind_rank))
@@ -664,8 +806,11 @@ pub fn build_search_hot_index(conn: &Connection) -> anyhow::Result<SearchHotInde
         files,
         symbol_exact,
         symbol_compact_exact,
+        symbol_qualified_exact,
         symbol_name_prefix,
         symbol_compact_prefix,
+        symbol_token_exact,
+        symbol_token_prefix,
         symbol_owner_exact,
         symbol_owner_prefix,
         symbol_module_exact,
@@ -705,15 +850,18 @@ pub fn search_symbols_with_hot_index(
     let target = offset.saturating_add(limit);
     let mut results = Vec::new();
     let mut seen = HashSet::new();
+    let mut hot_terminal = false;
     if let Some(index) = hot_index {
+        let plan = index.query_symbols_only_plan(pattern, target, 0, false);
+        hot_terminal = plan.terminal;
         merge_bucket_results(
             &mut results,
             &mut seen,
-            index.query_symbols_only(pattern, target, 0, false),
+            plan.results,
             target,
         );
     }
-    if results.len() < target {
+    if !hot_terminal && results.len() < target {
         merge_bucket_results(
             &mut results,
             &mut seen,
@@ -754,12 +902,15 @@ pub fn global_find_with_hot_index(
     let target = offset.saturating_add(limit);
     let mut results = Vec::new();
     let mut seen = HashSet::new();
+    let mut hot_terminal = false;
 
     if let Some(index) = hot_index {
-        merge_bucket_results(&mut results, &mut seen, index.query(pattern, target, 0, false), target);
+        let plan = index.query_plan(pattern, target, 0, false);
+        hot_terminal = plan.terminal;
+        merge_bucket_results(&mut results, &mut seen, plan.results, target);
     }
 
-    if results.len() < target {
+    if !hot_terminal && results.len() < target {
         let db_results = hybrid_fast_find(conn, None, pattern, target, 0, false)?
             .as_array()
             .cloned()
@@ -767,7 +918,7 @@ pub fn global_find_with_hot_index(
         merge_bucket_results(&mut results, &mut seen, db_results, target);
     }
 
-    if results.len() < target {
+    if !hot_terminal && results.len() < target {
         merge_bucket_results_value(
             &mut results,
             &mut seen,
@@ -803,12 +954,15 @@ fn hybrid_fast_find(
     let target = offset.saturating_add(limit);
     let mut results = Vec::new();
     let mut seen = HashSet::new();
+    let mut hot_terminal = false;
 
     if let Some(index) = hot_index {
-        merge_bucket_results(&mut results, &mut seen, index.query(pattern, target, 0, class_only), target);
+        let plan = index.query_plan(pattern, target, 0, class_only);
+        hot_terminal = plan.terminal;
+        merge_bucket_results(&mut results, &mut seen, plan.results, target);
     }
 
-    if results.len() < target {
+    if !hot_terminal && results.len() < target {
         let db_results = if class_only {
             bucketed_symbol_results(conn, pattern, target, true)?
         } else {
@@ -1164,6 +1318,83 @@ fn is_identifier_query(query: &str) -> bool {
     }
 
     chars.all(|ch| ch == '_' || ch == ':' || ch.is_ascii_alphanumeric())
+}
+
+fn split_qualified_query(query: &str) -> Option<(&str, &str)> {
+    let query = query.trim();
+    let split_at = query.rfind("::")?;
+    let owner = query[..split_at].trim();
+    let member = query[split_at + 2..].trim();
+    if owner.is_empty() || member.is_empty() {
+        return None;
+    }
+    Some((owner, member))
+}
+
+fn preferred_identifier_token(query: &str) -> Option<String> {
+    if !is_identifier_query(query.trim()) || query.contains("::") {
+        return None;
+    }
+
+    let mut tokens = identifier_search_tokens(query.trim());
+    if tokens.is_empty() {
+        return None;
+    }
+    tokens.sort_unstable_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+    let token = tokens.into_iter().next()?;
+    (token.len() >= 3).then_some(token)
+}
+
+fn identifier_search_tokens(input: &str) -> Vec<String> {
+    let chars = input.chars().collect::<Vec<_>>();
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+
+    for index in 0..chars.len() {
+        let ch = chars[index];
+        if !ch.is_ascii_alphanumeric() {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+
+        let should_split = if let Some(prev) = current.chars().last() {
+            let next = chars.get(index + 1).copied();
+            (prev.is_ascii_lowercase() && ch.is_ascii_uppercase())
+                || (prev.is_ascii_alphabetic() && ch.is_ascii_digit())
+                || (prev.is_ascii_digit() && ch.is_ascii_alphabetic())
+                || (prev.is_ascii_uppercase()
+                    && ch.is_ascii_uppercase()
+                    && next.map(|value| value.is_ascii_lowercase()).unwrap_or(false))
+        } else {
+            false
+        };
+
+        if should_split && !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+
+        current.push(ch.to_ascii_lowercase());
+    }
+
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    if tokens.len() > 1
+        && tokens
+            .first()
+            .map(|token| token.len() == 1)
+            .unwrap_or(false)
+    {
+        tokens.remove(0);
+    }
+
+    tokens.retain(|token| !token.is_empty());
+    tokens.sort_unstable();
+    tokens.dedup();
+    tokens
 }
 
 fn is_explicit_type_query(query: &str) -> bool {
@@ -2376,6 +2607,23 @@ mod tests {
     }
 
     #[test]
+    fn hot_index_fast_find_explicit_type_skips_owner_member_noise() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let file_id = insert_project_header_file(&conn, "Game", "GameplayAbility.h");
+        let class_id = insert_class_symbol(&conn, file_id, "UGameplayAbility");
+        insert_property_symbol(&conn, class_id, file_id, "UGameplayAbility", "AbilityTags");
+
+        let hot_index = build_search_hot_index(&conn).unwrap();
+        let items = fast_find_with_hot_index(&conn, Some(&hot_index), "UGameplayAbility", 20, 0).unwrap();
+        let items = items.as_array().unwrap();
+
+        assert!(items.iter().any(|item| item["name"] == "UGameplayAbility"));
+        assert!(!items.iter().any(|item| item["name"] == "AbilityTags"));
+    }
+
+    #[test]
     fn hot_index_matches_unreal_type_without_underscores() {
         let conn = Connection::open_in_memory().unwrap();
         crate::db::init_db(&conn).unwrap();
@@ -2440,6 +2688,23 @@ mod tests {
         assert!(items
             .iter()
             .any(|item| item["name"] == "USGameplayAbility_Block"));
+    }
+
+    #[test]
+    fn hot_index_fast_find_matches_qualified_member_exactly() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let file_id = insert_project_header_file(&conn, "Engine", "Actor.h");
+        let class_id = insert_class_symbol(&conn, file_id, "AActor");
+        insert_property_symbol(&conn, class_id, file_id, "AActor", "Tick");
+
+        let hot_index = build_search_hot_index(&conn).unwrap();
+        let items = fast_find_with_hot_index(&conn, Some(&hot_index), "AActor::Tick", 20, 0).unwrap();
+        let items = items.as_array().unwrap();
+
+        assert!(items.iter().any(|item| item["name"] == "Tick"));
+        assert!(items.iter().all(|item| item["name"] != "AActor"));
     }
 
     #[test]
