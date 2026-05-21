@@ -461,6 +461,10 @@ fn collect_missing_visible_type_items(
             continue;
         }
 
+        if is_unreal_implicitly_visible_type(&reference.name) {
+            continue;
+        }
+
         let project_match = cached_type_visibility_lookup(
             project_lookup_cache,
             conn,
@@ -1263,6 +1267,10 @@ fn is_ignored_type_token(token: &str) -> bool {
             | "FAnsiStringView"
             | "FWideStringView"
     ) || token.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+}
+
+fn is_unreal_implicitly_visible_type(name: &str) -> bool {
+    matches!(name, "FObjectInitializer")
 }
 
 #[derive(Clone, Debug)]
@@ -3131,6 +3139,30 @@ mod tests {
 
         let items = value["items"].as_array().unwrap();
         assert!(!items.iter().any(|item| item["code"] == "UECPP004"));
+    }
+
+    #[test]
+    fn does_not_warn_for_fobjectinitializer_visibility() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "class UMyActor\n{\npublic:\n    explicit UMyActor(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());\n};\n",
+            Some("C:/Project/Source/Game/Public/MyActor.h".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| {
+            item["code"] == "UECPP004"
+                && item["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("FObjectInitializer")
+        }));
     }
 
     #[test]
