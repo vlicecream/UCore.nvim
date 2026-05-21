@@ -1,6 +1,6 @@
 use anyhow::Result;
 use regex::Regex;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -122,6 +122,13 @@ pub fn process_diagnostics(
                 file_path.as_deref(),
             )
         },
+    )?;
+    extend_diagnostic_phase(
+        &mut items,
+        "unknown_symbols",
+        file_label,
+        log_enabled,
+        || unknown_symbol_diagnostics(conn, engine_conn, content, file_path.as_deref()),
     )?;
     extend_diagnostic_phase(
         &mut items,
@@ -406,6 +413,685 @@ fn missing_visible_type_diagnostics(
     )?;
 
     Ok(items)
+}
+
+fn unknown_symbol_diagnostics(
+    conn: &Connection,
+    engine_conn: Option<&Connection>,
+    content: &str,
+    file_path: Option<&str>,
+) -> Result<Vec<DiagnosticItem>> {
+    let Some(file_path) = file_path else {
+        return Ok(Vec::new());
+    };
+
+    if !is_cpp_source_or_header(file_path) {
+        return Ok(Vec::new());
+    }
+
+    let mut parser = Parser::new();
+    let language: tree_sitter::Language = tree_sitter_unreal_cpp::LANGUAGE.into();
+    parser.set_language(&language)?;
+
+    let Some(tree) = parser.parse(content, None) else {
+        return Ok(Vec::new());
+    };
+
+    let root = tree.root_node();
+    let mut seen = HashSet::new();
+    let mut items = Vec::new();
+
+    collect_unknown_symbol_items(
+        conn,
+        engine_conn,
+        root,
+        content,
+        file_path,
+        &mut seen,
+        &mut items,
+    )?;
+
+    Ok(items)
+}
+
+fn collect_unknown_symbol_items(
+    conn: &Connection,
+    engine_conn: Option<&Connection>,
+    node: tree_sitter::Node,
+    content: &str,
+    file_path: &str,
+    seen: &mut HashSet<(u32, u32, &'static str)>,
+    items: &mut Vec<DiagnosticItem>,
+) -> Result<()> {
+    match node.kind() {
+        "field_expression" => {
+            collect_unknown_field_expression_item(
+                conn,
+                engine_conn,
+                node,
+                content,
+                file_path,
+                seen,
+                items,
+            )?;
+        }
+        "qualified_identifier" => {
+            collect_unknown_qualified_identifier_item(
+                conn,
+                engine_conn,
+                node,
+                content,
+                file_path,
+                seen,
+                items,
+            )?;
+        }
+        "identifier" => {
+            collect_unknown_identifier_item(
+                conn,
+                engine_conn,
+                node,
+                content,
+                file_path,
+                seen,
+                items,
+            )?;
+        }
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_unknown_symbol_items(
+            conn,
+            engine_conn,
+            child,
+            content,
+            file_path,
+            seen,
+            items,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn collect_unknown_field_expression_item(
+    conn: &Connection,
+    engine_conn: Option<&Connection>,
+    node: tree_sitter::Node,
+    content: &str,
+    file_path: &str,
+    seen: &mut HashSet<(u32, u32, &'static str)>,
+    items: &mut Vec<DiagnosticItem>,
+) -> Result<()> {
+    let Some(receiver) = node.child_by_field_name("argument").or_else(|| node.child(0)) else {
+        return Ok(());
+    };
+    let Some(field) = node.child_by_field_name("field") else {
+        return Ok(());
+    };
+
+    let field_name = node_text(field, content).trim();
+    if field_name.is_empty() || is_ignored_unknown_symbol_name(field_name) {
+        return Ok(());
+    }
+
+    if let Some(receiver_type) =
+        resolve_expression_type_for_diagnostics(conn, engine_conn, receiver, content)?
+    {
+        if !member_exists_across_dbs(conn, engine_conn, &receiver_type, field_name)? {
+            push_unknown_symbol_item(
+                items,
+                seen,
+                file_path,
+                field.start_position().row as u32,
+                field.start_position().column as u32,
+                field.end_position().row as u32,
+                field.end_position().column as u32,
+                "UECPP009",
+                format!("Type {} has no member named {}.", receiver_type, field_name),
+            );
+        }
+        return Ok(());
+    }
+
+    if receiver.kind() == "identifier" {
+        let receiver_name = node_text(receiver, content).trim();
+        if !receiver_name.is_empty()
+            && !identifier_usage_is_known(conn, engine_conn, receiver, content, receiver_name)?
+        {
+            push_unknown_symbol_item(
+                items,
+                seen,
+                file_path,
+                receiver.start_position().row as u32,
+                receiver.start_position().column as u32,
+                receiver.end_position().row as u32,
+                receiver.end_position().column as u32,
+                "UECPP008",
+                format!("Unknown identifier {}.", receiver_name),
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn collect_unknown_qualified_identifier_item(
+    conn: &Connection,
+    engine_conn: Option<&Connection>,
+    node: tree_sitter::Node,
+    content: &str,
+    file_path: &str,
+    seen: &mut HashSet<(u32, u32, &'static str)>,
+    items: &mut Vec<DiagnosticItem>,
+) -> Result<()> {
+    let Some(scope) = node.child_by_field_name("scope") else {
+        return Ok(());
+    };
+    let Some(name_node) = node.child_by_field_name("name") else {
+        return Ok(());
+    };
+
+    let member_name = node_text(name_node, content).trim();
+    if member_name.is_empty() || is_ignored_unknown_symbol_name(member_name) {
+        return Ok(());
+    }
+
+    let scope_text = node_text(scope, content).trim();
+    let resolved_scope = if scope_text == "ThisClass" {
+        find_enclosing_class_name(node, content)
+    } else if scope_text == "Super" {
+        find_enclosing_class_name(node, content)
+            .and_then(|class_name| enclosing_class_base_names(node, content).into_iter().next().or_else(|| {
+                direct_parent_names_for_class(conn, &class_name).ok().and_then(|mut names| names.drain(..).next())
+            }))
+    } else if class_ids_by_name(conn, scope_text)?.is_empty()
+        && engine_conn
+            .map(|engine_conn| class_ids_by_name(engine_conn, scope_text))
+            .transpose()?
+            .unwrap_or_default()
+            .is_empty()
+    {
+        None
+    } else {
+        Some(scope_text.to_string())
+    };
+
+    if let Some(scope_name) = resolved_scope {
+        if !member_exists_across_dbs(conn, engine_conn, &scope_name, member_name)? {
+            push_unknown_symbol_item(
+                items,
+                seen,
+                file_path,
+                name_node.start_position().row as u32,
+                name_node.start_position().column as u32,
+                name_node.end_position().row as u32,
+                name_node.end_position().column as u32,
+                "UECPP009",
+                format!("Type {} has no member named {}.", scope_name, member_name),
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn collect_unknown_identifier_item(
+    conn: &Connection,
+    engine_conn: Option<&Connection>,
+    node: tree_sitter::Node,
+    content: &str,
+    file_path: &str,
+    seen: &mut HashSet<(u32, u32, &'static str)>,
+    items: &mut Vec<DiagnosticItem>,
+) -> Result<()> {
+    let name = node_text(node, content).trim();
+    if name.is_empty()
+        || is_ignored_unknown_symbol_name(name)
+        || !is_unknown_identifier_usage_candidate(node, content)
+        || identifier_usage_is_known(conn, engine_conn, node, content, name)?
+    {
+        return Ok(());
+    }
+
+    push_unknown_symbol_item(
+        items,
+        seen,
+        file_path,
+        node.start_position().row as u32,
+        node.start_position().column as u32,
+        node.end_position().row as u32,
+        node.end_position().column as u32,
+        "UECPP008",
+        format!("Unknown identifier {}.", name),
+    );
+    Ok(())
+}
+
+fn push_unknown_symbol_item(
+    items: &mut Vec<DiagnosticItem>,
+    seen: &mut HashSet<(u32, u32, &'static str)>,
+    file_path: &str,
+    line: u32,
+    character: u32,
+    end_line: u32,
+    end_character: u32,
+    code: &'static str,
+    message: String,
+) {
+    if !seen.insert((line, character, code)) {
+        return;
+    }
+
+    items.push(
+        DiagnosticItem::new(
+            Some(file_path),
+            line,
+            character,
+            DiagnosticSeverity::Error,
+            "UCore",
+            code,
+            message,
+        )
+        .with_end(end_line, end_character),
+    );
+}
+
+fn is_unknown_identifier_usage_candidate(node: tree_sitter::Node, content: &str) -> bool {
+    if node.kind() != "identifier" {
+        return false;
+    }
+
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+
+    if matches!(
+        parent.kind(),
+        "qualified_identifier"
+            | "field_expression"
+            | "class_specifier"
+            | "struct_specifier"
+            | "enum_specifier"
+            | "namespace_definition"
+            | "goto_statement"
+            | "labeled_statement"
+            | "preproc_include"
+            | "preproc_def"
+            | "preproc_function_def"
+            | "preproc_call"
+            | "template_type"
+            | "template_function"
+            | "template_method"
+    ) {
+        return false;
+    }
+
+    if matches!(
+        parent.kind(),
+        "declaration" | "field_declaration" | "parameter_declaration"
+    ) {
+        if parent
+            .child_by_field_name("type")
+            .is_some_and(|type_node| node.byte_range().start >= type_node.byte_range().start
+                && node.byte_range().end <= type_node.byte_range().end)
+        {
+            return false;
+        }
+
+        if parent
+            .child_by_field_name("declarator")
+            .and_then(find_name_node)
+            .is_some_and(|name_node| same_node(name_node, node))
+        {
+            return false;
+        }
+    }
+
+    if matches!(
+        parent.kind(),
+        "function_declarator"
+            | "pointer_declarator"
+            | "reference_declarator"
+            | "array_declarator"
+            | "parenthesized_declarator"
+            | "init_declarator"
+    ) && find_name_node(parent).is_some_and(|name_node| same_node(name_node, node))
+    {
+        return false;
+    }
+
+    let text = node_text(node, content).trim();
+    !text.is_empty()
+}
+
+fn identifier_usage_is_known(
+    conn: &Connection,
+    engine_conn: Option<&Connection>,
+    node: tree_sitter::Node,
+    content: &str,
+    name: &str,
+) -> Result<bool> {
+    if matches!(name, "this" | "Super" | "nullptr" | "true" | "false") {
+        return Ok(true);
+    }
+
+    if crate::query::goto::infer_var_type(content, name, Some(node.start_position().row as u32))
+        .is_some()
+    {
+        return Ok(true);
+    }
+
+    if let Some(class_name) = find_enclosing_class_name(node, content) {
+        if member_exists_across_dbs(conn, engine_conn, &class_name, name)? {
+            return Ok(true);
+        }
+    }
+
+    if enum_value_exists_across_dbs(conn, engine_conn, name)? {
+        return Ok(true);
+    }
+
+    if identifier_is_call_target(node) {
+        return function_exists_across_dbs(conn, engine_conn, name);
+    }
+
+    Ok(false)
+}
+
+fn identifier_is_call_target(node: tree_sitter::Node) -> bool {
+    node.parent()
+        .filter(|parent| parent.kind() == "call_expression")
+        .and_then(|parent| parent.child_by_field_name("function").or_else(|| parent.child(0)))
+        .is_some_and(|function_node| same_node(function_node, node))
+}
+
+fn resolve_expression_type_for_diagnostics(
+    conn: &Connection,
+    engine_conn: Option<&Connection>,
+    node: tree_sitter::Node,
+    content: &str,
+) -> Result<Option<String>> {
+    match node.kind() {
+        "identifier" | "field_identifier" => {
+            let name = node_text(node, content).trim();
+            if name.is_empty() {
+                return Ok(None);
+            }
+
+            if name == "this" {
+                return Ok(find_enclosing_class_name(node, content));
+            }
+
+            if name == "Super" {
+                if let Some(class_name) = find_enclosing_class_name(node, content) {
+                    if let Some(parent_name) = enclosing_class_base_names(node, content).into_iter().next() {
+                        return Ok(Some(parent_name));
+                    }
+
+                    if let Some(parent_name) =
+                        direct_parent_names_for_class(conn, &class_name)?.into_iter().next()
+                    {
+                        return Ok(Some(parent_name));
+                    }
+                }
+                return Ok(None);
+            }
+
+            if let Some(local_type) =
+                crate::query::goto::infer_var_type(content, name, Some(node.start_position().row as u32))
+            {
+                return Ok(Some(local_type));
+            }
+
+            if let Some(class_name) = find_enclosing_class_name(node, content) {
+                if let Some(member_type) =
+                    member_type_across_dbs(conn, engine_conn, &class_name, name)?
+                {
+                    return Ok(Some(member_type));
+                }
+            }
+
+            if !class_ids_by_name(conn, name)?.is_empty()
+                || engine_conn
+                    .map(|engine_conn| class_ids_by_name(engine_conn, name))
+                    .transpose()?
+                    .unwrap_or_default()
+                    .len()
+                    > 0
+            {
+                return Ok(Some(name.to_string()));
+            }
+
+            Ok(None)
+        }
+        "field_expression" => {
+            let Some(receiver) = node.child_by_field_name("argument").or_else(|| node.child(0)) else {
+                return Ok(None);
+            };
+            let Some(field) = node.child_by_field_name("field") else {
+                return Ok(None);
+            };
+            let receiver_type =
+                resolve_expression_type_for_diagnostics(conn, engine_conn, receiver, content)?;
+            let Some(receiver_type) = receiver_type else {
+                return Ok(None);
+            };
+            member_type_across_dbs(conn, engine_conn, &receiver_type, node_text(field, content).trim())
+        }
+        "qualified_identifier" => {
+            let Some(scope) = node.child_by_field_name("scope") else {
+                return Ok(None);
+            };
+            let Some(name_node) = node.child_by_field_name("name") else {
+                return Ok(None);
+            };
+
+            let scope_name = if node_text(scope, content).trim() == "ThisClass" {
+                find_enclosing_class_name(node, content)
+            } else {
+                resolve_expression_type_for_diagnostics(conn, engine_conn, scope, content)?
+            };
+            let Some(scope_name) = scope_name else {
+                return Ok(None);
+            };
+            member_type_across_dbs(conn, engine_conn, &scope_name, node_text(name_node, content).trim())
+        }
+        _ => Ok(None),
+    }
+}
+
+fn member_exists_across_dbs(
+    conn: &Connection,
+    engine_conn: Option<&Connection>,
+    class_name: &str,
+    member_name: &str,
+) -> Result<bool> {
+    if member_exists_on_class_or_bases(conn, class_name, member_name)? {
+        return Ok(true);
+    }
+
+    if let Some(engine_conn) = engine_conn {
+        if member_exists_on_class_or_bases(engine_conn, class_name, member_name)? {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn member_exists_on_class_or_bases(
+    conn: &Connection,
+    class_name: &str,
+    member_name: &str,
+) -> Result<bool> {
+    let mut queue = VecDeque::from([strip_namespace(class_name)]);
+    let mut visited = HashSet::new();
+
+    while let Some(current) = queue.pop_front() {
+        if current.is_empty() || !visited.insert(current.clone()) {
+            continue;
+        }
+
+        if member_exists_on_class_name(conn, &current, member_name)? {
+            return Ok(true);
+        }
+
+        queue.extend(direct_parent_names_for_class(conn, &current)?);
+    }
+
+    Ok(false)
+}
+
+fn member_type_across_dbs(
+    conn: &Connection,
+    engine_conn: Option<&Connection>,
+    class_name: &str,
+    member_name: &str,
+) -> Result<Option<String>> {
+    if let Some(member_type) = member_type_on_class_or_bases(conn, class_name, member_name)? {
+        return Ok(Some(member_type));
+    }
+
+    if let Some(engine_conn) = engine_conn {
+        if let Some(member_type) = member_type_on_class_or_bases(engine_conn, class_name, member_name)? {
+            return Ok(Some(member_type));
+        }
+    }
+
+    Ok(None)
+}
+
+fn member_type_on_class_or_bases(
+    conn: &Connection,
+    class_name: &str,
+    member_name: &str,
+) -> Result<Option<String>> {
+    let mut queue = VecDeque::from([strip_namespace(class_name)]);
+    let mut visited = HashSet::new();
+
+    while let Some(current) = queue.pop_front() {
+        if current.is_empty() || !visited.insert(current.clone()) {
+            continue;
+        }
+
+        if let Some(member_type) = member_type_on_class_name(conn, &current, member_name)? {
+            return Ok(Some(member_type));
+        }
+
+        queue.extend(direct_parent_names_for_class(conn, &current)?);
+    }
+
+    Ok(None)
+}
+
+fn member_type_on_class_name(
+    conn: &Connection,
+    class_name: &str,
+    member_name: &str,
+) -> Result<Option<String>> {
+    let short = strip_namespace(class_name);
+    if short.is_empty() {
+        return Ok(None);
+    }
+
+    let sql = r#"
+        SELECT COALESCE(srt.text, '')
+        FROM members m
+        JOIN classes c ON m.class_id = c.id
+        JOIN strings sc ON c.name_id = sc.id
+        JOIN strings sm ON m.name_id = sm.id
+        LEFT JOIN strings srt ON m.return_type_id = srt.id
+        WHERE sc.text = ?1
+          AND sm.text = ?2
+        ORDER BY
+            CASE WHEN COALESCE(m.access, '') = 'impl' THEN 1 ELSE 0 END,
+            m.line_number
+        LIMIT 1
+    "#;
+
+    let value = conn
+        .query_row(sql, params![short, member_name], |row| row.get::<_, String>(0))
+        .optional()?
+        .map(|text| crate::parser::cpp::clean_type_string(&text))
+        .filter(|text| !text.trim().is_empty());
+
+    Ok(value)
+}
+
+fn function_exists_across_dbs(
+    conn: &Connection,
+    engine_conn: Option<&Connection>,
+    name: &str,
+) -> Result<bool> {
+    if function_exists(conn, name)? {
+        return Ok(true);
+    }
+
+    if let Some(engine_conn) = engine_conn {
+        if function_exists(engine_conn, name)? {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn function_exists(conn: &Connection, name: &str) -> Result<bool> {
+    let sql = r#"
+        SELECT 1
+        FROM search_symbols
+        WHERE name = ?1
+          AND is_function_like = 1
+        LIMIT 1
+    "#;
+
+    Ok(conn.query_row(sql, [name], |_row| Ok(())).is_ok())
+}
+
+fn enum_value_exists_across_dbs(
+    conn: &Connection,
+    engine_conn: Option<&Connection>,
+    name: &str,
+) -> Result<bool> {
+    if enum_value_exists(conn, name)? {
+        return Ok(true);
+    }
+
+    if let Some(engine_conn) = engine_conn {
+        if enum_value_exists(engine_conn, name)? {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn enum_value_exists(conn: &Connection, name: &str) -> Result<bool> {
+    let sql = r#"
+        SELECT 1
+        FROM enum_values ev
+        JOIN strings s ON ev.name_id = s.id
+        WHERE s.text = ?1
+        LIMIT 1
+    "#;
+
+    Ok(conn.query_row(sql, [name], |_row| Ok(())).is_ok())
+}
+
+fn is_ignored_unknown_symbol_name(name: &str) -> bool {
+    matches!(
+        name,
+        "this" | "Super" | "ThisClass" | "nullptr" | "true" | "false"
+    ) || name
+        .chars()
+        .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+}
+
+fn same_node(left: tree_sitter::Node, right: tree_sitter::Node) -> bool {
+    left.byte_range() == right.byte_range()
 }
 
 fn collect_missing_visible_type_items(
@@ -4136,6 +4822,94 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn warns_on_unknown_identifier_expression_statement() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "void Run()\n{\n    xxxxx;\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| {
+            item["code"] == "UECPP008"
+                && item["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("xxxxx")
+        }));
+    }
+
+    #[test]
+    fn warns_on_unknown_receiver_in_field_expression() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "void Run()\n{\n    xxxxx->xxx();\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| {
+            item["code"] == "UECPP008"
+                && item["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("xxxxx")
+        }));
+    }
+
+    #[test]
+    fn does_not_warn_for_known_local_identifier_usage() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "void Run()\n{\n    int32 Value = 1;\n    Value;\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP008"));
+    }
+
+    #[test]
+    fn does_not_warn_for_known_member_call() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let class_id = insert_class(&conn, "UMyActor");
+        insert_impl_member(&conn, class_id, "DoThing", "()", Some("void"));
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "class UMyActor\n{\npublic:\n    void Run()\n    {\n        DoThing();\n    }\n};\n",
+            Some("C:/Project/Source/Game/Public/MyActor.h".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP008"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP009"));
     }
 
     #[test]
