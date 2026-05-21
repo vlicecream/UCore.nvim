@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rusqlite::{Connection, OptionalExtension, ToSql};
+use rusqlite::{params, Connection, OptionalExtension, ToSql};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -24,13 +24,20 @@ struct MemberDeclHotEntry {
     class_name: String,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+struct CallSiteHotEntry {
+    file_id: i64,
+    path: String,
+    line: i64,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct UsageHotIndex {
     file_paths_by_id: HashMap<i64, String>,
     file_ids_by_path: HashMap<String, i64>,
     all_file_ids: Vec<i64>,
     defs_by_name: HashMap<String, Vec<i64>>,
-    calls_by_name_lc: HashMap<String, Vec<i64>>,
+    calls_by_name_lc: HashMap<String, Vec<CallSiteHotEntry>>,
     include_reverse: HashMap<i64, Vec<i64>>,
     member_defs_by_key: HashMap<String, Vec<i64>>,
     member_decls_by_key: HashMap<String, Vec<MemberDeclHotEntry>>,
@@ -89,7 +96,7 @@ pub fn build_usage_hot_index(conn: &Connection) -> Result<UsageHotIndex> {
     }
 
     let mut defs_by_name = HashMap::<String, Vec<i64>>::new();
-    let mut calls_by_name_lc = HashMap::<String, Vec<i64>>::new();
+    let mut calls_by_name_lc = HashMap::<String, Vec<CallSiteHotEntry>>::new();
     let mut include_reverse = HashMap::<i64, Vec<i64>>::new();
     let mut member_defs_by_key = HashMap::<String, Vec<i64>>::new();
     let mut member_decls_by_key = HashMap::<String, Vec<MemberDeclHotEntry>>::new();
@@ -147,11 +154,24 @@ pub fn build_usage_hot_index(conn: &Connection) -> Result<UsageHotIndex> {
         defs_by_name.entry(name).or_default().push(file_id);
     }
 
-    let mut stmt = conn.prepare("SELECT name_lc, file_id FROM search_symbol_calls")?;
-    let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
+    let mut stmt = conn.prepare(
+        "SELECT name_lc, file_id, path, line_number
+         FROM search_symbol_calls
+         ORDER BY file_id, line_number",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            CallSiteHotEntry {
+                file_id: row.get::<_, i64>(1)?,
+                path: normalize_path(&row.get::<_, String>(2)?),
+                line: row.get::<_, i64>(3)?,
+            },
+        ))
+    })?;
     for row in rows {
-        let (name_lc, file_id) = row?;
-        calls_by_name_lc.entry(name_lc).or_default().push(file_id);
+        let (name_lc, item) = row?;
+        calls_by_name_lc.entry(name_lc).or_default().push(item);
     }
 
     let mut stmt = conn.prepare(
@@ -164,7 +184,7 @@ pub fn build_usage_hot_index(conn: &Connection) -> Result<UsageHotIndex> {
     }
 
     dedupe_id_map(&mut defs_by_name);
-    dedupe_id_map(&mut calls_by_name_lc);
+    dedupe_call_site_map(&mut calls_by_name_lc);
     dedupe_i64_id_map(&mut include_reverse);
     dedupe_id_map(&mut member_defs_by_key);
     for items in member_decls_by_key.values_mut() {
@@ -240,17 +260,37 @@ fn find_symbol_usages_inner(
         _ => Vec::new(),
     };
 
-    let indexed_search_used = search_indexed_candidate_lines(
-        conn,
-        &candidates.file_paths,
-        symbol_name,
-        MAX_RESULTS.saturating_sub(results.len()),
-        scope,
-        |item| {
+    if !matches!(scope, Some(UsageScope::Local(_))) {
+        let direct_results = get_direct_call_results(
+            conn,
+            hot_index,
+            symbol_name,
+            scope,
+            MAX_RESULTS.saturating_sub(results.len()),
+        )?;
+        for item in direct_results {
             push_unique_result(&mut results, item);
-            Ok(())
-        },
-    )?;
+            if results.len() >= MAX_RESULTS {
+                break;
+            }
+        }
+    }
+
+    let indexed_search_used = if results.len() >= MAX_RESULTS {
+        false
+    } else {
+        search_indexed_candidate_lines(
+            conn,
+            &candidates.file_paths,
+            symbol_name,
+            MAX_RESULTS.saturating_sub(results.len()),
+            scope,
+            |item| {
+                push_unique_result(&mut results, item);
+                Ok(())
+            },
+        )?
+    };
 
     if !indexed_search_used {
         for path in &candidates.file_paths {
@@ -812,7 +852,25 @@ impl UsageHotIndex {
     }
 
     fn find_symbol_call_file_ids(&self, symbol_name: &str) -> Option<Vec<i64>> {
-        self.calls_by_name_lc.get(&symbol_name.to_ascii_lowercase()).cloned()
+        let mut ids = Vec::new();
+        let mut seen = HashSet::new();
+        for item in self.calls_by_name_lc.get(&symbol_name.to_ascii_lowercase())? {
+            if seen.insert(item.file_id) {
+                ids.push(item.file_id);
+            }
+        }
+        Some(ids)
+    }
+
+    fn get_direct_call_entries(&self, symbol_name: &str, limit: usize) -> Option<Vec<CallSiteHotEntry>> {
+        let mut results = Vec::new();
+        for entry in self.calls_by_name_lc.get(&symbol_name.to_ascii_lowercase())? {
+            if results.len() >= limit {
+                break;
+            }
+            results.push(entry.clone());
+        }
+        Some(results)
     }
 
     fn find_including_file_ids(&self, def_ids: &[i64]) -> Option<Vec<i64>> {
@@ -900,6 +958,20 @@ fn dedupe_id_map(map: &mut HashMap<String, Vec<i64>>) {
     for ids in map.values_mut() {
         ids.sort_unstable();
         ids.dedup();
+    }
+}
+
+fn dedupe_call_site_map(map: &mut HashMap<String, Vec<CallSiteHotEntry>>) {
+    for entries in map.values_mut() {
+        entries.sort_by(|left, right| {
+            left.file_id
+                .cmp(&right.file_id)
+                .then_with(|| left.line.cmp(&right.line))
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        entries.dedup_by(|left, right| {
+            left.file_id == right.file_id && left.line == right.line && left.path == right.path
+        });
     }
 }
 
@@ -1011,6 +1083,71 @@ fn find_symbol_call_file_ids(conn: &Connection, symbol_name: &str) -> Result<Vec
     )?;
 
     Ok(ids)
+}
+
+fn get_direct_call_results(
+    conn: &Connection,
+    hot_index: Option<&UsageHotIndex>,
+    symbol_name: &str,
+    scope: Option<&UsageScope>,
+    limit: usize,
+) -> Result<Vec<Value>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let overscan_limit = limit.saturating_mul(8).clamp(limit, 4096);
+    let entries = if let Some(entries) = hot_index.and_then(|index| index.get_direct_call_entries(symbol_name, overscan_limit)) {
+        entries
+    } else {
+        let sql = r#"
+            SELECT file_id, path, line_number
+            FROM search_symbol_calls
+            WHERE name_lc = lower(?)
+            ORDER BY path_lc, line_number
+            LIMIT ?
+            "#;
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(params![symbol_name, overscan_limit as i64], |row| {
+            Ok(CallSiteHotEntry {
+                file_id: row.get::<_, i64>(0)?,
+                path: normalize_path(&row.get::<_, String>(1)?),
+                line: row.get::<_, i64>(2)?,
+            })
+        })?;
+
+        let mut entries = Vec::new();
+        for row in rows {
+            entries.push(row?);
+        }
+        entries
+    };
+
+    let mut results = Vec::new();
+    let mut content_cache = HashMap::<String, Option<String>>::new();
+    let mut member_context_cache = HashMap::<String, Option<FileMemberContext>>::new();
+    for entry in entries {
+        if results.len() >= limit {
+            break;
+        }
+        let item = text::TextLineMatch {
+            path: entry.path.clone(),
+            line_number: entry.line,
+            line_text: context_line_for_path(&entry.path, entry.line),
+        };
+        let _ = process_indexed_line_match(
+            symbol_name,
+            &item,
+            scope,
+            &mut content_cache,
+            &mut member_context_cache,
+            &mut |value| {
+                push_unique_result(&mut results, value);
+                Ok(())
+            },
+        )?;
+    }
+    Ok(results)
 }
 
 /// Collect all indexed file ids as a last-resort unresolved usage scope fallback.
