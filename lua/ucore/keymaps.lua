@@ -1,4 +1,5 @@
 local config = require("ucore.config")
+local explorer = require("ucore.explorer")
 local navigation = require("ucore.navigation")
 local project = require("ucore.project")
 
@@ -81,6 +82,25 @@ local function setup_buffer(args)
 	set_buffer_map_modes({ "n", "i" }, bufnr, keymaps.signature, function()
 		require("ucore.assist").signature_help()
 	end, "UCore signature")
+end
+
+local function setup_global_explorer(args)
+	local keymaps = keymap_config()
+	if keymaps.enable == false then
+		return
+	end
+
+	local lhs = normalize_lhs(keymaps.explorer)
+	if not lhs then
+		return
+	end
+
+	local bufnr = args.buf
+	vim.keymap.set("n", lhs, explorer.toggle, {
+		buffer = bufnr,
+		desc = "UCore explorer",
+		silent = true,
+	})
 end
 
 -- Register gf for any buffer inside an Unreal project tree, including
@@ -166,6 +186,7 @@ function M.setup()
 			local path = vim.api.nvim_buf_get_name(args.buf)
 			if is_unreal_path(path) then
 				setup_global_find(args)
+				setup_global_explorer(args)
 				setup_diagnostics_action(args)
 			end
 		end,
@@ -201,6 +222,7 @@ function M.reset()
 			delete_buffer_map(bufnr, keymaps.rename)
 			delete_buffer_map(bufnr, keymaps.signature, { "n", "i" })
 			delete_buffer_map(bufnr, keymaps.global_find)
+			delete_buffer_map(bufnr, keymaps.explorer)
 			delete_buffer_map(bufnr, diagnostics_config.action_keymap)
 		end
 	end

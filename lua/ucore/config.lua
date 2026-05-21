@@ -278,6 +278,7 @@ local function default_values()
 				blueprint = "gb",
 				source_toggle = "gs",
 				global_find = "gf",
+				explorer = "<leader>fe",
 				signature = "<C-k>",
 				rename = "<leader>rn",
 			},
