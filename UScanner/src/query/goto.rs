@@ -415,6 +415,25 @@ fn looks_like_gameplay_tag_path(text: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.'))
 }
 
+fn looks_like_include_path(text: &str) -> bool {
+    !text.trim().is_empty()
+        && (text.contains('/')
+            || text.contains('\\')
+            || text.ends_with(".h")
+            || text.ends_with(".hpp")
+            || text.ends_with(".hh")
+            || text.ends_with(".hxx")
+            || text.ends_with(".inl"))
+}
+
+fn is_include_line(content: &str, line: u32) -> bool {
+    content
+        .lines()
+        .nth(line as usize)
+        .map(|text| text.trim_start().starts_with("#include"))
+        .unwrap_or(false)
+}
+
 /// Find the node under Neovim's 0-based cursor column.
 /// 根据 Neovim 传来的 0-based 光标列查找当前节点。
 fn cursor_node_at(root: Node, row: usize, col: usize) -> Option<Node> {
@@ -2864,6 +2883,115 @@ fn get_class_name_by_id(conn: &Connection, class_id: i64) -> Result<String> {
     )?)
 }
 
+fn get_file_id_by_full_path(conn: &Connection, file_path: &str) -> Result<Option<i64>> {
+    let normalized = file_path.replace('\\', "/");
+    let sql = r#"
+        SELECT f.id
+        FROM files f
+        JOIN dir_paths dp ON f.directory_id = dp.id
+        JOIN strings sf ON f.filename_id = sf.id
+        WHERE
+            CASE
+                WHEN dp.full_path = '/' THEN '/' || sf.text
+                WHEN substr(dp.full_path, -1) = '/' THEN dp.full_path || sf.text
+                ELSE dp.full_path || '/' || sf.text
+            END = ?
+        LIMIT 1
+    "#;
+
+    conn.query_row(sql, [normalized], |row| row.get::<_, i64>(0))
+        .optional()
+        .map_err(Into::into)
+}
+
+fn find_file_by_include_path(
+    conn: &Connection,
+    current_file_path: Option<&str>,
+    include_path: &str,
+) -> Result<Option<Value>> {
+    let include_path = include_path.trim();
+    if include_path.is_empty() {
+        return Ok(None);
+    }
+
+    if let Some(current_file_path) = current_file_path {
+        if let Some(file_id) = get_file_id_by_full_path(conn, current_file_path)? {
+            let sql = format!(
+                r#"
+                {}
+                SELECT dp.full_path || '/' || sf.text
+                FROM file_includes fi
+                JOIN strings si ON fi.include_path_id = si.id
+                JOIN files f ON fi.resolved_file_id = f.id
+                JOIN dir_paths dp ON f.directory_id = dp.id
+                JOIN strings sf ON f.filename_id = sf.id
+                WHERE fi.file_id = ?
+                  AND si.text = ?
+                  AND fi.resolved_file_id IS NOT NULL
+                LIMIT 1
+                "#,
+                PATH_CTE
+            );
+
+            if let Some(path) = conn
+                .query_row(&sql, params![file_id, include_path], |row| row.get::<_, String>(0))
+                .optional()?
+            {
+                return Ok(Some(json!({
+                    "symbol_name": include_path,
+                    "file_path": normalize_path(&path),
+                    "line_number": 1,
+                    "kind": "include",
+                })));
+            }
+        }
+    }
+
+    let basename = std::path::Path::new(include_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(include_path);
+    let like_pattern = format!("%/{}", include_path.replace('\\', "/"));
+    let sql = format!(
+        r#"
+        {}
+        SELECT dp.full_path || '/' || sf.text
+        FROM files f
+        JOIN dir_paths dp ON f.directory_id = dp.id
+        JOIN strings sf ON f.filename_id = sf.id
+        WHERE sf.text = ?
+           OR (
+                CASE
+                    WHEN dp.full_path = '/' THEN '/' || sf.text
+                    WHEN substr(dp.full_path, -1) = '/' THEN dp.full_path || sf.text
+                    ELSE dp.full_path || '/' || sf.text
+                END LIKE ?
+              )
+        ORDER BY
+            CASE
+                WHEN sf.text = ? THEN 0
+                ELSE 1
+            END,
+            LENGTH(dp.full_path || '/' || sf.text)
+        LIMIT 1
+        "#,
+        PATH_CTE
+    );
+
+    let result = conn
+        .query_row(&sql, params![basename, like_pattern, basename], |row| {
+            Ok(json!({
+                "symbol_name": include_path,
+                "file_path": normalize_path(&row.get::<_, String>(0)?),
+                "line_number": 1,
+                "kind": "include",
+            }))
+        })
+        .optional()?;
+
+    Ok(result)
+}
+
 /// Walk inheritance chain looking for implementation by class name.
 /// 遍历继承链，按类名查找实现。
 fn find_impl_in_inheritance(
@@ -3127,8 +3255,16 @@ fn goto_definition_inner(
     prefer_impl: bool,
 ) -> Result<Value> {
     if let Some(tag_path) = string_literal_under_cursor(&content, line, character) {
-        if looks_like_gameplay_tag_path(&tag_path) {
+        if is_include_line(&content, line) && looks_like_include_path(&tag_path) {
+            if let Some(result) = find_file_by_include_path(conn, file_path.as_deref(), &tag_path)? {
+                return Ok(result);
+            }
+        } else if looks_like_gameplay_tag_path(&tag_path) {
             if let Some(result) = find_gameplay_tag_by_path(conn, &tag_path)? {
+                return Ok(result);
+            }
+        } else if looks_like_include_path(&tag_path) {
+            if let Some(result) = find_file_by_include_path(conn, file_path.as_deref(), &tag_path)? {
                 return Ok(result);
             }
         }
@@ -3721,8 +3857,8 @@ fn tokens(text: &str) -> Vec<&str> {
 mod tests {
     use super::{
         extract_cursor_context, extract_cursor_function_signature, find_local_declaration,
-        goto_implementation, infer_var_type, normalize_parameter_signature, resolve_impl_class,
-        string_literal_under_cursor,
+        goto_definition, goto_implementation, infer_var_type, normalize_parameter_signature,
+        resolve_impl_class, string_literal_under_cursor,
     };
     use rusqlite::Connection;
     use std::path::Path;
@@ -3835,6 +3971,25 @@ public:
         conn.execute(
             "INSERT INTO members (class_id, file_id, name_id, type_id, access, detail, line_number) VALUES (?, ?, ?, ?, ?, ?, ?)",
             rusqlite::params![class_id, file_id, name_id, type_id, access, detail, line_number],
+        )
+        .unwrap();
+    }
+
+    fn insert_include(
+        conn: &Connection,
+        file_id: i64,
+        include_path: &str,
+        resolved_file_id: i64,
+    ) {
+        let include_path_id = insert_string(conn, include_path);
+        let base_filename = Path::new(include_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(include_path);
+        let base_filename_id = insert_string(conn, base_filename);
+        conn.execute(
+            "INSERT INTO file_includes (file_id, include_path_id, base_filename_id, resolved_file_id) VALUES (?, ?, ?, ?)",
+            rusqlite::params![file_id, include_path_id, base_filename_id, resolved_file_id],
         )
         .unwrap();
     }
@@ -3991,5 +4146,65 @@ public:
             Some("C:/Project/Source/Game/Private/MyAbility.cpp")
         );
         assert_eq!(value["line_number"].as_i64(), Some(34));
+    }
+
+    #[test]
+    fn goto_definition_resolves_include_target() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let current_path = "C:/Project/Source/Game/Private/MyActor.cpp";
+        let target_path = "C:/Project/Source/Game/Public/MyHeader.h";
+        let current_file_id = insert_file_at_path(&conn, current_path, false);
+        let target_file_id = insert_file_at_path(&conn, target_path, true);
+        insert_include(&conn, current_file_id, "MyHeader.h", target_file_id);
+
+        let content = "#include \"MyHeader.h\"\n";
+        let (line, col) = line_and_col(content, "MyHeader.h", 0);
+        let value = goto_definition(
+            &conn,
+            content.to_string(),
+            line,
+            col,
+            Some(current_path.to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            value["file_path"].as_str(),
+            Some("C:/Project/Source/Game/Public/MyHeader.h")
+        );
+        assert_eq!(value["kind"].as_str(), Some("include"));
+        assert_eq!(value["line_number"].as_i64(), Some(1));
+    }
+
+    #[test]
+    fn goto_implementation_resolves_include_target() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let current_path = "C:/Project/Source/Game/Private/MyActor.cpp";
+        let target_path = "C:/Project/Source/Game/Public/MyHeader.h";
+        let current_file_id = insert_file_at_path(&conn, current_path, false);
+        let target_file_id = insert_file_at_path(&conn, target_path, true);
+        insert_include(&conn, current_file_id, "MyHeader.h", target_file_id);
+
+        let content = "#include \"MyHeader.h\"\n";
+        let (line, col) = line_and_col(content, "MyHeader.h", 0);
+        let value = goto_implementation(
+            &conn,
+            content.to_string(),
+            line,
+            col,
+            Some(current_path.to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            value["file_path"].as_str(),
+            Some("C:/Project/Source/Game/Public/MyHeader.h")
+        );
+        assert_eq!(value["kind"].as_str(), Some("include"));
+        assert_eq!(value["line_number"].as_i64(), Some(1));
     }
 }
