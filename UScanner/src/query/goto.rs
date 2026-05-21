@@ -33,7 +33,9 @@ pub struct NavigationHotIndex {
     class_ids_by_name: HashMap<String, Vec<i64>>,
     parent_ids_by_child: HashMap<i64, Vec<i64>>,
     type_defs_by_name: HashMap<String, Vec<TypeNavEntry>>,
+    type_defs_by_compact_name: HashMap<String, Vec<TypeNavEntry>>,
     members_by_class_and_name: HashMap<String, Vec<MemberNavEntry>>,
+    members_by_qualified_name: HashMap<String, Vec<MemberNavEntry>>,
     members_anywhere_by_name: HashMap<String, Vec<MemberNavEntry>>,
 }
 
@@ -246,6 +248,14 @@ fn get_enclosing_class(node: Node, src: &[u8]) -> Option<String> {
 /// 去掉类型名里的 namespace 前缀。
 fn strip_namespace(name: &str) -> String {
     name.rsplit("::").next().unwrap_or(name).trim().to_string()
+}
+
+fn compact_identifier(input: &str) -> String {
+    input
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
 }
 
 fn is_current_class_alias(name: &str) -> bool {
@@ -1200,6 +1210,10 @@ fn class_member_key(class_id: i64, symbol_name: &str) -> String {
     format!("{}\n{}", class_id, symbol_name)
 }
 
+fn qualified_member_key(class_name: &str, symbol_name: &str) -> String {
+    format!("{}\n{}", strip_namespace(class_name), symbol_name)
+}
+
 fn member_entry_to_value(entry: &MemberNavEntry) -> Value {
     json!({
         "symbol_name": entry.symbol_name,
@@ -1224,6 +1238,7 @@ pub fn build_navigation_hot_index(conn: &Connection) -> Result<NavigationHotInde
 
     let mut class_ids_by_name = HashMap::<String, Vec<i64>>::new();
     let mut type_defs_by_name = HashMap::<String, Vec<TypeNavEntry>>::new();
+    let mut type_defs_by_compact_name = HashMap::<String, Vec<TypeNavEntry>>::new();
     let mut stmt = conn.prepare(&format!(
         r#"
         {}
@@ -1253,26 +1268,38 @@ pub fn build_navigation_hot_index(conn: &Connection) -> Result<NavigationHotInde
     })?;
     for row in rows {
         let (class_id, class_name, line_number, file_path, kind) = row?;
+        let short_name = strip_namespace(&class_name);
         class_ids_by_name
-            .entry(strip_namespace(&class_name))
+            .entry(short_name.clone())
             .or_default()
             .push(class_id);
+        let entry = TypeNavEntry {
+            symbol_name: class_name,
+            line_number,
+            file_path: file_path.clone(),
+            kind,
+            sort_rank: type_sort_rank(&file_path, line_number),
+        };
         type_defs_by_name
-            .entry(strip_namespace(&class_name))
+            .entry(short_name.clone())
             .or_default()
-            .push(TypeNavEntry {
-                symbol_name: class_name,
-                line_number,
-                file_path: file_path.clone(),
-                kind,
-                sort_rank: type_sort_rank(&file_path, line_number),
-            });
+            .push(entry.clone());
+        let compact_name = compact_identifier(&short_name);
+        if !compact_name.is_empty() {
+            type_defs_by_compact_name
+                .entry(compact_name)
+                .or_default()
+                .push(entry);
+        }
     }
     for ids in class_ids_by_name.values_mut() {
         ids.sort_unstable();
         ids.dedup();
     }
     for entries in type_defs_by_name.values_mut() {
+        entries.sort_by(|left, right| left.sort_rank.cmp(&right.sort_rank));
+    }
+    for entries in type_defs_by_compact_name.values_mut() {
         entries.sort_by(|left, right| left.sort_rank.cmp(&right.sort_rank));
     }
 
@@ -1312,6 +1339,7 @@ pub fn build_navigation_hot_index(conn: &Connection) -> Result<NavigationHotInde
     }
 
     let mut members_by_class_and_name = HashMap::<String, Vec<MemberNavEntry>>::new();
+    let mut members_by_qualified_name = HashMap::<String, Vec<MemberNavEntry>>::new();
     let mut members_anywhere_by_name = HashMap::<String, Vec<MemberNavEntry>>::new();
     let mut stmt = conn.prepare(&format!(
         r#"
@@ -1358,6 +1386,10 @@ pub fn build_navigation_hot_index(conn: &Connection) -> Result<NavigationHotInde
             .entry(class_member_key(class_id, &symbol_name))
             .or_default()
             .push(entry.clone());
+        members_by_qualified_name
+            .entry(qualified_member_key(&entry.class_name, &entry.symbol_name))
+            .or_default()
+            .push(entry.clone());
         members_anywhere_by_name
             .entry(symbol_name)
             .or_default()
@@ -1377,12 +1409,21 @@ pub fn build_navigation_hot_index(conn: &Connection) -> Result<NavigationHotInde
                 .then_with(|| left.file_path.cmp(&right.file_path))
         });
     }
+    for entries in members_by_qualified_name.values_mut() {
+        entries.sort_by(|left, right| {
+            left.prefer_def_rank
+                .cmp(&right.prefer_def_rank)
+                .then_with(|| left.file_path.cmp(&right.file_path))
+        });
+    }
 
     Ok(NavigationHotIndex {
         class_ids_by_name,
         parent_ids_by_child,
         type_defs_by_name,
+        type_defs_by_compact_name,
         members_by_class_and_name,
+        members_by_qualified_name,
         members_anywhere_by_name,
     })
 }
@@ -1392,7 +1433,9 @@ impl NavigationHotIndex {
         self.class_ids_by_name.len()
             + self.parent_ids_by_child.len()
             + self.type_defs_by_name.len()
+            + self.type_defs_by_compact_name.len()
             + self.members_by_class_and_name.len()
+            + self.members_by_qualified_name.len()
             + self.members_anywhere_by_name.len()
     }
 
@@ -1431,6 +1474,27 @@ impl NavigationHotIndex {
         Some(member_entry_to_value(&selected))
     }
 
+    fn find_member_by_qualified_name(
+        &self,
+        class_name: &str,
+        symbol_name: &str,
+        prefer_impl: bool,
+    ) -> Option<Value> {
+        let entries = self
+            .members_by_qualified_name
+            .get(&qualified_member_key(class_name, symbol_name))?;
+        let mut selected = entries.first()?.clone();
+        if prefer_impl {
+            if let Some(best) = entries
+                .iter()
+                .min_by(|left, right| left.prefer_impl_rank.cmp(&right.prefer_impl_rank))
+            {
+                selected = best.clone();
+            }
+        }
+        Some(member_entry_to_value(&selected))
+    }
+
     fn find_member_anywhere(&self, symbol_name: &str, prefer_impl: bool) -> Option<Value> {
         let entries = self.members_anywhere_by_name.get(symbol_name)?;
         let mut selected = entries.first()?.clone();
@@ -1446,12 +1510,24 @@ impl NavigationHotIndex {
     }
 
     fn find_type_definition(&self, name: &str) -> Option<Value> {
-        let entry = self
+        let short_name = strip_namespace(name);
+        if short_name.is_empty() {
+            return None;
+        }
+
+        if let Some(entry) = self
             .type_defs_by_name
-            .get(&strip_namespace(name))?
-            .first()?
-            .clone();
-        Some(type_entry_to_value(&entry))
+            .get(&short_name)
+            .and_then(|entries| entries.first())
+        {
+            return Some(type_entry_to_value(entry));
+        }
+
+        let compact = compact_identifier(&short_name);
+        self.type_defs_by_compact_name
+            .get(&compact)
+            .and_then(|entries| entries.first())
+            .map(type_entry_to_value)
     }
 }
 
@@ -2444,6 +2520,9 @@ fn find_member_by_class_name(
     }
 
     if let Some(hot_index) = hot_index {
+        if let Some(value) = hot_index.find_member_by_qualified_name(&name, symbol_name, prefer_impl) {
+            return Ok(Some(value));
+        }
         for class_id in hot_index.get_class_ids(&name) {
             if let Some(value) = hot_index.find_member_in_class(class_id, symbol_name, prefer_impl) {
                 return Ok(Some(value));

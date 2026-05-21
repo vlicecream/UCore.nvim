@@ -1,5 +1,6 @@
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, ToSql};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -16,13 +17,14 @@ const MAX_FILES: usize = 2000;
 const SQL_CHUNK_SIZE: usize = 100;
 const STREAM_BATCH_SIZE: usize = 15;
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct MemberDeclHotEntry {
     path: String,
     line: i64,
     class_name: String,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct UsageHotIndex {
     file_paths_by_id: HashMap<i64, String>,
     file_ids_by_path: HashMap<String, i64>,
@@ -789,6 +791,18 @@ fn is_type_like_symbol(conn: &Connection, symbol_name: &str) -> Result<bool> {
 }
 
 impl UsageHotIndex {
+    pub fn size_hint(&self) -> usize {
+        self.file_paths_by_id.len()
+            + self.file_ids_by_path.len()
+            + self.all_file_ids.len()
+            + self.defs_by_name.len()
+            + self.calls_by_name_lc.len()
+            + self.include_reverse.len()
+            + self.member_defs_by_key.len()
+            + self.member_decls_by_key.len()
+            + self.class_like_names.len()
+    }
+
     fn find_member_definition_file_ids(&self, symbol_name: &str, owner_class: &str) -> Option<Vec<i64>> {
         self.member_defs_by_key.get(&member_key(symbol_name, owner_class)).cloned()
     }

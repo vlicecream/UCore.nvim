@@ -842,6 +842,7 @@ fn handle_state_query(
                 state,
                 project_root,
                 conn,
+                project_db_path,
                 engine_db_path,
                 content,
                 line,
@@ -862,6 +863,7 @@ fn handle_state_query(
                 state,
                 project_root,
                 conn,
+                project_db_path,
                 engine_db_path,
                 content,
                 line,
@@ -1113,6 +1115,7 @@ fn goto_definition_with_engine(
     state: Arc<AppState>,
     project_root: &str,
     project_conn: &rusqlite::Connection,
+    project_db_path: &str,
     engine_db_path: Option<String>,
     content: String,
     line: u32,
@@ -1132,8 +1135,12 @@ fn goto_definition_with_engine(
         return Ok(value);
     }
 
-    let mut project_result = query::goto::goto_definition(
+    let project_nav_hot_index =
+        load_navigation_hot_index(&state, project_db_path, "goto definition project");
+
+    let mut project_result = query::goto::goto_definition_with_hot_index(
         project_conn,
+        project_nav_hot_index.as_deref(),
         content.clone(),
         line,
         character,
@@ -1162,11 +1169,33 @@ fn goto_definition_with_engine(
             return Ok(Value::Null);
         }
     };
-    let prefer_direct_engine_lookup =
-        should_try_direct_engine_navigation_lookup(&content, line, character, false);
+    let engine_nav_hot_index =
+        load_navigation_hot_index(&state, &engine_db_path, "goto definition engine");
+    let engine_content = content.clone();
+    let engine_file_path = file_path.clone();
 
-    if prefer_direct_engine_lookup {
-        let mut direct_result = match {
+    let mut engine_result = match {
+        let engine_conn = engine_conn.lock();
+        query::goto::goto_definition_with_hot_index(
+            &engine_conn,
+            engine_nav_hot_index.as_deref(),
+            engine_content,
+            line,
+            character,
+            engine_file_path,
+        )
+    } {
+        Ok(value) => value,
+        Err(err) => {
+            warn!("Failed to query Engine DB goto definition: {}", err);
+            return Ok(Value::Null);
+        }
+    };
+
+    if engine_result.is_null()
+        && should_try_direct_engine_navigation_lookup(&content, line, character, false)
+    {
+        engine_result = match {
             let engine_conn = engine_conn.lock();
             query::goto::goto_definition(&engine_conn, content.clone(), line, character, file_path.clone())
         } {
@@ -1176,34 +1205,7 @@ fn goto_definition_with_engine(
                 Value::Null
             }
         };
-
-        if !direct_result.is_null() {
-            tag_value_source(&mut direct_result, "engine");
-            navigation_cache.lock().put(cache_key, direct_result.clone());
-            return Ok(direct_result);
-        }
     }
-
-    let engine_nav_hot_index =
-        load_navigation_hot_index(&state, &engine_db_path, "goto definition engine");
-
-    let mut engine_result = match {
-        let engine_conn = engine_conn.lock();
-        query::goto::goto_definition_with_hot_index(
-            &engine_conn,
-            engine_nav_hot_index.as_deref(),
-            content,
-            line,
-            character,
-            file_path,
-        )
-    } {
-        Ok(value) => value,
-        Err(err) => {
-            warn!("Failed to query Engine DB goto definition: {}", err);
-            return Ok(Value::Null);
-        }
-    };
 
     if !engine_result.is_null() {
         tag_value_source(&mut engine_result, "engine");
@@ -1255,6 +1257,7 @@ fn goto_implementation_with_engine(
     state: Arc<AppState>,
     project_root: &str,
     project_conn: &rusqlite::Connection,
+    project_db_path: &str,
     engine_db_path: Option<String>,
     content: String,
     line: u32,
@@ -1274,8 +1277,12 @@ fn goto_implementation_with_engine(
         return Ok(value);
     }
 
-    let mut project_result = query::goto::goto_implementation(
+    let project_nav_hot_index =
+        load_navigation_hot_index(&state, project_db_path, "goto implementation project");
+
+    let mut project_result = query::goto::goto_implementation_with_hot_index(
         project_conn,
+        project_nav_hot_index.as_deref(),
         content.clone(),
         line,
         character,
@@ -1304,11 +1311,33 @@ fn goto_implementation_with_engine(
             return Ok(Value::Null);
         }
     };
-    let prefer_direct_engine_lookup =
-        should_try_direct_engine_navigation_lookup(&content, line, character, true);
+    let engine_nav_hot_index =
+        load_navigation_hot_index(&state, &engine_db_path, "goto implementation engine");
+    let engine_content = content.clone();
+    let engine_file_path = file_path.clone();
 
-    if prefer_direct_engine_lookup {
-        let mut direct_result = match {
+    let mut engine_result = match {
+        let engine_conn = engine_conn.lock();
+        query::goto::goto_implementation_with_hot_index(
+            &engine_conn,
+            engine_nav_hot_index.as_deref(),
+            engine_content,
+            line,
+            character,
+            engine_file_path,
+        )
+    } {
+        Ok(value) => value,
+        Err(err) => {
+            warn!("Failed to query Engine DB goto implementation: {}", err);
+            return Ok(Value::Null);
+        }
+    };
+
+    if engine_result.is_null()
+        && should_try_direct_engine_navigation_lookup(&content, line, character, true)
+    {
+        engine_result = match {
             let engine_conn = engine_conn.lock();
             query::goto::goto_implementation(&engine_conn, content.clone(), line, character, file_path.clone())
         } {
@@ -1318,34 +1347,7 @@ fn goto_implementation_with_engine(
                 Value::Null
             }
         };
-
-        if !direct_result.is_null() {
-            tag_value_source(&mut direct_result, "engine");
-            navigation_cache.lock().put(cache_key, direct_result.clone());
-            return Ok(direct_result);
-        }
     }
-
-    let engine_nav_hot_index =
-        load_navigation_hot_index(&state, &engine_db_path, "goto implementation engine");
-
-    let mut engine_result = match {
-        let engine_conn = engine_conn.lock();
-        query::goto::goto_implementation_with_hot_index(
-            &engine_conn,
-            engine_nav_hot_index.as_deref(),
-            content,
-            line,
-            character,
-            file_path,
-        )
-    } {
-        Ok(value) => value,
-        Err(err) => {
-            warn!("Failed to query Engine DB goto implementation: {}", err);
-            return Ok(Value::Null);
-        }
-    };
 
     if !engine_result.is_null() {
         tag_value_source(&mut engine_result, "engine");

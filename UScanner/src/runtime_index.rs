@@ -9,10 +9,12 @@ use sha2::{Digest, Sha256};
 
 use crate::query::goto::NavigationHotIndex;
 use crate::query::search::SearchHotIndex;
+use crate::query::usage::UsageHotIndex;
 
 const RUNTIME_INDEX_SCHEMA_VERSION: u32 = 1;
-pub const NAVIGATION_INDEX_VERSION: u32 = 1;
+pub const NAVIGATION_INDEX_VERSION: u32 = 2;
 pub const SEARCH_INDEX_VERSION: u32 = 2;
+pub const USAGE_INDEX_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct RuntimeIndexManifest {
@@ -21,12 +23,14 @@ struct RuntimeIndexManifest {
     db_mtime_secs: u64,
     navigation_version: Option<u32>,
     search_version: Option<u32>,
+    usage_version: Option<u32>,
 }
 
 #[derive(Clone, Copy)]
 enum RuntimeIndexKind {
     Navigation,
     Search,
+    Usage,
 }
 
 pub fn load_navigation_index(primary_db_path: &str) -> Result<Option<NavigationHotIndex>> {
@@ -63,6 +67,23 @@ pub fn save_search_index(primary_db_path: &str, index: &SearchHotIndex) -> Resul
     )
 }
 
+pub fn load_usage_index(primary_db_path: &str) -> Result<Option<UsageHotIndex>> {
+    load_index(
+        primary_db_path,
+        RuntimeIndexKind::Usage,
+        USAGE_INDEX_VERSION,
+    )
+}
+
+pub fn save_usage_index(primary_db_path: &str, index: &UsageHotIndex) -> Result<()> {
+    save_index(
+        primary_db_path,
+        RuntimeIndexKind::Usage,
+        USAGE_INDEX_VERSION,
+        index,
+    )
+}
+
 fn load_index<T: DeserializeOwned>(
     primary_db_path: &str,
     kind: RuntimeIndexKind,
@@ -80,6 +101,7 @@ fn load_index<T: DeserializeOwned>(
     let version_matches = match kind {
         RuntimeIndexKind::Navigation => manifest.navigation_version == Some(expected_version),
         RuntimeIndexKind::Search => manifest.search_version == Some(expected_version),
+        RuntimeIndexKind::Usage => manifest.usage_version == Some(expected_version),
     };
     if !version_matches {
         return Ok(None);
@@ -136,6 +158,7 @@ fn save_index<T: Serialize>(
     match kind {
         RuntimeIndexKind::Navigation => manifest.navigation_version = Some(version),
         RuntimeIndexKind::Search => manifest.search_version = Some(version),
+        RuntimeIndexKind::Usage => manifest.usage_version = Some(version),
     }
 
     let manifest_json = serde_json::to_vec_pretty(&manifest)?;
@@ -188,6 +211,7 @@ fn index_file_path(primary_db_path: &str, kind: RuntimeIndexKind) -> PathBuf {
     let file_name = match kind {
         RuntimeIndexKind::Navigation => "nav.idx",
         RuntimeIndexKind::Search => "symbol.idx",
+        RuntimeIndexKind::Usage => "usage.idx",
     };
     index_dir(primary_db_path).join(file_name)
 }
@@ -214,6 +238,7 @@ mod tests {
     use crate::db;
     use crate::query::goto::build_navigation_hot_index;
     use crate::query::search::build_search_hot_index;
+    use crate::query::usage::build_usage_hot_index;
     use rusqlite::Connection;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -265,6 +290,27 @@ mod tests {
             .expect("search index should load");
 
         assert_eq!(loaded.size_hint(), search_index.size_hint());
+
+        let _ = fs::remove_dir_all(base.join(".ucore"));
+        let _ = fs::remove_file(&db_path);
+        let _ = fs::remove_dir(&base);
+    }
+
+    #[test]
+    fn save_and_load_usage_index_round_trips() {
+        let base = temp_base("usage");
+        fs::create_dir_all(&base).unwrap();
+        let db_path = base.join("ucore.db");
+        let conn = Connection::open(&db_path).unwrap();
+        db::init_db(&conn).unwrap();
+
+        let usage_index = build_usage_hot_index(&conn).unwrap();
+        save_usage_index(db_path.to_string_lossy().as_ref(), &usage_index).unwrap();
+        let loaded = load_usage_index(db_path.to_string_lossy().as_ref())
+            .unwrap()
+            .expect("usage index should load");
+
+        assert_eq!(loaded.size_hint(), usage_index.size_hint());
 
         let _ = fs::remove_dir_all(base.join(".ucore"));
         let _ = fs::remove_file(&db_path);

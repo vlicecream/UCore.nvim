@@ -19,6 +19,7 @@ use crate::db::project_path::get_or_create_directory;
 use crate::db::text::TextIndexFile;
 use crate::query::goto::build_navigation_hot_index;
 use crate::query::search::build_search_hot_index;
+use crate::query::usage::build_usage_hot_index;
 use crate::runtime_index;
 use crate::server::asset;
 use crate::types::{
@@ -121,9 +122,12 @@ pub fn run_refresh(req: RefreshRequest, reporter: Arc<dyn ProgressReporter>) -> 
     reporter.report("finalizing", 0, 100, "Build nav index");
     let nav_index = build_navigation_hot_index(&conn)?;
     runtime_index::save_navigation_index(&ctx.db_path_native, &nav_index)?;
-    reporter.report("finalizing", 50, 100, "Build symbol index");
+    reporter.report("finalizing", 34, 100, "Build symbol index");
     let search_index = build_search_hot_index(&conn)?;
     runtime_index::save_search_index(&ctx.db_path_native, &search_index)?;
+    reporter.report("finalizing", 67, 100, "Build usage index");
+    let usage_index = build_usage_hot_index(&conn)?;
+    runtime_index::save_usage_index(&ctx.db_path_native, &usage_index)?;
     reporter.report("finalizing", 100, 100, "Runtime indexes ready");
 
     reporter.report("complete", 100, 100, "Refresh complete.");

@@ -620,11 +620,20 @@ impl AppState {
         }
 
         let started_at = Instant::now();
-        let conn = open_read_only_connection(db_path)?;
-        let index = Arc::new(build_usage_hot_index(&conn)?);
+        let (index, source) = if let Some(index) = runtime_index::load_usage_index(db_path)? {
+            (Arc::new(index), "runtime")
+        } else {
+            let conn = open_read_only_connection(db_path)?;
+            let index = Arc::new(build_usage_hot_index(&conn)?);
+            if let Err(err) = runtime_index::save_usage_index(db_path, index.as_ref()) {
+                warn!("Failed to persist usage runtime index for {}: {}", db_path, err);
+            }
+            (index, "db")
+        };
         info!(
-            "Usage hot index built: {} in {} ms",
+            "Usage hot index ready: {} source={} in {} ms",
             db_path,
+            source,
             started_at.elapsed().as_millis()
         );
 
