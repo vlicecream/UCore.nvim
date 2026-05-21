@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use crate::db::asset as asset_db;
+use crate::db::text;
+use crate::runtime_index::{self, AssetRuntimeIndex};
 use crate::server::state::{AppState, AssetGraph};
 use crate::server::utils::normalize_path_key;
 use crate::types::ProgressReporter;
@@ -191,16 +193,54 @@ impl Drop for ActiveAssetScanGuard {
     }
 }
 
+pub fn remove_single_asset_from_state(state: &AppState, project_root: &str, file_path: &Path) {
+    let root_key = normalize_path_key(project_root);
+    let asset_path = to_asset_path(file_path);
+    let mut graphs = state.asset_graphs.lock();
+    if let Some(graph) = graphs.get_mut(&root_key) {
+        remove_asset_from_graph(graph, &asset_path);
+    }
+}
+
 pub fn populate_asset_graph_state(
     state: &AppState,
     project_root: &str,
     conn: &Connection,
 ) -> Result<()> {
-    let graph = load_asset_graph_from_db(conn)?;
+    let graph = load_or_build_asset_graph(conn)?;
     let root_key = normalize_path_key(project_root);
     let mut graphs = state.asset_graphs.lock();
     graphs.insert(root_key, graph);
     Ok(())
+}
+
+pub fn ensure_asset_graph_state(
+    state: &AppState,
+    project_root: &str,
+    conn: &Connection,
+) -> bool {
+    let root_key = normalize_path_key(project_root);
+    {
+        let graphs = state.asset_graphs.lock();
+        if graphs.contains_key(&root_key) {
+            return true;
+        }
+    }
+
+    populate_asset_graph_state(state, project_root, conn).is_ok()
+}
+
+pub fn persist_asset_graph_state(
+    state: &AppState,
+    project_root: &str,
+    primary_db_path: &str,
+) -> Result<()> {
+    let root_key = normalize_path_key(project_root);
+    let graphs = state.asset_graphs.lock();
+    let Some(graph) = graphs.get(&root_key) else {
+        return Ok(());
+    };
+    runtime_index::save_asset_index(primary_db_path, &asset_runtime_from_graph(graph))
 }
 
 pub fn get_asset_usages_from_state(
@@ -1069,6 +1109,46 @@ fn remove_asset_from_graph(graph: &mut AssetGraph, asset_path: &str) {
     }
 }
 
+fn asset_runtime_from_graph(graph: &AssetGraph) -> AssetRuntimeIndex {
+    AssetRuntimeIndex {
+        references: runtime_map_from_graph(&graph.references),
+        derived: runtime_map_from_graph(&graph.derived),
+        functions: runtime_map_from_graph(&graph.functions),
+    }
+}
+
+fn graph_from_asset_runtime(index: AssetRuntimeIndex) -> AssetGraph {
+    AssetGraph {
+        references: graph_map_from_runtime(index.references),
+        derived: graph_map_from_runtime(index.derived),
+        functions: graph_map_from_runtime(index.functions),
+    }
+}
+
+fn runtime_map_from_graph(
+    map: &HashMap<Arc<str>, HashSet<Arc<str>>>,
+) -> HashMap<String, Vec<String>> {
+    let mut out = HashMap::new();
+    for (key, values) in map {
+        let mut items = values.iter().map(|item| item.to_string()).collect::<Vec<_>>();
+        items.sort_unstable();
+        out.insert(key.to_string(), items);
+    }
+    out
+}
+
+fn graph_map_from_runtime(map: HashMap<String, Vec<String>>) -> HashMap<Arc<str>, HashSet<Arc<str>>> {
+    let mut out = HashMap::new();
+    for (key, values) in map {
+        let mut items = HashSet::new();
+        for value in values {
+            items.insert(Arc::<str>::from(value));
+        }
+        out.insert(Arc::<str>::from(key), items);
+    }
+    out
+}
+
 fn load_asset_graph_from_db(conn: &Connection) -> Result<AssetGraph> {
     let Some(asset_conn) = asset_db::open_asset_db_read_only_for_primary(conn)? else {
         return Ok(AssetGraph::default());
@@ -1125,6 +1205,27 @@ fn load_asset_graph_from_db(conn: &Connection) -> Result<AssetGraph> {
         }
     }
 
+    Ok(graph)
+}
+
+fn load_or_build_asset_graph(conn: &Connection) -> Result<AssetGraph> {
+    let primary_db_path = text::current_primary_db_path(conn)?;
+    if let Some(primary_db_path) = primary_db_path.as_deref() {
+        if let Some(index) = runtime_index::load_asset_index(primary_db_path)? {
+            return Ok(graph_from_asset_runtime(index));
+        }
+    }
+
+    let graph = load_asset_graph_from_db(conn)?;
+    if let Some(primary_db_path) = primary_db_path.as_deref() {
+        if let Err(err) = runtime_index::save_asset_index(primary_db_path, &asset_runtime_from_graph(&graph)) {
+            warn!(
+                "Failed to persist asset runtime index for {}: {}",
+                primary_db_path,
+                err
+            );
+        }
+    }
     Ok(graph)
 }
 

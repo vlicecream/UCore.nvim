@@ -147,13 +147,27 @@ async fn handle_asset_change(state: Arc<AppState>, root_key: String, path: PathB
         }
     };
 
-    crate::server::asset::update_single_asset(state, &root_key, &path).await;
+    crate::server::asset::update_single_asset(state.clone(), &root_key, &path).await;
+    let state_for_persist = state.clone();
+    let root_key_for_persist = root_key.clone();
+    let db_path_for_persist = db_path_native.clone();
 
     tokio::task::spawn_blocking(move || {
         let mut conn = conn.lock();
         if let Err(err) = crate::server::asset::upsert_asset_file(&mut conn, &path) {
             error!("Failed to persist asset update {}: {}", path.display(), err);
             return;
+        }
+        if let Err(err) = crate::server::asset::persist_asset_graph_state(
+            &state_for_persist,
+            &root_key_for_persist,
+            &db_path_for_persist,
+        ) {
+            error!(
+                "Failed to persist asset runtime graph after update {}: {}",
+                path.display(),
+                err
+            );
         }
 
         info!("Asset change persisted: {}", path.display());
@@ -173,12 +187,27 @@ async fn handle_asset_delete(state: Arc<AppState>, project: MatchedProject, path
             return;
         }
     };
+    crate::server::asset::remove_single_asset_from_state(&state, &project.root_key, &path);
+    let state_for_persist = state.clone();
+    let root_key_for_persist = project.root_key.clone();
+    let db_path_for_persist = db_path_native.clone();
 
     tokio::task::spawn_blocking(move || {
         let mut conn = conn.lock();
         if let Err(err) = crate::server::asset::delete_asset_file(&mut conn, &path) {
             error!("Failed to delete asset index entry {}: {}", path.display(), err);
             return;
+        }
+        if let Err(err) = crate::server::asset::persist_asset_graph_state(
+            &state_for_persist,
+            &root_key_for_persist,
+            &db_path_for_persist,
+        ) {
+            error!(
+                "Failed to persist asset runtime graph after delete {}: {}",
+                path.display(),
+                err
+            );
         }
 
         info!("Asset removed from index: {}", path.display());

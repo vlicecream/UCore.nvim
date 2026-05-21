@@ -914,12 +914,18 @@ fn handle_state_query(
         }
 
         QueryRequest::GetAssetUsages { asset_path } => Ok(Some(
-            asset::get_asset_usages_from_state(&state, project_root, &asset_path)
+            {
+                let _ = asset::ensure_asset_graph_state(&state, project_root, conn);
+                asset::get_asset_usages_from_state(&state, project_root, &asset_path)
+            }
                 .unwrap_or(asset::get_asset_usages(conn, &asset_path)?),
         )),
 
         QueryRequest::GetAssetUsageHints { names } => Ok(Some(
-            asset::get_asset_usage_hints_from_state(&state, project_root, &names)
+            {
+                let _ = asset::ensure_asset_graph_state(&state, project_root, conn);
+                asset::get_asset_usage_hints_from_state(&state, project_root, &names)
+            }
                 .unwrap_or(asset::get_asset_usage_hints(conn, &names)?),
         )),
 
@@ -942,6 +948,7 @@ fn handle_state_query(
             .cloned()
             .unwrap_or_default();
 
+            let _ = asset::ensure_asset_graph_state(&state, project_root, conn);
             if !asset::merge_derived_classes_from_state(&state, project_root, &base_class, &mut db_results) {
                 asset::merge_derived_classes(conn, &base_class, &mut db_results)?;
             }

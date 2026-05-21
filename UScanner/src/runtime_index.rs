@@ -15,6 +15,20 @@ const RUNTIME_INDEX_SCHEMA_VERSION: u32 = 1;
 pub const NAVIGATION_INDEX_VERSION: u32 = 2;
 pub const SEARCH_INDEX_VERSION: u32 = 2;
 pub const USAGE_INDEX_VERSION: u32 = 1;
+pub const ASSET_INDEX_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AssetRuntimeIndex {
+    pub references: std::collections::HashMap<String, Vec<String>>,
+    pub derived: std::collections::HashMap<String, Vec<String>>,
+    pub functions: std::collections::HashMap<String, Vec<String>>,
+}
+
+impl AssetRuntimeIndex {
+    pub fn size_hint(&self) -> usize {
+        self.references.len() + self.derived.len() + self.functions.len()
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct RuntimeIndexManifest {
@@ -24,6 +38,7 @@ struct RuntimeIndexManifest {
     navigation_version: Option<u32>,
     search_version: Option<u32>,
     usage_version: Option<u32>,
+    asset_version: Option<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -31,6 +46,7 @@ enum RuntimeIndexKind {
     Navigation,
     Search,
     Usage,
+    Asset,
 }
 
 pub fn load_navigation_index(primary_db_path: &str) -> Result<Option<NavigationHotIndex>> {
@@ -84,6 +100,23 @@ pub fn save_usage_index(primary_db_path: &str, index: &UsageHotIndex) -> Result<
     )
 }
 
+pub fn load_asset_index(primary_db_path: &str) -> Result<Option<AssetRuntimeIndex>> {
+    load_index(
+        primary_db_path,
+        RuntimeIndexKind::Asset,
+        ASSET_INDEX_VERSION,
+    )
+}
+
+pub fn save_asset_index(primary_db_path: &str, index: &AssetRuntimeIndex) -> Result<()> {
+    save_index(
+        primary_db_path,
+        RuntimeIndexKind::Asset,
+        ASSET_INDEX_VERSION,
+        index,
+    )
+}
+
 fn load_index<T: DeserializeOwned>(
     primary_db_path: &str,
     kind: RuntimeIndexKind,
@@ -102,6 +135,7 @@ fn load_index<T: DeserializeOwned>(
         RuntimeIndexKind::Navigation => manifest.navigation_version == Some(expected_version),
         RuntimeIndexKind::Search => manifest.search_version == Some(expected_version),
         RuntimeIndexKind::Usage => manifest.usage_version == Some(expected_version),
+        RuntimeIndexKind::Asset => manifest.asset_version == Some(expected_version),
     };
     if !version_matches {
         return Ok(None);
@@ -159,6 +193,7 @@ fn save_index<T: Serialize>(
         RuntimeIndexKind::Navigation => manifest.navigation_version = Some(version),
         RuntimeIndexKind::Search => manifest.search_version = Some(version),
         RuntimeIndexKind::Usage => manifest.usage_version = Some(version),
+        RuntimeIndexKind::Asset => manifest.asset_version = Some(version),
     }
 
     let manifest_json = serde_json::to_vec_pretty(&manifest)?;
@@ -212,6 +247,7 @@ fn index_file_path(primary_db_path: &str, kind: RuntimeIndexKind) -> PathBuf {
         RuntimeIndexKind::Navigation => "nav.idx",
         RuntimeIndexKind::Search => "symbol.idx",
         RuntimeIndexKind::Usage => "usage.idx",
+        RuntimeIndexKind::Asset => "asset.idx",
     };
     index_dir(primary_db_path).join(file_name)
 }
@@ -311,6 +347,40 @@ mod tests {
             .expect("usage index should load");
 
         assert_eq!(loaded.size_hint(), usage_index.size_hint());
+
+        let _ = fs::remove_dir_all(base.join(".ucore"));
+        let _ = fs::remove_file(&db_path);
+        let _ = fs::remove_dir(&base);
+    }
+
+    #[test]
+    fn save_and_load_asset_index_round_trips() {
+        let base = temp_base("asset");
+        fs::create_dir_all(&base).unwrap();
+        let db_path = base.join("ucore.db");
+        let conn = Connection::open(&db_path).unwrap();
+        db::init_db(&conn).unwrap();
+
+        let mut index = AssetRuntimeIndex::default();
+        index.references.insert(
+            "weaponforgemain".to_string(),
+            vec!["/game/ui/wbp_weaponforge".to_string()],
+        );
+        index.derived.insert(
+            "uweaponforgemain".to_string(),
+            vec!["/game/ui/wbp_weaponforge".to_string()],
+        );
+        index.functions.insert(
+            "nativeconstruct".to_string(),
+            vec!["/game/ui/wbp_weaponforge".to_string()],
+        );
+
+        save_asset_index(db_path.to_string_lossy().as_ref(), &index).unwrap();
+        let loaded = load_asset_index(db_path.to_string_lossy().as_ref())
+            .unwrap()
+            .expect("asset index should load");
+
+        assert_eq!(loaded.size_hint(), index.size_hint());
 
         let _ = fs::remove_dir_all(base.join(".ucore"));
         let _ = fs::remove_file(&db_path);
