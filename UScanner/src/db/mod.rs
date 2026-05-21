@@ -560,17 +560,18 @@ pub fn save_to_db(
 ) -> anyhow::Result<()> {
     init_db(conn)?;
     let total = results.len();
+    let progress_total = total.max(1) + DB_WRITE_FINALIZE_STEPS;
     let started_at = Instant::now();
 
     info!("DB write start: {} parse results (chunk_size={})", total, DB_BULK_CHUNK_SIZE);
 
     prepare_bulk_write(conn)?;
-    reporter.report("db_write", 0, total.max(1), "Prepare");
-    reporter.report("db_write", 0, total.max(1), "Drop");
+    reporter.report("db_write", 0, progress_total, "Prepare");
+    reporter.report("db_write", 0, progress_total, "Drop");
     drop_indices(conn)?;
     info!("DB write drop indices finished in {} ms", started_at.elapsed().as_millis());
 
-    reporter.report("db_write", 0, total.max(1), "Insert");
+    reporter.report("db_write", 0, progress_total, "Insert");
     let mut string_cache: HashMap<String, i64> = HashMap::new();
     let mut dir_cache: HashMap<(Option<i64>, i64), i64> = HashMap::new();
     let mut module_name_cache: HashMap<Option<i64>, Option<String>> = HashMap::new();
@@ -584,6 +585,7 @@ pub fn save_to_db(
             chunk,
             reporter.as_ref(),
             total,
+            progress_total,
             chunk_index * chunk_size,
             &mut string_cache,
             &mut dir_cache,
@@ -599,7 +601,7 @@ pub fn save_to_db(
         );
     }
 
-    finalize_bulk_write(conn, reporter)?;
+    finalize_bulk_write(conn, reporter, total.max(1), progress_total)?;
     Ok(())
 }
 
@@ -706,7 +708,8 @@ fn save_to_db_bulk_chunk(
     conn: &mut Connection,
     results: &[ParseResult],
     reporter: &dyn ProgressReporter,
-    total: usize,
+    insert_total: usize,
+    progress_total: usize,
     global_offset: usize,
     string_cache: &mut HashMap<String, i64>,
     dir_cache: &mut HashMap<(Option<i64>, i64), i64>,
@@ -823,15 +826,20 @@ fn save_to_db_bulk_chunk(
 
         for (index, result) in results.iter().enumerate() {
             let current = global_offset + index + 1;
-            let percent = progress_percent(current, total);
+            let percent = progress_percent(current, progress_total);
 
-            if current == total
+            if current == insert_total
                 || current == 1
                 || current % ITEM_PROGRESS_EVERY == 0
                 || percent > *last_reported_percent
             {
                 *last_reported_percent = percent;
-                reporter.report("db_write", current, total, &format!("{}/{}", current, total));
+                reporter.report(
+                    "db_write",
+                    current,
+                    progress_total,
+                    &format!("{}/{}", current, insert_total),
+                );
             }
 
             let path_obj = Path::new(&result.path);
@@ -1825,6 +1833,8 @@ fn progress_percent(current: usize, total: usize) -> usize {
     (current * 100 / total).min(100)
 }
 
+const DB_WRITE_FINALIZE_STEPS: usize = 5;
+
 /// Configure SQLite for fast bulk insertion.
 /// 配置 SQLite 以提升批量写入性能。
 fn prepare_bulk_write(conn: &Connection) -> anyhow::Result<()> {
@@ -1843,13 +1853,15 @@ fn prepare_bulk_write(conn: &Connection) -> anyhow::Result<()> {
 fn finalize_bulk_write(
     conn: &mut Connection,
     reporter: Arc<dyn ProgressReporter>,
+    inserted_total: usize,
+    progress_total: usize,
 ) -> anyhow::Result<()> {
     let started_at = Instant::now();
-    reporter.report("finalizing", 60, 100, "Commit");
+    reporter.report("db_write", inserted_total + 1, progress_total, "Commit");
     reporter.report(
-        "finalizing",
-        70,
-        100,
+        "db_write",
+        inserted_total + 2,
+        progress_total,
         "Indices",
     );
     create_indices(conn)?;
@@ -1857,13 +1869,13 @@ fn finalize_bulk_write(
 
     conn.execute("PRAGMA foreign_keys = ON", [])?;
 
-    reporter.report("finalizing", 80, 100, "Inheritance");
+    reporter.report("db_write", inserted_total + 3, progress_total, "Inheritance");
     resolve_inheritance(conn)?;
 
-    reporter.report("finalizing", 85, 100, "Includes");
+    reporter.report("db_write", inserted_total + 4, progress_total, "Includes");
     resolve_file_includes_by_path(conn)?;
 
-    reporter.report("finalizing", 95, 100, "Optimize");
+    reporter.report("db_write", inserted_total + 5, progress_total, "Optimize");
     conn.execute("INSERT INTO search_files_fts(search_files_fts) VALUES('optimize')", [])?;
     conn.execute("INSERT INTO search_symbols_fts(search_symbols_fts) VALUES('optimize')", [])?;
     conn.execute("PRAGMA optimize", [])?;
