@@ -257,8 +257,7 @@ pub fn process_completion_with_engine(
         .ok_or_else(|| anyhow::anyhow!("failed to parse current buffer"))?;
 
     let root = tree.root_node();
-    let cursor_node = cursor_node(root, line, character)
-        .ok_or_else(|| anyhow::anyhow!("no tree-sitter node at cursor"))?;
+    let cursor_node = cursor_node(root, line, character).unwrap_or(root);
     let buffer_inheritance = build_buffer_inheritance_map(root, content);
     if log_enabled {
         info!(
@@ -748,11 +747,19 @@ struct MemberCompletionRequest<'a> {
 fn cursor_node(root: Node, line: u32, character: u32) -> Option<Node> {
     let row = line as usize;
     let col = character as usize;
+    let current = Point::new(row, col);
+    let next = Point::new(row, col.saturating_add(1));
 
     root.descendant_for_point_range(
         Point::new(row, col.saturating_sub(1)),
         Point::new(row, col),
     )
+        .or_else(|| root.descendant_for_point_range(current, next))
+        .or_else(|| {
+            let previous = Point::new(row, col.saturating_sub(1));
+            root.descendant_for_point_range(previous, current)
+        })
+        .or_else(|| root.descendant_for_point_range(current, current))
 }
 
 /// Detect member completion after ., ->, or ::.
@@ -4346,10 +4353,17 @@ fn read_completion_cache(
             .optional()?;
 
         if let Some(blob) = blob {
-            let value: Value = serde_json::from_slice(&blob)?;
+            match serde_json::from_slice::<Value>(&blob) {
+                Ok(value) => {
+                    if let Some(items) = value.as_array() {
+                        return Ok(Some(items.clone()));
+                    }
 
-            if let Some(items) = value.as_array() {
-                return Ok(Some(items.clone()));
+                    let _ = conn.execute("DELETE FROM persistent_cache WHERE key = ?", [key]);
+                }
+                Err(_) => {
+                    let _ = conn.execute("DELETE FROM persistent_cache WHERE key = ?", [key]);
+                }
             }
         }
     }
@@ -4944,7 +4958,9 @@ fn get_file_id_by_full_path(conn: &Connection, file_path: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::Mutex as ParkingLotMutex;
     use rusqlite::Connection;
+    use std::sync::Arc;
 
     const TEST_FILE: &str = "C:/Project/Source/Game/MyActor.cpp";
 
@@ -6358,5 +6374,63 @@ public:
             ),
             "virtual UAbilitySystemComponent* GetAbilitySystemComponent() const override;",
         );
+    }
+
+    #[test]
+    fn cursor_node_can_resolve_identifier_at_word_start() {
+        let source = "auto /*cursor*/Value = 1;";
+        let (content, line, character) = source_with_cursor(source);
+        let mut parser = Parser::new();
+        let language: tree_sitter::Language = tree_sitter_unreal_cpp::LANGUAGE.into();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(&content, None).unwrap();
+        let node = cursor_node(tree.root_node(), line, character);
+        assert!(node.is_some());
+    }
+
+    #[test]
+    fn corrupted_persistent_completion_cache_does_not_break_completion() {
+        let conn = test_db();
+        let cache_conn = Connection::open_in_memory().unwrap();
+        crate::db::init_cache_db(&cache_conn).unwrap();
+        cache_conn
+            .execute(
+                "INSERT INTO persistent_cache (key, value, last_used) VALUES (?, ?, 0)",
+                rusqlite::params!["broken-key", vec![0xff_u8, 0xfe_u8, 0xfd_u8]],
+            )
+            .unwrap();
+
+        let persistent_cache = Some(Arc::new(ParkingLotMutex::new(cache_conn)));
+        let cached = read_completion_cache("broken-key", &None, &persistent_cache).unwrap();
+        assert!(cached.is_none());
+
+        let remaining: i64 = persistent_cache
+            .as_ref()
+            .unwrap()
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM persistent_cache WHERE key = ?",
+                ["broken-key"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0);
+
+        let (content, line, character) = source_with_cursor("ret/*cursor*/");
+        let items = process_completion(
+            &conn,
+            &content,
+            line,
+            character,
+            Some(TEST_FILE.to_string()),
+            None,
+            persistent_cache,
+        )
+        .unwrap()
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+
+        assert!(has_label(&items, "return"));
     }
 }
