@@ -85,6 +85,11 @@ pub struct CursorCtx {
 }
 
 #[derive(Debug, Clone)]
+struct CursorFunctionSignature {
+    parameters: String,
+}
+
+#[derive(Debug, Clone)]
 struct LocalDeclMatch {
     row: usize,
     col: usize,
@@ -1711,6 +1716,147 @@ fn header_function_declaration_cursor(content: &str, line: u32, character: u32) 
     false
 }
 
+fn extract_cursor_function_signature(
+    content: &str,
+    line: u32,
+    character: u32,
+) -> Option<CursorFunctionSignature> {
+    let language: tree_sitter::Language = tree_sitter_unreal_cpp::LANGUAGE.into();
+    let mut parser = Parser::new();
+    parser.set_language(&language).ok()?;
+
+    let tree = parser.parse(content, None)?;
+    let root = tree.root_node();
+    let src = content.as_bytes();
+    let point = Point::new(line as usize, character as usize);
+    let raw_node = cursor_node_at(root, line as usize, character as usize)?;
+
+    let mut current = Some(raw_node);
+    while let Some(node) = current {
+        if is_function_like(node.kind()) {
+            return None;
+        }
+
+        if matches!(node.kind(), "field_declaration" | "declaration") {
+            let declarator = node.child_by_field_name("declarator").and_then(|decl| {
+                if decl.kind() == "function_declarator" {
+                    Some(decl)
+                } else {
+                    find_descendant_of_kind(decl, "function_declarator")
+                }
+            })?;
+
+            let name_node = extract_decl_name_node(declarator)?;
+            if !node_contains_point(name_node, point) {
+                return None;
+            }
+
+            let params = find_child_by_type(declarator, "parameter_list")?;
+            let parameters = normalize_parameter_signature(node_text(&params, src));
+            if parameters.is_empty() {
+                return None;
+            }
+
+            return Some(CursorFunctionSignature { parameters });
+        }
+
+        current = node.parent();
+    }
+
+    None
+}
+
+fn normalize_space(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn normalize_parameter_signature(params: &str) -> String {
+    let mut out = String::with_capacity(params.len());
+    let mut paren_depth = 0i32;
+    let mut angle_depth = 0i32;
+    let mut brace_depth = 0i32;
+    let mut bracket_depth = 0i32;
+    let mut skipping_default = false;
+
+    for ch in params.chars() {
+        if skipping_default {
+            match ch {
+                '(' => paren_depth += 1,
+                ')' => {
+                    if paren_depth == 1
+                        && angle_depth == 0
+                        && brace_depth == 0
+                        && bracket_depth == 0
+                    {
+                        skipping_default = false;
+                        paren_depth -= 1;
+                        out.push(')');
+                    } else {
+                        paren_depth -= 1;
+                    }
+                }
+                '<' => angle_depth += 1,
+                '>' => angle_depth = (angle_depth - 1).max(0),
+                '{' => brace_depth += 1,
+                '}' => brace_depth = (brace_depth - 1).max(0),
+                '[' => bracket_depth += 1,
+                ']' => bracket_depth = (bracket_depth - 1).max(0),
+                ',' if paren_depth == 1
+                    && angle_depth == 0
+                    && brace_depth == 0
+                    && bracket_depth == 0 =>
+                {
+                    skipping_default = false;
+                    out.push(',');
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        match ch {
+            '(' => {
+                paren_depth += 1;
+                out.push(ch);
+            }
+            ')' => {
+                paren_depth -= 1;
+                out.push(ch);
+            }
+            '<' => {
+                angle_depth += 1;
+                out.push(ch);
+            }
+            '>' => {
+                angle_depth = (angle_depth - 1).max(0);
+                out.push(ch);
+            }
+            '{' => {
+                brace_depth += 1;
+                out.push(ch);
+            }
+            '}' => {
+                brace_depth = (brace_depth - 1).max(0);
+                out.push(ch);
+            }
+            '[' => {
+                bracket_depth += 1;
+                out.push(ch);
+            }
+            ']' => {
+                bracket_depth = (bracket_depth - 1).max(0);
+                out.push(ch);
+            }
+            '=' if paren_depth >= 1 && angle_depth == 0 && brace_depth == 0 && bracket_depth == 0 => {
+                skipping_default = true;
+            }
+            _ => out.push(ch),
+        }
+    }
+
+    normalize_space(&out).replace(" )", ")").replace(" ,", ",")
+}
+
 fn function_signature_label(
     owner_class: Option<&str>,
     name: &str,
@@ -2650,6 +2796,65 @@ fn find_member_by_class_name(
     Ok(result)
 }
 
+fn find_member_by_class_name_and_params(
+    conn: &Connection,
+    class_name: &str,
+    symbol_name: &str,
+    normalized_params: &str,
+    prefer_impl: bool,
+) -> Result<Option<Value>> {
+    let name = strip_namespace(class_name);
+    if name.is_empty() || normalized_params.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let order_by = member_order_by_clause(prefer_impl);
+    let sql = format!(
+        r#"
+        {}
+        SELECT
+            sm.text,
+            m.line_number,
+            dp.full_path || '/' || sf.text,
+            sc.text,
+            COALESCE(m.detail, '')
+        FROM members m
+        JOIN strings sm ON m.name_id = sm.id
+        JOIN classes c ON m.class_id = c.id
+        JOIN strings sc ON c.name_id = sc.id
+        JOIN files f ON COALESCE(m.file_id, c.file_id) = f.id
+        JOIN dir_paths dp ON f.directory_id = dp.id
+        JOIN strings sf ON f.filename_id = sf.id
+        WHERE c.name_id IN (SELECT id FROM strings WHERE text = ?)
+          AND sm.text = ?
+        {}
+        "#,
+        PATH_CTE,
+        order_by,
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query(params![name, symbol_name])?;
+
+    while let Some(row) = rows.next()? {
+        let detail: String = row.get(4)?;
+        if normalize_parameter_signature(&detail) != normalized_params {
+            continue;
+        }
+
+        let mut value = json!({
+            "symbol_name": row.get::<_, String>(0)?,
+            "line_number": row.get::<_, i64>(1)?,
+            "file_path": normalize_path(&row.get::<_, String>(2)?),
+            "class_name": row.get::<_, String>(3)?,
+        });
+        fix_symbol_location(&mut value, symbol_name);
+        return Ok(Some(value));
+    }
+
+    Ok(None)
+}
+
 /// Get class name from class_id.
 fn get_class_name_by_id(conn: &Connection, class_id: i64) -> Result<String> {
     Ok(conn.query_row(
@@ -2699,6 +2904,60 @@ fn find_impl_in_inheritance(
                     if let Some(result) =
                         find_member_by_class_name(conn, None, &parent_short, symbol_name, true)?
                     {
+                        return Ok(Some(result));
+                    }
+                }
+            }
+
+            if !visited.contains(&parent_id) {
+                queue.push_back(parent_id);
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn find_impl_in_inheritance_with_params(
+    conn: &Connection,
+    class_name: &str,
+    symbol_name: &str,
+    normalized_params: &str,
+) -> Result<Option<Value>> {
+    let name = strip_namespace(class_name);
+    if name.is_empty() || normalized_params.trim().is_empty() {
+        return Ok(None);
+    }
+
+    if let Some(result) =
+        find_member_by_class_name_and_params(conn, &name, symbol_name, normalized_params, true)?
+    {
+        return Ok(Some(result));
+    }
+
+    let mut gctx = GotoCtx::new(conn);
+    let start_ids = gctx.get_class_ids(&name)?;
+    let mut queue = VecDeque::from(start_ids);
+    let mut visited = HashSet::new();
+    let mut tried_names = HashSet::new();
+    tried_names.insert(name.to_string());
+
+    while let Some(class_id) = queue.pop_front() {
+        if !visited.insert(class_id) {
+            continue;
+        }
+
+        for parent_id in gctx.get_parent_ids(class_id)? {
+            if let Ok(parent_name) = get_class_name_by_id(conn, parent_id) {
+                let parent_short = strip_namespace(&parent_name);
+                if !parent_short.is_empty() && tried_names.insert(parent_short.clone()) {
+                    if let Some(result) = find_member_by_class_name_and_params(
+                        conn,
+                        &parent_short,
+                        symbol_name,
+                        normalized_params,
+                        true,
+                    )? {
                         return Ok(Some(result));
                     }
                 }
@@ -2939,7 +3198,25 @@ fn goto_definition_inner(
     // be returned as implementations.
     // 实现模式：按类名搜。不全局兜底，避免跳到无关类的同名成员。
     if prefer_impl {
+        let current_signature = extract_cursor_function_signature(&content, line, character);
         if let Some(ref name) = resolve_impl_class(&ctx, &content, line) {
+            if let Some(signature) = current_signature.as_ref() {
+                if let Some(result) = find_impl_in_inheritance_with_params(
+                    conn,
+                    name,
+                    &ctx.symbol,
+                    &signature.parameters,
+                )? {
+                    tracing::debug!(
+                        "goto_{}: resolved '{}' through impl class '{}' with params '{}'",
+                        mode,
+                        ctx.symbol,
+                        name,
+                        signature.parameters
+                    );
+                    return Ok(result);
+                }
+            }
             if let Some(result) = find_impl_in_inheritance(conn, hot_index, name, &ctx.symbol)? {
                 tracing::debug!(
                     "goto_{}: resolved '{}' through impl class '{}'",
@@ -3443,9 +3720,12 @@ fn tokens(text: &str) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_cursor_context, find_local_declaration, infer_var_type, resolve_impl_class,
+        extract_cursor_context, extract_cursor_function_signature, find_local_declaration,
+        goto_implementation, infer_var_type, normalize_parameter_signature, resolve_impl_class,
         string_literal_under_cursor,
     };
+    use rusqlite::Connection;
+    use std::path::Path;
 
     const SAMPLE: &str = r#"
 void StartDeath()
@@ -3479,6 +3759,85 @@ public:
     }
 };
 "#;
+
+    fn insert_string(conn: &Connection, text: &str) -> i64 {
+        conn.execute("INSERT OR IGNORE INTO strings (text) VALUES (?)", [text])
+            .unwrap();
+        conn.query_row("SELECT id FROM strings WHERE text = ?", [text], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn get_or_create_dir(conn: &Connection, parent_id: Option<i64>, name_id: i64) -> i64 {
+        conn.execute(
+            "INSERT OR IGNORE INTO directories (parent_id, name_id) VALUES (?, ?)",
+            rusqlite::params![parent_id, name_id],
+        )
+        .unwrap();
+        conn.query_row(
+            "SELECT id FROM directories WHERE parent_id IS ?1 AND name_id = ?2",
+            rusqlite::params![parent_id, name_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn insert_file_at_path(conn: &Connection, path: &str, is_header: bool) -> i64 {
+        let normalized = path.replace('\\', "/");
+        let parts = normalized
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+        assert!(!parts.is_empty(), "path must contain a filename");
+
+        let filename = parts.last().copied().unwrap();
+        let filename_id = insert_string(conn, filename);
+        let extension = Path::new(filename)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or_default()
+            .to_string();
+
+        let mut parent_id = None;
+        for part in &parts[..parts.len() - 1] {
+            let name_id = insert_string(conn, part);
+            parent_id = Some(get_or_create_dir(conn, parent_id, name_id));
+        }
+
+        conn.execute(
+            "INSERT INTO files (directory_id, filename_id, extension, is_header) VALUES (?, ?, ?, ?)",
+            rusqlite::params![parent_id, filename_id, extension, if is_header { 1 } else { 0 }],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn insert_class_in_file(conn: &Connection, name: &str, file_id: i64) -> i64 {
+        let name_id = insert_string(conn, name);
+        conn.execute(
+            "INSERT INTO classes (name_id, file_id, symbol_type, line_number, end_line_number) VALUES (?, ?, 'class', 1, 1)",
+            rusqlite::params![name_id, file_id],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn insert_member(
+        conn: &Connection,
+        class_id: i64,
+        file_id: i64,
+        name: &str,
+        access: &str,
+        detail: &str,
+        line_number: i64,
+    ) {
+        let name_id = insert_string(conn, name);
+        let type_id = insert_string(conn, "function");
+        conn.execute(
+            "INSERT INTO members (class_id, file_id, name_id, type_id, access, detail, line_number) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            rusqlite::params![class_id, file_id, name_id, type_id, access, detail, line_number],
+        )
+        .unwrap();
+    }
 
     fn line_and_col(content: &str, needle: &str, occurrence: usize) -> (u32, u32) {
         let mut found = 0usize;
@@ -3562,5 +3921,75 @@ public:
             string_literal_under_cursor(sample, line, col),
             Some("Status.Death".to_string())
         );
+    }
+
+    #[test]
+    fn normalize_parameter_signature_strips_default_arguments() {
+        let params = "(const FGameplayAbilitySpecHandle Handle, const FGameplayTagContainer* SourceTags = nullptr, FGameplayTagContainer* OptionalRelevantTags = nullptr)";
+        assert_eq!(
+            normalize_parameter_signature(params),
+            "(const FGameplayAbilitySpecHandle Handle, const FGameplayTagContainer* SourceTags, FGameplayTagContainer* OptionalRelevantTags)"
+        );
+    }
+
+    #[test]
+    fn extract_cursor_function_signature_reads_declaration_params() {
+        let sample = "virtual bool CanActivateAbility(const FGameplayAbilitySpecHandle Handle, const FGameplayTagContainer* SourceTags = nullptr) const override;";
+        let (line, col) = line_and_col(sample, "CanActivateAbility", 0);
+        let signature =
+            extract_cursor_function_signature(sample, line, col).expect("expected signature");
+
+        assert_eq!(
+            signature.parameters,
+            "(const FGameplayAbilitySpecHandle Handle, const FGameplayTagContainer* SourceTags)"
+        );
+    }
+
+    #[test]
+    fn goto_implementation_matches_cpp_member_with_normalized_params() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let header_path = "C:/Project/Source/Game/Public/MyAbility.h";
+        let cpp_path = "C:/Project/Source/Game/Private/MyAbility.cpp";
+        let header_file_id = insert_file_at_path(&conn, header_path, true);
+        let cpp_file_id = insert_file_at_path(&conn, cpp_path, false);
+        let class_id = insert_class_in_file(&conn, "UMyAbility", header_file_id);
+
+        insert_member(
+            &conn,
+            class_id,
+            header_file_id,
+            "CanActivateAbility",
+            "public",
+            "(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo, const FGameplayTagContainer* SourceTags = nullptr, const FGameplayTagContainer* TargetTags = nullptr, FGameplayTagContainer* OptionalRelevantTags = nullptr)",
+            12,
+        );
+        insert_member(
+            &conn,
+            class_id,
+            cpp_file_id,
+            "CanActivateAbility",
+            "impl",
+            "(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo, const FGameplayTagContainer* SourceTags, const FGameplayTagContainer* TargetTags, FGameplayTagContainer* OptionalRelevantTags)",
+            34,
+        );
+
+        let content = "class UMyAbility\n{\npublic:\n    virtual bool CanActivateAbility(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo, const FGameplayTagContainer* SourceTags = nullptr, const FGameplayTagContainer* TargetTags = nullptr, FGameplayTagContainer* OptionalRelevantTags = nullptr) const override;\n};\n";
+        let (line, col) = line_and_col(content, "CanActivateAbility", 0);
+        let value = goto_implementation(
+            &conn,
+            content.to_string(),
+            line,
+            col,
+            Some(header_path.to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            value["file_path"].as_str(),
+            Some("C:/Project/Source/Game/Private/MyAbility.cpp")
+        );
+        assert_eq!(value["line_number"].as_i64(), Some(34));
     }
 }
