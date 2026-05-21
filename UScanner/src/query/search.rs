@@ -26,6 +26,7 @@
 //! `FastFind` 不查正文，正文由 Lua 另起 `SearchCodeText` 阶段追加。
 
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
@@ -38,7 +39,7 @@ use crate::db::text;
 const FIND_FUZZY_FALLBACK_LIMIT: usize = 256;
 static FAST_FIND_LOG_ENABLED: OnceLock<bool> = OnceLock::new();
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct SymbolHotEntry {
     name: String,
     kind: String,
@@ -54,7 +55,7 @@ struct SymbolHotEntry {
     is_class_like: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct FileHotEntry {
     basename: String,
     path: String,
@@ -64,6 +65,7 @@ struct FileHotEntry {
     path_lc: String,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct SearchHotIndex {
     symbols: Vec<SymbolHotEntry>,
     files: Vec<FileHotEntry>,
@@ -90,6 +92,23 @@ fn fast_find_log_enabled() -> bool {
 }
 
 impl SearchHotIndex {
+    pub fn size_hint(&self) -> usize {
+        self.symbols.len()
+            + self.files.len()
+            + self.symbol_exact.len()
+            + self.symbol_compact_exact.len()
+            + self.symbol_name_prefix.len()
+            + self.symbol_compact_prefix.len()
+            + self.symbol_owner_exact.len()
+            + self.symbol_owner_prefix.len()
+            + self.symbol_module_exact.len()
+            + self.symbol_module_prefix.len()
+            + self.file_basename_exact.len()
+            + self.file_path_exact.len()
+            + self.file_basename_prefix.len()
+            + self.file_path_prefix.len()
+    }
+
     fn query(&self, pattern: &str, limit: usize, offset: usize, class_only: bool) -> Vec<Value> {
         let target = offset.saturating_add(limit).clamp(1, 10_000);
         let query_text = pattern.trim();

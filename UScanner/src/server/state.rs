@@ -546,11 +546,20 @@ impl AppState {
         }
 
         let started_at = Instant::now();
-        let conn = open_read_only_connection(db_path)?;
-        let index = Arc::new(build_search_hot_index(&conn)?);
+        let (index, source) = if let Some(index) = runtime_index::load_search_index(db_path)? {
+            (Arc::new(index), "runtime")
+        } else {
+            let conn = open_read_only_connection(db_path)?;
+            let index = Arc::new(build_search_hot_index(&conn)?);
+            if let Err(err) = runtime_index::save_search_index(db_path, index.as_ref()) {
+                warn!("Failed to persist search runtime index for {}: {}", db_path, err);
+            }
+            (index, "db")
+        };
         info!(
-            "Search hot index built: {} in {} ms",
+            "Search hot index ready: {} source={} in {} ms",
             db_path,
+            source,
             started_at.elapsed().as_millis()
         );
 
