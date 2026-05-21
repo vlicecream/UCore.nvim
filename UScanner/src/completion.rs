@@ -443,14 +443,14 @@ pub fn process_completion_with_engine(
         let mut items = collect_buffer_type_items(root, content, line as usize, &prefix);
         merge_completion_items(
             &mut items,
-            fetch_global_type_symbols(conn, &prefix)?,
+            fetch_global_type_symbols_cached(conn, &prefix, &cache, "project")?,
             MAX_COMPLETION_ITEMS,
         );
 
         if let Some(engine_ctx) = engine_ctx.as_ref() {
             merge_completion_items(
                 &mut items,
-                fetch_global_type_symbols(engine_ctx.conn, &prefix)?,
+                fetch_global_type_symbols_cached(engine_ctx.conn, &prefix, &cache, "engine")?,
                 MAX_COMPLETION_ITEMS,
             );
         }
@@ -518,14 +518,16 @@ pub fn process_completion_with_engine(
         && strong_item_count(&items) < STRONG_MATCH_TARGET
         && !suppress_globals_for_class_context
     {
-        let global_items = fetch_global_symbols(conn, &prefix)?;
+        let global_items = fetch_global_symbols_cached(conn, &prefix, &cache, "project")?;
         merge_completion_items(&mut items, global_items, MAX_COMPLETION_ITEMS);
 
         if prefix_len >= MIN_ENGINE_GLOBAL_PREFIX_LEN
             && strong_item_count(&items) < STRONG_MATCH_TARGET
+            && (declaration_context || looks_like_type_prefix(&prefix) || prefix_len >= 6)
         {
             if let Some(engine_ctx) = engine_ctx.as_ref() {
-                let engine_items = fetch_global_symbols(engine_ctx.conn, &prefix)?;
+                let engine_items =
+                    fetch_global_symbols_cached(engine_ctx.conn, &prefix, &cache, "engine")?;
                 merge_completion_items(
                     &mut items,
                     engine_items,
@@ -2486,6 +2488,51 @@ fn strong_item_count(items: &[Value]) -> usize {
         .count()
 }
 
+fn should_use_persistent_completion_cache(prefix: &str, declaration_context: bool) -> bool {
+    let prefix_len = prefix.chars().count();
+    if prefix_len == 0 {
+        return false;
+    }
+
+    if declaration_context {
+        return prefix_len >= 2;
+    }
+
+    prefix_len >= 2
+}
+
+fn should_write_persistent_completion_cache(
+    prefix: &str,
+    declaration_context: bool,
+    item_count: usize,
+) -> bool {
+    should_use_persistent_completion_cache(prefix, declaration_context) && item_count <= 64
+}
+
+fn looks_like_type_prefix(prefix: &str) -> bool {
+    let trimmed = prefix.trim();
+    let Some(first) = trimmed.chars().next() else {
+        return false;
+    };
+
+    first.is_ascii_uppercase() || trimmed.contains("::")
+}
+
+fn read_memory_completion_cache(
+    key: &str,
+    memory_cache: &Option<Arc<Mutex<CompletionCache>>>,
+) -> Result<Option<Vec<Value>>> {
+    read_completion_cache(key, memory_cache, &None)
+}
+
+fn write_memory_completion_cache(
+    key: &str,
+    items: &[Value],
+    memory_cache: &Option<Arc<Mutex<CompletionCache>>>,
+) {
+    write_completion_cache(key, items, memory_cache, &None);
+}
+
 // -----------------------------------------------------------------------------
 // Member fetch
 // -----------------------------------------------------------------------------
@@ -2517,6 +2564,11 @@ fn fetch_members_recursive(
         include_impl_members as u8,
         declaration_context as u8,
     );
+    let persistent_cache = if should_use_persistent_completion_cache(&prefix, declaration_context) {
+        persistent_cache
+    } else {
+        None
+    };
 
     if let Some(items) = read_completion_cache(&cache_key, &memory_cache, &persistent_cache)? {
         if log_enabled {
@@ -2602,7 +2654,11 @@ fn fetch_members_recursive(
         }
     }
 
-    write_completion_cache(&cache_key, &items, &memory_cache, &persistent_cache);
+    if should_write_persistent_completion_cache(&prefix, declaration_context, items.len()) {
+        write_completion_cache(&cache_key, &items, &memory_cache, &persistent_cache);
+    } else {
+        write_completion_cache(&cache_key, &items, &memory_cache, &None);
+    }
 
     if log_enabled {
         info!(
@@ -3129,6 +3185,38 @@ fn fetch_global_type_symbols(conn: &Connection, prefix: &str) -> Result<Vec<Valu
     let mut items = Vec::new();
     let mut seen = HashSet::new();
     append_global_type_items(conn, prefix, &mut seen, &mut items)?;
+    Ok(items)
+}
+
+fn fetch_global_symbols_cached(
+    conn: &Connection,
+    prefix: &str,
+    memory_cache: &Option<Arc<Mutex<CompletionCache>>>,
+    scope: &str,
+) -> Result<Vec<Value>> {
+    let key = format!("global-symbols:{}:{}", scope, prefix);
+    if let Some(items) = read_memory_completion_cache(&key, memory_cache)? {
+        return Ok(items);
+    }
+
+    let items = fetch_global_symbols(conn, prefix)?;
+    write_memory_completion_cache(&key, &items, memory_cache);
+    Ok(items)
+}
+
+fn fetch_global_type_symbols_cached(
+    conn: &Connection,
+    prefix: &str,
+    memory_cache: &Option<Arc<Mutex<CompletionCache>>>,
+    scope: &str,
+) -> Result<Vec<Value>> {
+    let key = format!("global-type-symbols:{}:{}", scope, prefix);
+    if let Some(items) = read_memory_completion_cache(&key, memory_cache)? {
+        return Ok(items);
+    }
+
+    let items = fetch_global_type_symbols(conn, prefix)?;
+    write_memory_completion_cache(&key, &items, memory_cache);
     Ok(items)
 }
 
