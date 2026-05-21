@@ -1,5 +1,6 @@
 use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
@@ -8,7 +9,7 @@ use tree_sitter::{Node, Parser, Point};
 use crate::db::ensure_search_projections;
 use crate::db::project_path::PATH_CTE;
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct TypeNavEntry {
     symbol_name: String,
     line_number: i64,
@@ -17,7 +18,7 @@ struct TypeNavEntry {
     sort_rank: (u8, u8, i64),
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct MemberNavEntry {
     symbol_name: String,
     line_number: i64,
@@ -27,6 +28,7 @@ struct MemberNavEntry {
     prefer_impl_rank: (u8, u8, i64),
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct NavigationHotIndex {
     class_ids_by_name: HashMap<String, Vec<i64>>,
     parent_ids_by_child: HashMap<i64, Vec<i64>>,
@@ -1386,6 +1388,14 @@ pub fn build_navigation_hot_index(conn: &Connection) -> Result<NavigationHotInde
 }
 
 impl NavigationHotIndex {
+    pub fn size_hint(&self) -> usize {
+        self.class_ids_by_name.len()
+            + self.parent_ids_by_child.len()
+            + self.type_defs_by_name.len()
+            + self.members_by_class_and_name.len()
+            + self.members_anywhere_by_name.len()
+    }
+
     fn get_class_ids(&self, name: &str) -> Vec<i64> {
         self.class_ids_by_name
             .get(&strip_namespace(name))

@@ -14,6 +14,7 @@ use crate::db;
 use crate::query::goto::{build_navigation_hot_index, NavigationHotIndex};
 use crate::query::search::{build_search_hot_index, SearchHotIndex};
 use crate::query::usage::{build_usage_hot_index, UsageHotIndex};
+use crate::runtime_index;
 use crate::types::{ConfigCache, PhaseInfo, Progress, ProgressPlan, ProgressReporter};
 
 const COMPLETION_CACHE_CAPACITY: usize = 50_000;
@@ -573,11 +574,20 @@ impl AppState {
         }
 
         let started_at = Instant::now();
-        let conn = open_read_only_connection(db_path)?;
-        let index = Arc::new(build_navigation_hot_index(&conn)?);
+        let (index, source) = if let Some(index) = runtime_index::load_navigation_index(db_path)? {
+            (Arc::new(index), "runtime")
+        } else {
+            let conn = open_read_only_connection(db_path)?;
+            let index = Arc::new(build_navigation_hot_index(&conn)?);
+            if let Err(err) = runtime_index::save_navigation_index(db_path, index.as_ref()) {
+                warn!("Failed to persist navigation runtime index for {}: {}", db_path, err);
+            }
+            (index, "db")
+        };
         info!(
-            "Navigation hot index built: {} in {} ms",
+            "Navigation hot index ready: {} source={} in {} ms",
             db_path,
+            source,
             started_at.elapsed().as_millis()
         );
 
