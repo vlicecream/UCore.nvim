@@ -31,6 +31,13 @@ struct CallSiteHotEntry {
     line: i64,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+struct DefinitionHotEntry {
+    path: String,
+    line: i64,
+    owner_name: Option<String>,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct UsageHotIndex {
     file_paths_by_id: HashMap<i64, String>,
@@ -42,6 +49,9 @@ pub struct UsageHotIndex {
     member_defs_by_key: HashMap<String, Vec<i64>>,
     member_decls_by_key: HashMap<String, Vec<MemberDeclHotEntry>>,
     class_like_names: HashSet<String>,
+    function_like_names: HashSet<String>,
+    member_function_keys: HashSet<String>,
+    function_defs_by_name: HashMap<String, Vec<DefinitionHotEntry>>,
 }
 
 /// Find symbol usages and return all collected results at once.
@@ -101,10 +111,13 @@ pub fn build_usage_hot_index(conn: &Connection) -> Result<UsageHotIndex> {
     let mut member_defs_by_key = HashMap::<String, Vec<i64>>::new();
     let mut member_decls_by_key = HashMap::<String, Vec<MemberDeclHotEntry>>::new();
     let mut class_like_names = HashSet::<String>::new();
+    let mut function_like_names = HashSet::<String>::new();
+    let mut member_function_keys = HashSet::<String>::new();
+    let mut function_defs_by_name = HashMap::<String, Vec<DefinitionHotEntry>>::new();
 
     let mut stmt = conn.prepare(
         r#"
-        SELECT name, file_id, owner_name, path, line_number, is_class_like
+        SELECT name, file_id, owner_name, path, line_number, is_class_like, is_function_like
         FROM search_symbols
         ORDER BY file_id, line_number
         "#,
@@ -117,16 +130,37 @@ pub fn build_usage_hot_index(conn: &Connection) -> Result<UsageHotIndex> {
             normalize_path(&row.get::<_, String>(3)?),
             row.get::<_, Option<i64>>(4)?,
             row.get::<_, i64>(5)? != 0,
+            row.get::<_, i64>(6)? != 0,
         ))
     })?;
     for row in rows {
-        let (name, file_id, owner_name, path, line_number, is_class_like) = row?;
+        let (name, file_id, owner_name, path, line_number, is_class_like, is_function_like) = row?;
         defs_by_name.entry(name.clone()).or_default().push(file_id);
         if is_class_like {
             class_like_names.insert(name);
-        } else if let Some(owner_name) = owner_name {
+            continue;
+        }
+
+        if is_function_like {
+            function_like_names.insert(name.clone());
+            if let Some(line) = line_number {
+                function_defs_by_name
+                    .entry(name.clone())
+                    .or_default()
+                    .push(DefinitionHotEntry {
+                        path: path.clone(),
+                        line,
+                        owner_name: owner_name.clone(),
+                    });
+            }
+        }
+
+        if let Some(owner_name) = owner_name {
             let key = member_key(&name, &owner_name);
             member_defs_by_key.entry(key.clone()).or_default().push(file_id);
+            if is_function_like {
+                member_function_keys.insert(key.clone());
+            }
             if let Some(line) = line_number {
                 member_decls_by_key
                     .entry(key)
@@ -187,6 +221,7 @@ pub fn build_usage_hot_index(conn: &Connection) -> Result<UsageHotIndex> {
     dedupe_call_site_map(&mut calls_by_name_lc);
     dedupe_i64_id_map(&mut include_reverse);
     dedupe_id_map(&mut member_defs_by_key);
+    dedupe_definition_map(&mut function_defs_by_name);
     for items in member_decls_by_key.values_mut() {
         items.sort_by(|left, right| {
             left.path
@@ -209,6 +244,9 @@ pub fn build_usage_hot_index(conn: &Connection) -> Result<UsageHotIndex> {
         member_defs_by_key,
         member_decls_by_key,
         class_like_names,
+        function_like_names,
+        member_function_keys,
+        function_defs_by_name,
     })
 }
 
@@ -250,6 +288,16 @@ fn find_symbol_usages_inner(
     }
 
     let candidates = collect_candidate_files(conn, hot_index, symbol_name, current_file, scope)?;
+    let short_circuit_text_search = match scope {
+        Some(UsageScope::Member(member_scope)) => is_member_function_symbol(
+            conn,
+            hot_index,
+            symbol_name,
+            &member_scope.member_owner_class,
+        )?,
+        Some(UsageScope::Local(_)) => false,
+        None => is_function_like_symbol(conn, hot_index, symbol_name)?,
+    };
     let mut results = match scope {
         Some(UsageScope::Member(member_scope)) => get_member_declaration_results(
             conn,
@@ -259,6 +307,16 @@ fn find_symbol_usages_inner(
         )?,
         _ => Vec::new(),
     };
+
+    if scope.is_none() && short_circuit_text_search {
+        let definition_results = get_function_definition_results(conn, hot_index, symbol_name)?;
+        for item in definition_results {
+            push_unique_result(&mut results, item);
+            if results.len() >= MAX_RESULTS {
+                break;
+            }
+        }
+    }
 
     if !matches!(scope, Some(UsageScope::Local(_))) {
         let direct_results = get_direct_call_results(
@@ -276,7 +334,7 @@ fn find_symbol_usages_inner(
         }
     }
 
-    let indexed_search_used = if results.len() >= MAX_RESULTS {
+    let indexed_search_used = if short_circuit_text_search || results.len() >= MAX_RESULTS {
         false
     } else {
         search_indexed_candidate_lines(
@@ -292,7 +350,7 @@ fn find_symbol_usages_inner(
         )?
     };
 
-    if !indexed_search_used {
+    if !short_circuit_text_search && !indexed_search_used {
         for path in &candidates.file_paths {
             if results.len() >= MAX_RESULTS {
                 break;
@@ -841,6 +899,9 @@ impl UsageHotIndex {
             + self.member_defs_by_key.len()
             + self.member_decls_by_key.len()
             + self.class_like_names.len()
+            + self.function_like_names.len()
+            + self.member_function_keys.len()
+            + self.function_defs_by_name.len()
     }
 
     fn find_member_definition_file_ids(&self, symbol_name: &str, owner_class: &str) -> Option<Vec<i64>> {
@@ -923,6 +984,14 @@ impl UsageHotIndex {
         self.class_like_names.contains(symbol_name)
     }
 
+    fn is_function_like_symbol(&self, symbol_name: &str) -> bool {
+        self.function_like_names.contains(symbol_name)
+    }
+
+    fn is_member_function_symbol(&self, symbol_name: &str, owner_class: &str) -> bool {
+        self.member_function_keys.contains(&member_key(symbol_name, owner_class))
+    }
+
     fn find_type_reference_file_ids(&self, symbol_name: &str) -> Option<Vec<i64>> {
         self.find_symbol_call_file_ids(symbol_name)
     }
@@ -943,6 +1012,26 @@ impl UsageHotIndex {
                     "context": context,
                     "kind": kind,
                     "class_name": entry.class_name,
+                }),
+            );
+        }
+        Some(results)
+    }
+
+    fn get_function_definition_results(&self, symbol_name: &str) -> Option<Vec<Value>> {
+        let entries = self.function_defs_by_name.get(symbol_name)?;
+        let mut results = Vec::new();
+        for entry in entries {
+            let context = context_line_for_path(&entry.path, entry.line);
+            let col = find_identifier_in_line(&context, symbol_name).unwrap_or(0);
+            push_unique_result(
+                &mut results,
+                json!({
+                    "path": entry.path,
+                    "line": entry.line,
+                    "col": col,
+                    "context": context,
+                    "kind": classify_symbol_location(&entry.path, &context, symbol_name, entry.owner_name.as_deref()),
                 }),
             );
         }
@@ -979,6 +1068,20 @@ fn dedupe_i64_id_map(map: &mut HashMap<i64, Vec<i64>>) {
     for ids in map.values_mut() {
         ids.sort_unstable();
         ids.dedup();
+    }
+}
+
+fn dedupe_definition_map(map: &mut HashMap<String, Vec<DefinitionHotEntry>>) {
+    for entries in map.values_mut() {
+        entries.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.line.cmp(&right.line))
+                .then_with(|| left.owner_name.cmp(&right.owner_name))
+        });
+        entries.dedup_by(|left, right| {
+            left.path == right.path && left.line == right.line && left.owner_name == right.owner_name
+        });
     }
 }
 
@@ -1085,6 +1188,47 @@ fn find_symbol_call_file_ids(conn: &Connection, symbol_name: &str) -> Result<Vec
     Ok(ids)
 }
 
+fn is_function_like_symbol(
+    conn: &Connection,
+    hot_index: Option<&UsageHotIndex>,
+    symbol_name: &str,
+) -> Result<bool> {
+    if let Some(index) = hot_index {
+        return Ok(index.is_function_like_symbol(symbol_name));
+    }
+
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM search_symbols WHERE is_function_like = 1 AND name = ? LIMIT 1",
+            [symbol_name],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    Ok(exists)
+}
+
+fn is_member_function_symbol(
+    conn: &Connection,
+    hot_index: Option<&UsageHotIndex>,
+    symbol_name: &str,
+    owner_class: &str,
+) -> Result<bool> {
+    if let Some(index) = hot_index {
+        return Ok(index.is_member_function_symbol(symbol_name, owner_class));
+    }
+
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM search_symbols WHERE is_function_like = 1 AND name = ? AND owner_name = ? LIMIT 1",
+            [symbol_name, owner_class],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    Ok(exists)
+}
+
 fn get_direct_call_results(
     conn: &Connection,
     hot_index: Option<&UsageHotIndex>,
@@ -1146,6 +1290,46 @@ fn get_direct_call_results(
                 Ok(())
             },
         )?;
+    }
+    Ok(results)
+}
+
+fn get_function_definition_results(
+    conn: &Connection,
+    hot_index: Option<&UsageHotIndex>,
+    symbol_name: &str,
+) -> Result<Vec<Value>> {
+    if let Some(results) = hot_index.and_then(|index| index.get_function_definition_results(symbol_name)) {
+        return Ok(results);
+    }
+
+    let sql = r#"
+        SELECT path, line_number, owner_name
+        FROM search_symbols
+        WHERE name = ?
+          AND is_function_like = 1
+        ORDER BY path_lc, line_number
+        "#;
+
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map([symbol_name], |row| {
+        let path = normalize_path(&row.get::<_, String>(0)?);
+        let line = row.get::<_, i64>(1)?;
+        let owner_name = row.get::<_, Option<String>>(2)?;
+        let context = context_line_for_path(&path, line);
+        let col = find_identifier_in_line(&context, symbol_name).unwrap_or(0);
+        Ok(json!({
+            "path": path,
+            "line": line,
+            "col": col,
+            "context": context,
+            "kind": classify_symbol_location(&path, &context, symbol_name, owner_name.as_deref()),
+        }))
+    })?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        push_unique_result(&mut results, row?);
     }
     Ok(results)
 }
@@ -1617,6 +1801,25 @@ fn classify_member_location(path: &str, context: &str, symbol_name: &str) -> &'s
     let is_cpp = path.ends_with(".cpp") || path.ends_with(".cc") || path.ends_with(".cxx");
 
     if is_cpp && context.contains("::") && context.contains(symbol_name) {
+        return "definition";
+    }
+
+    "declaration"
+}
+
+fn classify_symbol_location(
+    path: &str,
+    context: &str,
+    symbol_name: &str,
+    owner_name: Option<&str>,
+) -> &'static str {
+    if owner_name.is_some() {
+        return classify_member_location(path, context, symbol_name);
+    }
+
+    let path_lc = path.to_ascii_lowercase();
+    let is_cpp = path_lc.ends_with(".cpp") || path_lc.ends_with(".cc") || path_lc.ends_with(".cxx");
+    if is_cpp && context.contains(symbol_name) && (context.contains('{') || context.contains('(')) {
         return "definition";
     }
 

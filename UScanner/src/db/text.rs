@@ -457,56 +457,54 @@ pub fn search_matching_lines_in_paths(
         return collect_line_matches_from_paths_fallback(allowed_paths, needle, limit, offset);
     }
 
+    let mut sql = String::from(
+        "SELECT tl.path, tl.line_number, tl.line_text
+         FROM text_lines_fts
+         JOIN text_lines tl ON tl.id = text_lines_fts.rowid
+         WHERE text_lines_fts MATCH ?1
+           AND tl.path IN (",
+    );
+    for (index, _) in allowed_paths.iter().enumerate() {
+        if index > 0 {
+            sql.push_str(", ");
+        }
+        sql.push('?');
+        sql.push_str(&(index + 2).to_string());
+    }
+    sql.push_str(
+        ")
+         ORDER BY bm25(text_lines_fts), tl.path, tl.line_number
+         LIMIT ?",
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let mut params = Vec::with_capacity(allowed_paths.len() + 2);
+    params.push(SqlValue::Text(quoted_match_query(needle)));
+    for path in allowed_paths {
+        params.push(SqlValue::Text(normalize_path(path)));
+    }
+    params.push(SqlValue::Integer(
+        limit.clamp(1, 5_000) as i64 + offset.min(1_000_000) as i64,
+    ));
+
+    let rows = stmt.query_map(params_from_iter(params), |row| {
+        Ok(TextLineMatch {
+            path: normalize_path(&row.get::<_, String>(0)?),
+            line_number: row.get::<_, i64>(1)?,
+            line_text: row.get::<_, String>(2)?,
+        })
+    })?;
+
     let mut results = Vec::new();
     let mut skipped = 0usize;
-    for chunk in allowed_paths.chunks(200) {
+    for row in rows {
+        if skipped < offset {
+            skipped += 1;
+            continue;
+        }
+        results.push(row?);
         if results.len() >= limit {
             break;
-        }
-
-        let mut sql = String::from(
-            "SELECT tl.path, tl.line_number, tl.line_text
-             FROM text_lines_fts
-             JOIN text_lines tl ON tl.id = text_lines_fts.rowid
-             WHERE text_lines_fts MATCH ?1
-               AND tl.path IN (",
-        );
-        for (index, _) in chunk.iter().enumerate() {
-            if index > 0 {
-                sql.push_str(", ");
-            }
-            sql.push('?');
-            sql.push_str(&(index + 2).to_string());
-        }
-        sql.push_str(
-            ")
-             ORDER BY bm25(text_lines_fts), tl.path, tl.line_number",
-        );
-
-        let mut stmt = conn.prepare(&sql)?;
-        let mut params = Vec::with_capacity(chunk.len() + 1);
-        params.push(SqlValue::Text(quoted_match_query(needle)));
-        for path in chunk {
-            params.push(SqlValue::Text(normalize_path(path)));
-        }
-
-        let rows = stmt.query_map(params_from_iter(params), |row| {
-            Ok(TextLineMatch {
-                path: normalize_path(&row.get::<_, String>(0)?),
-                line_number: row.get::<_, i64>(1)?,
-                line_text: row.get::<_, String>(2)?,
-            })
-        })?;
-
-        for row in rows {
-            if skipped < offset {
-                skipped += 1;
-                continue;
-            }
-            results.push(row?);
-            if results.len() >= limit {
-                break;
-            }
         }
     }
 
