@@ -274,13 +274,12 @@ pub fn get_asset_usage_hints_from_state(
             continue;
         }
 
-        let usage = asset_usages_from_graph(graph, name);
         items.push(json!({
             "name": name,
-            "derived_count": usage.get("derived").and_then(Value::as_array).map(|v| v.len()).unwrap_or(0),
+            "derived_count": asset_usage_count_from_graph(&graph.derived, name),
             "reference_count":
-                usage.get("references").and_then(Value::as_array).map(|v| v.len()).unwrap_or(0)
-                + usage.get("function_references").and_then(Value::as_array).map(|v| v.len()).unwrap_or(0),
+                asset_usage_count_from_graph(&graph.references, name)
+                + asset_usage_count_from_graph(&graph.functions, name),
         }));
     }
 
@@ -401,6 +400,7 @@ pub fn refresh_asset_index(
             total_elapsed_ms = overall_started_at.elapsed().as_millis(),
             "Asset index full refresh finished"
         );
+        let _ = persist_asset_runtime_index(conn);
         return Ok(());
     }
 
@@ -461,6 +461,7 @@ pub fn refresh_asset_index(
         total_elapsed_ms = overall_started_at.elapsed().as_millis(),
         "Asset index delta refresh finished"
     );
+    let _ = persist_asset_runtime_index(conn);
     Ok(())
 }
 
@@ -1229,6 +1230,14 @@ fn load_or_build_asset_graph(conn: &Connection) -> Result<AssetGraph> {
     Ok(graph)
 }
 
+fn persist_asset_runtime_index(conn: &Connection) -> Result<()> {
+    let Some(primary_db_path) = text::current_primary_db_path(conn)? else {
+        return Ok(());
+    };
+    let graph = load_asset_graph_from_db(conn)?;
+    runtime_index::save_asset_index(&primary_db_path, &asset_runtime_from_graph(&graph))
+}
+
 /// Query all indexed assets from the persistent DB.
 /// 从持久化数据库获取全部已索引资产。
 pub fn get_assets(conn: &Connection) -> Result<Value> {
@@ -1412,6 +1421,21 @@ fn collect_asset_paths_from_map(
             out.insert(item.to_string());
         }
     }
+}
+
+fn asset_usage_count_from_graph(
+    map: &HashMap<Arc<str>, HashSet<Arc<str>>>,
+    lookup_name: &str,
+) -> usize {
+    let mut seen = HashSet::<&str>::new();
+    for name in make_asset_lookup_names(lookup_name) {
+        if let Some(items) = map.get(name.as_str()) {
+            for item in items {
+                seen.insert(item.as_ref());
+            }
+        }
+    }
+    seen.len()
 }
 
 pub fn get_asset_usage_hints(conn: &Connection, names: &[String]) -> Result<Value> {
