@@ -23,6 +23,188 @@ local DIRECTORY_CHOICES = {
   { label = "Private", desc = "<Module>/Private/" },
 }
 
+local function normalize_symbol_type(symbol_type)
+  symbol_type = tostring(symbol_type or ""):lower()
+  if symbol_type == "uclass" or symbol_type == "uinterface" then
+    return "class"
+  end
+  if symbol_type == "ustruct" then
+    return "struct"
+  end
+  return symbol_type
+end
+
+local function normalize_source(source)
+  return tostring(source or ""):lower()
+end
+
+local function normalize_path(path)
+  return tostring(path or ""):gsub("\\", "/")
+end
+
+local function strip_class_prefix(name)
+  name = tostring(name or "")
+  local prefix = name:sub(1, 1)
+  if prefix == "U" or prefix == "A" or prefix == "F" or prefix == "I" then
+    return name:sub(2)
+  end
+  return name
+end
+
+local function make_parent_item(name, opts)
+  opts = opts or {}
+  return {
+    name = tostring(name or ""),
+    type = tostring(opts.type or ""),
+    path = normalize_path(opts.path or ""),
+    module_name = tostring(opts.module_name or ""),
+    source = tostring(opts.source or ""),
+    display_path = tostring(opts.display_path or ""),
+    is_fallback = opts.is_fallback == true,
+  }
+end
+
+local function parent_item_key(item)
+  local name = tostring(item and item.name or ""):lower()
+  local path = normalize_path(item and item.path or ""):lower()
+  local module_name = tostring(item and item.module_name or ""):lower()
+  return table.concat({ name, path, module_name }, "\t")
+end
+
+local function parent_item_text(item)
+  local parts = {
+    tostring(item and item.name or ""),
+    tostring(item and item.module_name or ""),
+    normalize_path(item and item.path or ""),
+    normalize_source(item and item.source or ""),
+  }
+  return table.concat(parts, " "):lower()
+end
+
+local function query_tokens(pattern)
+  local tokens = {}
+  for token in tostring(pattern or ""):lower():gmatch("%S+") do
+    table.insert(tokens, token)
+  end
+  return tokens
+end
+
+local function matches_all_tokens(text, tokens)
+  if #tokens == 0 then
+    return true
+  end
+
+  for _, token in ipairs(tokens) do
+    if not text:find(token, 1, true) then
+      return false
+    end
+  end
+
+  return true
+end
+
+local function parent_item_score(item, pattern)
+  local query = vim.trim(tostring(pattern or "")):lower()
+  local name = tostring(item.name or "")
+  local lowered_name = name:lower()
+  local path = normalize_path(item.path or ""):lower()
+  local module_name = tostring(item.module_name or ""):lower()
+  local source = normalize_source(item.source)
+  local symbol_type = normalize_symbol_type(item.type)
+  local stripped_name = strip_class_prefix(name):lower()
+
+  local score = 0
+
+  if query ~= "" then
+    if lowered_name == query then
+      score = score - 1200
+    elseif stripped_name == query then
+      score = score - 1150
+    elseif lowered_name:find(query, 1, true) == 1 then
+      score = score - 900
+    elseif stripped_name:find(query, 1, true) == 1 then
+      score = score - 820
+    elseif module_name:find(query, 1, true) then
+      score = score - 520
+    elseif path:find(query, 1, true) then
+      score = score - 360
+    end
+  end
+
+  if symbol_type == "class" then
+    score = score - 220
+  elseif symbol_type == "struct" then
+    score = score - 80
+  end
+
+  if name:match("^[UAI]") then
+    score = score - 120
+  elseif name:match("^F") then
+    score = score + 30
+  end
+
+  if source == "project" then
+    score = score - 40
+  elseif source == "engine" then
+    score = score + 10
+  end
+
+  if path:find("/private/", 1, true) then
+    score = score + 70
+  end
+  if path:find("/editor/", 1, true) then
+    score = score + 60
+  end
+
+  return score
+end
+
+local function sort_parent_items(items, pattern)
+  table.sort(items, function(left, right)
+    local left_score = parent_item_score(left, pattern)
+    local right_score = parent_item_score(right, pattern)
+    if left_score ~= right_score then
+      return left_score < right_score
+    end
+
+    local left_name = tostring(left.name or "")
+    local right_name = tostring(right.name or "")
+    if left_name ~= right_name then
+      return left_name < right_name
+    end
+
+    return tostring(left.path or "") < tostring(right.path or "")
+  end)
+end
+
+local function format_parent_item(item)
+  if type(item) ~= "table" then
+    return tostring(item)
+  end
+
+  local name = tostring(item.name or "")
+  local module_name = tostring(item.module_name or "")
+  local source = normalize_source(item.source)
+  local path = normalize_path(item.path or "")
+
+  if source == "" and module_name == "" and path == "" then
+    return name
+  end
+
+  local suffix = {}
+  if source ~= "" then
+    table.insert(suffix, source)
+  end
+  if module_name ~= "" then
+    table.insert(suffix, module_name)
+  end
+  if path ~= "" then
+    table.insert(suffix, path)
+  end
+
+  return string.format("%s  [%s]", name, table.concat(suffix, " | "))
+end
+
 local function ensure_parent_classes(root, callback)
   if PARENT_CLASS_CACHE then
     callback(PARENT_CLASS_CACHE)
@@ -34,7 +216,7 @@ local function ensure_parent_classes(root, callback)
   for _, name in ipairs(FALLBACK_PARENT_CLASSES) do
     if not seen[name] then
       seen[name] = true
-      table.insert(items, name)
+      table.insert(items, make_parent_item(name, { is_fallback = true }))
     end
   end
   PARENT_CLASS_CACHE = items
@@ -44,8 +226,9 @@ end
 local VALID_PARENT_SYMBOL_TYPES = {
   class = true,
   struct = true,
-  UCLASS = true,
-  USTRUCT = true,
+  uclass = true,
+  ustruct = true,
+  uinterface = true,
 }
 
 local function search_parent_classes(root, pattern, callback)
@@ -56,23 +239,48 @@ local function search_parent_classes(root, pattern, callback)
   end
 
   remote.search_class_symbols(root, pattern, function(results, err)
-    if err or not results then
-      callback({})
-      return
+    local merged = {}
+    local seen = {}
+    local tokens = query_tokens(pattern)
+
+    local function push(item)
+      if type(item) ~= "table" or item.name == "" then
+        return
+      end
+      local key = parent_item_key(item)
+      if seen[key] then
+        return
+      end
+      if not matches_all_tokens(parent_item_text(item), tokens) then
+        return
+      end
+      seen[key] = true
+      table.insert(merged, item)
     end
 
-    local items = {}
-    local seen = {}
-    for _, r in ipairs(results) do
-      local name = r.name or r.text or ""
-      local symbol_type = tostring(r.type or "")
-      if VALID_PARENT_SYMBOL_TYPES[symbol_type] and name ~= "" and not seen[name] then
-        seen[name] = true
-        table.insert(items, name)
+    if not err and type(results) == "table" then
+      for _, r in ipairs(results) do
+        local name = tostring(r.name or r.text or "")
+        local symbol_type = normalize_symbol_type(r.type)
+        if VALID_PARENT_SYMBOL_TYPES[symbol_type] and name ~= "" then
+          push(make_parent_item(name, {
+            type = symbol_type,
+            path = r.path,
+            module_name = r.module_name,
+            source = r.source,
+          }))
+        end
       end
     end
-    table.sort(items)
-    callback(items)
+
+    ensure_parent_classes(root, function(common_items)
+      for _, item in ipairs(common_items or {}) do
+        push(item)
+      end
+
+      sort_parent_items(merged, pattern)
+      callback(merged)
+    end)
   end, 200)
 end
 
@@ -121,8 +329,8 @@ local function pick_parent_class_live(root, common_items, default_parent, callba
       entry_maker = function(item)
         return {
           value = item,
-          display = item,
-          ordinal = item,
+          display = format_parent_item(item),
+          ordinal = parent_item_text(item),
         }
       end,
     })
@@ -209,10 +417,12 @@ local function choose_parent_class(root, default_parent, callback)
         if item == SEARCH_PARENT_SENTINEL then
           return "Search..."
         end
-        if item == default_parent then
-          return item .. "  (default)"
+        local name = type(item) == "table" and tostring(item.name or "") or tostring(item)
+        local formatted = format_parent_item(item)
+        if name == default_parent then
+          return formatted .. "  (default)"
         end
-        return item
+        return formatted
       end,
     }, function(selection)
       if not selection then
@@ -249,7 +459,7 @@ local function choose_parent_class(root, default_parent, callback)
           vim.ui.select(search_items, {
             prompt = "Search results:",
             format_item = function(item)
-              return item
+              return format_parent_item(item)
             end,
           }, callback)
         end)
@@ -330,7 +540,7 @@ local ENGINE_PARENT_HEADERS = {
   UAudioComponent = "Components/AudioComponent.h",
 }
 
-local function parent_header_path(parent_class, root, module_dir)
+local function parent_header_path(parent_class, root, module_dir, parent_item)
   if not parent_class or parent_class == "" then
     return nil
   end
@@ -339,10 +549,45 @@ local function parent_header_path(parent_class, root, module_dir)
     return ENGINE_PARENT_HEADERS[parent_class]
   end
 
-  local pattern = normalize(root) .. "/**/" .. parent_class .. ".h"
-  local files = vim.fn.glob(pattern, false, true)
+  if type(parent_item) == "table" and tostring(parent_item.path or "") ~= "" then
+    return trim_module_include(parent_item.path)
+  end
+
+  local search_roots = { normalize(root) }
+  local engine = project.cached_engine_metadata(root) or project.engine_metadata(root)
+  local engine_root = type(engine) == "table" and normalize(engine.engine_root or "") or ""
+  if engine_root ~= "" then
+    table.insert(search_roots, engine_root)
+  end
+
+  local basename_candidates = {
+    parent_class,
+    strip_class_prefix(parent_class),
+  }
+
+  local files = {}
+  local seen = {}
+  for _, search_root in ipairs(search_roots) do
+    if search_root ~= "" then
+      for _, basename in ipairs(basename_candidates) do
+        basename = vim.trim(tostring(basename or ""))
+        if basename ~= "" then
+          local pattern = search_root .. "/**/" .. basename .. ".h"
+          for _, path in ipairs(vim.fn.glob(pattern, false, true)) do
+            path = normalize(path)
+            if path ~= "" and not seen[path] then
+              seen[path] = true
+              table.insert(files, path)
+            end
+          end
+        end
+      end
+    end
+  end
+
   if #files == 0 then
-    return parent_class .. ".h"
+    local short_name = strip_class_prefix(parent_class)
+    return (short_name ~= "" and short_name or parent_class) .. ".h"
   end
 
   table.sort(files, function(a, b)
@@ -370,6 +615,11 @@ end
 local function header_include_path(header_path, module_dir)
   header_path = normalize(header_path)
   module_dir = normalize(module_dir)
+
+  local trimmed = trim_module_include(header_path)
+  if trimmed and trimmed ~= "" and trimmed ~= header_path then
+    return trimmed
+  end
 
   if module_dir ~= "" and header_path:find(module_dir, 1, true) == 1 then
     local rel = header_path:sub(#module_dir + 2)
@@ -546,8 +796,11 @@ function M.create(class_name)
     local default_parent = prefix_default_parent(class_name)
     choose_parent_class(root, default_parent, function(parent_selection)
         if not parent_selection then return end
-        local parent_class = parent_selection
-        local parent_include = parent_header_path(parent_class, root, module_dir)
+        local parent_item = type(parent_selection) == "table"
+          and parent_selection
+          or make_parent_item(parent_selection)
+        local parent_class = tostring(parent_item.name or "")
+        local parent_include = parent_header_path(parent_class, root, module_dir, parent_item)
 
         local h_content = build_h_template(class_name, parent_class, module_api, parent_include, choice_key)
         local h_fd = io.open(h_path, "w")
