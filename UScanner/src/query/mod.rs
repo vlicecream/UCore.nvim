@@ -10,6 +10,7 @@ pub mod class;
 pub mod config;
 pub mod file;
 pub mod goto;
+pub mod intern;
 pub mod module;
 pub mod search;
 pub mod usage;

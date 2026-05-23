@@ -11,6 +11,7 @@ use tree_sitter::{Node, Parser, Point};
 use crate::db::ensure_search_projections;
 use crate::db::text;
 use crate::query::goto;
+use crate::query::intern::{StrId, StringPool};
 
 const MAX_RESULTS: usize = 300;
 const MAX_FILES: usize = 2000;
@@ -19,13 +20,21 @@ const STREAM_BATCH_SIZE: usize = 15;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct MemberDeclHotEntry {
-    path: String,
+    path: StrId,
     line: i64,
-    class_name: String,
+    class_name: StrId,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 struct CallSiteHotEntry {
+    file_id: i64,
+    path: StrId,
+    line: i64,
+}
+
+#[derive(Clone)]
+struct CallSiteResolved {
+    #[allow(dead_code)]
     file_id: i64,
     path: String,
     line: i64,
@@ -33,14 +42,15 @@ struct CallSiteHotEntry {
 
 #[derive(Clone, Serialize, Deserialize)]
 struct DefinitionHotEntry {
-    path: String,
+    path: StrId,
     line: i64,
-    owner_name: Option<String>,
+    owner_name: Option<StrId>,
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct UsageHotIndex {
-    file_paths_by_id: HashMap<i64, String>,
+    pool: StringPool,
+    file_paths_by_id: HashMap<i64, StrId>,
     file_ids_by_path: HashMap<String, i64>,
     all_file_ids: Vec<i64>,
     defs_by_name: HashMap<String, Vec<i64>>,
@@ -89,8 +99,10 @@ pub fn find_symbol_usages_for_cursor(
 pub fn build_usage_hot_index(conn: &Connection) -> Result<UsageHotIndex> {
     ensure_search_projections(conn)?;
 
-    let mut file_paths_by_id = HashMap::new();
-    let mut file_ids_by_path = HashMap::new();
+    let mut pool = StringPool::default();
+
+    let mut file_paths_by_id: HashMap<i64, StrId> = HashMap::new();
+    let mut file_ids_by_path: HashMap<String, i64> = HashMap::new();
     let mut all_file_ids = Vec::new();
     let mut stmt = conn.prepare(
         "SELECT file_id, path FROM search_files ORDER BY file_id"
@@ -100,8 +112,9 @@ pub fn build_usage_hot_index(conn: &Connection) -> Result<UsageHotIndex> {
     })?;
     for row in rows {
         let (file_id, path) = row?;
-        file_ids_by_path.insert(path.clone(), file_id);
-        file_paths_by_id.insert(file_id, path);
+        let path_id = pool.intern(&path);
+        file_ids_by_path.insert(path, file_id);
+        file_paths_by_id.insert(file_id, path_id);
         all_file_ids.push(file_id);
     }
 
@@ -141,6 +154,9 @@ pub fn build_usage_hot_index(conn: &Connection) -> Result<UsageHotIndex> {
             continue;
         }
 
+        let path_id = pool.intern(&path);
+        let owner_name_id = pool.intern_opt(owner_name.as_deref());
+
         if is_function_like {
             function_like_names.insert(name.clone());
             if let Some(line) = line_number {
@@ -148,9 +164,9 @@ pub fn build_usage_hot_index(conn: &Connection) -> Result<UsageHotIndex> {
                     .entry(name.clone())
                     .or_default()
                     .push(DefinitionHotEntry {
-                        path: path.clone(),
+                        path: path_id,
                         line,
-                        owner_name: owner_name.clone(),
+                        owner_name: owner_name_id,
                     });
             }
         }
@@ -162,13 +178,14 @@ pub fn build_usage_hot_index(conn: &Connection) -> Result<UsageHotIndex> {
                 member_function_keys.insert(key.clone());
             }
             if let Some(line) = line_number {
+                let class_name_id = pool.intern(&owner_name);
                 member_decls_by_key
                     .entry(key)
                     .or_default()
                     .push(MemberDeclHotEntry {
-                        path,
+                        path: path_id,
                         line,
-                        class_name: owner_name,
+                        class_name: class_name_id,
                     });
             }
         }
@@ -196,16 +213,19 @@ pub fn build_usage_hot_index(conn: &Connection) -> Result<UsageHotIndex> {
     let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
-            CallSiteHotEntry {
-                file_id: row.get::<_, i64>(1)?,
-                path: normalize_path(&row.get::<_, String>(2)?),
-                line: row.get::<_, i64>(3)?,
-            },
+            row.get::<_, i64>(1)?,
+            normalize_path(&row.get::<_, String>(2)?),
+            row.get::<_, i64>(3)?,
         ))
     })?;
     for row in rows {
-        let (name_lc, item) = row?;
-        calls_by_name_lc.entry(name_lc).or_default().push(item);
+        let (name_lc, file_id, path, line) = row?;
+        let path_id = pool.intern(&path);
+        calls_by_name_lc.entry(name_lc).or_default().push(CallSiteHotEntry {
+            file_id,
+            path: path_id,
+            line,
+        });
     }
 
     let mut stmt = conn.prepare(
@@ -235,6 +255,7 @@ pub fn build_usage_hot_index(conn: &Connection) -> Result<UsageHotIndex> {
     }
 
     Ok(UsageHotIndex {
+        pool,
         file_paths_by_id,
         file_ids_by_path,
         all_file_ids,
@@ -940,13 +961,17 @@ impl UsageHotIndex {
         Some(ids)
     }
 
-    fn get_direct_call_entries(&self, symbol_name: &str, limit: usize) -> Option<Vec<CallSiteHotEntry>> {
+    fn get_direct_call_entries(&self, symbol_name: &str, limit: usize) -> Option<Vec<CallSiteResolved>> {
         let mut results = Vec::new();
         for entry in self.calls_by_name_lc.get(&symbol_name.to_ascii_lowercase())? {
             if results.len() >= limit {
                 break;
             }
-            results.push(entry.clone());
+            results.push(CallSiteResolved {
+                file_id: entry.file_id,
+                path: self.pool.get(entry.path).to_string(),
+                line: entry.line,
+            });
         }
         Some(results)
     }
@@ -974,8 +999,8 @@ impl UsageHotIndex {
         let normalized = normalize_path(file_path);
         self.file_ids_by_path.get(&normalized).copied().or_else(|| {
             let filename = Path::new(file_path).file_name()?.to_str()?;
-            self.file_paths_by_id.iter().find_map(|(file_id, path)| {
-                Path::new(path)
+            self.file_paths_by_id.iter().find_map(|(file_id, path_id)| {
+                Path::new(self.pool.get(*path_id))
                     .file_name()
                     .and_then(|name| name.to_str())
                     .filter(|name| name.eq_ignore_ascii_case(filename))
@@ -987,8 +1012,8 @@ impl UsageHotIndex {
     fn get_file_paths_by_ids(&self, ids: &[i64]) -> Option<Vec<String>> {
         let mut paths = Vec::new();
         for id in ids {
-            let path = self.file_paths_by_id.get(id)?;
-            paths.push(path.clone());
+            let path_id = self.file_paths_by_id.get(id)?;
+            paths.push(self.pool.get(*path_id).to_string());
         }
         Some(paths)
     }
@@ -1017,18 +1042,20 @@ impl UsageHotIndex {
         let entries = self.member_decls_by_key.get(&member_key(symbol_name, owner_class))?;
         let mut results = Vec::new();
         for entry in entries {
-            let context = context_line_for_path(&entry.path, entry.line);
+            let path = self.pool.get(entry.path);
+            let class_name = self.pool.get(entry.class_name);
+            let context = context_line_for_path(path, entry.line);
             let col = find_identifier_in_line(&context, symbol_name).unwrap_or(0);
-            let kind = classify_member_location(&entry.path, &context, symbol_name);
+            let kind = classify_member_location(path, &context, symbol_name);
             push_unique_result(
                 &mut results,
                 json!({
-                    "path": entry.path,
+                    "path": path,
                     "line": entry.line,
                     "col": col,
                     "context": context,
                     "kind": kind,
-                    "class_name": entry.class_name,
+                    "class_name": class_name,
                 }),
             );
         }
@@ -1039,16 +1066,18 @@ impl UsageHotIndex {
         let entries = self.function_defs_by_name.get(symbol_name)?;
         let mut results = Vec::new();
         for entry in entries {
-            let context = context_line_for_path(&entry.path, entry.line);
+            let path = self.pool.get(entry.path);
+            let owner_name = self.pool.get_opt(entry.owner_name);
+            let context = context_line_for_path(path, entry.line);
             let col = find_identifier_in_line(&context, symbol_name).unwrap_or(0);
             push_unique_result(
                 &mut results,
                 json!({
-                    "path": entry.path,
+                    "path": path,
                     "line": entry.line,
                     "col": col,
                     "context": context,
-                    "kind": classify_symbol_location(&entry.path, &context, symbol_name, entry.owner_name.as_deref()),
+                    "kind": classify_symbol_location(path, &context, symbol_name, owner_name),
                 }),
             );
         }
@@ -1274,7 +1303,7 @@ fn get_direct_call_results(
             "#;
         let mut stmt = conn.prepare(sql)?;
         let rows = stmt.query_map(params![symbol_name, overscan_limit as i64], |row| {
-            Ok(CallSiteHotEntry {
+            Ok(CallSiteResolved {
                 file_id: row.get::<_, i64>(0)?,
                 path: normalize_path(&row.get::<_, String>(1)?),
                 line: row.get::<_, i64>(2)?,
