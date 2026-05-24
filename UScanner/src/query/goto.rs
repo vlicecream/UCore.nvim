@@ -8,30 +8,28 @@ use tree_sitter::{Node, Parser, Point};
 
 use crate::db::ensure_search_projections;
 use crate::db::project_path::PATH_CTE;
-use crate::query::intern::{StrId, StringPool};
 
 #[derive(Clone, Serialize, Deserialize)]
 struct TypeNavEntry {
-    symbol_name: StrId,
+    symbol_name: String,
     line_number: i64,
-    file_path: StrId,
-    kind: StrId,
+    file_path: String,
+    kind: String,
     sort_rank: (u8, u8, i64),
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 struct MemberNavEntry {
-    symbol_name: StrId,
+    symbol_name: String,
     line_number: i64,
-    file_path: StrId,
-    class_name: StrId,
+    file_path: String,
+    class_name: String,
     prefer_def_rank: (u8, u8, i64),
     prefer_impl_rank: (u8, u8, i64),
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct NavigationHotIndex {
-    pool: StringPool,
     class_ids_by_name: HashMap<String, Vec<i64>>,
     parent_ids_by_child: HashMap<i64, Vec<i64>>,
     type_defs_by_name: HashMap<String, Vec<TypeNavEntry>>,
@@ -1321,31 +1319,27 @@ fn qualified_member_key(class_name: &str, symbol_name: &str) -> String {
     format!("{}\n{}", strip_namespace(class_name), symbol_name)
 }
 
-impl NavigationHotIndex {
-    fn member_entry_to_value(&self, entry: &MemberNavEntry) -> Value {
-        json!({
-            "symbol_name": self.pool.get(entry.symbol_name),
-            "line_number": entry.line_number,
-            "file_path": self.pool.get(entry.file_path),
-            "class_name": self.pool.get(entry.class_name),
-        })
-    }
+fn member_entry_to_value(entry: &MemberNavEntry) -> Value {
+    json!({
+        "symbol_name": entry.symbol_name,
+        "line_number": entry.line_number,
+        "file_path": entry.file_path,
+        "class_name": entry.class_name,
+    })
+}
 
-    fn type_entry_to_value(&self, entry: &TypeNavEntry) -> Value {
-        json!({
-            "symbol_name": self.pool.get(entry.symbol_name),
-            "line_number": entry.line_number,
-            "file_path": self.pool.get(entry.file_path),
-            "class_name": self.pool.get(entry.symbol_name),
-            "kind": self.pool.get(entry.kind),
-        })
-    }
+fn type_entry_to_value(entry: &TypeNavEntry) -> Value {
+    json!({
+        "symbol_name": entry.symbol_name,
+        "line_number": entry.line_number,
+        "file_path": entry.file_path,
+        "class_name": entry.symbol_name,
+        "kind": entry.kind,
+    })
 }
 
 pub fn build_navigation_hot_index(conn: &Connection) -> Result<NavigationHotIndex> {
     ensure_search_projections(conn)?;
-
-    let mut pool = StringPool::default();
 
     let mut class_ids_by_name = HashMap::<String, Vec<i64>>::new();
     let mut type_defs_by_name = HashMap::<String, Vec<TypeNavEntry>>::new();
@@ -1385,10 +1379,10 @@ pub fn build_navigation_hot_index(conn: &Connection) -> Result<NavigationHotInde
             .or_default()
             .push(class_id);
         let entry = TypeNavEntry {
-            symbol_name: pool.intern(&class_name),
+            symbol_name: class_name,
             line_number,
-            file_path: pool.intern(&file_path),
-            kind: pool.intern(&kind),
+            file_path: file_path.clone(),
+            kind,
             sort_rank: type_sort_rank(&file_path, line_number),
         };
         type_defs_by_name
@@ -1486,10 +1480,10 @@ pub fn build_navigation_hot_index(conn: &Connection) -> Result<NavigationHotInde
     for row in rows {
         let (class_id, class_name, symbol_name, line_number, file_path, access) = row?;
         let entry = MemberNavEntry {
-            symbol_name: pool.intern(&symbol_name),
+            symbol_name: symbol_name.clone(),
             line_number,
-            file_path: pool.intern(&file_path),
-            class_name: pool.intern(&class_name),
+            file_path: file_path.clone(),
+            class_name,
             prefer_def_rank: member_def_sort_rank(&file_path, line_number),
             prefer_impl_rank: member_impl_sort_rank(&file_path, &access, line_number),
         };
@@ -1498,7 +1492,7 @@ pub fn build_navigation_hot_index(conn: &Connection) -> Result<NavigationHotInde
             .or_default()
             .push(entry.clone());
         members_by_qualified_name
-            .entry(qualified_member_key(&class_name, &symbol_name))
+            .entry(qualified_member_key(&entry.class_name, &entry.symbol_name))
             .or_default()
             .push(entry.clone());
         members_anywhere_by_name
@@ -1506,25 +1500,29 @@ pub fn build_navigation_hot_index(conn: &Connection) -> Result<NavigationHotInde
             .or_default()
             .push(entry);
     }
-    let sort_members = |entries: &mut Vec<MemberNavEntry>| {
+    for entries in members_by_class_and_name.values_mut() {
         entries.sort_by(|left, right| {
             left.prefer_def_rank
                 .cmp(&right.prefer_def_rank)
-                .then_with(|| pool.get(left.file_path).cmp(pool.get(right.file_path)))
+                .then_with(|| left.file_path.cmp(&right.file_path))
         });
-    };
-    for entries in members_by_class_and_name.values_mut() {
-        sort_members(entries);
     }
     for entries in members_anywhere_by_name.values_mut() {
-        sort_members(entries);
+        entries.sort_by(|left, right| {
+            left.prefer_def_rank
+                .cmp(&right.prefer_def_rank)
+                .then_with(|| left.file_path.cmp(&right.file_path))
+        });
     }
     for entries in members_by_qualified_name.values_mut() {
-        sort_members(entries);
+        entries.sort_by(|left, right| {
+            left.prefer_def_rank
+                .cmp(&right.prefer_def_rank)
+                .then_with(|| left.file_path.cmp(&right.file_path))
+        });
     }
 
     Ok(NavigationHotIndex {
-        pool,
         class_ids_by_name,
         parent_ids_by_child,
         type_defs_by_name,
@@ -1578,7 +1576,7 @@ impl NavigationHotIndex {
                 selected = best.clone();
             }
         }
-        Some(self.member_entry_to_value(&selected))
+        Some(member_entry_to_value(&selected))
     }
 
     fn find_member_by_qualified_name(
@@ -1599,7 +1597,7 @@ impl NavigationHotIndex {
                 selected = best.clone();
             }
         }
-        Some(self.member_entry_to_value(&selected))
+        Some(member_entry_to_value(&selected))
     }
 
     fn find_member_anywhere(&self, symbol_name: &str, prefer_impl: bool) -> Option<Value> {
@@ -1613,7 +1611,7 @@ impl NavigationHotIndex {
                 selected = best.clone();
             }
         }
-        Some(self.member_entry_to_value(&selected))
+        Some(member_entry_to_value(&selected))
     }
 
     fn find_type_definition(&self, name: &str) -> Option<Value> {
@@ -1627,14 +1625,14 @@ impl NavigationHotIndex {
             .get(&short_name)
             .and_then(|entries| entries.first())
         {
-            return Some(self.type_entry_to_value(entry));
+            return Some(type_entry_to_value(entry));
         }
 
         let compact = compact_identifier(&short_name);
         self.type_defs_by_compact_name
             .get(&compact)
             .and_then(|entries| entries.first())
-            .map(|entry| self.type_entry_to_value(entry))
+            .map(type_entry_to_value)
     }
 }
 

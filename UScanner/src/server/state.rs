@@ -17,7 +17,7 @@ use crate::query::usage::{build_usage_hot_index, UsageHotIndex};
 use crate::runtime_index;
 use crate::types::{ConfigCache, PhaseInfo, Progress, ProgressPlan, ProgressReporter};
 
-const COMPLETION_CACHE_CAPACITY: usize = 2_000;
+const COMPLETION_CACHE_CAPACITY: usize = 50_000;
 const DIAGNOSTICS_CACHE_CAPACITY: usize = 512;
 const DIAGNOSTICS_CACHE_TTL: Duration = Duration::from_millis(1500);
 const NAVIGATION_CACHE_CAPACITY: usize = 1024;
@@ -716,8 +716,8 @@ fn open_persistent_cache_connection(cache_db_path: &str) -> Result<rusqlite::Con
 fn configure_primary_connection(conn: &rusqlite::Connection) -> Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
-    conn.pragma_update(None, "cache_size", "-50000")?;
-    conn.pragma_update(None, "mmap_size", "0")?;
+    conn.pragma_update(None, "cache_size", "-500000")?;
+    conn.pragma_update(None, "mmap_size", "1073741824")?;
     conn.pragma_update(None, "temp_store", "MEMORY")?;
     Ok(())
 }
