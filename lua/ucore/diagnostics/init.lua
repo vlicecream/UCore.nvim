@@ -12,6 +12,7 @@ local enabled = true
 local refresh_sequences = {}
 local active_requests = {}
 local pending_refreshes = {}
+local applied_buffers_by_primary = {}
 local try_include_symbol
 local float_sequence = 0
 local float_winid = nil
@@ -48,6 +49,7 @@ end
 local function open_file_overlays(project_root, primary_bufnr)
 	local overlays = {}
 	local seen = {}
+	local snapshots = {}
 	local normalized_root = normalize_path(project_root or "")
 	local primary_path = primary_bufnr and normalize_path(vim.api.nvim_buf_get_name(primary_bufnr)) or nil
 
@@ -67,6 +69,7 @@ local function open_file_overlays(project_root, primary_bufnr)
 						file_path = name,
 						content = current_content(bufnr),
 					})
+					snapshots[bufnr] = vim.api.nvim_buf_get_changedtick(bufnr)
 				end
 			end
 		end
@@ -79,9 +82,10 @@ local function open_file_overlays(project_root, primary_bufnr)
 			file_path = primary_path,
 			content = current_content(primary_bufnr),
 		})
+		snapshots[primary_bufnr] = vim.api.nvim_buf_get_changedtick(primary_bufnr)
 	end
 
-	return overlays
+	return overlays, snapshots
 end
 
 local function resolve_bufnr_for_path(file_path, fallback_bufnr)
@@ -132,20 +136,44 @@ end
 
 local function apply_items(items, fallback_bufnr)
 	local by_buf = {}
+	local next_applied = {}
+	local previous_applied = applied_buffers_by_primary[fallback_bufnr] or {}
 
 	for _, item in ipairs(items or {}) do
 		local bufnr, diagnostic = diagnostic_from_item(item, fallback_bufnr)
 		by_buf[bufnr] = by_buf[bufnr] or {}
 		table.insert(by_buf[bufnr], diagnostic)
+		next_applied[bufnr] = true
 	end
 
 	if fallback_bufnr and not by_buf[fallback_bufnr] then
 		vim.diagnostic.set(ns, fallback_bufnr, {})
+		next_applied[fallback_bufnr] = true
+	end
+
+	for bufnr, _ in pairs(previous_applied) do
+		if not next_applied[bufnr] and vim.api.nvim_buf_is_valid(bufnr) then
+			vim.diagnostic.reset(ns, bufnr)
+		end
 	end
 
 	for bufnr, diagnostics in pairs(by_buf) do
 		vim.diagnostic.set(ns, bufnr, diagnostics)
 	end
+
+	applied_buffers_by_primary[fallback_bufnr] = next_applied
+end
+
+local function snapshots_are_current(snapshots)
+	for bufnr, tick in pairs(snapshots or {}) do
+		if not vim.api.nvim_buf_is_valid(bufnr) then
+			return false
+		end
+		if vim.api.nvim_buf_get_changedtick(bufnr) ~= tick then
+			return false
+		end
+	end
+	return true
 end
 
 function M.refresh(bufnr, opts)
@@ -183,12 +211,13 @@ function M.refresh(bufnr, opts)
 	refresh_sequences[bufnr] = (refresh_sequences[bufnr] or 0) + 1
 	local sequence = refresh_sequences[bufnr]
 	local changedtick = vim.api.nvim_buf_get_changedtick(bufnr)
+	local open_files, overlay_snapshots = open_file_overlays(root, bufnr)
 	active_requests[bufnr] = true
 
 	remote.get_diagnostics(root, {
 		content = current_content(bufnr),
 		file_path = normalize_path(file_path),
-		open_files = open_file_overlays(root, bufnr),
+		open_files = open_files,
 	}, function(result, err)
 		active_requests[bufnr] = nil
 
@@ -205,6 +234,7 @@ function M.refresh(bufnr, opts)
 		if sequence ~= refresh_sequences[bufnr]
 			or not vim.api.nvim_buf_is_valid(bufnr)
 			or vim.api.nvim_buf_get_changedtick(bufnr) ~= changedtick
+			or not snapshots_are_current(overlay_snapshots)
 		then
 			return
 		end
@@ -225,8 +255,10 @@ end
 
 function M.clear(bufnr)
 	if bufnr then
+		applied_buffers_by_primary[bufnr] = nil
 		vim.diagnostic.reset(ns, bufnr)
 	else
+		applied_buffers_by_primary = {}
 		vim.diagnostic.reset(ns)
 	end
 end
@@ -1714,28 +1746,10 @@ function M.setup()
 		end,
 	})
 
-	vim.api.nvim_create_autocmd("BufEnter", {
-		group = group,
-		pattern = { "*.h", "*.hpp", "*.cpp", "*.cc", "*.cxx" },
-		callback = function(args)
-			M.refresh(args.buf, { force = true, silent = true })
-		end,
-	})
-
 	vim.api.nvim_create_autocmd("InsertLeave", {
 		group = group,
 		pattern = { "*.h", "*.hpp", "*.cpp", "*.cc", "*.cxx" },
-		callback = function(args)
-			M.refresh(args.buf, { force = true, silent = true })
-		end,
-	})
-
-	vim.api.nvim_create_autocmd("CursorHold", {
-		group = group,
-		pattern = { "*.h", "*.hpp", "*.cpp", "*.cc", "*.cxx" },
-		callback = function(args)
-			M.refresh(args.buf, { force = true, silent = true })
-		end,
+		callback = schedule_refresh,
 	})
 
 	vim.api.nvim_create_autocmd({ "CursorMoved", "BufEnter" }, {
@@ -1773,6 +1787,7 @@ function M.reset()
 	refresh_sequences = {}
 	active_requests = {}
 	pending_refreshes = {}
+	applied_buffers_by_primary = {}
 	float_sequence = float_sequence + 1
 	close_cursor_float()
 	pcall(vim.api.nvim_del_augroup_by_name, group_name)
