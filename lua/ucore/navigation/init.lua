@@ -454,13 +454,21 @@ local function fallback_normal(keys)
 		return false
 	end
 
-	local ok = pcall(vim.cmd, "normal! " .. keys)
-	if ok then
-		pcall(vim.cmd, "nohlsearch")
-		return true
+	local termcodes = vim.api.nvim_replace_termcodes(keys, true, false, true)
+	if not termcodes or termcodes == "" then
+		return false
 	end
 
-	return false
+	-- `normal! gi` can fail under nvim_exec2 because it enters Insert mode
+	-- while the Lua callback is still executing. Feed the raw keys instead so
+	-- normal-mode fallbacks like `gd` and mode-switching ones like `gi` both
+	-- behave like native user input.
+	vim.schedule(function()
+		pcall(vim.cmd, "nohlsearch")
+		vim.api.nvim_feedkeys(termcodes, "n", false)
+	end)
+
+	return true
 end
 
 -- Smart goto-definition entry.
