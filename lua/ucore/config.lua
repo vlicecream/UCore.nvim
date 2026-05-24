@@ -220,7 +220,7 @@ local function default_values()
 
 		-- Delay auto boot slightly to avoid fighting startup/plugin loading.
 		-- 稍微延迟自动启动，避免和 nvim 启动/插件加载抢时机。
-		auto_boot_delay_ms = 300,
+		auto_boot_delay_ms = 50,
 
 		-- Maximum number of readiness checks during boot.
 		-- boot 期间最多检查多少次 server ready。

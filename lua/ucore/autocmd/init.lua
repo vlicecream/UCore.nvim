@@ -9,7 +9,6 @@ local group_name = "UCoreAutoBoot"
 local booted_projects = {}
 local pending_projects = {}
 local attempts_scheduled = false
-local find_warm_requested = {}
 
 local function prewarm_find(root, opts)
 	pcall(function()
@@ -80,7 +79,7 @@ local function try_auto_boot(args)
 	end
 
 	attempts_scheduled = true
-	local delays = { 0, 100, 300, 700 }
+	local delays = { 0, 200 }
 	local idx = 0
 
 	local function tick()
@@ -95,12 +94,9 @@ local function try_auto_boot(args)
 		if root then
 			attempts_scheduled = false
 			require("ucore.explorer").auto_open_for_project(root)
-			if not find_warm_requested[root] then
-				find_warm_requested[root] = true
-				vim.defer_fn(function()
-					prewarm_find(root)
-				end, 1000)
-			end
+			-- prewarm_find is called again after boot succeeds with force=true,
+			-- so no need for a separate pre-boot warm here.
+			-- boot 成功后会以 force=true 再触发一次 prewarm_find，这里不再重复。
 			if config.values.auto_boot then
 				schedule_boot(root)
 			end
@@ -136,7 +132,6 @@ function M.reset()
 	booted_projects = {}
 	pending_projects = {}
 	attempts_scheduled = false
-	find_warm_requested = {}
 end
 
 return M
