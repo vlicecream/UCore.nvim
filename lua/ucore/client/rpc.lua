@@ -177,6 +177,28 @@ local function handle_frame(frame)
 		local method = msg[2]
 		local params = msg[3]
 
+		-- Capture the partial callback synchronously before scheduling. The
+		-- response frame (msg_type == 1) clears `pending[msgid]` immediately,
+		-- so if both partial and response land in the same TCP chunk and the
+		-- partial lookup were done inside vim.schedule, pending would already
+		-- be nil and the partial would be silently dropped.
+		-- 在 schedule 之前同步取出 partial_callback。msg_type==1 会**同步**清掉
+		-- pending[msgid]；如果 partial 和 response 落在同一个 chunk，等到
+		-- schedule 执行时 pending 已被清空，partial 会被静默丢弃。
+		local partial_msgid
+		local partial_cb
+		local partial_items
+		local partial_append
+		local partial_done
+		if method == "query/partial" then
+			partial_msgid = params and decode_integer(params.msgid)
+			local pending_entry = partial_msgid and pending[partial_msgid] or nil
+			partial_cb = pending_entry and pending_entry.partial_callback
+			partial_items = params and params.items
+			partial_append = params and params.append == true
+			partial_done = params and params.done == true
+		end
+
 		vim.schedule(function()
 			if method == "progress_plan" then
 				log.write_progress("rpc-progress-plan", {
@@ -198,13 +220,10 @@ local function handle_frame(frame)
 			end
 
 			if method == "query/partial" then
-				local msgid = params and decode_integer(params.msgid)
-				local pending_entry = msgid and pending[msgid] or nil
-				local partial_cb = pending_entry and pending_entry.partial_callback
 				if partial_cb then
-					partial_cb(params.items, nil, {
-						append = params.append == true,
-						done = params.done == true,
+					partial_cb(partial_items, nil, {
+						append = partial_append,
+						done = partial_done,
 					})
 				end
 				return
