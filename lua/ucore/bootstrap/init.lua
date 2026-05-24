@@ -164,9 +164,12 @@ end
 -- Remove Lua-only fields before sending a request to Rust.
 -- 发送给 Rust 前移除 Lua 内部字段。
 local function rust_payload(payload)
-	local copy = vim.deepcopy(payload)
-	copy._engine = nil
-	copy._engine_paths = nil
+	local copy = {}
+	for key, value in pairs(payload) do
+		if key ~= "_engine" and key ~= "_engine_paths" then
+			copy[key] = value
+		end
+	end
 	return copy
 end
 
@@ -458,37 +461,68 @@ function M.boot(callback, opts)
 				end
 				workspace_register_progress(100, "Workspace registered.")
 
-				run_refresh_if_needed(payload, setup_result, function(refresh_ok, refresh_err)
-					if not refresh_ok then
+				-- After setup, fire refresh + watch in parallel and kick off
+				-- engine refresh in the background. Project is marked ready as
+				-- soon as refresh + watch finish — engine refresh no longer
+				-- gates queries because engine searches fall back to SQLite.
+				-- setup 完成后并行触发 refresh + watch，engine refresh 后台异步。
+				-- 项目 ready 不再等 engine——engine 查询走 SQLite fallback。
+				local refresh_done = false
+				local refresh_failure = nil
+				local watch_done = false
+				local watch_failure = nil
+				local finalized = false
+
+				local function try_finalize()
+					if finalized then
+						return
+					end
+					if not (refresh_done and watch_done) then
+						return
+					end
+					finalized = true
+
+					local err_msg = refresh_failure or watch_failure
+					if err_msg then
 						booting = false
-						fail(tostring(refresh_err))
-						return callback(false, refresh_err)
+						fail(tostring(err_msg))
+						return callback(false, err_msg)
 					end
 
-					project_finalize_progress(95, "Starting file watcher...")
-					run_watch(payload, function(watch_ok, watch_err)
-						if not watch_ok then
-							booting = false
-							fail(tostring(watch_err))
-							return callback(false, watch_err)
-						end
+					project_finalize_progress(100)
+					booting = false
+					set_project_ready(payload.project_root, true)
+					log.write_progress("boot-finish", {
+						project_root = payload.project_root,
+					})
+					status.finish("UCore Ready - Project Indexed")
+					callback(true)
+				end
 
-						project_finalize_progress(100)
-						run_engine_refresh_step(payload, function(engine_ok, engine_err)
-							booting = false
-							if not engine_ok then
-								set_project_ready(payload.project_root, false)
-								return callback(false, engine_err)
-							end
-
-							set_project_ready(payload.project_root, true)
-							log.write_progress("boot-finish", {
-								project_root = payload.project_root,
-							})
-							callback(true)
-						end)
-					end)
+				project_finalize_progress(20, "Refreshing project index...")
+				run_refresh_if_needed(payload, setup_result, function(refresh_ok, refresh_err)
+					refresh_done = true
+					if not refresh_ok then
+						refresh_failure = refresh_err
+					end
+					try_finalize()
 				end)
+
+				project_finalize_progress(40, "Starting file watcher...")
+				run_watch(payload, function(watch_ok, watch_err)
+					watch_done = true
+					if not watch_ok then
+						watch_failure = watch_err
+					end
+					try_finalize()
+				end)
+
+				-- Fire-and-forget engine refresh. Status / log progress comes
+				-- from inside run_engine_refresh_step. A failed engine refresh
+				-- does NOT mark the project unready: engine queries fall back
+				-- to SQLite FTS so the user keeps working.
+				-- engine refresh 不阻塞 boot 完成，失败也不影响 project ready。
+				run_engine_refresh_step(payload, function() end)
 			end)
 		end)
 	end, {
