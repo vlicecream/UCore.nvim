@@ -160,6 +160,13 @@ pub fn process_diagnostics(
     )?;
     extend_diagnostic_phase(
         &mut items,
+        "invalid_expression_token",
+        file_label,
+        log_enabled,
+        || invalid_expression_token_diagnostics(content, file_path.as_deref()),
+    )?;
+    extend_diagnostic_phase(
+        &mut items,
         "duplicate_members",
         file_label,
         log_enabled,
@@ -1660,6 +1667,32 @@ fn invalid_member_token_diagnostics(
     Ok(items)
 }
 
+fn invalid_expression_token_diagnostics(
+    content: &str,
+    file_path: Option<&str>,
+) -> Result<Vec<DiagnosticItem>> {
+    let Some(file_path) = file_path else {
+        return Ok(Vec::new());
+    };
+
+    if !is_source_file(file_path) {
+        return Ok(Vec::new());
+    }
+
+    let mut parser = Parser::new();
+    let language: tree_sitter::Language = tree_sitter_unreal_cpp::LANGUAGE.into();
+    parser.set_language(&language)?;
+
+    let Some(tree) = parser.parse(content, None) else {
+        return Ok(Vec::new());
+    };
+
+    let root = tree.root_node();
+    let mut items = Vec::new();
+    collect_invalid_expression_token_items(root, content, file_path, &mut items);
+    Ok(items)
+}
+
 fn collect_invalid_member_token_items(
     node: tree_sitter::Node,
     content: &str,
@@ -1673,6 +1706,22 @@ fn collect_invalid_member_token_items(
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         collect_invalid_member_token_items(child, content, file_path, items);
+    }
+}
+
+fn collect_invalid_expression_token_items(
+    node: tree_sitter::Node,
+    content: &str,
+    file_path: &str,
+    items: &mut Vec<DiagnosticItem>,
+) {
+    if node.kind() == "compound_statement" {
+        collect_invalid_expression_token_lines(node, content, file_path, items);
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_invalid_expression_token_items(child, content, file_path, items);
     }
 }
 
@@ -1711,6 +1760,33 @@ fn invalid_member_token_line(
     Some(trimmed)
 }
 
+fn invalid_expression_token_line(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    if trimmed.is_empty()
+        || !trimmed.ends_with(';')
+        || trimmed.contains('{')
+        || trimmed.contains('}')
+        || trimmed.contains('(')
+        || trimmed.contains(')')
+        || trimmed.contains('=')
+        || trimmed.contains("->")
+        || trimmed.contains('.')
+        || trimmed.starts_with("return ")
+    {
+        return None;
+    }
+
+    let token = trimmed.trim_end_matches(';').trim();
+    if token.is_empty()
+        || !token.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == ':')
+        || is_ignored_unknown_symbol_name(token)
+    {
+        return None;
+    }
+
+    Some(token)
+}
+
 fn collect_invalid_member_token_lines(
     node: tree_sitter::Node,
     content: &str,
@@ -1741,6 +1817,42 @@ fn collect_invalid_member_token_lines(
                 "UCore",
                 "UECPP010",
                 format!("Unexpected token {} in class member declaration.", token),
+            )
+            .with_end(row as u32, (column + token.len()) as u32),
+        );
+    }
+}
+
+fn collect_invalid_expression_token_lines(
+    node: tree_sitter::Node,
+    content: &str,
+    file_path: &str,
+    items: &mut Vec<DiagnosticItem>,
+) {
+    let lines = content.lines().collect::<Vec<_>>();
+    let start_row = node.start_position().row as usize;
+    let end_row = node.end_position().row as usize;
+
+    for row in start_row..=end_row {
+        let Some(line) = lines.get(row).copied() else {
+            continue;
+        };
+        let Some(token) = invalid_expression_token_line(line) else {
+            continue;
+        };
+        let Some(column) = line.find(token) else {
+            continue;
+        };
+
+        items.push(
+            DiagnosticItem::new(
+                Some(file_path),
+                row as u32,
+                column as u32,
+                DiagnosticSeverity::Error,
+                "UCore",
+                "UECPP018",
+                format!("Unexpected expression token {}.", token),
             )
             .with_end(row as u32, (column + token.len()) as u32),
         );
@@ -5595,6 +5707,7 @@ mod tests {
                     .unwrap_or_default()
                     .contains("xxxxx")
         }));
+        assert!(items.iter().any(|item| item["code"] == "UECPP018"));
     }
 
     #[test]
