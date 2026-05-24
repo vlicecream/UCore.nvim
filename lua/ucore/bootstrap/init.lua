@@ -499,7 +499,6 @@ function M.boot(callback, opts)
 					callback(true)
 				end
 
-				project_finalize_progress(20, "Refreshing project index...")
 				run_refresh_if_needed(payload, setup_result, function(refresh_ok, refresh_err)
 					refresh_done = true
 					if not refresh_ok then
@@ -508,7 +507,6 @@ function M.boot(callback, opts)
 					try_finalize()
 				end)
 
-				project_finalize_progress(40, "Starting file watcher...")
 				run_watch(payload, function(watch_ok, watch_err)
 					watch_done = true
 					if not watch_ok then

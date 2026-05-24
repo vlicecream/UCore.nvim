@@ -645,7 +645,13 @@ function M.start(message)
 	panels.init.state = "running"
 	panels.init.spinner_active_keys.boot = true
 	panels.init.items.boot = message or "UCore Initializing..."
-	initialize_progress_placeholders(panels.init)
+	-- Do NOT pre-fill every phase as "X 0%". Phases should only appear
+	-- once they actually emit progress, otherwise the panel shows a wall
+	-- of 0% placeholders that aren't running yet (especially confusing
+	-- with parallel refresh + background engine refresh, where many
+	-- phases will never run sequentially anyway).
+	-- 不再预填全部 phase 为 0%——避免显示一堆还没开始的占位行，
+	-- 在并行 refresh + 后台 engine 场景尤其明显。
 	render()
 	schedule_spinner()
 end
