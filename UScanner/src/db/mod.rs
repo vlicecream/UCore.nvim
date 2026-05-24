@@ -34,7 +34,7 @@ const DB_BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
 /// SQLite busy timeout for bulk writes.
 /// 批量写入时的 busy timeout。
 const DB_BULK_BUSY_TIMEOUT: Duration = Duration::from_millis(60_000);
-const DB_BULK_CHUNK_SIZE: usize = 500;
+const DB_BULK_CHUNK_SIZE: usize = 4000;
 const ITEM_PROGRESS_EVERY: usize = 250;
 
 /// Ensure the on-disk database matches the current schema version.

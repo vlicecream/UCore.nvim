@@ -13,8 +13,8 @@ pub const TEXT_DB_VERSION: i32 = 3;
 
 const TEXT_DB_BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
 const TEXT_DB_BULK_BUSY_TIMEOUT: Duration = Duration::from_millis(60_000);
-const TEXT_INDEX_BULK_CHUNK_SIZE: usize = 500;
-const TEXT_INDEX_DELTA_CHUNK_SIZE: usize = 250;
+const TEXT_INDEX_BULK_CHUNK_SIZE: usize = 4000;
+const TEXT_INDEX_DELTA_CHUNK_SIZE: usize = 1000;
 
 #[derive(Debug, Clone)]
 pub struct TextIndexFile {
