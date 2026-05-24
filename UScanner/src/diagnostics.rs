@@ -1045,6 +1045,10 @@ fn resolve_expression_type_for_diagnostics(
                 {
                     return Ok(Some(member_type));
                 }
+
+                if member_exists_across_dbs(conn, engine_conn, &class_name, name)? {
+                    return Ok(Some(class_name));
+                }
             }
 
             if !class_ids_by_name(conn, name)?.is_empty()
@@ -1394,7 +1398,12 @@ fn collect_missing_visible_type_items(
             &reference.name,
             include_paths,
             engine_seed_include_paths,
-        ) || is_bind_widget_anim_context_text(content, reference.line as usize, &reference.name) {
+        ) || is_bind_widget_anim_context_text(
+            content,
+            reference.source_start_line as usize,
+            reference.source_end_line as usize,
+            &reference.name,
+        ) {
             continue;
         }
 
@@ -1532,6 +1541,8 @@ struct TypeReference {
     end_line: u32,
     end_character: u32,
     requires_complete: bool,
+    source_start_line: u32,
+    source_end_line: u32,
 }
 
 fn collect_missing_return_items(
@@ -2725,6 +2736,8 @@ fn type_references_from_type_node(
             end_line: end.row as u32,
             end_character: end.column as u32,
             requires_complete,
+            source_start_line: start.row as u32,
+            source_end_line: end.row as u32,
         })
         .collect()
 }
@@ -2882,14 +2895,19 @@ fn is_unreal_implicitly_visible_type(
         || (name == "UWidgetAnimation" && has_umg_animation_header)
 }
 
-fn is_bind_widget_anim_context_text(content: &str, row: usize, name: &str) -> bool {
+fn is_bind_widget_anim_context_text(
+    content: &str,
+    start_row: usize,
+    end_row: usize,
+    name: &str,
+) -> bool {
     if name != "UWidgetAnimation" {
         return false;
     }
 
     let lines = content.lines().collect::<Vec<_>>();
-    let start = row.saturating_sub(3);
-    let end = (row + 1).min(lines.len().saturating_sub(1));
+    let start = start_row.saturating_sub(3);
+    let end = end_row.min(lines.len().saturating_sub(1));
     for index in start..=end {
         let line = lines.get(index).copied().unwrap_or("");
         if line.contains("BindWidgetAnimOptional") || line.contains("BindWidgetAnim") {
@@ -4219,6 +4237,19 @@ fn find_enclosing_class_name(node: tree_sitter::Node, content: &str) -> Option<S
             }
         }
 
+        if parent.kind() == "function_definition" || parent.kind() == "unreal_function_definition" {
+            if let Some(decl) = parent.child_by_field_name("declarator") {
+                if let Some(qi) = find_child_by_type(decl, "qualified_identifier") {
+                    if let Some(scope) = qi.child_by_field_name("scope") {
+                        let scope_text = node_text(scope, content).trim();
+                        if !scope_text.is_empty() {
+                            return Some(strip_namespace(scope_text));
+                        }
+                    }
+                }
+            }
+        }
+
         current = parent.parent();
     }
 
@@ -4237,6 +4268,19 @@ fn enclosing_class_base_names(node: tree_sitter::Node, content: &str) -> Vec<Str
                 | "unreal_reflected_struct_declaration"
         ) {
             return extract_base_names_from_class_text(node_text(parent, content));
+        }
+
+        if parent.kind() == "function_definition" || parent.kind() == "unreal_function_definition" {
+            if let Some(decl) = parent.child_by_field_name("declarator") {
+                if let Some(qi) = find_child_by_type(decl, "qualified_identifier") {
+                    if let Some(scope) = qi.child_by_field_name("scope") {
+                        let scope_text = node_text(scope, content).trim();
+                        if !scope_text.is_empty() {
+                            return Vec::new();
+                        }
+                    }
+                }
+            }
         }
 
         current = parent.parent();
