@@ -6,7 +6,6 @@ use std::sync::OnceLock;
 use anyhow::Context;
 use memmap2::Mmap;
 use regex::Regex;
-use sha2::{Digest, Sha256};
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Node, Parser, Query, QueryCursor};
 
@@ -249,11 +248,12 @@ pub fn process_file(
 
     let content_bytes = &mmap[..];
 
-    // Content hash is used to skip unchanged files.
-    // 通过内容 hash 跳过未变化的文件。
-    let mut hasher = Sha256::new();
-    hasher.update(content_bytes);
-    let new_hash = hex::encode(hasher.finalize());
+    // Content hash is used to skip unchanged files. blake3 is significantly
+    // faster than SHA256 on large source files (SIMD + tree hash) while
+    // providing equivalent change-detection guarantees for our use case.
+    // 通过内容 hash 跳过未变化的文件。blake3 在大文件上 SIMD 加速远快于
+    // SHA256，对我们的去重场景两者效果等价。
+    let new_hash = blake3::hash(content_bytes).to_hex().to_string();
 
     if input.old_hash.as_ref() == Some(&new_hash) {
         return Ok(ParseResult {
