@@ -46,6 +46,17 @@ local panels = {
 		"task:plugin",
 		"task:asset_bridge",
 	}),
+	engine_init = make_panel("UCore Engine Index", "ucore.status.engine_init", {
+		"boot",
+		"progress:UCore Engine Discovery",
+		"progress:UCore Engine DB Prepare",
+		"progress:UCore Engine Analysis",
+		"progress:UCore Engine DB Write",
+		"progress:UCore Engine Text DB Write",
+		"progress:UCore Engine Asset Scan",
+		"progress:UCore Engine Asset Persist",
+		"progress:UCore Engine Finalize",
+	}),
 	init = make_panel("UCore Workspace Init", "ucore.status.init", {
 		"boot",
 		"progress:UCore Server Start",
@@ -59,14 +70,6 @@ local panels = {
 		"progress:UCore Project Asset Scan",
 		"progress:UCore Project Asset Persist",
 		"progress:UCore Project Finalize",
-		"progress:UCore Engine Discovery",
-		"progress:UCore Engine DB Prepare",
-		"progress:UCore Engine Analysis",
-		"progress:UCore Engine DB Write",
-		"progress:UCore Engine Text DB Write",
-		"progress:UCore Engine Asset Scan",
-		"progress:UCore Engine Asset Persist",
-		"progress:UCore Engine Finalize",
 	}),
 }
 
@@ -75,12 +78,19 @@ local function panel_is_modal(panel)
 end
 
 local function panel_for_key(key)
+	if type(key) == "string" and key:find("^progress:UCore Engine ", 1, true) == 1 then
+		return panels.engine_init
+	end
+
 	return panels.init
 end
 
 local function panel_storage_key(panel)
 	if panel == panels.unreal_init then
 		return "unreal_init"
+	end
+	if panel == panels.engine_init then
+		return "engine_init"
 	end
 
 	return "init"
@@ -97,7 +107,9 @@ local function panel_has_spinner_items(panel)
 end
 
 local function any_spinner_items()
-	return panel_has_spinner_items(panels.unreal_init) or panel_has_spinner_items(panels.init)
+	return panel_has_spinner_items(panels.unreal_init)
+		or panel_has_spinner_items(panels.engine_init)
+		or panel_has_spinner_items(panels.init)
 end
 
 local function spinner_frame()
@@ -435,16 +447,23 @@ local function render_now()
 		if init_height > 0 then
 			row = row + init_height + 1
 		end
+		local engine_height = render_float_panel("engine_init", panels.engine_init, row)
+		if engine_height > 0 then
+			row = row + engine_height + 1
+		end
 		local unreal_height = render_float_panel("unreal_init", panels.unreal_init, row)
 		if unreal_height > 0 then
 			row = row + unreal_height + 1
 		end
 		panels.init.notify_handle = nil
+		panels.engine_init.notify_handle = nil
 		panels.unreal_init.notify_handle = nil
 	else
 		close_float("init")
+		close_float("engine_init")
 		close_float("unreal_init")
 		render_notify_panel(panels.init)
+		render_notify_panel(panels.engine_init)
 		render_notify_panel(panels.unreal_init)
 	end
 end
@@ -621,6 +640,8 @@ end
 
 local function reset_all()
 	reset_panel(panels.unreal_init)
+	reset_panel(panels.engine_init)
+	suppress_panel_keys(panels.engine_init)
 	reset_panel(panels.init)
 	render()
 end
@@ -640,6 +661,8 @@ local function apply_pending_init_finish()
 end
 
 function M.start(message)
+	reset_panel(panels.engine_init)
+	suppress_panel_keys(panels.engine_init)
 	reset_panel(panels.init)
 	panels.init.boot_active = true
 	panels.init.state = "running"
@@ -725,6 +748,10 @@ function M.progress_finish(title, message)
 	panel.spinner_active_keys[key] = nil
 	panel.items[key] = text
 	bump_dismiss_version(panel)
+	if panel == panels.engine_init and not panel_has_spinner_items(panel) then
+		panel.state = "complete"
+		schedule_panel_dismiss(panel, 5000)
+	end
 	render()
 	if panel == panels.init then
 		apply_pending_init_finish()

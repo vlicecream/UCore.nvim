@@ -132,6 +132,18 @@ local function finish_engine_skip_phases()
 	})
 end
 
+local function finish_engine_status(message)
+	if message and message ~= "" then
+		status.progress_finish("UCore Engine Discovery", message)
+	else
+		status.progress_finish("UCore Engine Discovery", "UCore Engine Discovery 100%")
+	end
+end
+
+local function fail_engine_status(message)
+	status.progress_fail("UCore Engine Discovery", message or "UCore Engine Discovery Failed")
+end
+
 -- Build a setup/refresh/watch payload for the current Unreal project.
 -- 为当前 Unreal 工程构造 setup/refresh/watch 请求体。
 local function current_project_payload(project_root)
@@ -338,14 +350,14 @@ end
 local function run_engine_refresh_step(payload, after_finish)
 	run_engine_refresh_if_needed(payload, function(ok, err)
 		if ok then
-			status.finish("UCore Ready - Initialization Complete")
+			finish_engine_status("UCore Engine Index Ready")
 			if type(after_finish) == "function" then
 				after_finish(true)
 			end
 			return
 		end
 
-		status.fail("UCore Engine Discovery Failed", tostring(err))
+		fail_engine_status("UCore Engine Discovery Failed: " .. tostring(err))
 		if type(after_finish) == "function" then
 			after_finish(false, err)
 		end
