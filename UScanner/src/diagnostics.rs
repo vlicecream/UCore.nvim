@@ -760,6 +760,9 @@ fn collect_unknown_qualified_identifier_item(
     };
 
     if let Some(scope_name) = resolved_scope {
+        if is_known_static_member(&scope_name, member_name) {
+            return Ok(());
+        }
         if !member_exists_across_dbs(conn, engine_conn, &scope_name, member_name)? {
             push_unknown_symbol_item(
                 items,
@@ -1049,6 +1052,10 @@ fn member_exists_across_dbs(
     class_name: &str,
     member_name: &str,
 ) -> Result<bool> {
+    if is_known_member_on_builtin_type(class_name, member_name) {
+        return Ok(true);
+    }
+
     if member_exists_on_class_or_bases(conn, class_name, member_name)? {
         return Ok(true);
     }
@@ -1091,6 +1098,10 @@ fn member_type_across_dbs(
     class_name: &str,
     member_name: &str,
 ) -> Result<Option<String>> {
+    if let Some(member_type) = builtin_member_type(class_name, member_name) {
+        return Ok(Some(member_type));
+    }
+
     if let Some(member_type) = member_type_on_class_or_bases(conn, class_name, member_name)? {
         return Ok(Some(member_type));
     }
@@ -1102,6 +1113,77 @@ fn member_type_across_dbs(
     }
 
     Ok(None)
+}
+
+fn normalize_member_receiver_type(class_name: &str) -> String {
+    let trimmed = crate::parser::cpp::clean_type_string(class_name).trim().to_string();
+    if let Some(inner) = trimmed
+        .strip_prefix("TArray<")
+        .and_then(|text| text.strip_suffix('>'))
+    {
+        return format!("TArray<{}>", crate::parser::cpp::clean_type_string(inner));
+    }
+
+    if let Some(inner) = trimmed
+        .strip_prefix("TSet<")
+        .and_then(|text| text.strip_suffix('>'))
+    {
+        return format!("TSet<{}>", crate::parser::cpp::clean_type_string(inner));
+    }
+
+    if let Some(inner) = trimmed
+        .strip_prefix("TAutoConsoleVariable<")
+        .and_then(|text| text.strip_suffix('>'))
+    {
+        return format!(
+            "TAutoConsoleVariable<{}>",
+            crate::parser::cpp::clean_type_string(inner)
+        );
+    }
+
+    trimmed
+}
+
+fn is_known_member_on_builtin_type(class_name: &str, member_name: &str) -> bool {
+    let normalized = normalize_member_receiver_type(class_name);
+    matches!(
+        (normalized.as_str(), member_name),
+        ("AActor", "GetActorLocation")
+            | ("AActor", "GetActorForwardVector")
+            | ("AActor", "GetActorQuat")
+            | ("AActor", "IsA")
+            | ("TArray", "Add")
+            | ("TArray", "Empty")
+            | ("FOverlapResult", "GetActor")
+            | ("TAutoConsoleVariable<int32>", "GetValueOnGameThread")
+    ) || normalized.starts_with("TArray<") && matches!(member_name, "Add" | "Empty")
+}
+
+fn builtin_member_type(class_name: &str, member_name: &str) -> Option<String> {
+    let normalized = normalize_member_receiver_type(class_name);
+    match (normalized.as_str(), member_name) {
+        ("AActor", "GetActorLocation") => Some("FVector".to_string()),
+        ("AActor", "GetActorForwardVector") => Some("FVector".to_string()),
+        ("AActor", "GetActorQuat") => Some("FQuat".to_string()),
+        ("AActor", "IsA") => Some("bool".to_string()),
+        ("FOverlapResult", "GetActor") => Some("AActor".to_string()),
+        ("TAutoConsoleVariable<int32>", "GetValueOnGameThread") => Some("int32".to_string()),
+        _ => None,
+    }
+}
+
+fn is_known_static_member(scope_name: &str, member_name: &str) -> bool {
+    let normalized = crate::parser::cpp::clean_type_string(scope_name);
+    matches!(
+        (normalized.as_str(), member_name),
+        ("FVector", "DistSquared")
+            | ("FVector", "Distance")
+            | ("FVector2D", "Distance")
+            | ("FMath", "Clamp")
+            | ("FMath", "Abs")
+            | ("FMath", "Max")
+            | ("FMath", "Min")
+    )
 }
 
 fn member_type_on_class_or_bases(
@@ -5732,6 +5814,25 @@ mod tests {
                     .unwrap_or_default()
                     .contains("xxxxx")
         }));
+    }
+
+    #[test]
+    fn does_not_warn_for_range_for_variable_or_common_unreal_helpers() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "void Run(TArray<AActor*>& OutTargets, const TArray<FOverlapResult>& OverlapResults, const FVector& SourceLocation)\n{\n    OutTargets.Empty();\n    for (const FOverlapResult& Result : OverlapResults)\n    {\n        if (AActor* HitActor = Result.GetActor())\n        {\n            OutTargets.Add(HitActor);\n        }\n    }\n    for (AActor* OverlapActor : OutTargets)\n    {\n        const float DistanceSq = FVector::DistSquared(OverlapActor->GetActorLocation(), SourceLocation);\n    }\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP008"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP009"));
     }
 
     #[test]

@@ -618,6 +618,26 @@ fn scan_for_var_decl(
                 }
             }
         }
+        "for_range_loop" | "range_based_for_statement" | "for_statement" => {
+            if let Some(type_node) = node.child_by_field_name("type") {
+                if let Some(decl_node) = node.child_by_field_name("declarator") {
+                    if let Some(name_node) = extract_decl_name_node(decl_node) {
+                        let name = node_text(&name_node, src).trim();
+                        if name == var_name {
+                            let raw_type = node_text(&type_node, src).trim();
+                            let cleaned = clean_type(raw_type);
+                            if !cleaned.is_empty() {
+                                matches.push((
+                                    name_node.start_position().row,
+                                    name_node.start_position().column,
+                                    cleaned,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         _ => {}
     }
