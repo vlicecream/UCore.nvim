@@ -13,6 +13,7 @@ local refresh_sequences = {}
 local active_requests = {}
 local pending_refreshes = {}
 local applied_buffers_by_primary = {}
+local applied_signatures_by_buf = {}
 local try_include_symbol
 local float_sequence = 0
 local float_winid = nil
@@ -46,12 +47,116 @@ local function is_header_like_path(path)
 	return path:match("%.h$") or path:match("%.hh$") or path:match("%.hpp$")
 end
 
+local function source_to_header_candidates(path)
+	path = normalize_path(path or "")
+	if path == "" then
+		return {}
+	end
+
+	local ext = path:match("%.([^.]*)$")
+	if not ext then
+		return {}
+	end
+
+	local base = path:sub(1, -(#ext + 2))
+	local candidates = {
+		base .. ".h",
+		base .. ".hpp",
+		base .. ".hh",
+		base .. ".hxx",
+	}
+
+	local mapped = path:gsub("/Private/", "/Public/")
+	if mapped ~= path then
+		local mapped_base = mapped:sub(1, -(#ext + 2))
+		table.insert(candidates, 1, mapped_base .. ".h")
+		table.insert(candidates, 2, mapped_base .. ".hpp")
+		table.insert(candidates, 3, mapped_base .. ".hh")
+		table.insert(candidates, 4, mapped_base .. ".hxx")
+	end
+
+	local legacy = path:gsub("/Private/", "/Classes/")
+	if legacy ~= path then
+		local legacy_base = legacy:sub(1, -(#ext + 2))
+		table.insert(candidates, legacy_base .. ".h")
+		table.insert(candidates, legacy_base .. ".hpp")
+		table.insert(candidates, legacy_base .. ".hh")
+		table.insert(candidates, legacy_base .. ".hxx")
+	end
+
+	local seen = {}
+	local result = {}
+	for _, candidate in ipairs(candidates) do
+		if candidate ~= "" and not seen[candidate] then
+			seen[candidate] = true
+			table.insert(result, candidate)
+		end
+	end
+
+	return result
+end
+
+local function header_to_source_candidates(path)
+	path = normalize_path(path or "")
+	if path == "" then
+		return {}
+	end
+
+	local ext = path:match("%.([^.]*)$")
+	if not ext then
+		return {}
+	end
+
+	local base = path:sub(1, -(#ext + 2))
+	local candidates = {
+		base .. ".cpp",
+		base .. ".cc",
+		base .. ".cxx",
+	}
+
+	local mapped = path:gsub("/Classes/", "/Private/"):gsub("/Public/", "/Private/")
+	if mapped ~= path then
+		local mapped_base = mapped:sub(1, -(#ext + 2))
+		table.insert(candidates, 1, mapped_base .. ".cpp")
+		table.insert(candidates, 2, mapped_base .. ".cc")
+		table.insert(candidates, 3, mapped_base .. ".cxx")
+	end
+
+	local seen = {}
+	local result = {}
+	for _, candidate in ipairs(candidates) do
+		if candidate ~= "" and not seen[candidate] then
+			seen[candidate] = true
+			table.insert(result, candidate)
+		end
+	end
+
+	return result
+end
+
+local function counterpart_paths_for_file(path)
+	if is_header_like_path(path) then
+		return header_to_source_candidates(path)
+	end
+
+	return source_to_header_candidates(path)
+end
+
+local function counterpart_path_set(path)
+	local lookup = {}
+	for _, candidate in ipairs(counterpart_paths_for_file(path)) do
+		lookup[normalize_path(candidate)] = true
+	end
+	return lookup
+end
+
 local function open_file_overlays(project_root, primary_bufnr)
 	local overlays = {}
 	local seen = {}
 	local snapshots = {}
 	local normalized_root = normalize_path(project_root or "")
 	local primary_path = primary_bufnr and normalize_path(vim.api.nvim_buf_get_name(primary_bufnr)) or nil
+	local counterpart_paths = counterpart_path_set(primary_path)
 
 	for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
 		if vim.api.nvim_buf_is_valid(bufnr) then
@@ -59,7 +164,8 @@ local function open_file_overlays(project_root, primary_bufnr)
 			if name and name ~= "" and is_cpp_like_path(name) and not seen[name] then
 				local root = project.find_project_root(name)
 				if root and normalize_path(root) == normalized_root then
-					local include = bufnr == primary_bufnr or vim.bo[bufnr].modified == true
+					local include = bufnr == primary_bufnr
+						or (counterpart_paths[name] == true and vim.bo[bufnr].modified == true)
 					if not include then
 						goto continue
 					end
@@ -134,7 +240,57 @@ local function diagnostic_from_item(item, fallback_bufnr)
 	}
 end
 
-local function apply_items(items, fallback_bufnr)
+local function severity_value(value)
+	return severity_map[tostring(value or "warning"):lower()] or vim.diagnostic.severity.WARN
+end
+
+local function filter_items(items, opts)
+	if not (opts and opts.errors_only) then
+		return items or {}
+	end
+
+	local filtered = {}
+	for _, item in ipairs(items or {}) do
+		if severity_value(item.severity) <= vim.diagnostic.severity.ERROR then
+			table.insert(filtered, item)
+		end
+	end
+	return filtered
+end
+
+local function diagnostic_signature(diagnostic)
+	return table.concat({
+		tostring(diagnostic.lnum or 0),
+		tostring(diagnostic.col or 0),
+		tostring(diagnostic.end_lnum or 0),
+		tostring(diagnostic.end_col or 0),
+		tostring(diagnostic.severity or 0),
+		tostring(diagnostic.code or ""),
+		tostring(diagnostic.source or ""),
+		tostring(diagnostic.message or ""),
+	}, "\31")
+end
+
+local function diagnostics_signature(diagnostics)
+	local items = vim.deepcopy(diagnostics or {})
+	table.sort(items, function(left, right)
+		local left_key = diagnostic_signature(left)
+		local right_key = diagnostic_signature(right)
+		return left_key < right_key
+	end)
+
+	local parts = {}
+	for _, diagnostic in ipairs(items) do
+		table.insert(parts, diagnostic_signature(diagnostic))
+	end
+
+	return table.concat(parts, "\30")
+end
+
+local function apply_items(items, fallback_bufnr, opts)
+	opts = opts or {}
+	items = filter_items(items, opts)
+
 	local by_buf = {}
 	local next_applied = {}
 	local previous_applied = applied_buffers_by_primary[fallback_bufnr] or {}
@@ -147,18 +303,23 @@ local function apply_items(items, fallback_bufnr)
 	end
 
 	if fallback_bufnr and not by_buf[fallback_bufnr] then
-		vim.diagnostic.set(ns, fallback_bufnr, {})
+		by_buf[fallback_bufnr] = {}
 		next_applied[fallback_bufnr] = true
 	end
 
 	for bufnr, _ in pairs(previous_applied) do
 		if not next_applied[bufnr] and vim.api.nvim_buf_is_valid(bufnr) then
 			vim.diagnostic.reset(ns, bufnr)
+			applied_signatures_by_buf[bufnr] = nil
 		end
 	end
 
 	for bufnr, diagnostics in pairs(by_buf) do
-		vim.diagnostic.set(ns, bufnr, diagnostics)
+		local signature = diagnostics_signature(diagnostics)
+		if applied_signatures_by_buf[bufnr] ~= signature then
+			vim.diagnostic.set(ns, bufnr, diagnostics)
+			applied_signatures_by_buf[bufnr] = signature
+		end
 	end
 
 	applied_buffers_by_primary[fallback_bufnr] = next_applied
@@ -248,7 +409,7 @@ function M.refresh(bufnr, opts)
 
 		local items = type(result) == "table" and (result.items or result) or {}
 		vim.schedule(function()
-			apply_items(items, bufnr)
+			apply_items(items, bufnr, opts)
 		end)
 	end)
 end
@@ -256,9 +417,11 @@ end
 function M.clear(bufnr)
 	if bufnr then
 		applied_buffers_by_primary[bufnr] = nil
+		applied_signatures_by_buf[bufnr] = nil
 		vim.diagnostic.reset(ns, bufnr)
 	else
 		applied_buffers_by_primary = {}
+		applied_signatures_by_buf = {}
 		vim.diagnostic.reset(ns)
 	end
 end
@@ -1629,7 +1792,7 @@ function M.from_build_output(output, project_root)
 
 		local items = type(result) == "table" and (result.items or result) or {}
 		vim.schedule(function()
-			apply_items(items, vim.api.nvim_get_current_buf())
+			apply_items(items, vim.api.nvim_get_current_buf(), { errors_only = false })
 		end)
 	end)
 end
@@ -1654,7 +1817,25 @@ function M.from_quickfix(items)
 		end
 	end
 
-	apply_items(diagnostics, vim.api.nvim_get_current_buf())
+	apply_items(diagnostics, vim.api.nvim_get_current_buf(), { errors_only = false })
+end
+
+local function associated_refresh_targets(bufnr, file_path)
+	local targets = {}
+	local seen = { [bufnr] = true }
+
+	for _, candidate in ipairs(counterpart_paths_for_file(file_path)) do
+		local normalized = normalize_path(candidate)
+		if normalized and normalized ~= "" then
+			local other = find_buffer_for_path(normalized)
+			if other and other ~= bufnr and vim.api.nvim_buf_is_valid(other) and not seen[other] then
+				seen[other] = true
+				table.insert(targets, other)
+			end
+		end
+	end
+
+	return targets
 end
 
 local function schedule_refresh(args)
@@ -1662,6 +1843,13 @@ local function schedule_refresh(args)
 	local delay = diagnostics_config.debounce_ms or 300
 	local bufnr = args.buf
 	local file_path = vim.api.nvim_buf_get_name(bufnr)
+	local event = tostring(args.event or "")
+	local stable_refresh = event == "BufWritePost" or event == "InsertLeave" or event == "BufReadPost"
+	local refresh_opts = {
+		silent = true,
+		force = true,
+		errors_only = not stable_refresh,
+	}
 	local root = file_path ~= "" and project.find_project_root(file_path) or nil
 
 	if not root then
@@ -1673,31 +1861,18 @@ local function schedule_refresh(args)
 
 	vim.defer_fn(function()
 		if sequence == refresh_sequences[bufnr] then
-			M.refresh(bufnr, { silent = true, force = true })
+			M.refresh(bufnr, refresh_opts)
 		end
 	end, delay)
 
-	if not is_header_like_path(file_path) then
-		return
-	end
-
-	local normalized_root = normalize_path(root)
-	for _, other_bufnr in ipairs(vim.api.nvim_list_bufs()) do
-		if other_bufnr ~= bufnr and vim.api.nvim_buf_is_valid(other_bufnr) then
-			local other_path = vim.api.nvim_buf_get_name(other_bufnr)
-			if other_path ~= "" and is_cpp_like_path(other_path) then
-				local other_root = project.find_project_root(other_path)
-				if other_root and normalize_path(other_root) == normalized_root then
-					refresh_sequences[other_bufnr] = (refresh_sequences[other_bufnr] or 0) + 1
-					local other_sequence = refresh_sequences[other_bufnr]
-					vim.defer_fn(function()
-						if other_sequence == refresh_sequences[other_bufnr] and vim.api.nvim_buf_is_valid(other_bufnr) then
-							M.refresh(other_bufnr, { silent = true, force = true })
-						end
-					end, delay)
-				end
+	for _, other_bufnr in ipairs(associated_refresh_targets(bufnr, file_path)) do
+		refresh_sequences[other_bufnr] = (refresh_sequences[other_bufnr] or 0) + 1
+		local other_sequence = refresh_sequences[other_bufnr]
+		vim.defer_fn(function()
+			if other_sequence == refresh_sequences[other_bufnr] and vim.api.nvim_buf_is_valid(other_bufnr) then
+				M.refresh(other_bufnr, refresh_opts)
 			end
-		end
+		end, delay)
 	end
 end
 
@@ -1709,7 +1884,11 @@ function M.setup()
 	end
 
 	local display_config = {
-		underline = diagnostics_config.underline ~= false,
+		underline = diagnostics_config.underline ~= false and {
+			severity = {
+				min = vim.diagnostic.severity.ERROR,
+			},
+		} or false,
 		virtual_text = diagnostics_config.virtual_text == true,
 		signs = diagnostics_config.signs ~= false,
 		update_in_insert = diagnostics_config.update_in_insert == true,
@@ -1788,6 +1967,7 @@ function M.reset()
 	active_requests = {}
 	pending_refreshes = {}
 	applied_buffers_by_primary = {}
+	applied_signatures_by_buf = {}
 	float_sequence = float_sequence + 1
 	close_cursor_float()
 	pcall(vim.api.nvim_del_augroup_by_name, group_name)
