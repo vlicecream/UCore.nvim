@@ -600,19 +600,31 @@ fn scan_for_var_decl(
     match node.kind() {
         "declaration" | "parameter_declaration" | "field_declaration" => {
             if let Some(type_node) = node.child_by_field_name("type") {
-                if let Some(decl_node) = node.child_by_field_name("declarator") {
+                let raw_type = node_text(&type_node, src).trim();
+                let cleaned = clean_type(raw_type);
+                if cleaned.is_empty() {
+                    // keep scanning children
+                } else if let Some(decl_node) = node.child_by_field_name("declarator") {
                     if let Some(name_node) = extract_decl_name_node(decl_node) {
                         let name = node_text(&name_node, src).trim();
                         if name == var_name {
-                            let raw_type = node_text(&type_node, src).trim();
-                            let cleaned = clean_type(raw_type);
-                            if !cleaned.is_empty() {
-                                matches.push((
-                                    name_node.start_position().row,
-                                    name_node.start_position().column,
-                                    cleaned,
-                                ));
-                            }
+                            matches.push((
+                                name_node.start_position().row,
+                                name_node.start_position().column,
+                                cleaned.clone(),
+                            ));
+                        }
+                    }
+                } else {
+                    let text = node_text(&node, src).trim();
+                    let pattern = format!(r"\b{}\b", regex::escape(var_name));
+                    if let Ok(re) = regex::Regex::new(&pattern) {
+                        if let Some(found) = re.find(text) {
+                            matches.push((
+                                node.start_position().row,
+                                node.start_position().column + found.start(),
+                                cleaned,
+                            ));
                         }
                     }
                 }
@@ -663,6 +675,19 @@ fn select_nearest_type_match<'a>(
 fn extract_decl_name_node<'a>(node: Node<'a>) -> Option<Node<'a>> {
     match node.kind() {
         "identifier" | "field_identifier" => Some(node),
+        "optional_parameter_declaration" | "parameter_declaration" => {
+            if let Some(decl) = node.child_by_field_name("declarator") {
+                return extract_decl_name_node(decl);
+            }
+
+            for child in children_of(node) {
+                if let Some(name) = extract_decl_name_node(child) {
+                    return Some(name);
+                }
+            }
+
+            None
+        }
 
         "pointer_declarator"
         | "reference_declarator"

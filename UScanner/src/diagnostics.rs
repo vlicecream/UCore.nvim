@@ -924,6 +924,14 @@ fn identifier_usage_is_known(
         return Ok(true);
     }
 
+    if is_parameter_identifier(node, content, name) {
+        return Ok(true);
+    }
+
+    if identifier_matches_nearby_parameter_list(node, content, name) {
+        return Ok(true);
+    }
+
     if crate::query::goto::infer_var_type(content, name, Some(node.start_position().row as u32))
         .is_some()
     {
@@ -945,6 +953,45 @@ fn identifier_usage_is_known(
     }
 
     Ok(false)
+}
+
+fn is_parameter_identifier(node: tree_sitter::Node, content: &str, name: &str) -> bool {
+    let mut current = Some(node);
+    while let Some(cursor) = current {
+        if cursor.kind() == "parameter_declaration" {
+            let text = node_text(cursor, content);
+            if text.contains(name) {
+                return true;
+            }
+        }
+        current = cursor.parent();
+    }
+
+    false
+}
+
+fn identifier_matches_nearby_parameter_list(
+    node: tree_sitter::Node,
+    content: &str,
+    name: &str,
+) -> bool {
+    let mut current = node.parent();
+    while let Some(cursor) = current {
+        let kind = cursor.kind();
+        if matches!(kind, "function_declarator" | "declaration" | "field_declaration") {
+            let text = node_text(cursor, content);
+            if text.contains('(') && text.contains(')') {
+                let pattern = format!(r"\b{}\b", regex::escape(name));
+                if let Ok(re) = Regex::new(&pattern) {
+                    return re.is_match(text);
+                }
+                return false;
+            }
+        }
+        current = cursor.parent();
+    }
+
+    false
 }
 
 fn identifier_is_call_target(node: tree_sitter::Node) -> bool {
@@ -1347,7 +1394,7 @@ fn collect_missing_visible_type_items(
             &reference.name,
             include_paths,
             engine_seed_include_paths,
-        ) {
+        ) || is_bind_widget_anim_context_text(content, reference.line as usize, &reference.name) {
             continue;
         }
 
@@ -1767,6 +1814,7 @@ fn collect_invalid_expression_token_items(
 ) {
     if node.kind() == "compound_statement" {
         collect_invalid_expression_token_lines(node, content, file_path, items);
+        return;
     }
 
     let mut cursor = node.walk();
@@ -1821,6 +1869,7 @@ fn invalid_expression_token_line(line: &str) -> Option<&str> {
         || trimmed.contains('=')
         || trimmed.contains("->")
         || trimmed.contains('.')
+        || trimmed == "return;"
         || trimmed.starts_with("return ")
     {
         return None;
@@ -2804,7 +2853,16 @@ fn is_unreal_implicitly_visible_type(
                 || normalized.ends_with("EngineMinimal.h")
         });
 
-    has_minimal_header
+    let has_umg_animation_header = include_paths
+        .iter()
+        .chain(engine_seed_include_paths.iter())
+        .any(|path| {
+            let normalized = path.replace('\\', "/");
+            normalized.ends_with("Animation/WidgetAnimation.h")
+                || normalized.ends_with("WidgetAnimation.h")
+        });
+
+    (has_minimal_header
         && matches!(
             name,
             "UObject"
@@ -2820,7 +2878,26 @@ fn is_unreal_implicitly_visible_type(
                 | "UAnimMontage"
                 | "UAnimSequenceBase"
                 | "UWorld"
-        )
+        ))
+        || (name == "UWidgetAnimation" && has_umg_animation_header)
+}
+
+fn is_bind_widget_anim_context_text(content: &str, row: usize, name: &str) -> bool {
+    if name != "UWidgetAnimation" {
+        return false;
+    }
+
+    let lines = content.lines().collect::<Vec<_>>();
+    let start = row.saturating_sub(3);
+    let end = (row + 1).min(lines.len().saturating_sub(1));
+    for index in start..=end {
+        let line = lines.get(index).copied().unwrap_or("");
+        if line.contains("BindWidgetAnimOptional") || line.contains("BindWidgetAnim") {
+            return true;
+        }
+    }
+
+    false
 }
 
 #[derive(Clone, Debug)]
@@ -5801,6 +5878,53 @@ mod tests {
         let items = value["items"].as_array().unwrap();
         assert!(!items.iter().any(|item| item["code"] == "UECPP008"));
         assert!(!items.iter().any(|item| item["code"] == "UECPP009"));
+    }
+
+    #[test]
+    fn does_not_flag_return_statement_as_invalid_expression_token() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "void Run()\n{\n    return;\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP018"));
+    }
+
+    #[test]
+    fn does_not_warn_for_fobjectinitializer_default_argument_or_widget_animation_pointer() {
+        let project_conn = Connection::open_in_memory().unwrap();
+        let engine_conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&project_conn).unwrap();
+        crate::db::init_db(&engine_conn).unwrap();
+
+        let shared_file_id = insert_header_file(&project_conn, "Game", "MinimalistButton.h");
+        insert_include_decl(&project_conn, shared_file_id, "CoreMinimal.h", None);
+
+        let core_minimal_file_id = insert_header_file(&engine_conn, "Core", "CoreMinimal.h");
+        let widget_anim_file_id = insert_header_file(&engine_conn, "UMG", "Animation/WidgetAnimation.h");
+        insert_include_decl(&engine_conn, core_minimal_file_id, "Animation/WidgetAnimation.h", Some(widget_anim_file_id));
+        insert_class(&engine_conn, "UWidgetAnimation");
+
+        let value = process_diagnostics(
+            &project_conn,
+            Some(&engine_conn),
+            "UCLASS()\nclass UMinimalistButton : public UCommonButtonBase\n{\n    GENERATED_BODY()\npublic:\n    explicit UMinimalistButton(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());\nprotected:\n    UPROPERTY(Transient, meta=(BindWidgetAnimOptional))\n    TObjectPtr<UWidgetAnimation> Anim_Click = nullptr;\n};\n",
+            Some("C:/Project/Source/Game/Public/MinimalistButton.h".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP008"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP004"));
     }
 
     #[test]
