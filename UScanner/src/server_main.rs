@@ -13,6 +13,9 @@ use u_scanner::server::state::AppState;
 use u_scanner::server::utils::normalize_path_key;
 use u_scanner::server::watcher::handle_file_change;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 const DEFAULT_PORT: u16 = 30110;
 const WATCH_EVENT_CHANNEL_SIZE: usize = 256;
 const WATCH_DEBOUNCE_MS: u64 = 50;

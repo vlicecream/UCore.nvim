@@ -11,13 +11,22 @@ path = "src/main.rs"
 name = "u_core_server"
 path = "src/server_main.rs"
 
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+opt-level = 3
+strip = true
+
 [dependencies]
 anyhow = "1.0.102"
+blake3 = "1.5"
 byteorder = "1.5.0"
 hex = "0.4.3"
 ignore = "0.4.25"
 lru = "0.17.0"
 memmap2 = "0.9.10"
+mimalloc = { version = "0.1", default-features = false }
 notify = "8.2.0"
 parking_lot = "0.12.5"
 rayon = "1.11.0"

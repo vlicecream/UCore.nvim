@@ -8,6 +8,9 @@ use tree_sitter::Query;
 use u_scanner::types::{ParseResult, RawRequest, RefreshRequest, StdoutReporter};
 use u_scanner::{db, refresh, scanner};
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 const DEFAULT_SERVER_PORT: u16 = 30110;
 const READ_BUFFER_SIZE: usize = 4096;
 const FRAME_HEADER_SIZE: usize = 4;
