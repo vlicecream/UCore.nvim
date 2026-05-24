@@ -111,6 +111,20 @@ pub fn process_diagnostics(
     )?;
     extend_diagnostic_phase(
         &mut items,
+        "member_syntax",
+        file_label,
+        log_enabled,
+        || member_syntax_diagnostics(content, file_path.as_deref()),
+    )?;
+    extend_diagnostic_phase(
+        &mut items,
+        "super_calls",
+        file_label,
+        log_enabled,
+        || super_call_diagnostics(conn, engine_conn, content, file_path.as_deref()),
+    )?;
+    extend_diagnostic_phase(
+        &mut items,
         "visible_types",
         file_label,
         log_enabled,
@@ -136,6 +150,20 @@ pub fn process_diagnostics(
         file_label,
         log_enabled,
         || incomplete_member_declaration_diagnostics(content, file_path.as_deref()),
+    )?;
+    extend_diagnostic_phase(
+        &mut items,
+        "invalid_member_token",
+        file_label,
+        log_enabled,
+        || invalid_member_token_diagnostics(content, file_path.as_deref()),
+    )?;
+    extend_diagnostic_phase(
+        &mut items,
+        "duplicate_members",
+        file_label,
+        log_enabled,
+        || duplicate_member_diagnostics(content, file_path.as_deref()),
     )?;
     extend_diagnostic_phase(
         &mut items,
@@ -230,6 +258,25 @@ fn unreal_rule_diagnostics(content: &str, file_path: Option<&str>) -> Result<Vec
                     )
                     .with_end(next_index as u32, next_line.len() as u32));
                 }
+
+                if !macro_text.starts_with("UENUM") {
+                    if let Some((generated_index, generated_line)) =
+                        generated_body_line(&lines, next_index)
+                    {
+                        if generated_index > next_index + 6 {
+                            items.push(DiagnosticItem::new(
+                                file_path,
+                                generated_index as u32,
+                                leading_spaces(generated_line) as u32,
+                                DiagnosticSeverity::Warning,
+                                "UCore",
+                                "UHT003",
+                                "GENERATED_BODY() should appear near the start of the reflected type body.",
+                            )
+                            .with_end(generated_index as u32, generated_line.len() as u32));
+                        }
+                    }
+                }
             }
         }
 
@@ -246,6 +293,22 @@ fn unreal_rule_diagnostics(content: &str, file_path: Option<&str>) -> Result<Vec
                     "BlueprintCallable functions should declare a Category.",
                 )
                 .with_end(index as u32, line.len() as u32));
+            }
+
+            if let Some((next_index, next_line)) = next_meaningful_line(&lines, index + 1) {
+                let next_trimmed = next_line.trim_start();
+                if !looks_like_function_declaration(next_trimmed) {
+                    items.push(DiagnosticItem::new(
+                        file_path,
+                        next_index as u32,
+                        leading_spaces(next_line) as u32,
+                        DiagnosticSeverity::Error,
+                        "UCore",
+                        "UECPP011",
+                        "UFUNCTION() must be followed by a function declaration.",
+                    )
+                    .with_end(next_index as u32, next_line.len() as u32));
+                }
             }
         }
 
@@ -266,6 +329,22 @@ fn unreal_rule_diagnostics(content: &str, file_path: Option<&str>) -> Result<Vec
                     "Private BlueprintReadWrite property should use meta=(AllowPrivateAccess=true).",
                 )
                 .with_end(index as u32, line.len() as u32));
+            }
+
+            if let Some((next_index, next_line)) = next_meaningful_line(&lines, index + 1) {
+                let next_trimmed = next_line.trim_start();
+                if !looks_like_property_declaration(next_trimmed) {
+                    items.push(DiagnosticItem::new(
+                        file_path,
+                        next_index as u32,
+                        leading_spaces(next_line) as u32,
+                        DiagnosticSeverity::Error,
+                        "UCore",
+                        "UECPP012",
+                        "UPROPERTY() must be followed by a property declaration ending with ';'.",
+                    )
+                    .with_end(next_index as u32, next_line.len() as u32));
+                }
             }
         }
     }
@@ -348,6 +427,60 @@ fn override_diagnostics(
         file_path,
         &mut items,
     )?;
+    Ok(items)
+}
+
+fn super_call_diagnostics(
+    conn: &Connection,
+    engine_conn: Option<&Connection>,
+    content: &str,
+    file_path: Option<&str>,
+) -> Result<Vec<DiagnosticItem>> {
+    let Some(file_path) = file_path else {
+        return Ok(Vec::new());
+    };
+
+    if !is_cpp_source_or_header(file_path) {
+        return Ok(Vec::new());
+    }
+
+    let mut parser = Parser::new();
+    let language: tree_sitter::Language = tree_sitter_unreal_cpp::LANGUAGE.into();
+    parser.set_language(&language)?;
+
+    let Some(tree) = parser.parse(content, None) else {
+        return Ok(Vec::new());
+    };
+
+    let root = tree.root_node();
+    let mut items = Vec::new();
+    collect_super_call_items(conn, engine_conn, root, content, file_path, &mut items)?;
+    Ok(items)
+}
+
+fn member_syntax_diagnostics(
+    content: &str,
+    file_path: Option<&str>,
+) -> Result<Vec<DiagnosticItem>> {
+    let Some(file_path) = file_path else {
+        return Ok(Vec::new());
+    };
+
+    if !is_cpp_source_or_header(file_path) {
+        return Ok(Vec::new());
+    }
+
+    let mut parser = Parser::new();
+    let language: tree_sitter::Language = tree_sitter_unreal_cpp::LANGUAGE.into();
+    parser.set_language(&language)?;
+
+    let Some(tree) = parser.parse(content, None) else {
+        return Ok(Vec::new());
+    };
+
+    let root = tree.root_node();
+    let mut items = Vec::new();
+    collect_member_syntax_items(root, content, file_path, &mut items);
     Ok(items)
 }
 
@@ -1497,6 +1630,183 @@ fn incomplete_member_declaration_diagnostics(
     Ok(items)
 }
 
+fn invalid_member_token_diagnostics(
+    content: &str,
+    file_path: Option<&str>,
+) -> Result<Vec<DiagnosticItem>> {
+    let Some(header_path) = file_path else {
+        return Ok(Vec::new());
+    };
+
+    if !is_header_file(header_path) {
+        return Ok(Vec::new());
+    }
+
+    let mut parser = Parser::new();
+    let language: tree_sitter::Language = tree_sitter_unreal_cpp::LANGUAGE.into();
+    parser.set_language(&language)?;
+
+    let Some(tree) = parser.parse(content, None) else {
+        return Ok(Vec::new());
+    };
+
+    let root = tree.root_node();
+    let mut items = Vec::new();
+    collect_invalid_member_token_items(root, content, header_path, &mut items);
+    Ok(items)
+}
+
+fn collect_invalid_member_token_items(
+    node: tree_sitter::Node,
+    content: &str,
+    file_path: &str,
+    items: &mut Vec<DiagnosticItem>,
+) {
+    if node.kind() == "field_declaration_list" {
+        collect_invalid_member_token_lines(node, content, file_path, items);
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_invalid_member_token_items(child, content, file_path, items);
+    }
+}
+
+fn invalid_member_token_line(
+    line: &str,
+) -> Option<&str> {
+    let trimmed = line.trim();
+    if trimmed.is_empty()
+        || trimmed.ends_with(':')
+        || trimmed.contains(';')
+        || trimmed.contains('{')
+        || trimmed.contains('}')
+        || trimmed.contains('(')
+        || trimmed.contains(')')
+        || trimmed.contains('=')
+        || trimmed.starts_with('#')
+    {
+        return None;
+    }
+
+    if matches!(trimmed, "public" | "private" | "protected") {
+        return None;
+    }
+
+    if !trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == ':')
+    {
+        return None;
+    }
+
+    if is_ignored_unknown_symbol_name(trimmed) {
+        return None;
+    }
+
+    Some(trimmed)
+}
+
+fn collect_invalid_member_token_lines(
+    node: tree_sitter::Node,
+    content: &str,
+    file_path: &str,
+    items: &mut Vec<DiagnosticItem>,
+) {
+    let lines = content.lines().collect::<Vec<_>>();
+    let start_row = node.start_position().row as usize;
+    let end_row = node.end_position().row as usize;
+
+    for row in start_row..=end_row {
+        let Some(line) = lines.get(row).copied() else {
+            continue;
+        };
+        let Some(token) = invalid_member_token_line(line) else {
+            continue;
+        };
+        let Some(column) = line.find(token) else {
+            continue;
+        };
+
+        items.push(
+            DiagnosticItem::new(
+                Some(file_path),
+                row as u32,
+                column as u32,
+                DiagnosticSeverity::Error,
+                "UCore",
+                "UECPP010",
+                format!("Unexpected token {} in class member declaration.", token),
+            )
+            .with_end(row as u32, (column + token.len()) as u32),
+        );
+    }
+}
+
+fn collect_duplicate_member_items(
+    node: tree_sitter::Node,
+    content: &str,
+    file_path: &str,
+    seen: &mut HashMap<(String, String), (u32, u32)>,
+    items: &mut Vec<DiagnosticItem>,
+) {
+    if let Some(class_name) = find_enclosing_class_name(node, content) {
+        if let Some(name_node) = find_name_node(node) {
+            let name = node_text(name_node, content).trim().to_string();
+            if !name.is_empty() && matches!(node.kind(), "field_declaration" | "declaration" | "function_definition" | "unreal_function_declaration") {
+                let key = (class_name, name.clone());
+                let start = name_node.start_position();
+                let end = name_node.end_position();
+                if seen.insert(key.clone(), (start.row as u32, start.column as u32)).is_some() {
+                    items.push(
+                        DiagnosticItem::new(
+                            Some(file_path),
+                            start.row as u32,
+                            start.column as u32,
+                            DiagnosticSeverity::Error,
+                            "UCore",
+                            "UECPP016",
+                            format!("Duplicate member declaration {} in {}.", key.1, key.0),
+                        )
+                        .with_end(end.row as u32, end.column as u32),
+                    );
+                }
+            }
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_duplicate_member_items(child, content, file_path, seen, items);
+    }
+}
+
+fn duplicate_member_diagnostics(
+    content: &str,
+    file_path: Option<&str>,
+) -> Result<Vec<DiagnosticItem>> {
+    let Some(file_path) = file_path else {
+        return Ok(Vec::new());
+    };
+
+    if !is_cpp_source_or_header(file_path) {
+        return Ok(Vec::new());
+    }
+
+    let mut parser = Parser::new();
+    let language: tree_sitter::Language = tree_sitter_unreal_cpp::LANGUAGE.into();
+    parser.set_language(&language)?;
+
+    let Some(tree) = parser.parse(content, None) else {
+        return Ok(Vec::new());
+    };
+
+    let mut items = Vec::new();
+    let mut seen = HashMap::new();
+    collect_duplicate_member_items(tree.root_node(), content, file_path, &mut seen, &mut items);
+    Ok(items)
+}
+
 fn collect_incomplete_member_decl_items(
     node: tree_sitter::Node,
     content: &str,
@@ -1611,6 +1921,28 @@ fn collect_override_items(
                     )
                     .with_end(decl.end_line, decl.end_character),
                 );
+            } else if !base_member_signature_matches_across_dbs(
+                conn,
+                engine_conn,
+                &decl.class_name,
+                &decl,
+                &buffer_base_names,
+            )? {
+                items.push(
+                    DiagnosticItem::new(
+                        decl.file_path.as_deref(),
+                        decl.line,
+                        decl.character,
+                        DiagnosticSeverity::Error,
+                        "UCore",
+                        "UECPP017",
+                        format!(
+                            "Function {}::{} is marked override but its signature does not match any base declaration.",
+                            decl.class_name, decl.name
+                        ),
+                    )
+                    .with_end(decl.end_line, decl.end_character),
+                );
             }
         }
     }
@@ -1621,6 +1953,265 @@ fn collect_override_items(
     }
 
     Ok(())
+}
+
+fn base_member_signature_matches_across_dbs(
+    conn: &Connection,
+    engine_conn: Option<&Connection>,
+    class_name: &str,
+    decl: &HeaderFunctionDecl,
+    initial_parent_names: &[String],
+) -> Result<bool> {
+    let mut queue = VecDeque::new();
+
+    if initial_parent_names.is_empty() {
+        queue.extend(direct_parent_names_for_class(conn, class_name)?);
+        if let Some(engine_conn) = engine_conn {
+            queue.extend(direct_parent_names_for_class(engine_conn, class_name)?);
+        }
+    } else {
+        queue.extend(initial_parent_names.iter().cloned());
+    }
+
+    let expected_params = normalize_parameter_signature(&decl.parameters);
+    let expected_return = normalize_space(&crate::parser::cpp::clean_type_string(&decl.return_type));
+    let expected_const = decl.is_const;
+    let mut visited = HashSet::new();
+
+    while let Some(parent_name) = queue.pop_front() {
+        let short_name = strip_namespace(&parent_name);
+        if short_name.is_empty() || !visited.insert(short_name.clone()) {
+            continue;
+        }
+
+        if let Some(signature) = member_signature_on_class_name(conn, &short_name, &decl.name)? {
+            return Ok(member_signature_matches(&signature, &expected_params, &expected_return, expected_const));
+        }
+
+        if let Some(engine_conn) = engine_conn {
+            if let Some(signature) = member_signature_on_class_name(engine_conn, &short_name, &decl.name)? {
+                return Ok(member_signature_matches(&signature, &expected_params, &expected_return, expected_const));
+            }
+        }
+
+        queue.extend(direct_parent_names_for_class(conn, &short_name)?);
+        if let Some(engine_conn) = engine_conn {
+            queue.extend(direct_parent_names_for_class(engine_conn, &short_name)?);
+        }
+    }
+
+    Ok(false)
+}
+
+fn member_signature_matches(
+    actual: &MemberSignature,
+    expected_params: &str,
+    expected_return: &str,
+    expected_const: bool,
+) -> bool {
+    let actual_params = normalize_parameter_signature(&actual.params);
+    let actual_return = normalize_space(&crate::parser::cpp::clean_type_string(&actual.return_type));
+
+    actual_params == expected_params
+        && actual_return == expected_return
+        && actual.is_const == expected_const
+}
+
+fn collect_super_call_items(
+    conn: &Connection,
+    engine_conn: Option<&Connection>,
+    node: tree_sitter::Node,
+    content: &str,
+    file_path: &str,
+    items: &mut Vec<DiagnosticItem>,
+) -> Result<()> {
+    if node.kind() == "qualified_identifier" {
+        let scope = node
+            .child_by_field_name("scope")
+            .map(|scope| node_text(scope, content).trim().to_string())
+            .unwrap_or_default();
+        let name_node = node.child_by_field_name("name");
+
+        if scope == "Super" {
+            let name = name_node
+                .map(|name_node| node_text(name_node, content).trim().to_string())
+                .unwrap_or_default();
+
+            if name.is_empty() {
+                return Ok(());
+            }
+
+            let class_name = find_enclosing_class_name(node, content).unwrap_or_default();
+            let parent_names = enclosing_class_base_names(node, content);
+            if class_name.is_empty() || parent_names.is_empty() {
+                let start = node.start_position();
+                let end = node.end_position();
+                items.push(
+                    DiagnosticItem::new(
+                        Some(file_path),
+                        start.row as u32,
+                        start.column as u32,
+                        DiagnosticSeverity::Error,
+                        "UCore",
+                        "UECPP014",
+                        format!("Super::{} is invalid because the current class has no base class.", name),
+                    )
+                    .with_end(end.row as u32, end.column as u32),
+                );
+            } else if !has_base_member_named_across_dbs(conn, engine_conn, &class_name, &name, &parent_names)? {
+                let start = node.start_position();
+                let end = node.end_position();
+                items.push(
+                    DiagnosticItem::new(
+                        Some(file_path),
+                        start.row as u32,
+                        start.column as u32,
+                        DiagnosticSeverity::Error,
+                        "UCore",
+                        "UECPP015",
+                        format!("Super has no member named {}.", name),
+                    )
+                    .with_end(end.row as u32, end.column as u32),
+                );
+            }
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_super_call_items(conn, engine_conn, child, content, file_path, items)?;
+    }
+
+    Ok(())
+}
+
+fn collect_member_syntax_items(
+    node: tree_sitter::Node,
+    content: &str,
+    file_path: &str,
+    items: &mut Vec<DiagnosticItem>,
+) {
+    if node.kind() == "field_declaration_list" {
+        collect_generated_body_duplicates(node, content, file_path, items);
+        collect_missing_field_semicolon_items(node, content, file_path, items);
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_member_syntax_items(child, content, file_path, items);
+    }
+}
+
+fn collect_generated_body_duplicates(
+    node: tree_sitter::Node,
+    content: &str,
+    file_path: &str,
+    items: &mut Vec<DiagnosticItem>,
+) {
+    let lines = content.lines().collect::<Vec<_>>();
+    let start_row = node.start_position().row as usize;
+    let end_row = node.end_position().row as usize;
+    let mut hits = Vec::new();
+
+    for row in start_row..=end_row {
+        let Some(line) = lines.get(row).copied() else {
+            continue;
+        };
+        if line.contains("GENERATED_BODY")
+            || line.contains("GENERATED_UCLASS_BODY")
+            || line.contains("GENERATED_UINTERFACE_BODY")
+        {
+            hits.push((row, line));
+        }
+    }
+
+    if hits.len() <= 1 {
+        return;
+    }
+
+    for (row, line) in hits.into_iter().skip(1) {
+        items.push(
+            DiagnosticItem::new(
+                Some(file_path),
+                row as u32,
+                leading_spaces(line) as u32,
+                DiagnosticSeverity::Error,
+                "UCore",
+                "UHT004",
+                "Reflected type contains multiple GENERATED_BODY-style macros.",
+            )
+            .with_end(row as u32, line.len() as u32),
+        );
+    }
+}
+
+fn collect_missing_field_semicolon_items(
+    node: tree_sitter::Node,
+    content: &str,
+    file_path: &str,
+    items: &mut Vec<DiagnosticItem>,
+) {
+    let lines = content.lines().collect::<Vec<_>>();
+    let start_row = node.start_position().row as usize;
+    let end_row = node.end_position().row as usize;
+
+    for row in start_row..=end_row {
+        let Some(line) = lines.get(row).copied() else {
+            continue;
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || trimmed.ends_with(';')
+            || trimmed.ends_with(':')
+            || trimmed.contains('{')
+            || trimmed.contains('}')
+            || trimmed.contains('(')
+            || trimmed.starts_with("UPROPERTY")
+            || trimmed.starts_with("UFUNCTION")
+            || trimmed.starts_with("GENERATED_BODY")
+            || trimmed.starts_with("GENERATED_UCLASS_BODY")
+            || trimmed.starts_with("GENERATED_UINTERFACE_BODY")
+            || matches!(trimmed, "public" | "private" | "protected")
+        {
+            continue;
+        }
+
+        let mut tokens = trimmed.split_whitespace().collect::<Vec<_>>();
+        if tokens.len() < 2 {
+            continue;
+        }
+
+        let name = tokens.pop().unwrap_or("");
+        let type_part = tokens.join(" ");
+        if name.is_empty()
+            || type_part.is_empty()
+            || !name.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+            || is_ignored_unknown_symbol_name(name)
+        {
+            continue;
+        }
+
+        if !type_part
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | ':' | '<' | '>' | '*' | '&' | ','))
+        {
+            continue;
+        }
+
+        let column = line.find(name).unwrap_or(leading_spaces(line));
+        items.push(
+            DiagnosticItem::new(
+                Some(file_path),
+                row as u32,
+                column as u32,
+                DiagnosticSeverity::Error,
+                "UCore",
+                "UECPP013",
+                format!("Property declaration for {} is missing a trailing ';'.", name),
+            )
+            .with_end(row as u32, (column + name.len()) as u32),
+        );
+    }
 }
 
 fn collect_missing_impl_items(
@@ -1804,6 +2395,50 @@ fn member_exists_on_class_name(
     Ok(conn
         .query_row(sql, params![short, member_name], |_row| Ok(()))
         .is_ok())
+}
+
+fn member_signature_on_class_name(
+    conn: &Connection,
+    class_name: &str,
+    member_name: &str,
+) -> Result<Option<MemberSignature>> {
+    let short = strip_namespace(class_name);
+    if short.is_empty() {
+        return Ok(None);
+    }
+
+    let sql = r#"
+        SELECT
+            COALESCE(m.detail, ''),
+            COALESCE(srt.text, ''),
+            COALESCE(m.access, '')
+        FROM members m
+        JOIN classes c ON m.class_id = c.id
+        JOIN strings sc ON c.name_id = sc.id
+        JOIN strings sm ON m.name_id = sm.id
+        JOIN strings st ON m.type_id = st.id
+        LEFT JOIN strings srt ON m.return_type_id = srt.id
+        WHERE sc.text = ?1
+          AND sm.text = ?2
+          AND st.text = 'function'
+        ORDER BY
+            CASE WHEN COALESCE(m.access, '') = 'impl' THEN 1 ELSE 0 END,
+            m.line_number
+        LIMIT 1
+    "#;
+
+    conn.query_row(sql, params![short, member_name], |row| {
+        let params_text = row.get::<_, String>(0)?;
+        let return_type = row.get::<_, String>(1)?;
+        let access = row.get::<_, String>(2)?;
+        Ok(MemberSignature {
+            params: params_text,
+            return_type,
+            is_const: contains_token(&access, "const"),
+        })
+    })
+    .optional()
+    .map_err(Into::into)
 }
 
 fn strip_namespace(name: &str) -> String {
@@ -2693,6 +3328,13 @@ struct HeaderFunctionDecl {
     expected_definitions: Vec<ExpectedDefinition>,
 }
 
+#[derive(Clone, Debug)]
+struct MemberSignature {
+    params: String,
+    return_type: String,
+    is_const: bool,
+}
+
 fn member_function_declaration(
     node: tree_sitter::Node,
     content: &str,
@@ -3545,6 +4187,31 @@ fn declaration_block_has_generated_body(lines: &[&str], declaration_index: usize
         })
 }
 
+fn generated_body_line<'a>(lines: &'a [&str], declaration_index: usize) -> Option<(usize, &'a str)> {
+    let end = (declaration_index + 20).min(lines.len());
+    lines[declaration_index..end]
+        .iter()
+        .enumerate()
+        .find(|(_, line)| {
+            line.contains("GENERATED_BODY")
+                || line.contains("GENERATED_UCLASS_BODY")
+                || line.contains("GENERATED_UINTERFACE_BODY")
+        })
+        .map(|(offset, line)| (declaration_index + offset, *line))
+}
+
+fn looks_like_function_declaration(text: &str) -> bool {
+    !text.is_empty() && text.contains('(') && text.contains(')') && text.ends_with(';')
+}
+
+fn looks_like_property_declaration(text: &str) -> bool {
+    !text.is_empty()
+        && text.ends_with(';')
+        && !text.contains('(')
+        && !text.starts_with("UPROPERTY")
+        && !text.starts_with("UFUNCTION")
+}
+
 fn next_meaningful_line<'a>(lines: &'a [&str], start: usize) -> Option<(usize, &'a str)> {
     lines
         .iter()
@@ -4308,6 +4975,27 @@ mod tests {
     }
 
     #[test]
+    fn warns_when_override_signature_does_not_match_base() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let base_id = insert_class(&conn, "UBaseAbility");
+        insert_decl_member(&conn, base_id, "EndAbility", "(bool bReplicate)", Some("void"));
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "class UMyAbility : public UBaseAbility\n{\npublic:\n    virtual void EndAbility() override;\n};\n",
+            Some("C:/Project/Source/Game/Public/MyAbility.h".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| item["code"] == "UECPP017"));
+    }
+
+    #[test]
     fn does_not_warn_for_engine_override_name_on_project_child() {
         let project_conn = Connection::open_in_memory().unwrap();
         let engine_conn = Connection::open_in_memory().unwrap();
@@ -4504,6 +5192,30 @@ mod tests {
         let items = value["items"].as_array().unwrap();
         assert!(!items.iter().any(|item| item["code"] == "UECPP001"));
         assert!(items.iter().any(|item| item["code"] == "UECPP002"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn invalid_member_token_in_class_reports_error() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let root = temp_project_path("invalid_member_token");
+        let header = root.join("Source/Game/Public/MyActor.h");
+        std::fs::create_dir_all(header.parent().unwrap()).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "UCLASS()\nclass UMyActor : public UAnimNotify\n{\nGENERATED_BODY()\npublic:\n    virtual void Notify();\nprotected:\n    UPROPERTY(EditAnywhere)\n    float Distance = 10.f;\n    xxxx\n};\n",
+            Some(header.to_string_lossy().replace('\\', "/")),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| item["code"] == "UECPP010"));
 
         let _ = std::fs::remove_dir_all(root);
     }
