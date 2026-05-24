@@ -153,6 +153,7 @@ local function cargo_scanner_cmd(source_dir)
 	return {
 		"cargo",
 		"run",
+		"--locked",
 		"--quiet",
 		"--manifest-path",
 		source_dir .. "/Cargo.toml",
@@ -168,6 +169,7 @@ local function cargo_server_cmd(source_dir)
 	return {
 		"cargo",
 		"run",
+		"--locked",
 		"--manifest-path",
 		source_dir .. "/Cargo.toml",
 		"--bin",

@@ -57,7 +57,7 @@ function Invoke-UCoreCargoBuild {
   )
 
   $vsDevCmd = Get-VsDevCmd
-  $cargoCommand = "cargo build --release --manifest-path `"$ManifestPath`" --bin u_core_server --bin u_scanner"
+  $cargoCommand = "cargo build --locked --release --manifest-path `"$ManifestPath`" --bin u_core_server --bin u_scanner"
 
   if ($vsDevCmd) {
     $command = "call `"$vsDevCmd`" -arch=x64 -host_arch=x64 >nul && " +
