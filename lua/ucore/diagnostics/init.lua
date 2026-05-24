@@ -1840,11 +1840,13 @@ end
 
 local function schedule_refresh(args)
 	local diagnostics_config = config.values.diagnostics or {}
-	local delay = diagnostics_config.debounce_ms or 300
 	local bufnr = args.buf
 	local file_path = vim.api.nvim_buf_get_name(bufnr)
 	local event = tostring(args.event or "")
 	local stable_refresh = event == "BufWritePost" or event == "InsertLeave" or event == "BufReadPost"
+	local delay = stable_refresh
+			and (diagnostics_config.debounce_ms or 300)
+		or (diagnostics_config.live_debounce_ms or 80)
 	local refresh_opts = {
 		silent = true,
 		force = true,

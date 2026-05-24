@@ -1286,7 +1286,11 @@ fn collect_missing_visible_type_items(
             continue;
         }
 
-        if is_unreal_implicitly_visible_type(&reference.name) {
+        if is_unreal_implicitly_visible_type(
+            &reference.name,
+            include_paths,
+            engine_seed_include_paths,
+        ) {
             continue;
         }
 
@@ -2620,8 +2624,41 @@ fn is_ignored_type_token(token: &str) -> bool {
     ) || token.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
 }
 
-fn is_unreal_implicitly_visible_type(name: &str) -> bool {
-    matches!(name, "FObjectInitializer")
+fn is_unreal_implicitly_visible_type(
+    name: &str,
+    include_paths: &HashSet<String>,
+    engine_seed_include_paths: &HashSet<String>,
+) -> bool {
+    if name == "FObjectInitializer" {
+        return true;
+    }
+
+    let has_minimal_header = include_paths
+        .iter()
+        .chain(engine_seed_include_paths.iter())
+        .any(|path| {
+            let normalized = path.replace('\\', "/");
+            normalized.ends_with("CoreMinimal.h")
+                || normalized.ends_with("EngineMinimal.h")
+        });
+
+    has_minimal_header
+        && matches!(
+            name,
+            "UObject"
+                | "AActor"
+                | "ACharacter"
+                | "APawn"
+                | "UActorComponent"
+                | "USceneComponent"
+                | "UPrimitiveComponent"
+                | "USkeletalMeshComponent"
+                | "UStaticMeshComponent"
+                | "UAnimInstance"
+                | "UAnimMontage"
+                | "UAnimSequenceBase"
+                | "UWorld"
+        )
 }
 
 #[derive(Clone, Debug)]

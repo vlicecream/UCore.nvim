@@ -334,6 +334,7 @@ local function default_values()
 			float_in_insert = false,
 			float_delay_ms = 200,
 			update_in_insert = true,
+			live_debounce_ms = 80,
 			debounce_ms = 300,
 		},
 
