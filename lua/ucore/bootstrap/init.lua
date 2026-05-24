@@ -144,6 +144,26 @@ local function fail_engine_status(message)
 	status.progress_fail("UCore Engine Discovery", message or "UCore Engine Discovery Failed")
 end
 
+local function refresh_active_buffer_diagnostics()
+	vim.schedule(function()
+		local ok, diagnostics = pcall(require, "ucore.diagnostics")
+		if not ok or not diagnostics or type(diagnostics.refresh) ~= "function" then
+			return
+		end
+
+		local bufnr = vim.api.nvim_get_current_buf()
+		if not bufnr or bufnr == 0 or not vim.api.nvim_buf_is_valid(bufnr) then
+			return
+		end
+
+		diagnostics.refresh(bufnr, {
+			force = true,
+			silent = true,
+			errors_only = false,
+		})
+	end)
+end
+
 -- Build a setup/refresh/watch payload for the current Unreal project.
 -- 为当前 Unreal 工程构造 setup/refresh/watch 请求体。
 local function current_project_payload(project_root)
@@ -507,6 +527,7 @@ function M.boot(callback, opts)
 					log.write_progress("boot-finish", {
 						project_root = payload.project_root,
 					})
+					refresh_active_buffer_diagnostics()
 					status.finish("UCore Ready - Project Indexed")
 					callback(true)
 				end
