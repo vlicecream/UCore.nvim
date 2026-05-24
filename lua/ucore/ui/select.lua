@@ -787,6 +787,22 @@ local function filter_live_find_items(items, query, limit)
 		return left.index < right.index
 	end)
 
+	-- Backend already filtered + ranked the items (FTS treats `_` as a word
+	-- boundary, so a query like `ability_` returns Ability* matches the
+	-- client-side strict matcher would otherwise drop). If our stricter token
+	-- filter found nothing, fall back to the backend order so the picker is
+	-- never empty when the backend produced results.
+	-- 后端 FTS 把 `_` 当词分界（`ability_` 也会匹配 Ability* 这类没下划线的
+	-- 项），客户端严格 token 过滤可能把它们全过滤掉。如果过滤后为空就回退到
+	-- 后端原顺序，避免 picker 显示空白。
+	if vim.tbl_isempty(ranked) then
+		local result = {}
+		for index = 1, math.min(#prepared, limit) do
+			table.insert(result, prepared[index])
+		end
+		return result
+	end
+
 	local result = {}
 	for index = 1, math.min(#ranked, limit) do
 		table.insert(result, ranked[index].item)
