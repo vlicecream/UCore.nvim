@@ -716,8 +716,8 @@ fn open_persistent_cache_connection(cache_db_path: &str) -> Result<rusqlite::Con
 fn configure_primary_connection(conn: &rusqlite::Connection) -> Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
-    conn.pragma_update(None, "cache_size", "-500000")?;
-    conn.pragma_update(None, "mmap_size", "1073741824")?;
+    conn.pragma_update(None, "cache_size", "-50000")?;
+    conn.pragma_update(None, "mmap_size", "0")?;
     conn.pragma_update(None, "temp_store", "MEMORY")?;
     Ok(())
 }
