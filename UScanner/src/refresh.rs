@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use ignore::{WalkBuilder, WalkState};
 use rayon::prelude::*;
 use regex::Regex;
@@ -88,7 +88,7 @@ pub fn run_refresh(req: RefreshRequest, reporter: Arc<dyn ProgressReporter>) -> 
     )?;
 
     reporter.report("db_prepare", 55, 100, "Build file plan");
-    let plan = build_file_plan(
+    let mut plan = build_file_plan(
         discovery.files,
         existing_files,
         module_map,
@@ -100,6 +100,20 @@ pub fn run_refresh(req: RefreshRequest, reporter: Arc<dyn ProgressReporter>) -> 
     remove_deleted_files(&mut conn, &plan.deleted)?;
     reporter.report("db_prepare", 100, 100, "Ready");
 
+    // Spawn the text-DB write in parallel with the main-DB writes. The text
+    // index lives in a separate SQLite file and only needs the list of files
+    // from the plan (which is already finalized at this point). Source files
+    // are mmapped per-line by sync_text_files itself, so it doesn't depend on
+    // anything we still have to write to the primary DB.
+    // text DB 写入跟主 DB 写入并行——text 索引在独立 SQLite 文件，只需要 plan
+    // 里的文件列表，跟主 DB 写入互相独立。
+    let text_db_path = ctx.db_path_native.clone();
+    let text_files = std::mem::take(&mut plan.text_files_to_index);
+    let text_reporter = reporter.clone();
+    let text_handle: thread::JoinHandle<Result<()>> = thread::spawn(move || {
+        db::text::sync_text_files(&text_db_path, &text_files, Some(&*text_reporter))
+    });
+
     parse_changed_sources(
         &mut conn,
         plan.sources_to_parse,
@@ -107,11 +121,6 @@ pub fn run_refresh(req: RefreshRequest, reporter: Arc<dyn ProgressReporter>) -> 
         reporter.clone(),
     )?;
     upsert_non_source_files(&mut conn, plan.other_files)?;
-    db::text::sync_text_files(
-        &ctx.db_path_native,
-        &plan.text_files_to_index,
-        Some(reporter.as_ref()),
-    )?;
 
     if should_index_assets(&ctx) {
         asset::refresh_asset_index(&mut conn, &ctx.project_root, reporter.clone())?;
@@ -119,19 +128,70 @@ pub fn run_refresh(req: RefreshRequest, reporter: Arc<dyn ProgressReporter>) -> 
         reporter.report("asset_index", 100, 100, "Asset index skipped.");
     }
 
-    reporter.report("finalizing", 0, 100, "Build nav index");
-    let nav_index = build_navigation_hot_index(&conn)?;
-    runtime_index::save_navigation_index(&ctx.db_path_native, &nav_index)?;
-    reporter.report("finalizing", 34, 100, "Build symbol index");
-    let search_index = build_search_hot_index(&conn)?;
-    runtime_index::save_search_index(&ctx.db_path_native, &search_index)?;
-    reporter.report("finalizing", 67, 100, "Build usage index");
-    let usage_index = build_usage_hot_index(&conn)?;
-    runtime_index::save_usage_index(&ctx.db_path_native, &usage_index)?;
+    // Wait for the parallel text-DB write to finish before building hot
+    // indexes (hot index build doesn't depend on text, but completing the
+    // text write here keeps refresh semantics: when run_refresh returns,
+    // every DB is consistent on disk).
+    // 等 text DB 完成再进入 hot index 阶段，确保 refresh 返回时所有 DB 一致。
+    text_handle
+        .join()
+        .map_err(|_| anyhow!("text-index thread panicked"))??;
+
+    // Build the three hot indexes in parallel. Each runs against its own
+    // read-only SQLite connection against the now-finalized primary DB, and
+    // each writes to a distinct .idx file so disk contention is minimal.
+    // 三个 hot index 各开一个只读连接并行构建，分别写不同 .idx 文件，无冲突。
+    reporter.report("finalizing", 0, 100, "Build runtime indexes");
+    let nav_db_path = ctx.db_path_native.clone();
+    let search_db_path = ctx.db_path_native.clone();
+    let usage_db_path = ctx.db_path_native.clone();
+
+    let nav_handle: thread::JoinHandle<Result<()>> = thread::spawn(move || {
+        let conn = open_readonly_refresh_conn(&nav_db_path)?;
+        let nav_index = build_navigation_hot_index(&conn)?;
+        runtime_index::save_navigation_index(&nav_db_path, &nav_index)?;
+        Ok(())
+    });
+    let search_handle: thread::JoinHandle<Result<()>> = thread::spawn(move || {
+        let conn = open_readonly_refresh_conn(&search_db_path)?;
+        let search_index = build_search_hot_index(&conn)?;
+        runtime_index::save_search_index(&search_db_path, &search_index)?;
+        Ok(())
+    });
+    let usage_handle: thread::JoinHandle<Result<()>> = thread::spawn(move || {
+        let conn = open_readonly_refresh_conn(&usage_db_path)?;
+        let usage_index = build_usage_hot_index(&conn)?;
+        runtime_index::save_usage_index(&usage_db_path, &usage_index)?;
+        Ok(())
+    });
+
+    nav_handle
+        .join()
+        .map_err(|_| anyhow!("nav-index thread panicked"))??;
+    search_handle
+        .join()
+        .map_err(|_| anyhow!("search-index thread panicked"))??;
+    usage_handle
+        .join()
+        .map_err(|_| anyhow!("usage-index thread panicked"))??;
     reporter.report("finalizing", 100, 100, "Runtime indexes ready");
 
     reporter.report("complete", 100, 100, "Refresh complete.");
     Ok(())
+}
+
+/// Open a short-lived read-only SQLite connection used inside refresh for
+/// parallel hot-index builds.
+/// 仅在 refresh 内部用、用于并行构建 hot index 的临时只读连接。
+fn open_readonly_refresh_conn(db_path: &str) -> Result<Connection> {
+    let conn = Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("failed to open read-only conn for {}", db_path))?;
+    conn.busy_timeout(Duration::from_secs(30))?;
+    conn.pragma_update(None, "query_only", "ON")?;
+    Ok(conn)
 }
 
 // -----------------------------------------------------------------------------
