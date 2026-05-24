@@ -17,7 +17,7 @@ use crate::query::usage::{build_usage_hot_index, UsageHotIndex};
 use crate::runtime_index;
 use crate::types::{ConfigCache, PhaseInfo, Progress, ProgressPlan, ProgressReporter};
 
-const COMPLETION_CACHE_CAPACITY: usize = 50_000;
+const COMPLETION_CACHE_CAPACITY: usize = 2_000;
 const DIAGNOSTICS_CACHE_CAPACITY: usize = 512;
 const DIAGNOSTICS_CACHE_TTL: Duration = Duration::from_millis(1500);
 const NAVIGATION_CACHE_CAPACITY: usize = 1024;
