@@ -681,6 +681,9 @@ fn collect_unknown_field_expression_item(
         resolve_expression_type_for_diagnostics(conn, engine_conn, receiver, content)?
     {
         if !member_exists_across_dbs(conn, engine_conn, &receiver_type, field_name)? {
+            if should_suppress_member_diagnostic(conn, engine_conn, &receiver_type)? {
+                return Ok(());
+            }
             push_unknown_symbol_item(
                 items,
                 seen,
@@ -760,10 +763,10 @@ fn collect_unknown_qualified_identifier_item(
     };
 
     if let Some(scope_name) = resolved_scope {
-        if is_known_static_member(&scope_name, member_name) {
-            return Ok(());
-        }
         if !member_exists_across_dbs(conn, engine_conn, &scope_name, member_name)? {
+            if should_suppress_member_diagnostic(conn, engine_conn, &scope_name)? {
+                return Ok(());
+            }
             push_unknown_symbol_item(
                 items,
                 seen,
@@ -1052,10 +1055,6 @@ fn member_exists_across_dbs(
     class_name: &str,
     member_name: &str,
 ) -> Result<bool> {
-    if is_known_member_on_builtin_type(class_name, member_name) {
-        return Ok(true);
-    }
-
     if member_exists_on_class_or_bases(conn, class_name, member_name)? {
         return Ok(true);
     }
@@ -1098,10 +1097,6 @@ fn member_type_across_dbs(
     class_name: &str,
     member_name: &str,
 ) -> Result<Option<String>> {
-    if let Some(member_type) = builtin_member_type(class_name, member_name) {
-        return Ok(Some(member_type));
-    }
-
     if let Some(member_type) = member_type_on_class_or_bases(conn, class_name, member_name)? {
         return Ok(Some(member_type));
     }
@@ -1115,75 +1110,48 @@ fn member_type_across_dbs(
     Ok(None)
 }
 
-fn normalize_member_receiver_type(class_name: &str) -> String {
-    let trimmed = crate::parser::cpp::clean_type_string(class_name).trim().to_string();
-    if let Some(inner) = trimmed
-        .strip_prefix("TArray<")
-        .and_then(|text| text.strip_suffix('>'))
-    {
-        return format!("TArray<{}>", crate::parser::cpp::clean_type_string(inner));
+fn looks_like_unreal_external_type(name: &str) -> bool {
+    let normalized = crate::parser::cpp::clean_type_string(name);
+    if normalized.contains('<') {
+        return true;
     }
 
-    if let Some(inner) = trimmed
-        .strip_prefix("TSet<")
-        .and_then(|text| text.strip_suffix('>'))
-    {
-        return format!("TSet<{}>", crate::parser::cpp::clean_type_string(inner));
-    }
+    let mut chars = normalized.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    let Some(second) = chars.next() else {
+        return false;
+    };
 
-    if let Some(inner) = trimmed
-        .strip_prefix("TAutoConsoleVariable<")
-        .and_then(|text| text.strip_suffix('>'))
-    {
-        return format!(
-            "TAutoConsoleVariable<{}>",
-            crate::parser::cpp::clean_type_string(inner)
-        );
-    }
-
-    trimmed
+    matches!(first, 'A' | 'U' | 'F' | 'E' | 'I' | 'T') && second.is_ascii_uppercase()
 }
 
-fn is_known_member_on_builtin_type(class_name: &str, member_name: &str) -> bool {
-    let normalized = normalize_member_receiver_type(class_name);
-    matches!(
-        (normalized.as_str(), member_name),
-        ("AActor", "GetActorLocation")
-            | ("AActor", "GetActorForwardVector")
-            | ("AActor", "GetActorQuat")
-            | ("AActor", "IsA")
-            | ("TArray", "Add")
-            | ("TArray", "Empty")
-            | ("FOverlapResult", "GetActor")
-            | ("TAutoConsoleVariable<int32>", "GetValueOnGameThread")
-    ) || normalized.starts_with("TArray<") && matches!(member_name, "Add" | "Empty")
-}
-
-fn builtin_member_type(class_name: &str, member_name: &str) -> Option<String> {
-    let normalized = normalize_member_receiver_type(class_name);
-    match (normalized.as_str(), member_name) {
-        ("AActor", "GetActorLocation") => Some("FVector".to_string()),
-        ("AActor", "GetActorForwardVector") => Some("FVector".to_string()),
-        ("AActor", "GetActorQuat") => Some("FQuat".to_string()),
-        ("AActor", "IsA") => Some("bool".to_string()),
-        ("FOverlapResult", "GetActor") => Some("AActor".to_string()),
-        ("TAutoConsoleVariable<int32>", "GetValueOnGameThread") => Some("int32".to_string()),
-        _ => None,
+fn should_suppress_member_diagnostic(
+    conn: &Connection,
+    engine_conn: Option<&Connection>,
+    class_name: &str,
+) -> Result<bool> {
+    let normalized = crate::parser::cpp::clean_type_string(class_name);
+    if normalized.is_empty() {
+        return Ok(false);
     }
-}
 
-fn is_known_static_member(scope_name: &str, member_name: &str) -> bool {
-    let normalized = crate::parser::cpp::clean_type_string(scope_name);
-    matches!(
-        (normalized.as_str(), member_name),
-        ("FVector", "DistSquared")
-            | ("FVector", "Distance")
-            | ("FVector2D", "Distance")
-            | ("FMath", "Clamp")
-            | ("FMath", "Abs")
-            | ("FMath", "Max")
-            | ("FMath", "Min")
-    )
+    if normalized.contains('<') {
+        return Ok(true);
+    }
+
+    if !class_ids_by_name(conn, &normalized)?.is_empty() {
+        return Ok(false);
+    }
+
+    if let Some(engine_conn) = engine_conn {
+        if !class_ids_by_name(engine_conn, &normalized)?.is_empty() {
+            return Ok(true);
+        }
+    }
+
+    Ok(looks_like_unreal_external_type(&normalized))
 }
 
 fn member_type_on_class_or_bases(
