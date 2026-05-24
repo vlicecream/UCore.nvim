@@ -3238,11 +3238,24 @@ fn open_engine_query_connection(
     }
 }
 
+/// Detect Unreal engine database paths. Engine queries skip the in-memory hot
+/// index and fall back to SQLite FTS so the engine workspace never resides in
+/// the server's heap.
+/// 识别引擎数据库路径——引擎查询跳过常驻 hot index，直接走 SQLite FTS，
+/// 避免把整个引擎索引解到堆上。
+fn is_engine_db_path(db_path: &str) -> bool {
+    let normalized = db_path.replace('\\', "/").to_ascii_lowercase();
+    normalized.contains("/engines/")
+}
+
 fn load_search_hot_index(
     state: &AppState,
     db_path: &str,
     label: &str,
 ) -> Option<Arc<query::search::SearchHotIndex>> {
+    if is_engine_db_path(db_path) {
+        return None;
+    }
     match state.get_search_hot_index(db_path) {
         Ok(index) => Some(index),
         Err(err) => {
@@ -3257,6 +3270,9 @@ fn load_navigation_hot_index(
     db_path: &str,
     label: &str,
 ) -> Option<Arc<query::goto::NavigationHotIndex>> {
+    if is_engine_db_path(db_path) {
+        return None;
+    }
     match state.get_navigation_hot_index(db_path) {
         Ok(index) => Some(index),
         Err(err) => {
@@ -3274,6 +3290,9 @@ fn load_usage_hot_index(
     db_path: &str,
     label: &str,
 ) -> Option<Arc<query::usage::UsageHotIndex>> {
+    if is_engine_db_path(db_path) {
+        return None;
+    }
     match state.get_usage_hot_index(db_path) {
         Ok(index) => Some(index),
         Err(err) => {
