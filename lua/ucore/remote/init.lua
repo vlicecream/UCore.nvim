@@ -66,16 +66,24 @@ function M.query(project_root, query, callback, opts)
 
 	query.project_root = project_root
 	query.engine_db_path = existing_engine_db_path(project_root)
+	local started_ms = completion_debug.now_ms()
 	completion_debug.log("query", "send", completion_debug.summarize_query(query))
 
 	-- Prefer the persistent TCP RPC path for interactive queries.
 	-- 交互式查询优先走持久 TCP RPC，避免每次启动 CLI 进程。
 	rpc.request("query", query, function(result, err)
+		local rpc_ms = completion_debug.elapsed_ms(started_ms)
 		if not err then
-			completion_debug.log("query", "result", query.kind or "unknown", completion_debug.summarize_result(result))
+			completion_debug.log(
+				"query",
+				"result",
+				query.kind or "unknown",
+				completion_debug.summarize_result(result),
+				string.format("rpc_ms=%s", rpc_ms)
+			)
 			return callback(result, nil, opts.final_meta)
 		end
-		completion_debug.log("query", "rpc-error", query.kind or "unknown", tostring(err))
+		completion_debug.log("query", "rpc-error", query.kind or "unknown", tostring(err), string.format("rpc_ms=%s", rpc_ms))
 
 		local err_text = tostring(err or "")
 		if err_text:find("Project not found:", 1, true) then
@@ -96,11 +104,24 @@ function M.query(project_root, query, callback, opts)
 
 		-- Fall back to the CLI bridge so early development stays forgiving.
 		-- RPC 失败时回退到 CLI 桥，方便开发阶段排查问题。
+		local cli_started_ms = completion_debug.now_ms()
 		cli.query(query, function(cli_result, cli_err)
 			if cli_err then
-				completion_debug.log("query", "cli-error", query.kind or "unknown", tostring(cli_err))
+				completion_debug.log(
+					"query",
+					"cli-error",
+					query.kind or "unknown",
+					tostring(cli_err),
+					string.format("cli_ms=%s", completion_debug.elapsed_ms(cli_started_ms))
+				)
 			else
-				completion_debug.log("query", "cli-result", query.kind or "unknown", completion_debug.summarize_result(cli_result))
+				completion_debug.log(
+					"query",
+					"cli-result",
+					query.kind or "unknown",
+					completion_debug.summarize_result(cli_result),
+					string.format("cli_ms=%s", completion_debug.elapsed_ms(cli_started_ms))
+				)
 			end
 			callback(cli_result, cli_err, opts.final_meta)
 		end)

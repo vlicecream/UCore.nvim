@@ -6,6 +6,14 @@ local function debug_enabled()
 	return config.log_enabled()
 end
 
+function M.now_ms()
+	return math.floor((vim.uv or vim.loop).hrtime() / 1000000)
+end
+
+function M.elapsed_ms(start_ms)
+	return M.now_ms() - (tonumber(start_ms) or M.now_ms())
+end
+
 local function log_path()
 	local data_dir = vim.fn.stdpath("data")
 	vim.fn.mkdir(data_dir .. "/ucore", "p")

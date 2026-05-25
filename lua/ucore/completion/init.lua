@@ -217,6 +217,7 @@ function M.request(opts, callback)
 
 	opts = opts or {}
 	callback = callback or function() end
+	local request_started_ms = debug.now_ms()
 
 	if vim.b.no_cmp or vim.b.ucore_completion_disabled then
 		debug.log("request", opts.source or "unknown", "disabled")
@@ -240,7 +241,9 @@ function M.request(opts, callback)
 	local character = cursor[2]
 	local bufnr = vim.api.nvim_get_current_buf()
 	local changedtick = vim.api.nvim_buf_get_changedtick(bufnr)
+	local content_started_ms = debug.now_ms()
 	local content = current_content()
+	local content_ms = debug.elapsed_ms(content_started_ms)
 	local request_key = table.concat({
 		bufnr,
 		changedtick,
@@ -256,6 +259,8 @@ function M.request(opts, callback)
 		string.format("tick=%s", changedtick),
 		string.format("line=%s", line),
 		string.format("char=%s", character),
+		string.format("content_len=%s", #content),
+		string.format("content_ms=%s", content_ms),
 		file_path
 	)
 
@@ -281,6 +286,7 @@ function M.request(opts, callback)
 		character = character,
 		file_path = file_path:gsub("\\", "/"),
 	}, function(result, err)
+		local remote_ms = debug.elapsed_ms(request_started_ms)
 		local pending = pending_request
 		if pending and pending.key == request_key then
 			pending_request = nil
@@ -319,24 +325,44 @@ function M.request(opts, callback)
 		end
 
 		if err then
-			debug.log("request", pending_opts.source or "unknown", "error", tostring(err))
+			debug.log(
+				"request",
+				pending_opts.source or "unknown",
+				"error",
+				tostring(err),
+				string.format("remote_ms=%s", remote_ms)
+			)
 			for _, cb in ipairs(callbacks) do
 				cb(nil, err)
 			end
 			return
 		end
 
+		local normalize_started_ms = debug.now_ms()
 		local items = normalize_items(result)
+		local normalize_ms = debug.elapsed_ms(normalize_started_ms)
 		debug.log(
 			"request",
 			pending_opts.source or "unknown",
 			"result",
-			string.format("items=%s", debug.count_items(items))
+			string.format("items=%s", debug.count_items(items)),
+			string.format("remote_ms=%s", remote_ms),
+			string.format("normalize_ms=%s", normalize_ms),
+			string.format("total_ms=%s", debug.elapsed_ms(request_started_ms))
 		)
 
+		local callback_started_ms = debug.now_ms()
 		for _, cb in ipairs(callbacks) do
 			cb(items, nil)
 		end
+		debug.log(
+			"request",
+			pending_opts.source or "unknown",
+			"callbacks",
+			string.format("count=%s", #callbacks),
+			string.format("callback_ms=%s", debug.elapsed_ms(callback_started_ms)),
+			string.format("total_ms=%s", debug.elapsed_ms(request_started_ms))
+		)
 	end)
 end
 
@@ -344,6 +370,7 @@ end
 -- 为自动补全回退路径驱动 Vim 原生插入补全。
 local function complete_auto(opts)
 	opts = opts or {}
+	local started_ms = debug.now_ms()
 
 	if not is_insert_mode() then
 		return
@@ -373,7 +400,15 @@ local function complete_auto(opts)
 				return
 			end
 
+			local complete_started_ms = debug.now_ms()
 			vim.fn.complete(start_col, items)
+			debug.log(
+				"native",
+				"complete",
+				string.format("items=%s", debug.count_items(items)),
+				string.format("complete_ms=%s", debug.elapsed_ms(complete_started_ms)),
+				string.format("total_ms=%s", debug.elapsed_ms(started_ms))
+			)
 		end)
 	end)
 end
@@ -395,11 +430,14 @@ local function schedule_auto_complete()
 	auto_sequence = auto_sequence + 1
 	local sequence = auto_sequence
 	local delay = completion_config.debounce_ms or 180
+	local scheduled_ms = debug.now_ms()
+	debug.log("native", "schedule", string.format("delay_ms=%s", delay))
 
 	vim.defer_fn(function()
 		if sequence ~= auto_sequence then
 			return
 		end
+		debug.log("native", "dispatch", string.format("wait_ms=%s", debug.elapsed_ms(scheduled_ms)))
 
 		complete_auto({
 			auto = true,

@@ -89,12 +89,20 @@ local function dispatch_latest()
 	end
 
 	in_flight_request = request
-	debug.log("blink", "dispatch", string.format("id=%s", request.id), string.format("prefix=%s", request.prefix))
+	request.dispatch_ms = debug.now_ms()
+	debug.log(
+		"blink",
+		"dispatch",
+		string.format("id=%s", request.id),
+		string.format("prefix=%s", request.prefix),
+		string.format("queue_wait_ms=%s", debug.elapsed_ms(request.queued_ms))
+	)
 
 	completion.request({
 		source = "blink",
 		allow_stale = true,
 	}, function(items, err)
+		local request_ms = debug.elapsed_ms(request.dispatch_ms)
 		local active = in_flight_request
 		in_flight_request = nil
 
@@ -107,7 +115,7 @@ local function dispatch_latest()
 		end
 
 		if err == "stale" then
-			debug.log("blink", "stale", string.format("id=%s", request.id))
+			debug.log("blink", "stale", string.format("id=%s", request.id), string.format("request_ms=%s", request_ms))
 			if queued_request and not queued_request.cancelled then
 				dispatch_latest()
 			end
@@ -115,7 +123,7 @@ local function dispatch_latest()
 		end
 
 		if err or not items then
-			debug.log("blink", "error", string.format("id=%s", request.id), tostring(err))
+			debug.log("blink", "error", string.format("id=%s", request.id), tostring(err), string.format("request_ms=%s", request_ms))
 			request.callback({
 				is_incomplete_forward = false,
 				is_incomplete_backward = false,
@@ -127,6 +135,7 @@ local function dispatch_latest()
 			return
 		end
 
+		local convert_started_ms = debug.now_ms()
 		local blink_items = {}
 		for _, item in ipairs(items) do
 			local converted = to_blink_item(item)
@@ -134,23 +143,41 @@ local function dispatch_latest()
 				table.insert(blink_items, converted)
 			end
 		end
+		local convert_ms = debug.elapsed_ms(convert_started_ms)
 
 		debug.log(
 			"blink",
 			"items",
 			string.format("id=%s", request.id),
 			string.format("raw=%s", debug.count_items(items)),
-			string.format("converted=%s", debug.count_items(blink_items))
+			string.format("converted=%s", debug.count_items(blink_items)),
+			string.format("request_ms=%s", request_ms),
+			string.format("convert_ms=%s", convert_ms)
 		)
 
+		local prune_started_ms = debug.now_ms()
 		blink_items = prune_items(blink_items)
-		debug.log("blink", "pruned", string.format("id=%s", request.id), string.format("items=%s", debug.count_items(blink_items)))
+		debug.log(
+			"blink",
+			"pruned",
+			string.format("id=%s", request.id),
+			string.format("items=%s", debug.count_items(blink_items)),
+			string.format("prune_ms=%s", debug.elapsed_ms(prune_started_ms))
+		)
 
+		local callback_started_ms = debug.now_ms()
 		request.callback({
 			is_incomplete_forward = false,
 			is_incomplete_backward = false,
 			items = blink_items,
 		})
+		debug.log(
+			"blink",
+			"callback",
+			string.format("id=%s", request.id),
+			string.format("callback_ms=%s", debug.elapsed_ms(callback_started_ms)),
+			string.format("total_ms=%s", debug.elapsed_ms(request.queued_ms))
+		)
 
 		if queued_request and not queued_request.cancelled then
 			dispatch_latest()
@@ -402,17 +429,20 @@ function M:get_completions(_, callback)
 		prefix = current_prefix(_),
 		callback = callback,
 		cancelled = false,
+		queued_ms = debug.now_ms(),
 	}
 
 	queued_request = request
-	debug.log("blink", "queue", string.format("id=%s", request.id), string.format("prefix=%s", request.prefix))
 	stop_timer()
-	scheduled_timer = vim.fn.timer_start(blink_delay_ms(), function()
+	local delay_ms = blink_delay_ms()
+	debug.log("blink", "queue", string.format("id=%s", request.id), string.format("prefix=%s", request.prefix), string.format("delay_ms=%s", delay_ms))
+	scheduled_timer = vim.fn.timer_start(delay_ms, function()
 		scheduled_timer = nil
 		if in_flight_request then
 			debug.log("blink", "timer-hit-inflight", string.format("id=%s", request.id))
 			return
 		end
+		debug.log("blink", "timer-dispatch", string.format("id=%s", request.id), string.format("wait_ms=%s", debug.elapsed_ms(request.queued_ms)))
 		dispatch_latest()
 	end)
 

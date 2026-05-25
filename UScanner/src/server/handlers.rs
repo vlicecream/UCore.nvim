@@ -983,11 +983,13 @@ fn handle_state_query(
             character,
             file_path,
         } => {
+            let completion_started_at = Instant::now();
             let file_path_display = file_path
                 .as_deref()
                 .unwrap_or("-")
                 .to_string();
             let cache = state.get_completion_cache(root_key);
+            let engine_open_started_at = Instant::now();
             let engine_conn = match engine_db_path
                 .as_deref()
                 .map(normalize_to_native)
@@ -1002,7 +1004,9 @@ fn handle_state_query(
                 },
                 None => None,
             };
+            let engine_open_ms = engine_open_started_at.elapsed().as_millis();
 
+            let completion_core_started_at = Instant::now();
             let value = crate::completion::process_completion_with_engine(
                 conn,
                 engine_conn.as_ref(),
@@ -1013,14 +1017,19 @@ fn handle_state_query(
                 Some(cache),
                 persistent_cache_conn,
             )?;
+            let completion_core_ms = completion_core_started_at.elapsed().as_millis();
 
-            debug!(
-                "completion query handled: root={} file={} line={} char={} engine_db={}",
+            info!(
+                target: "ucore::completion",
+                "Completion query handled: root={} file={} line={} char={} engine_db={} engine_open_ms={} core_ms={} total_ms={}",
                 root_key,
                 file_path_display,
                 line,
                 character,
                 engine_conn.is_some(),
+                engine_open_ms,
+                completion_core_ms,
+                completion_started_at.elapsed().as_millis(),
             );
 
             Ok(Some(value))
