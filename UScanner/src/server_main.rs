@@ -41,6 +41,7 @@ async fn main() -> Result<()> {
         connections: Mutex::new(HashMap::new()),
         read_only_connections: Mutex::new(HashMap::new()),
         persistent_cache_connections: Mutex::new(HashMap::new()),
+        query_indices_ready: Mutex::new(HashSet::new()),
         active_refreshes: Mutex::new(HashSet::new()),
         active_asset_scans: Mutex::new(HashSet::new()),
         watcher: Mutex::new(watcher),

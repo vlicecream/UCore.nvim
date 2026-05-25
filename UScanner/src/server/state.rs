@@ -365,6 +365,7 @@ pub struct AppState {
     pub connections: Mutex<HashMap<String, Arc<Mutex<rusqlite::Connection>>>>,
     pub read_only_connections: Mutex<HashMap<String, Arc<Mutex<rusqlite::Connection>>>>,
     pub persistent_cache_connections: Mutex<HashMap<String, Arc<Mutex<rusqlite::Connection>>>>,
+    pub query_indices_ready: Mutex<HashSet<String>>,
     pub active_refreshes: Mutex<HashSet<String>>,
     pub active_asset_scans: Mutex<HashSet<String>>,
     pub watcher: Mutex<notify::RecommendedWatcher>,
@@ -456,6 +457,7 @@ impl AppState {
     /// Open a new read-only database connection for parallel queries.
     /// 打开新的只读数据库连接，用于并发 query。
     pub fn get_read_only_connection(&self, db_path: &str) -> Result<rusqlite::Connection> {
+        self.ensure_query_indices(db_path)?;
         open_read_only_connection(db_path)
     }
 
@@ -465,6 +467,8 @@ impl AppState {
         &self,
         db_path: &str,
     ) -> Result<Arc<Mutex<rusqlite::Connection>>> {
+        self.ensure_query_indices(db_path)?;
+
         {
             let conns = self.read_only_connections.lock();
             if let Some(conn) = conns.get(db_path) {
@@ -481,6 +485,32 @@ impl AppState {
             .or_insert_with(|| Arc::clone(&conn));
 
         Ok(Arc::clone(existing))
+    }
+
+    /// Ensure query-only performance indexes exist before opening read-only connections.
+    /// 在打开只读连接前补齐查询性能索引。
+    fn ensure_query_indices(&self, db_path: &str) -> Result<()> {
+        {
+            let ready = self.query_indices_ready.lock();
+            if ready.contains(db_path) {
+                return Ok(());
+            }
+        }
+
+        match open_query_index_connection(db_path).and_then(|conn| {
+            db::ensure_query_indices(&conn)?;
+            Ok(())
+        }) {
+            Ok(()) => {}
+            Err(err) => warn!(
+                "Failed to ensure query indexes for {}: {}. Continuing with existing indexes.",
+                db_path, err
+            ),
+        }
+
+        let mut ready = self.query_indices_ready.lock();
+        ready.insert(db_path.to_string());
+        Ok(())
     }
 
     /// Get or create the per-project completion cache.
@@ -681,6 +711,7 @@ impl AppState {
     pub fn drop_connections(&self, db_path: &str, cache_db_path: Option<&str>) {
         self.connections.lock().remove(db_path);
         self.read_only_connections.lock().remove(db_path);
+        self.query_indices_ready.lock().remove(db_path);
         self.search_hot_indexes.lock().remove(db_path);
         self.navigation_hot_indexes.lock().remove(db_path);
         self.usage_hot_indexes.lock().remove(db_path);
@@ -707,6 +738,15 @@ fn open_primary_connection(db_path: &str) -> Result<rusqlite::Connection> {
 
     configure_primary_connection(&conn)?;
 
+    Ok(conn)
+}
+
+/// Open a read/write connection only for adding missing query indexes.
+/// 仅用于给旧库补齐查询索引；不做版本检查，不触发重建。
+fn open_query_index_connection(db_path: &str) -> Result<rusqlite::Connection> {
+    let conn = rusqlite::Connection::open(db_path)?;
+    conn.busy_timeout(PRIMARY_DB_BUSY_TIMEOUT)?;
+    configure_primary_connection(&conn)?;
     Ok(conn)
 }
 

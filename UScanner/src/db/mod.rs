@@ -431,6 +431,10 @@ fn create_indices(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_members_file_id ON members(file_id);
         CREATE INDEX IF NOT EXISTS idx_members_class_id ON members(class_id);
 
+        CREATE INDEX IF NOT EXISTS idx_inheritance_child_id ON inheritance(child_id);
+        CREATE INDEX IF NOT EXISTS idx_inheritance_parent_name_id ON inheritance(parent_name_id);
+        CREATE INDEX IF NOT EXISTS idx_inheritance_parent_class_id ON inheritance(parent_class_id);
+
         CREATE INDEX IF NOT EXISTS idx_symbol_calls_file_id ON symbol_calls(file_id);
         CREATE INDEX IF NOT EXISTS idx_symbol_calls_name_id ON symbol_calls(name_id);
 
@@ -482,6 +486,9 @@ fn drop_indices(conn: &Connection) -> rusqlite::Result<()> {
         "idx_members_name_id",
         "idx_members_file_id",
         "idx_members_class_id",
+        "idx_inheritance_child_id",
+        "idx_inheritance_parent_name_id",
+        "idx_inheritance_parent_class_id",
         "idx_symbol_calls_file_id",
         "idx_symbol_calls_name_id",
         "idx_file_includes_file_id",
@@ -516,6 +523,18 @@ fn drop_indices(conn: &Connection) -> rusqlite::Result<()> {
     }
 
     Ok(())
+}
+
+/// Ensure indexes needed by interactive query paths exist on already-built databases.
+/// 给已存在数据库补齐交互式查询需要的索引，不改变任何索引数据语义。
+pub fn ensure_query_indices(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_inheritance_child_id ON inheritance(child_id);
+        CREATE INDEX IF NOT EXISTS idx_inheritance_parent_name_id ON inheritance(parent_name_id);
+        CREATE INDEX IF NOT EXISTS idx_inheritance_parent_class_id ON inheritance(parent_class_id);
+        "#,
+    )
 }
 
 /// Get or create one interned string id.
