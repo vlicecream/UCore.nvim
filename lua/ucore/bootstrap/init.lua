@@ -361,7 +361,7 @@ local function run_engine_refresh_if_needed(payload, callback)
 	end, {
 		label = title,
 		detail = "Scanning engine...",
-		auto_finish = false,
+		silent = true,
 	})
 end
 
@@ -414,7 +414,6 @@ local function run_refresh_if_needed(payload, setup_result, callback)
 	end, {
 		label = "UCore Project Discovery",
 		detail = "Scanning project...",
-		auto_finish = false,
 	})
 end
 
