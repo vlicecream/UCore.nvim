@@ -256,6 +256,10 @@ local function session_by_msgid(msgid)
 		return sessions[msgid]
 	end
 
+	if msgid ~= nil then
+		return nil
+	end
+
 	if #start_order > 0 then
 		local fallback_id = table.remove(start_order, 1)
 		local fallback_session = sessions[fallback_id]
