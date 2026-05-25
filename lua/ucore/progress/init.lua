@@ -292,6 +292,12 @@ end
 
 function M.start(next_title, opts, msgid)
 	local session = register_start(next_title, opts, msgid)
+	log.write_progress("progress-start", {
+		msgid = msgid,
+		title = session.title,
+		target_kind = session.target_kind,
+		visible = session.visible,
+	})
 	if session.visible then
 		local initial_message = opts and opts.detail and opts.detail ~= ""
 				and tostring(opts.detail)
@@ -306,8 +312,19 @@ end
 function M.finish(message, msgid)
 	local session = session_by_msgid(msgid)
 	if not session then
+		log.write_progress("progress-finish-miss", {
+			msgid = msgid,
+			message = message,
+		})
 		return
 	end
+	log.write_progress("progress-finish", {
+		msgid = msgid,
+		title = session.title,
+		target_kind = session.target_kind,
+		current_display_title = session.current_display_title,
+		message = message,
+	})
 
 	session.active = false
 	session.last_percent = 100
@@ -337,9 +354,18 @@ end
 function M.handle_plan(plan, msgid, target_kind)
 	local session = session_by_msgid(msgid)
 	if not session or not session.active then
+		log.write_progress("progress-plan-miss", {
+			msgid = msgid,
+			target_kind = target_kind,
+		})
 		return
 	end
 	apply_target_kind(session, target_kind)
+	log.write_progress("progress-plan-ui", {
+		msgid = msgid,
+		target_kind = session.target_kind,
+		title = session.title,
+	})
 
 	local items = normalize_plan(plan)
 	if type(items) ~= "table" then
@@ -374,6 +400,11 @@ end
 function M.handle_progress(event, msgid, target_kind)
 	local session = session_by_msgid(msgid)
 	if not session or not session.active then
+		log.write_progress("progress-event-miss", {
+			msgid = msgid,
+			target_kind = target_kind,
+			stage = type(event) == "table" and (event.stage or event[2]) or nil,
+		})
 		return
 	end
 	apply_target_kind(session, target_kind)
@@ -411,10 +442,12 @@ function M.handle_progress(event, msgid, target_kind)
 
 	log.write_progress("progress-ui", {
 		msgid = msgid,
+		title = session.title,
 		stage = event.stage,
 		current = event.current,
 		total = event.total,
 		overall = overall,
+		target_kind = session.target_kind,
 		display_title = display_title,
 		detail = detail,
 	})
