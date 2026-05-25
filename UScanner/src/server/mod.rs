@@ -155,7 +155,7 @@ async fn dispatch_rpc(
     match method {
         "ping" => handlers::handle_ping(&state, &params).await,
         "setup" => handlers::handle_setup(state.clone(), &params).await,
-        "refresh" => handlers::handle_refresh(&state, &params, tx.clone()).await,
+        "refresh" => handlers::handle_refresh(&state, &params, tx.clone(), msgid).await,
         "watch" => handlers::handle_watch(&state, &params).await,
         "query" => handlers::handle_query(state.clone(), &params, tx.clone(), msgid).await,
         "scan" => handlers::handle_scan(&state, &params).await,

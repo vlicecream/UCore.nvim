@@ -503,6 +503,7 @@ pub async fn handle_refresh(
     state: &AppState,
     params: &Value,
     tx: mpsc::Sender<Vec<u8>>,
+    msgid: u64,
 ) -> Result<Value> {
     let mut req: RefreshRequest = convert_params(params)?;
     let root_key = normalize_path_key(&req.project_root);
@@ -531,7 +532,7 @@ pub async fn handle_refresh(
     req.db_path = Some(db_path_unix.clone());
     let _ = state.save_registry();
 
-    let reporter = Arc::new(RpcProgressReporter { tx });
+    let reporter = Arc::new(RpcProgressReporter { tx, msgid });
 
     let refresh_project_root = req.project_root.clone();
     tokio::task::spawn_blocking(move || refresh::run_refresh(req, reporter)).await??;

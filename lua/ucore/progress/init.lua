@@ -4,8 +4,6 @@ local status = require("ucore.status")
 
 local M = {}
 
--- Default refresh phase weights used when the Rust plan has not arrived yet.
--- 当 Rust 阶段计划还没到时使用的默认整体进度权重。
 local default_phase_order = {
 	"discovery",
 	"db_prepare",
@@ -26,136 +24,49 @@ local default_phases = {
 	finalizing = { label = "Finalizing", weight = 0.10 },
 }
 
-local phases = {}
-local phase_order = {}
-local last_percent = -1
-local last_stage = nil
-local last_detail = nil
-local last_tail = nil
-local active = false
-local title = "UCore refresh"
-local visible = true
-local stage_progress = {}
-local active_titles = {}
-local target_kind = "project"
-local current_display_title = nil
-local auto_finish = true
+local sessions = {}
+local start_order = {}
+local next_local_id = 0
+local pending_local_id = nil
 
-local function finish_active_titles(message)
-	if not visible then
-		return
-	end
-
-	local titles = {}
-	for name, active_flag in pairs(active_titles) do
-		if active_flag then
-			table.insert(titles, name)
-		end
-	end
-
-	if #titles == 0 and current_display_title then
-		table.insert(titles, current_display_title)
-	end
-
-	table.sort(titles)
-	for _, finish_title in ipairs(titles) do
-		status.progress_finish(finish_title, message or string.format("%s 100%%", finish_title))
-	end
-
-	active_titles = {}
+local function clone_default_phases()
+	return vim.deepcopy(default_phases)
 end
 
--- Load the built-in overall progress plan.
--- 加载内置的整体进度计划。
-local function load_default_plan()
-	phases = vim.deepcopy(default_phases)
-	phase_order = vim.deepcopy(default_phase_order)
+local function clone_default_phase_order()
+	return vim.deepcopy(default_phase_order)
 end
 
--- Reset progress state for a new refresh run.
--- 为新的 refresh 运行重置进度状态。
-local function reset()
-	load_default_plan()
-	last_percent = -1
-	last_stage = nil
-	last_detail = nil
-	last_tail = nil
-	stage_progress = {}
-	active_titles = {}
-	active = true
-	current_display_title = nil
-	auto_finish = true
-end
-
--- Start a new visible progress run with a user-facing title.
--- 使用面向用户的标题开始一次新的进度展示。
-function M.start(next_title, opts)
-	if active and current_display_title then
-		finish_active_titles()
-	end
-
+local function new_session(id, next_title, opts)
 	opts = opts or {}
-	title = next_title or "UCore refresh"
-	target_kind = opts.target_kind or "project"
-	auto_finish = opts.auto_finish ~= false
-	visible = opts.silent ~= true
-	reset()
-	auto_finish = opts.auto_finish ~= false
-	if visible then
-		local initial_message = opts.detail and opts.detail ~= "" and tostring(opts.detail) or string.format("%s 0%%", title)
-		status.progress(title, initial_message)
-	end
+	return {
+		id = id,
+		title = next_title or "UCore refresh",
+		target_kind = opts.target_kind or "project",
+		visible = opts.silent ~= true,
+		auto_finish = opts.auto_finish ~= false,
+		phases = clone_default_phases(),
+		phase_order = clone_default_phase_order(),
+		stage_progress = {},
+		last_percent = -1,
+		last_stage = nil,
+		last_detail = nil,
+		current_display_title = nil,
+		active_titles = {},
+		active = true,
+	}
 end
 
--- Finish the visible progress run and let it disappear shortly after.
--- 完成当前进度展示，并在短暂显示后自动消失。
-function M.finish(message)
-	if not active then
-		if current_display_title then
-			finish_active_titles(message)
-		end
-		return
-	end
-
-	active = false
-	last_percent = 100
-	last_stage = "complete"
-	local finish_title = current_display_title or title
-	local finish_message = message or string.format("%s 100%%", finish_title)
-	last_detail = nil
-	last_tail = nil
-	finish_active_titles(finish_message)
-end
-
--- Mark the current progress run as failed.
--- 标记当前进度展示失败。
-function M.fail(message)
-	active = false
-	last_stage = "failed"
-	last_detail = nil
-	last_tail = nil
-	if visible then
-		status.progress_fail(current_display_title or title, message or string.format("%s failed", title))
-	end
-end
-
--- Clamp one numeric value into a safe range.
--- 把数字限制到安全范围内。
 local function clamp(value, min, max)
 	if value < min then
 		return min
 	end
-
 	if value > max then
 		return max
 	end
-
 	return value
 end
 
--- Normalize a msgpack-decoded phase. rmp-serde may encode Rust structs as
--- either maps or arrays, depending on serializer settings.
--- 规范化 msgpack 解码后的阶段；Rust struct 可能被编码成 map，也可能是数组。
 local function normalize_phase(phase)
 	if type(phase) ~= "table" then
 		return nil
@@ -168,8 +79,6 @@ local function normalize_phase(phase)
 	}
 end
 
--- Normalize a msgpack-decoded progress plan.
--- 规范化 msgpack 解码后的 progress plan。
 local function normalize_plan(plan)
 	if type(plan) ~= "table" then
 		return {}
@@ -178,8 +87,6 @@ local function normalize_plan(plan)
 	return plan.phases or plan[2] or {}
 end
 
--- Normalize a msgpack-decoded progress event.
--- 规范化 msgpack 解码后的 progress event。
 local function normalize_event(event)
 	if type(event) ~= "table" then
 		return {}
@@ -193,114 +100,22 @@ local function normalize_event(event)
 	}
 end
 
-local function monotonic_event(event)
-	local stage = event.stage
-	if type(stage) ~= "string" or stage == "" then
-		return event
-	end
-
-	local previous = stage_progress[stage]
-	if previous then
-		if event.total > 0 and previous.total > 0 and event.total < previous.total then
-			event.total = previous.total
-		end
-		if event.current < previous.current then
-			event.current = previous.current
-		end
-	end
-
-	stage_progress[stage] = {
-		current = event.current,
-		total = event.total,
-	}
-	return event
-end
-
--- Build a lookup table from Rust's phase plan.
--- 根据 Rust 传来的阶段计划构造查找表。
-function M.handle_plan(plan)
-	if not active then
-		return
-	end
-
-	local items = normalize_plan(plan)
-	if type(items) ~= "table" then
-		return
-	end
-
-	reset()
-	phases = {}
-	phase_order = {}
-
-	for _, raw_phase in ipairs(items) do
-		local phase = normalize_phase(raw_phase)
-		local name = phase and phase.name
-		if name then
-			table.insert(phase_order, name)
-			phases[name] = {
-				label = phase.label or name,
-				weight = tonumber(phase.weight) or 0,
-			}
-		end
-	end
-
-	if vim.tbl_isempty(phases) then
-		load_default_plan()
-	end
-end
-
--- Convert phase-local progress into an overall percentage.
--- 把阶段内进度换算成整体百分比。
-local function overall_percent(event)
-	local stage = event.stage
-
-	if stage == "complete" then
-		return 100
-	end
-
-	local phase = phases[stage]
-	if not phase then
-		local current = tonumber(event.current) or 0
-		local total = tonumber(event.total) or 100
-		return clamp(math.floor((current / math.max(total, 1)) * 100), 0, 100)
-	end
-
-	local before = 0
-	for _, name in ipairs(phase_order) do
-		if name == stage then
-			break
-		end
-
-		before = before + ((phases[name] and phases[name].weight) or 0)
-	end
-
-	local current = tonumber(event.current) or 0
-	local total = tonumber(event.total) or 100
-	local local_ratio = clamp(current / math.max(total, 1), 0, 1)
-	local percent = (before + local_ratio * phase.weight) * 100
-
-	-- Keep progress monotonic even if Rust reuses a stage later.
-	-- 即使 Rust 后面复用某个阶段，也保持整体百分比不回退。
-	return clamp(math.floor(percent), last_percent, 100)
-end
-
 local function normalize_detail(message)
-	message = tostring(message or "")
-	return vim.trim(message)
+	return vim.trim(tostring(message or ""))
 end
 
-local function event_numbers(event)
-	local current = tonumber(event.current) or 0
-	local total = tonumber(event.total) or 0
-	return current, total
+local function target_prefix(session)
+	if session.target_kind == "engine" then
+		return "UCore Engine"
+	end
+	return "UCore Project"
 end
 
-local function stage_label(stage)
-	local phase = phases[stage]
+local function stage_label(session, stage)
+	local phase = session.phases[stage]
 	if phase and phase.label and phase.label ~= "" then
 		return phase.label
 	end
-
 	if type(stage) ~= "string" or stage == "" then
 		return nil
 	end
@@ -309,20 +124,7 @@ local function stage_label(stage)
 	for part in stage:gmatch("[^_]+") do
 		table.insert(words, part:sub(1, 1):upper() .. part:sub(2))
 	end
-
-	if #words == 0 then
-		return nil
-	end
-
-	return table.concat(words, " ")
-end
-
-local function target_prefix()
-	if target_kind == "engine" then
-		return "UCore Engine"
-	end
-
-	return "UCore Project"
+	return #words > 0 and table.concat(words, " ") or nil
 end
 
 local function asset_stage_label(detail)
@@ -336,8 +138,8 @@ local function asset_stage_label(detail)
 	return "Asset Scan"
 end
 
-local function display_title_for_event(event, detail)
-	local prefix = target_prefix()
+local function display_title_for_event(session, event, detail)
+	local prefix = target_prefix(session)
 	local stage = event.stage
 
 	if stage == "discovery" then
@@ -359,7 +161,58 @@ local function display_title_for_event(event, detail)
 		return prefix .. " " .. asset_stage_label(detail)
 	end
 
-	return prefix .. " " .. (stage_label(stage) or "Progress")
+	return prefix .. " " .. (stage_label(session, stage) or "Progress")
+end
+
+local function monotonic_event(session, event)
+	local stage = event.stage
+	if type(stage) ~= "string" or stage == "" then
+		return event
+	end
+
+	local previous = session.stage_progress[stage]
+	if previous then
+		if event.total > 0 and previous.total > 0 and event.total < previous.total then
+			event.total = previous.total
+		end
+		if event.current < previous.current then
+			event.current = previous.current
+		end
+	end
+
+	session.stage_progress[stage] = {
+		current = event.current,
+		total = event.total,
+	}
+	return event
+end
+
+local function overall_percent(session, event)
+	local stage = event.stage
+	if stage == "complete" then
+		return 100
+	end
+
+	local phase = session.phases[stage]
+	if not phase then
+		local current = tonumber(event.current) or 0
+		local total = tonumber(event.total) or 100
+		return clamp(math.floor((current / math.max(total, 1)) * 100), 0, 100)
+	end
+
+	local before = 0
+	for _, name in ipairs(session.phase_order) do
+		if name == stage then
+			break
+		end
+		before = before + ((session.phases[name] and session.phases[name].weight) or 0)
+	end
+
+	local current = tonumber(event.current) or 0
+	local total = tonumber(event.total) or 100
+	local local_ratio = clamp(current / math.max(total, 1), 0, 1)
+	local percent = (before + local_ratio * phase.weight) * 100
+	return clamp(math.floor(percent), session.last_percent, 100)
 end
 
 local function stage_percent(event)
@@ -368,58 +221,204 @@ local function stage_percent(event)
 	return clamp(math.floor((current / math.max(total, 1)) * 100), 0, 100)
 end
 
-local function format_progress_message(display_title, percent)
-	return string.format("%s %d%%", display_title, percent)
+local function finish_active_titles(session, message)
+	if not session.visible then
+		return
+	end
+
+	local titles = {}
+	for name, active_flag in pairs(session.active_titles) do
+		if active_flag then
+			table.insert(titles, name)
+		end
+	end
+	if #titles == 0 and session.current_display_title then
+		table.insert(titles, session.current_display_title)
+	end
+
+	table.sort(titles)
+	for _, finish_title in ipairs(titles) do
+		status.progress_finish(finish_title, message or string.format("%s 100%%", finish_title))
+	end
+
+	session.active_titles = {}
 end
 
--- Show user-facing progress notifications, throttled by overall percentage.
--- 按整体百分比节流显示面向用户的进度通知。
-function M.handle_progress(event)
-	if not active then
-		return
+local function session_by_msgid(msgid)
+	if msgid ~= nil and sessions[msgid] then
+		return sessions[msgid]
 	end
 
-	event = monotonic_event(normalize_event(event))
-
-	if event.stage == "complete" then
-		active = false
-		last_percent = 100
-		last_stage = "complete"
-		last_detail = nil
-		last_tail = normalize_detail(event.message)
-		if auto_finish then
-			return M.finish()
+	if pending_local_id ~= nil then
+		local local_session = sessions[pending_local_id]
+		if local_session then
+			sessions[msgid or pending_local_id] = local_session
+			if msgid ~= nil then
+				sessions[pending_local_id] = nil
+				local_session.id = msgid
+			end
+			pending_local_id = nil
+			return local_session
 		end
-		finish_visible_stage()
+	end
+
+	if #start_order > 0 then
+		local fallback_id = table.remove(start_order, 1)
+		local fallback_session = sessions[fallback_id]
+		if fallback_session then
+			sessions[msgid or fallback_id] = fallback_session
+			if msgid ~= nil then
+				sessions[fallback_id] = nil
+				fallback_session.id = msgid
+			end
+			return fallback_session
+		end
+	end
+
+	return nil
+end
+
+local function register_start(next_title, opts)
+	next_local_id = next_local_id + 1
+	local id = "local:" .. tostring(next_local_id)
+	local session = new_session(id, next_title, opts)
+	sessions[id] = session
+	table.insert(start_order, id)
+	pending_local_id = id
+	return session
+end
+
+local function cleanup_session(id)
+	sessions[id] = nil
+	for index = #start_order, 1, -1 do
+		if start_order[index] == id then
+			table.remove(start_order, index)
+		end
+	end
+	if pending_local_id == id then
+		pending_local_id = nil
+	end
+end
+
+function M.start(next_title, opts)
+	local session = register_start(next_title, opts)
+	if session.visible then
+		local initial_message = opts and opts.detail and opts.detail ~= ""
+				and tostring(opts.detail)
+			or string.format("%s 0%%", session.title)
+		status.progress(session.title, initial_message)
+	end
+end
+
+function M.finish(message, msgid)
+	local session = session_by_msgid(msgid)
+	if not session then
 		return
 	end
 
-	local overall = overall_percent(event)
+	session.active = false
+	session.last_percent = 100
+	session.last_stage = "complete"
+	session.last_detail = nil
+	local finish_title = session.current_display_title or session.title
+	local finish_message = message or string.format("%s 100%%", finish_title)
+	finish_active_titles(session, finish_message)
+	cleanup_session(session.id)
+end
+
+function M.fail(message, msgid)
+	local session = session_by_msgid(msgid)
+	if not session then
+		return
+	end
+
+	session.active = false
+	session.last_stage = "failed"
+	session.last_detail = nil
+	if session.visible then
+		status.progress_fail(session.current_display_title or session.title, message or string.format("%s failed", session.title))
+	end
+	cleanup_session(session.id)
+end
+
+function M.handle_plan(plan, msgid)
+	local session = session_by_msgid(msgid)
+	if not session or not session.active then
+		return
+	end
+
+	local items = normalize_plan(plan)
+	if type(items) ~= "table" then
+		return
+	end
+
+	session.phases = {}
+	session.phase_order = {}
+	session.stage_progress = {}
+	session.last_percent = -1
+	session.last_stage = nil
+	session.last_detail = nil
+
+	for _, raw_phase in ipairs(items) do
+		local phase = normalize_phase(raw_phase)
+		local name = phase and phase.name
+		if name then
+			table.insert(session.phase_order, name)
+			session.phases[name] = {
+				label = phase.label or name,
+				weight = tonumber(phase.weight) or 0,
+			}
+		end
+	end
+
+	if vim.tbl_isempty(session.phases) then
+		session.phases = clone_default_phases()
+		session.phase_order = clone_default_phase_order()
+	end
+end
+
+function M.handle_progress(event, msgid)
+	local session = session_by_msgid(msgid)
+	if not session or not session.active then
+		return
+	end
+
+	event = monotonic_event(session, normalize_event(event))
+	if event.stage == "complete" then
+		if session.auto_finish then
+			return M.finish(nil, session.id)
+		end
+		return M.finish(normalize_detail(event.message), session.id)
+	end
+
+	local overall = overall_percent(session, event)
 	local is_complete = overall >= 100
 	local detail = normalize_detail(event.message)
-	local display_title = display_title_for_event(event, detail)
+	local display_title = display_title_for_event(session, event, detail)
 	local percent = stage_percent(event)
-	local rendered = format_progress_message(display_title, percent)
+	local rendered = string.format("%s %d%%", display_title, percent)
 	if detail ~= "" and percent <= 0 then
 		rendered = detail
 	elseif detail ~= "" and percent < 100 and rendered == string.format("%s 0%%", display_title) then
 		rendered = string.format("%s - %s", display_title, detail)
 	end
-	local same_render = overall == last_percent and event.stage == last_stage and rendered == (last_detail or "")
 
-	-- Rust owns progress throttling; Lua ignores only stale or truly duplicate events.
-	-- Rust 负责节流；Lua 只忽略过期或完全重复的事件。
-	if not is_complete and (overall < last_percent or same_render) then
+	local same_render = overall == session.last_percent
+		and event.stage == session.last_stage
+		and rendered == (session.last_detail or "")
+
+	if not is_complete and (overall < session.last_percent or same_render) then
 		return
 	end
 
-	last_percent = overall
-	last_stage = event.stage
-	last_detail = rendered
-	last_tail = rendered:match("\n%-%-%-%- (.+)$") or detail
-	active_titles[display_title] = true
+	session.last_percent = overall
+	session.last_stage = event.stage
+	session.last_detail = rendered
+	session.active_titles[display_title] = true
+	session.current_display_title = display_title
 
 	log.write_progress("progress-ui", {
+		msgid = msgid,
 		stage = event.stage,
 		current = event.current,
 		total = event.total,
@@ -428,14 +427,12 @@ function M.handle_progress(event)
 		detail = detail,
 	})
 
-	current_display_title = display_title
-
 	if is_complete then
-		active_titles[display_title] = nil
-		return M.finish(string.format("%s 100%%", display_title))
+		session.active_titles[display_title] = nil
+		return M.finish(string.format("%s 100%%", display_title), session.id)
 	end
 
-	if visible then
+	if session.visible then
 		status.progress(display_title, rendered)
 	end
 end

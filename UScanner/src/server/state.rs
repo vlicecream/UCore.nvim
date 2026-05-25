@@ -34,6 +34,7 @@ const CACHE_DB_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
 /// 通过 RPC 通道上报 refresh 进度。
 pub struct RpcProgressReporter {
     pub tx: mpsc::Sender<Vec<u8>>,
+    pub msgid: u64,
 }
 
 impl ProgressReporter for RpcProgressReporter {
@@ -57,7 +58,7 @@ impl ProgressReporter for RpcProgressReporter {
             message: message.to_string(),
         };
 
-        let _ = send_msgpack_notification(&self.tx, "progress", progress);
+        let _ = send_msgpack_notification(&self.tx, "progress", self.msgid, progress);
     }
 
     /// Send the refresh phase plan.
@@ -74,17 +75,22 @@ impl ProgressReporter for RpcProgressReporter {
             phases: phases.to_vec(),
         };
 
-        let _ = send_msgpack_notification(&self.tx, "progress_plan", plan);
+        let _ = send_msgpack_notification(&self.tx, "progress_plan", self.msgid, plan);
     }
 }
 
 /// Encode and send a MessagePack RPC notification.
 /// 编码并发送一个 MessagePack RPC notification。
-fn send_msgpack_notification<T>(tx: &mpsc::Sender<Vec<u8>>, method: &str, payload: T) -> Result<()>
+fn send_msgpack_notification<T>(
+    tx: &mpsc::Sender<Vec<u8>>,
+    method: &str,
+    msgid: u64,
+    payload: T,
+) -> Result<()>
 where
     T: Serialize,
 {
-    let notification = (2, method, payload);
+    let notification = (2, method, serde_json::json!({ "msgid": msgid, "payload": payload }));
     let encoded = rmp_serde::to_vec(&notification)?;
 
     let mut framed = Vec::with_capacity(encoded.len() + 4);
