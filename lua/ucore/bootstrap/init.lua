@@ -12,6 +12,7 @@ local M = {}
 local booting = false
 local engine_refreshing = {}
 local ready_projects = {}
+local boot_states = {}
 
 local function project_key(project_root)
 	return tostring(project_root or "")
@@ -28,6 +29,45 @@ local function set_project_ready(project_root, ready)
 	else
 		ready_projects[key] = nil
 	end
+end
+
+local function boot_key(project_root)
+	return project_key(project_root)
+end
+
+local function get_boot_state(project_root)
+	local key = boot_key(project_root)
+	boot_states[key] = boot_states[key] or {}
+	return boot_states[key]
+end
+
+local function clear_boot_state(project_root)
+	boot_states[boot_key(project_root)] = nil
+end
+
+local function mark_boot_failed(project_root)
+	local state = get_boot_state(project_root)
+	state.failed = true
+end
+
+local function finish_boot_ui(payload)
+	local state = get_boot_state(payload.project_root)
+	if state.ui_finished then
+		return
+	end
+	if state.failed then
+		return
+	end
+	if not (state.project_done and state.watch_done and state.engine_done) then
+		return
+	end
+
+	state.ui_finished = true
+	log.write_progress("boot-finish", {
+		project_root = payload.project_root,
+	})
+	status.finish("UCore Ready - Project Indexed")
+	clear_boot_state(payload.project_root)
 end
 
 -- Report boot failures through the persistent initialization status.
@@ -373,15 +413,16 @@ local function run_engine_refresh_step(payload, after_finish)
 	run_engine_refresh_if_needed(payload, function(ok, err)
 		if ok then
 			finish_engine_status("UCore Engine Index Ready")
-			if type(after_finish) == "function" then
-				after_finish(true)
-			end
-			return
+		else
+			fail_engine_status("UCore Engine Discovery Failed: " .. tostring(err))
 		end
 
-		fail_engine_status("UCore Engine Discovery Failed: " .. tostring(err))
+		local state = get_boot_state(payload.project_root)
+		state.engine_done = true
+		finish_boot_ui(payload)
+
 		if type(after_finish) == "function" then
-			after_finish(false, err)
+			after_finish(ok, err)
 		end
 	end)
 end
@@ -390,6 +431,7 @@ end
 -- 当 setup 判断数据库缺失或过期时执行 refresh。
 local function run_refresh_if_needed(payload, setup_result, callback)
 	project_code_progress(0, "Checking project refresh...")
+	local state = get_boot_state(payload.project_root)
 
 	if not setup_result.needs_full_refresh then
 		log.write_progress("boot-project-skip", {
@@ -397,6 +439,8 @@ local function run_refresh_if_needed(payload, setup_result, callback)
 			project_root = payload.project_root,
 		})
 		finish_project_skip_phases()
+		state.project_done = true
+		finish_boot_ui(payload)
 		return callback(true)
 	end
 
@@ -412,6 +456,8 @@ local function run_refresh_if_needed(payload, setup_result, callback)
 			return callback(false, err)
 		end
 
+		state.project_done = true
+		finish_boot_ui(payload)
 		callback(true)
 	end, {
 		label = "UCore Project Discovery",
@@ -462,6 +508,7 @@ function M.boot(callback, opts)
 	end
 
 	booting = true
+	clear_boot_state(payload.project_root)
 	set_project_ready(payload.project_root, false)
 	log.write_progress("boot-start", {
 		project_root = payload.project_root,
@@ -474,6 +521,7 @@ function M.boot(callback, opts)
 	server.start(function(ok, start_message)
 		if not ok then
 			booting = false
+			mark_boot_failed(payload.project_root)
 			fail(start_message)
 			return callback(false, start_message)
 		end
@@ -483,6 +531,7 @@ function M.boot(callback, opts)
 		wait_compatible(payload, false, function(ready, ready_err)
 			if not ready then
 				booting = false
+				mark_boot_failed(payload.project_root)
 				fail(tostring(ready_err), "Log: " .. tostring(server.log_path()))
 				return callback(false, ready_err)
 			end
@@ -492,6 +541,7 @@ function M.boot(callback, opts)
 			run_setup(payload, function(setup_ok, setup_result)
 				if not setup_ok then
 					booting = false
+					mark_boot_failed(payload.project_root)
 					fail(tostring(setup_result))
 					return callback(false, setup_result)
 				end
@@ -507,20 +557,21 @@ function M.boot(callback, opts)
 				local refresh_failure = nil
 				local watch_done = false
 				local watch_failure = nil
-				local finalized = false
+				local project_finalized = false
 
 				local function try_finalize()
-					if finalized then
+					if project_finalized then
 						return
 					end
 					if not (refresh_done and watch_done) then
 						return
 					end
-					finalized = true
+					project_finalized = true
 
 					local err_msg = refresh_failure or watch_failure
 					if err_msg then
 						booting = false
+						mark_boot_failed(payload.project_root)
 						fail(tostring(err_msg))
 						return callback(false, err_msg)
 					end
@@ -528,11 +579,8 @@ function M.boot(callback, opts)
 					project_finalize_progress(100)
 					booting = false
 					set_project_ready(payload.project_root, true)
-					log.write_progress("boot-finish", {
-						project_root = payload.project_root,
-					})
 					refresh_active_buffer_diagnostics()
-					status.finish("UCore Ready - Project Indexed")
+					finish_boot_ui(payload)
 					callback(true)
 				end
 
@@ -549,6 +597,8 @@ function M.boot(callback, opts)
 					if not watch_ok then
 						watch_failure = watch_err
 					end
+					local state = get_boot_state(payload.project_root)
+					state.watch_done = true
 					try_finalize()
 				end)
 
