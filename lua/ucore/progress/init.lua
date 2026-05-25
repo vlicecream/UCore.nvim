@@ -48,6 +48,7 @@ local function new_session(id, next_title, opts)
 		phase_order = clone_default_phase_order(),
 		stage_progress = {},
 		title_rendered = {},
+		title_done = {},
 		last_percent = -1,
 		last_stage = nil,
 		last_detail = nil,
@@ -102,6 +103,12 @@ end
 
 local function normalize_detail(message)
 	return vim.trim(tostring(message or ""))
+end
+
+local function apply_target_kind(session, target_kind)
+	if target_kind == "project" or target_kind == "engine" then
+		session.target_kind = target_kind
+	end
 end
 
 local function target_prefix(session)
@@ -308,10 +315,6 @@ function M.finish(message, msgid)
 	session.last_detail = nil
 	local finish_title = session.current_display_title or session.title
 	local finish_message = message or string.format("%s 100%%", finish_title)
-	if session.visible and finish_title ~= session.title and session.active_titles[session.title] then
-		session.active_titles[session.title] = nil
-		status.clear("progress:" .. session.title)
-	end
 	finish_active_titles(session, finish_message)
 	cleanup_session(session.id)
 end
@@ -331,11 +334,12 @@ function M.fail(message, msgid)
 	cleanup_session(session.id)
 end
 
-function M.handle_plan(plan, msgid)
+function M.handle_plan(plan, msgid, target_kind)
 	local session = session_by_msgid(msgid)
 	if not session or not session.active then
 		return
 	end
+	apply_target_kind(session, target_kind)
 
 	local items = normalize_plan(plan)
 	if type(items) ~= "table" then
@@ -367,11 +371,12 @@ function M.handle_plan(plan, msgid)
 	end
 end
 
-function M.handle_progress(event, msgid)
+function M.handle_progress(event, msgid, target_kind)
 	local session = session_by_msgid(msgid)
 	if not session or not session.active then
 		return
 	end
+	apply_target_kind(session, target_kind)
 
 	event = monotonic_event(session, normalize_event(event))
 	if event.stage == "complete" then
@@ -390,11 +395,6 @@ function M.handle_progress(event, msgid)
 		rendered = detail
 	elseif detail ~= "" and percent < 100 and rendered == string.format("%s 0%%", display_title) then
 		rendered = string.format("%s - %s", display_title, detail)
-	end
-
-	if session.visible and display_title ~= session.title and session.active_titles[session.title] then
-		session.active_titles[session.title] = nil
-		status.clear("progress:" .. session.title)
 	end
 
 	local same_render = rendered == session.title_rendered[display_title]
@@ -421,6 +421,7 @@ function M.handle_progress(event, msgid)
 
 	if percent >= 100 then
 		session.active_titles[display_title] = nil
+		session.title_done[display_title] = true
 		return status.progress_finish(display_title, string.format("%s 100%%", display_title))
 	end
 

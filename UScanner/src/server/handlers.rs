@@ -532,7 +532,17 @@ pub async fn handle_refresh(
     req.db_path = Some(db_path_unix.clone());
     let _ = state.save_registry();
 
-    let reporter = Arc::new(RpcProgressReporter { tx, msgid });
+    let target_kind = if req.engine_root.is_some() {
+        "project"
+    } else {
+        "engine"
+    };
+
+    let reporter = Arc::new(RpcProgressReporter {
+        tx,
+        msgid,
+        target_kind: target_kind.to_string(),
+    });
 
     let refresh_project_root = req.project_root.clone();
     tokio::task::spawn_blocking(move || refresh::run_refresh(req, reporter)).await??;

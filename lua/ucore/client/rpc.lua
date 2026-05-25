@@ -202,26 +202,30 @@ local function handle_frame(frame)
 		vim.schedule(function()
 		if method == "progress_plan" then
 			local progress_msgid = type(params) == "table" and params.msgid or nil
+			local progress_target_kind = type(params) == "table" and params.target_kind or nil
 			local progress_payload = type(params) == "table" and (params.payload or params[2] or params) or params
 			log.write_progress("rpc-progress-plan", {
 				msgid = progress_msgid,
+				target_kind = progress_target_kind,
 				phase_count = type(progress_payload) == "table" and #(progress_payload.phases or progress_payload[2] or {}) or 0,
 			})
-			progress.handle_plan(progress_payload, progress_msgid)
+			progress.handle_plan(progress_payload, progress_msgid, progress_target_kind)
 			return
 		end
 
 		if method == "progress" then
 			local progress_msgid = type(params) == "table" and params.msgid or nil
+			local progress_target_kind = type(params) == "table" and params.target_kind or nil
 			local progress_payload = type(params) == "table" and (params.payload or params[2] or params) or params
 			log.write_progress("rpc-progress", {
 				msgid = progress_msgid,
+				target_kind = progress_target_kind,
 				stage = progress_payload and (progress_payload.stage or progress_payload[2]) or nil,
 				current = progress_payload and (progress_payload.current or progress_payload[3]) or nil,
 				total = progress_payload and (progress_payload.total or progress_payload[4]) or nil,
 				message = progress_payload and (progress_payload.message or progress_payload[5]) or nil,
 			})
-			progress.handle_progress(progress_payload, progress_msgid)
+			progress.handle_progress(progress_payload, progress_msgid, progress_target_kind)
 			return
 		end
 
