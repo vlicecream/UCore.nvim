@@ -36,17 +36,33 @@ local active = false
 local title = "UCore refresh"
 local visible = true
 local stage_progress = {}
+local active_titles = {}
 local target_kind = "project"
 local current_display_title = nil
 local auto_finish = true
 
-local function finish_visible_stage(message)
+local function finish_active_titles(message)
 	if not visible then
 		return
 	end
 
-	local finish_title = current_display_title or title
-	status.progress_finish(finish_title, message or string.format("%s 100%%", finish_title))
+	local titles = {}
+	for name, active_flag in pairs(active_titles) do
+		if active_flag then
+			table.insert(titles, name)
+		end
+	end
+
+	if #titles == 0 and current_display_title then
+		table.insert(titles, current_display_title)
+	end
+
+	table.sort(titles)
+	for _, finish_title in ipairs(titles) do
+		status.progress_finish(finish_title, message or string.format("%s 100%%", finish_title))
+	end
+
+	active_titles = {}
 end
 
 -- Load the built-in overall progress plan.
@@ -65,6 +81,7 @@ local function reset()
 	last_detail = nil
 	last_tail = nil
 	stage_progress = {}
+	active_titles = {}
 	active = true
 	current_display_title = nil
 	auto_finish = true
@@ -74,7 +91,7 @@ end
 -- 使用面向用户的标题开始一次新的进度展示。
 function M.start(next_title, opts)
 	if active and current_display_title then
-		finish_visible_stage()
+		finish_active_titles()
 	end
 
 	opts = opts or {}
@@ -85,7 +102,8 @@ function M.start(next_title, opts)
 	reset()
 	auto_finish = opts.auto_finish ~= false
 	if visible then
-		status.progress(title, string.format("%s 0%%", title))
+		local initial_message = opts.detail and opts.detail ~= "" and tostring(opts.detail) or string.format("%s 0%%", title)
+		status.progress(title, initial_message)
 	end
 end
 
@@ -94,7 +112,7 @@ end
 function M.finish(message)
 	if not active then
 		if current_display_title then
-			finish_visible_stage(message)
+			finish_active_titles(message)
 		end
 		return
 	end
@@ -106,7 +124,7 @@ function M.finish(message)
 	local finish_message = message or string.format("%s 100%%", finish_title)
 	last_detail = nil
 	last_tail = nil
-	finish_visible_stage(finish_message)
+	finish_active_titles(finish_message)
 end
 
 -- Mark the current progress run as failed.
@@ -380,7 +398,13 @@ function M.handle_progress(event)
 	local is_complete = overall >= 100
 	local detail = normalize_detail(event.message)
 	local display_title = display_title_for_event(event, detail)
-	local rendered = format_progress_message(display_title, stage_percent(event))
+	local percent = stage_percent(event)
+	local rendered = format_progress_message(display_title, percent)
+	if detail ~= "" and percent <= 0 then
+		rendered = detail
+	elseif detail ~= "" and percent < 100 and rendered == string.format("%s 0%%", display_title) then
+		rendered = string.format("%s - %s", display_title, detail)
+	end
 	local same_render = overall == last_percent and event.stage == last_stage and rendered == (last_detail or "")
 
 	-- Rust owns progress throttling; Lua ignores only stale or truly duplicate events.
@@ -393,6 +417,7 @@ function M.handle_progress(event)
 	last_stage = event.stage
 	last_detail = rendered
 	last_tail = rendered:match("\n%-%-%-%- (.+)$") or detail
+	active_titles[display_title] = true
 
 	log.write_progress("progress-ui", {
 		stage = event.stage,
@@ -403,12 +428,10 @@ function M.handle_progress(event)
 		detail = detail,
 	})
 
-	if current_display_title and current_display_title ~= display_title and visible then
-		status.progress_finish(current_display_title, string.format("%s 100%%", current_display_title))
-	end
 	current_display_title = display_title
 
 	if is_complete then
+		active_titles[display_title] = nil
 		return M.finish(string.format("%s 100%%", display_title))
 	end
 
