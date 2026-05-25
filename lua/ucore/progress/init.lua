@@ -228,6 +228,10 @@ local function stage_percent(event)
 	return clamp(math.floor((current / math.max(total, 1)) * 100), 0, 100)
 end
 
+local function should_render_detail(event)
+	return event.stage == "db_write" or event.stage == "text_write"
+end
+
 local function finish_active_titles(session, message)
 	if not session.visible then
 		return
@@ -426,7 +430,9 @@ function M.handle_progress(event, msgid, target_kind)
 	local percent = stage_percent(event)
 	local overall = overall_percent(session, event)
 	local rendered = string.format("%s %d%%", display_title, percent)
-	if detail ~= "" and percent <= 0 then
+	if detail ~= "" and should_render_detail(event) then
+		rendered = string.format("%s: %s", display_title, detail)
+	elseif detail ~= "" and percent <= 0 then
 		rendered = detail
 	elseif detail ~= "" and percent < 100 and rendered == string.format("%s 0%%", display_title) then
 		rendered = string.format("%s - %s", display_title, detail)
