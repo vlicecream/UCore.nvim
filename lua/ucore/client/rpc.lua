@@ -9,9 +9,11 @@ local HEARTBEAT_INTERVAL_MS = 120000
 
 local socket = nil
 local connected = false
+local connecting = false
 local read_buffer = ""
 local next_msgid = 1
 local pending = {}
+local connect_waiters = {}
 local heartbeat_timer = nil
 local heartbeat_autocmd_registered = false
 
@@ -28,6 +30,18 @@ local function stop_heartbeat()
 			heartbeat_timer:close()
 		end)
 		heartbeat_timer = nil
+	end
+end
+
+local function flush_connect_waiters(ok, err)
+	local waiters = connect_waiters
+	connect_waiters = {}
+	connecting = false
+
+	for _, callback in ipairs(waiters) do
+		vim.schedule(function()
+			callback(ok, err)
+		end)
 	end
 end
 
@@ -288,21 +302,30 @@ function M.connect(callback)
 		return callback(true, nil)
 	end
 
+	table.insert(connect_waiters, callback)
+	if connecting then
+		return
+	end
+
+	connecting = true
 	local client = uv.new_tcp()
+	if not client then
+		close_socket()
+		flush_connect_waiters(false, "UCore RPC socket could not be created")
+		return
+	end
+
 	socket = client
 	read_buffer = ""
 
 	client:connect("127.0.0.1", config.values.port, function(err)
 		if not same_socket(client) then
-			close_socket(client)
 			return
 		end
 
 		if err then
 			close_socket(client)
-			return vim.schedule(function()
-				callback(false, err)
-			end)
+			return flush_connect_waiters(false, err)
 		end
 
 		connected = true
@@ -310,9 +333,7 @@ function M.connect(callback)
 		ensure_heartbeat()
 		send_heartbeat()
 
-		vim.schedule(function()
-			callback(true, nil)
-		end)
+		flush_connect_waiters(true, nil)
 	end)
 end
 
@@ -368,6 +389,8 @@ function M.close()
 	close_socket()
 	stop_heartbeat()
 	pending = {}
+	connect_waiters = {}
+	connecting = false
 end
 
 return M
