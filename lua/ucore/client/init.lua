@@ -59,14 +59,12 @@ function M.refresh(payload, callback, opts)
 		auto_finish = true,
 	}, opts or {})
 	local show_progress = opts.silent ~= true
-	if show_progress then
-		progress.start(refresh_progress_title(payload, opts), opts)
-	end
+	local progress_msgid = nil
 
 	rpc.request("refresh", payload, function(result, err)
 		if not err then
 			if show_progress and opts.auto_finish ~= false then
-				progress.finish()
+				progress.finish(nil, progress_msgid)
 			end
 			return callback(result, nil)
 		end
@@ -74,16 +72,23 @@ function M.refresh(payload, callback, opts)
 		local text = tostring(err)
 		if text:find("ECONNREFUSED", 1, true) or text:lower():find("connection refused", 1, true) then
 			if show_progress and opts.auto_finish ~= false then
-				progress.finish()
+				progress.finish(nil, progress_msgid)
 			end
 			return cli.refresh(payload, callback)
 		end
 
 		if show_progress then
-			progress.fail("UCore Index Failed: " .. text)
+			progress.fail("UCore Index Failed: " .. text, progress_msgid)
 		end
 		callback(nil, err)
-	end)
+	end, {
+		on_request = function(msgid)
+			progress_msgid = msgid
+			if show_progress then
+				progress.start(refresh_progress_title(payload, opts), opts, msgid)
+			end
+		end,
+	})
 end
 M.watch = cli.watch
 M.query = cli.query

@@ -361,7 +361,6 @@ local function run_engine_refresh_if_needed(payload, callback)
 	end, {
 		label = title,
 		detail = "Scanning engine...",
-		silent = true,
 	})
 end
 

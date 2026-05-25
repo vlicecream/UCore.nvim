@@ -330,6 +330,10 @@ function M.request(method, params, callback, opts)
 			partial_callback = opts.partial_callback,
 		}
 
+		if type(opts.on_request) == "function" then
+			pcall(opts.on_request, msgid)
+		end
+
 		-- Request: [0, msgid, method, params]
 		-- 请求帧：[0, msgid, method, params]
 		local payload = vim.mpack.encode({ 0, msgid, method, params or {} })

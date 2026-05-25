@@ -172,6 +172,9 @@ local function render_item_line(key, message)
 		elseif text:sub(1, #label) == label then
 			text = vim.trim(text:sub(#label + 1))
 		end
+		if text == "100%" or text == "Complete" or text == "Ready" then
+			text = ""
+		end
 		if text ~= "" then
 			text = string.format("%s: %s", label, text)
 		else

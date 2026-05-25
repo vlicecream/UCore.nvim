@@ -27,7 +27,6 @@ local default_phases = {
 local sessions = {}
 local start_order = {}
 local next_local_id = 0
-local pending_local_id = nil
 
 local function clone_default_phases()
 	return vim.deepcopy(default_phases)
@@ -238,7 +237,7 @@ local function finish_active_titles(session, message)
 
 	table.sort(titles)
 	for _, finish_title in ipairs(titles) do
-		status.progress_finish(finish_title, message or string.format("%s 100%%", finish_title))
+		status.progress_finish(finish_title, string.format("%s 100%%", finish_title))
 	end
 
 	session.active_titles = {}
@@ -247,19 +246,6 @@ end
 local function session_by_msgid(msgid)
 	if msgid ~= nil and sessions[msgid] then
 		return sessions[msgid]
-	end
-
-	if pending_local_id ~= nil then
-		local local_session = sessions[pending_local_id]
-		if local_session then
-			sessions[msgid or pending_local_id] = local_session
-			if msgid ~= nil then
-				sessions[pending_local_id] = nil
-				local_session.id = msgid
-			end
-			pending_local_id = nil
-			return local_session
-		end
 	end
 
 	if #start_order > 0 then
@@ -278,13 +264,12 @@ local function session_by_msgid(msgid)
 	return nil
 end
 
-local function register_start(next_title, opts)
+local function register_start(next_title, opts, msgid)
 	next_local_id = next_local_id + 1
-	local id = "local:" .. tostring(next_local_id)
+	local id = msgid or ("local:" .. tostring(next_local_id))
 	local session = new_session(id, next_title, opts)
 	sessions[id] = session
 	table.insert(start_order, id)
-	pending_local_id = id
 	return session
 end
 
@@ -295,13 +280,10 @@ local function cleanup_session(id)
 			table.remove(start_order, index)
 		end
 	end
-	if pending_local_id == id then
-		pending_local_id = nil
-	end
 end
 
-function M.start(next_title, opts)
-	local session = register_start(next_title, opts)
+function M.start(next_title, opts, msgid)
+	local session = register_start(next_title, opts, msgid)
 	if session.visible then
 		local initial_message = opts and opts.detail and opts.detail ~= ""
 				and tostring(opts.detail)
@@ -401,6 +383,14 @@ function M.handle_progress(event, msgid)
 		rendered = detail
 	elseif detail ~= "" and percent < 100 and rendered == string.format("%s 0%%", display_title) then
 		rendered = string.format("%s - %s", display_title, detail)
+	end
+
+	if session.visible and session.current_display_title and session.current_display_title ~= display_title then
+		status.progress_finish(
+			session.current_display_title,
+			string.format("%s 100%%", session.current_display_title)
+		)
+		session.active_titles[session.current_display_title] = nil
 	end
 
 	local same_render = overall == session.last_percent
