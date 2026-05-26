@@ -8,8 +8,9 @@ use std::time::Instant;
 use tree_sitter::{Node, Parser, Point};
 use tracing::info;
 
-use crate::server::state::CompletionCache;
 use crate::db::ensure_search_projections;
+use crate::query::member_index::{HotMemberItem, MemberHotIndex};
+use crate::server::state::CompletionCache;
 
 const MAX_COMPLETION_ITEMS: usize = 128;
 const MAX_MEMBER_ITEMS_PER_CLASS: usize = 96;
@@ -33,6 +34,7 @@ fn completion_log_enabled() -> bool {
 /// 单次补全请求里的缓存和查询上下文。
 struct CompletionContext<'a> {
     conn: &'a Connection,
+    member_index: Option<&'a MemberHotIndex>,
     file_cache: HashMap<String, Vec<String>>,
     string_id_cache: HashMap<String, i64>,
     class_id_cache: HashMap<String, Vec<i64>>,
@@ -47,6 +49,7 @@ impl<'a> CompletionContext<'a> {
     fn new(conn: &'a Connection, file_path: Option<&str>) -> Self {
         Self {
             conn,
+            member_index: None,
             file_cache: HashMap::new(),
             string_id_cache: HashMap::new(),
             class_id_cache: HashMap::new(),
@@ -54,6 +57,11 @@ impl<'a> CompletionContext<'a> {
             current_file_id: file_path.and_then(|path| get_file_id_by_full_path(conn, path)),
             included_file_ids: None,
         }
+    }
+
+    fn with_member_index(mut self, member_index: Option<&'a MemberHotIndex>) -> Self {
+        self.member_index = member_index;
+        self
     }
 
     /// Get string id from strings table.
@@ -205,6 +213,8 @@ pub fn process_completion(
     process_completion_with_engine(
         conn,
         None,
+        None,
+        None,
         content,
         line,
         character,
@@ -219,6 +229,8 @@ pub fn process_completion(
 pub fn process_completion_with_engine(
     conn: &Connection,
     engine_conn: Option<&Connection>,
+    member_index: Option<&MemberHotIndex>,
+    engine_member_index: Option<&MemberHotIndex>,
     content: &str,
     line: u32,
     character: u32,
@@ -232,8 +244,9 @@ pub fn process_completion_with_engine(
     }
     let log_enabled = completion_log_enabled();
     let started_at = Instant::now();
-    let mut ctx = CompletionContext::new(conn, file_path.as_deref());
-    let mut engine_ctx = engine_conn.map(|conn| CompletionContext::new(conn, file_path.as_deref()));
+    let mut ctx = CompletionContext::new(conn, file_path.as_deref()).with_member_index(member_index);
+    let mut engine_ctx = engine_conn
+        .map(|conn| CompletionContext::new(conn, file_path.as_deref()).with_member_index(engine_member_index));
 
     if log_enabled {
         info!(
@@ -2586,11 +2599,42 @@ fn fetch_members_recursive(
     }
 
     let mut class_ids = ctx.class_ids_by_name(&class_name)?;
-
     if class_ids.is_empty() {
         if let Some(base) = class_name.split('<').next() {
             class_ids = ctx.class_ids_by_name(base)?;
         }
+    }
+
+    if let Some(index) = ctx.member_index {
+        let items = fetch_members_from_hot_index(
+            index,
+            &class_ids,
+            &prefix,
+            accessor,
+            assume_subclass_access,
+            include_impl_members,
+            declaration_context,
+        );
+
+        if should_write_persistent_completion_cache(&prefix, declaration_context, items.len()) {
+            write_completion_cache(&cache_key, &items, &memory_cache, &persistent_cache);
+        } else {
+            write_completion_cache(&cache_key, &items, &memory_cache, &None);
+        }
+
+        if log_enabled {
+            info!(
+                target: "ucore::completion",
+                "Completion member hot-index: class={} prefix={} accessor={} items={} total_ms={}",
+                class_name,
+                prefix,
+                accessor,
+                items.len(),
+                started_at.elapsed().as_millis()
+            );
+        }
+
+        return Ok(items);
     }
 
     let mut queue = VecDeque::from(
@@ -2673,6 +2717,185 @@ fn fetch_members_recursive(
     }
 
     Ok(items)
+}
+
+fn fetch_members_from_hot_index(
+    index: &MemberHotIndex,
+    class_ids: &[i64],
+    prefix: &str,
+    accessor_class: &str,
+    assume_subclass_access: bool,
+    include_impl_members: bool,
+    declaration_context: bool,
+) -> Vec<Value> {
+    let mut seen = HashSet::new();
+    let mut matched = index
+        .collect_members_recursive_from_ids(class_ids, include_impl_members, usize::MAX)
+        .into_iter()
+        .filter_map(|item| hot_member_candidate(
+            index,
+            item,
+            prefix,
+            accessor_class,
+            assume_subclass_access,
+            declaration_context,
+            &mut seen,
+        ))
+        .collect::<Vec<_>>();
+
+    matched.sort_by(|left, right| {
+        left.sort_text
+            .cmp(&right.sort_text)
+            .then_with(|| left.label.cmp(&right.label))
+    });
+
+    matched
+        .into_iter()
+        .take(MAX_COMPLETION_ITEMS)
+        .map(HotCompletionCandidate::into_value)
+        .collect()
+}
+
+struct HotCompletionCandidate {
+    label: String,
+    kind: i64,
+    detail: String,
+    documentation: String,
+    insert_text: String,
+    insert_text_format: i64,
+    sort_text: String,
+    score_offset: i64,
+    source_class: Option<String>,
+}
+
+impl HotCompletionCandidate {
+    fn into_value(self) -> Value {
+        let mut value = json!({
+            "label": self.label,
+            "kind": self.kind,
+            "detail": self.detail,
+            "documentation": self.documentation,
+            "insertText": self.insert_text,
+            "insertTextFormat": self.insert_text_format,
+            "filterText": self.label,
+            "sortText": self.sort_text,
+            "score_offset": self.score_offset,
+        });
+
+        if let Some(source_class) = self.source_class {
+            value["labelDetails"] = json!({
+                "detail": format!(" {}", self.detail),
+                "description": source_class,
+            });
+            value["sourceClass"] = json!(source_class);
+        }
+
+        value
+    }
+}
+
+fn hot_member_candidate(
+    index: &MemberHotIndex,
+    item: HotMemberItem,
+    prefix: &str,
+    accessor_class: &str,
+    assume_subclass_access: bool,
+    declaration_context: bool,
+    seen: &mut HashSet<String>,
+) -> Option<HotCompletionCandidate> {
+    match item {
+        HotMemberItem::Member { entry, class_rank } => {
+            let match_rank = completion_match_rank(&entry.name, prefix);
+            if match_rank == COMPLETION_MATCH_NONE {
+                return None;
+            }
+
+            if !index.is_member_accessible(
+                &entry.owner_class_name,
+                accessor_class,
+                entry.access.as_deref(),
+                assume_subclass_access,
+            ) {
+                return None;
+            }
+
+            let kind = completion_kind(&entry.member_type);
+            let function_detail = if entry.member_type == "function" {
+                entry.detail.as_deref()
+            } else {
+                None
+            };
+            let detail = if entry.member_type == "function" {
+                function_completion_detail(
+                    entry.return_type.as_deref(),
+                    function_detail,
+                    Some(&entry.owner_class_name),
+                )
+            } else {
+                member_detail(entry.return_type.as_deref(), &entry.owner_class_name)
+            };
+            let dedupe_key = format!("{}:{}", entry.name, detail);
+            if !seen.insert(dedupe_key) {
+                return None;
+            }
+
+            let insert_text = if entry.member_type == "function" {
+                if declaration_context {
+                    let should_override = entry.owner_class_name != accessor_class && !entry.is_static;
+                    function_declaration_insert_text(
+                        entry.return_type.as_deref(),
+                        &entry.name,
+                        function_detail,
+                        should_override,
+                    )
+                } else {
+                    function_snippet_text(&entry.name, function_detail)
+                }
+            } else {
+                entry.name.clone()
+            };
+            let insert_text_format = if entry.member_type == "function" && !declaration_context {
+                2
+            } else {
+                1
+            };
+
+            Some(HotCompletionCandidate {
+                label: entry.name.clone(),
+                kind,
+                detail,
+                documentation: entry.detail.clone().unwrap_or_default(),
+                insert_text,
+                insert_text_format,
+                sort_text: completion_sort_text(class_rank * 1000 + match_rank, kind, &entry.name),
+                score_offset: completion_score_offset(match_rank),
+                source_class: Some(entry.owner_class_name.clone()),
+            })
+        }
+        HotMemberItem::EnumValue { entry, class_rank } => {
+            let match_rank = completion_match_rank(&entry.name, prefix);
+            if match_rank == COMPLETION_MATCH_NONE {
+                return None;
+            }
+
+            if !seen.insert(format!("enum:{}", entry.name)) {
+                return None;
+            }
+
+            let kind = 20;
+            Some(HotCompletionCandidate {
+                label: entry.name.clone(),
+                kind,
+                detail: "enum item".to_string(),
+                documentation: String::new(),
+                insert_text: entry.name.clone(),
+                insert_text_format: 1,
+                sort_text: completion_sort_text(class_rank * 1000 + match_rank, kind, &entry.name),
+                score_offset: completion_score_offset(match_rank),
+                source_class: None,
+            })
+        }
+    }
 }
 
 /// Append members from one class.
@@ -5078,6 +5301,8 @@ mod tests {
         process_completion_with_engine(
             conn,
             Some(engine_conn),
+            None,
+            None,
             &content,
             line,
             character,

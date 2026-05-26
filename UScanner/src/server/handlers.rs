@@ -1005,11 +1005,34 @@ fn handle_state_query(
                 None => None,
             };
             let engine_open_ms = engine_open_started_at.elapsed().as_millis();
+            let project_member_index = match state.get_member_hot_index(project_db_path) {
+                Ok(index) => Some(index),
+                Err(err) => {
+                    warn!("Failed to open project member hot index for {}: {}", project_db_path, err);
+                    None
+                }
+            };
+            let engine_member_index = match engine_db_path
+                .as_deref()
+                .map(normalize_to_native)
+                .filter(|path| Path::new(path).is_file())
+            {
+                Some(path) => match state.get_member_hot_index(&path) {
+                    Ok(index) => Some(index),
+                    Err(err) => {
+                        warn!("Failed to open engine member hot index for {}: {}", path, err);
+                        None
+                    }
+                },
+                None => None,
+            };
 
             let completion_core_started_at = Instant::now();
             let value = crate::completion::process_completion_with_engine(
                 conn,
                 engine_conn.as_ref(),
+                project_member_index.as_deref(),
+                engine_member_index.as_deref(),
                 &content,
                 line,
                 character,

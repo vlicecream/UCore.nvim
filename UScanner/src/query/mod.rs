@@ -10,6 +10,7 @@ pub mod class;
 pub mod config;
 pub mod file;
 pub mod goto;
+pub mod member_index;
 pub mod module;
 pub mod search;
 pub mod usage;

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::query::goto::NavigationHotIndex;
+use crate::query::member_index::MemberHotIndex;
 use crate::query::search::SearchHotIndex;
 use crate::query::usage::UsageHotIndex;
 
@@ -16,6 +17,7 @@ pub const NAVIGATION_INDEX_VERSION: u32 = 2;
 pub const SEARCH_INDEX_VERSION: u32 = 2;
 pub const USAGE_INDEX_VERSION: u32 = 3;
 pub const ASSET_INDEX_VERSION: u32 = 1;
+pub const MEMBER_INDEX_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AssetRuntimeIndex {
@@ -39,6 +41,7 @@ struct RuntimeIndexManifest {
     search_version: Option<u32>,
     usage_version: Option<u32>,
     asset_version: Option<u32>,
+    member_version: Option<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -47,6 +50,7 @@ enum RuntimeIndexKind {
     Search,
     Usage,
     Asset,
+    Member,
 }
 
 pub fn load_navigation_index(primary_db_path: &str) -> Result<Option<NavigationHotIndex>> {
@@ -117,6 +121,23 @@ pub fn save_asset_index(primary_db_path: &str, index: &AssetRuntimeIndex) -> Res
     )
 }
 
+pub fn load_member_index(primary_db_path: &str) -> Result<Option<MemberHotIndex>> {
+    load_index(
+        primary_db_path,
+        RuntimeIndexKind::Member,
+        MEMBER_INDEX_VERSION,
+    )
+}
+
+pub fn save_member_index(primary_db_path: &str, index: &MemberHotIndex) -> Result<()> {
+    save_index(
+        primary_db_path,
+        RuntimeIndexKind::Member,
+        MEMBER_INDEX_VERSION,
+        index,
+    )
+}
+
 fn load_index<T: DeserializeOwned>(
     primary_db_path: &str,
     kind: RuntimeIndexKind,
@@ -136,6 +157,7 @@ fn load_index<T: DeserializeOwned>(
         RuntimeIndexKind::Search => manifest.search_version == Some(expected_version),
         RuntimeIndexKind::Usage => manifest.usage_version == Some(expected_version),
         RuntimeIndexKind::Asset => manifest.asset_version == Some(expected_version),
+        RuntimeIndexKind::Member => manifest.member_version == Some(expected_version),
     };
     if !version_matches {
         return Ok(None);
@@ -194,6 +216,7 @@ fn save_index<T: Serialize>(
         RuntimeIndexKind::Search => manifest.search_version = Some(version),
         RuntimeIndexKind::Usage => manifest.usage_version = Some(version),
         RuntimeIndexKind::Asset => manifest.asset_version = Some(version),
+        RuntimeIndexKind::Member => manifest.member_version = Some(version),
     }
 
     let manifest_json = serde_json::to_vec_pretty(&manifest)?;
@@ -248,6 +271,7 @@ fn index_file_path(primary_db_path: &str, kind: RuntimeIndexKind) -> PathBuf {
         RuntimeIndexKind::Search => "symbol.idx",
         RuntimeIndexKind::Usage => "usage.idx",
         RuntimeIndexKind::Asset => "asset.idx",
+        RuntimeIndexKind::Member => "member.idx",
     };
     index_dir(primary_db_path).join(file_name)
 }
@@ -273,6 +297,7 @@ mod tests {
     use super::*;
     use crate::db;
     use crate::query::goto::build_navigation_hot_index;
+    use crate::query::member_index::build_member_hot_index;
     use crate::query::search::build_search_hot_index;
     use crate::query::usage::build_usage_hot_index;
     use rusqlite::Connection;
@@ -379,6 +404,27 @@ mod tests {
         let loaded = load_asset_index(db_path.to_string_lossy().as_ref())
             .unwrap()
             .expect("asset index should load");
+
+        assert_eq!(loaded.size_hint(), index.size_hint());
+
+        let _ = fs::remove_dir_all(base.join(".ucore"));
+        let _ = fs::remove_file(&db_path);
+        let _ = fs::remove_dir(&base);
+    }
+
+    #[test]
+    fn save_and_load_member_index_round_trips() {
+        let base = temp_base("member");
+        fs::create_dir_all(&base).unwrap();
+        let db_path = base.join("ucore.db");
+        let conn = Connection::open(&db_path).unwrap();
+        db::init_db(&conn).unwrap();
+
+        let index = build_member_hot_index(&conn).unwrap();
+        save_member_index(db_path.to_string_lossy().as_ref(), &index).unwrap();
+        let loaded = load_member_index(db_path.to_string_lossy().as_ref())
+            .unwrap()
+            .expect("member index should load");
 
         assert_eq!(loaded.size_hint(), index.size_hint());
 
