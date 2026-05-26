@@ -407,14 +407,50 @@ pub fn process_completion_with_engine(
                 &ty,
                 request.prefix.clone(),
                 &buffer_inheritance,
-                cache,
-                persistent_cache,
+                cache.clone(),
+                persistent_cache.clone(),
                 current_class.as_deref(),
                 false,
                 false,
             )?;
 
             let final_items = dedupe_completion_items(members);
+            let final_items = if final_items.is_empty() {
+                let unwrapped_ty = unwrap_container_type(&ty);
+                if unwrapped_ty != ty {
+                    let retry_started_at = Instant::now();
+                    let retry_members = fetch_members_with_engine(
+                        &mut ctx,
+                        engine_ctx.as_mut(),
+                        &unwrapped_ty,
+                        request.prefix.clone(),
+                        &buffer_inheritance,
+                        cache,
+                        persistent_cache,
+                        current_class.as_deref(),
+                        false,
+                        false,
+                    )?;
+                    let retry_items = dedupe_completion_items(retry_members);
+                    if log_enabled {
+                        info!(
+                            target: "ucore::completion",
+                            "Completion member container-fallback: file={} type={} element_type={} prefix={} items={} retry_ms={}",
+                            file_path.as_deref().unwrap_or("-"),
+                            ty,
+                            unwrapped_ty,
+                            request.prefix.as_deref().unwrap_or(""),
+                            retry_items.len(),
+                            retry_started_at.elapsed().as_millis()
+                        );
+                    }
+                    retry_items
+                } else {
+                    final_items
+                }
+            } else {
+                final_items
+            };
             if log_enabled {
                 info!(
                     target: "ucore::completion",
@@ -5697,6 +5733,39 @@ public:
         assert!(has_label(&items, "ParentOnly"));
         assert!(!has_label(&items, "UPROPERTY"));
         assert!(!has_label(&items, "Cast"));
+    }
+
+    #[test]
+    fn member_completion_falls_back_to_container_element_type() {
+        let conn = test_db();
+        let file_id: i64 = conn
+            .query_row("SELECT id FROM files WHERE extension = 'cpp' LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let actor_id = insert_class(&conn, "AActor", file_id);
+        insert_member(
+            &conn,
+            actor_id,
+            "GetActorLocation",
+            "function",
+            Some("FVector"),
+            "public",
+            file_id,
+        );
+
+        let items = completion_at(
+            &conn,
+            r#"
+class UMyLibrary {
+public:
+    void Test() {
+        TArray<AActor*> OverlapActors;
+        OverlapActors->GetActor/*cursor*/
+    }
+};
+"#,
+        );
+
+        assert!(has_label(&items, "GetActorLocation"));
     }
 
     #[test]
