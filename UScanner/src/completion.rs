@@ -13,7 +13,6 @@ use crate::db::ensure_search_projections;
 
 const MAX_COMPLETION_ITEMS: usize = 128;
 const MAX_MEMBER_ITEMS_PER_CLASS: usize = 96;
-const MAX_CACHED_MEMBERS_PER_CLASS: usize = 1000;
 const MAX_TYPEDEF_DEPTH: usize = 4;
 const MIN_GLOBAL_PREFIX_LEN: usize = 3;
 const MIN_ENGINE_GLOBAL_PREFIX_LEN: usize = 4;
@@ -2489,7 +2488,6 @@ fn strong_item_count(items: &[Value]) -> usize {
         .count()
 }
 
-#[allow(dead_code)]
 fn should_use_persistent_completion_cache(prefix: &str, declaration_context: bool) -> bool {
     let prefix_len = prefix.chars().count();
     if prefix_len == 0 {
@@ -2503,7 +2501,6 @@ fn should_use_persistent_completion_cache(prefix: &str, declaration_context: boo
     prefix_len >= 2
 }
 
-#[allow(dead_code)]
 fn should_write_persistent_completion_cache(
     prefix: &str,
     declaration_context: bool,
@@ -2541,15 +2538,6 @@ fn write_memory_completion_cache(
 // -----------------------------------------------------------------------------
 
 /// Fetch members recursively through inheritance.
-///
-/// Caches the **full** member set per (class, accessor, flags) instead of per
-/// (class, prefix, ...) — typing a character no longer invalidates the cache,
-/// so after the first completion lands the user can type any number of
-/// characters and each lookup is a memory hit + an in-memory filter+rank.
-///
-/// 按 (class, accessor, flags) 缓存**全部**成员，不再按 prefix 缓存——
-/// 用户首次补全后，连续输入字符都命中内存缓存，只需做 prefix 过滤排序，
-/// 不再每个字符都重新走 SQL + 文件 IO。
 /// 递归继承链获取成员补全。
 fn fetch_members_recursive(
     ctx: &mut CompletionContext,
@@ -2568,21 +2556,25 @@ fn fetch_members_recursive(
     let prefix = prefix.unwrap_or_default();
     let accessor = accessor_class.unwrap_or("");
     let cache_key = format!(
-        "completion_all:{}:{}:{}:{}:{}",
+        "completion:{}:{}:{}:{}:{}:{}",
         class_name,
+        prefix,
         accessor,
         assume_subclass_access as u8,
         include_impl_members as u8,
         declaration_context as u8,
     );
+    let persistent_cache = if should_use_persistent_completion_cache(&prefix, declaration_context) {
+        persistent_cache
+    } else {
+        None
+    };
 
-    let all_items = if let Some(items) =
-        read_completion_cache(&cache_key, &memory_cache, &persistent_cache)?
-    {
+    if let Some(items) = read_completion_cache(&cache_key, &memory_cache, &persistent_cache)? {
         if log_enabled {
             info!(
                 target: "ucore::completion",
-                "Completion cache hit (class): class={} prefix={} accessor={} cached={} total_ms={}",
+                "Completion cache hit: class={} prefix={} accessor={} items={} total_ms={}",
                 class_name,
                 prefix,
                 accessor,
@@ -2590,71 +2582,10 @@ fn fetch_members_recursive(
                 started_at.elapsed().as_millis()
             );
         }
-        items
-    } else {
-        let built = build_all_members_recursive(
-            ctx,
-            &class_name,
-            accessor,
-            assume_subclass_access,
-            include_impl_members,
-            declaration_context,
-        )?;
-
-        // Only persist to disk when the cached size is modest — big inheritance
-        // trees are fine in memory but bloat the cache DB.
-        // 持久化到磁盘只针对较小的缓存项，避免大继承树撑爆 cache DB。
-        let persistent_for_write = if built.len() <= 200 {
-            persistent_cache.clone()
-        } else {
-            None
-        };
-        write_completion_cache(&cache_key, &built, &memory_cache, &persistent_for_write);
-
-        if log_enabled {
-            info!(
-                target: "ucore::completion",
-                "Completion cache miss (class): class={} prefix={} accessor={} built={} build_ms={}",
-                class_name,
-                prefix,
-                accessor,
-                built.len(),
-                started_at.elapsed().as_millis()
-            );
-        }
-        built
-    };
-
-    let filtered = filter_and_rank_completion_items(all_items, &prefix);
-
-    if log_enabled {
-        info!(
-            target: "ucore::completion",
-            "Completion filter: class={} prefix={} returned={} total_ms={}",
-            class_name,
-            prefix,
-            filtered.len(),
-            started_at.elapsed().as_millis()
-        );
+        return Ok(items);
     }
 
-    Ok(filtered)
-}
-
-/// Walk the inheritance tree once, collecting **every** member encountered
-/// (no prefix filter, no display cap during build). The result is cached so
-/// subsequent prefix changes can filter in memory.
-/// 一次性走完继承链，收集全部成员（不带 prefix 过滤、不施加显示上限）。
-/// 结果会被缓存，后续 prefix 变化只需要在内存中过滤即可。
-fn build_all_members_recursive(
-    ctx: &mut CompletionContext,
-    class_name: &str,
-    accessor: &str,
-    assume_subclass_access: bool,
-    include_impl_members: bool,
-    declaration_context: bool,
-) -> Result<Vec<Value>> {
-    let mut class_ids = ctx.class_ids_by_name(class_name)?;
+    let mut class_ids = ctx.class_ids_by_name(&class_name)?;
 
     if class_ids.is_empty() {
         if let Some(base) = class_name.split('<').next() {
@@ -2686,7 +2617,7 @@ fn build_all_members_recursive(
             class_id,
             &current_class_name,
             class_rank,
-            "",
+            &prefix,
             accessor,
             assume_subclass_access,
             include_impl_members,
@@ -2699,7 +2630,7 @@ fn build_all_members_recursive(
             ctx.conn,
             class_id,
             class_rank,
-            "",
+            &prefix,
             &mut seen_items,
             &mut items,
         )?;
@@ -2718,63 +2649,30 @@ fn build_all_members_recursive(
             }
         }
 
-        if items.len() >= MAX_CACHED_MEMBERS_PER_CLASS {
+        if items.len() >= MAX_COMPLETION_ITEMS {
             break;
         }
     }
 
-    Ok(items)
-}
-
-/// Filter cached items by prefix and re-rank using completion_match_rank.
-/// Updates each item's sortText and score_offset so the client sees the
-/// rank derived from the current prefix.
-/// 用当前 prefix 对已缓存的全量项过滤+重新排序，并刷新 sortText/score_offset。
-fn filter_and_rank_completion_items(items: Vec<Value>, prefix: &str) -> Vec<Value> {
-    if prefix.is_empty() {
-        return items.into_iter().take(MAX_COMPLETION_ITEMS).collect();
+    if should_write_persistent_completion_cache(&prefix, declaration_context, items.len()) {
+        write_completion_cache(&cache_key, &items, &memory_cache, &persistent_cache);
+    } else {
+        write_completion_cache(&cache_key, &items, &memory_cache, &None);
     }
 
-    let mut ranked: Vec<(usize, Value)> = items
-        .into_iter()
-        .filter_map(|item| {
-            let label = item.get("label").and_then(|v| v.as_str())?;
-            let rank = completion_match_rank(label, prefix);
-            if rank == COMPLETION_MATCH_NONE {
-                None
-            } else {
-                Some((rank, item))
-            }
-        })
-        .collect();
+    if log_enabled {
+        info!(
+            target: "ucore::completion",
+            "Completion cache miss: class={} prefix={} accessor={} items={} total_ms={}",
+            class_name,
+            prefix,
+            accessor,
+            items.len(),
+            started_at.elapsed().as_millis()
+        );
+    }
 
-    // Stable sort: items with the same new rank keep their build-time order
-    // (class_rank, kind, name), so current-class members still win ties over
-    // ancestor members.
-    // 稳定排序：相同 rank 的项保持构建期顺序（class_rank, kind, name），
-    // 因此同 rank 时当前类成员仍排在父类之前。
-    ranked.sort_by_key(|(rank, _)| *rank);
-
-    ranked
-        .into_iter()
-        .take(MAX_COMPLETION_ITEMS)
-        .enumerate()
-        .map(|(index, (rank, mut item))| {
-            if let Some(obj) = item.as_object_mut() {
-                // Prefix-sensitive sort key so clients (blink / native pum)
-                // present better matches first. Encodes new rank then
-                // original arrival order to preserve class_rank within ties.
-                // 前缀敏感的排序键：先按新 rank，再保持原顺序（class_rank 优先）。
-                let new_sort_text = format!("{:06}_{:06}", rank, index);
-                obj.insert("sortText".to_string(), json!(new_sort_text));
-                obj.insert(
-                    "score_offset".to_string(),
-                    json!(completion_score_offset(rank)),
-                );
-            }
-            item
-        })
-        .collect()
+    Ok(items)
 }
 
 /// Append members from one class.
