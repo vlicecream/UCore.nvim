@@ -1005,6 +1005,7 @@ fn handle_state_query(
                 None => None,
             };
             let engine_open_ms = engine_open_started_at.elapsed().as_millis();
+            let member_index_started_at = Instant::now();
             let project_member_index = match state.get_member_hot_index(project_db_path) {
                 Ok(index) => Some(index),
                 Err(err) => {
@@ -1026,6 +1027,16 @@ fn handle_state_query(
                 },
                 None => None,
             };
+            let member_index_ms = member_index_started_at.elapsed().as_millis();
+            if query_log_enabled() {
+                info!(
+                    target: "ucore::completion",
+                    "Completion member indexes: project={} engine={} load_ms={}",
+                    project_member_index.is_some(),
+                    engine_member_index.is_some(),
+                    member_index_ms
+                );
+            }
 
             let completion_core_started_at = Instant::now();
             let value = crate::completion::process_completion_with_engine(
@@ -1044,13 +1055,14 @@ fn handle_state_query(
 
             info!(
                 target: "ucore::completion",
-                "Completion query handled: root={} file={} line={} char={} engine_db={} engine_open_ms={} core_ms={} total_ms={}",
+                "Completion query handled: root={} file={} line={} char={} engine_db={} engine_open_ms={} member_index_ms={} core_ms={} total_ms={}",
                 root_key,
                 file_path_display,
                 line,
                 character,
                 engine_conn.is_some(),
                 engine_open_ms,
+                member_index_ms,
                 completion_core_ms,
                 completion_started_at.elapsed().as_millis(),
             );

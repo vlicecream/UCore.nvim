@@ -396,7 +396,9 @@ pub fn process_completion_with_engine(
         }
 
         if let Some(ty) = ty {
+            let typedef_started_at = Instant::now();
             let ty = resolve_typedef(&mut ctx, &ty)?;
+            let typedef_ms = typedef_started_at.elapsed().as_millis();
 
             let fetch_started_at = Instant::now();
             let members = fetch_members_with_engine(
@@ -423,6 +425,18 @@ pub fn process_completion_with_engine(
                     final_items.len(),
                     started_at.elapsed().as_millis(),
                     fetch_started_at.elapsed().as_millis()
+                );
+                info!(
+                    target: "ucore::completion",
+                    "Completion member breakdown: file={} receiver={} resolved_type={} prefix={} parse_to_member_ms={} typedef_ms={} fetch_ms={} dedupe_items={}",
+                    file_path.as_deref().unwrap_or("-"),
+                    receiver_text,
+                    ty,
+                    request.prefix.as_deref().unwrap_or(""),
+                    member_started_at.elapsed().as_millis(),
+                    typedef_ms,
+                    fetch_started_at.elapsed().as_millis(),
+                    final_items.len()
                 );
             }
 
@@ -609,6 +623,8 @@ fn fetch_members_with_engine(
     assume_engine_subclass_access: bool,
     declaration_context: bool,
 ) -> Result<Vec<Value>> {
+    let log_enabled = completion_log_enabled();
+    let started_at = Instant::now();
     let mut items = fetch_members_recursive(
         ctx,
         class_name,
@@ -620,8 +636,19 @@ fn fetch_members_with_engine(
         false,
         declaration_context,
     )?;
+    if log_enabled {
+        info!(
+            target: "ucore::completion",
+            "Completion member project fetch: class={} prefix={} items={} ms={}",
+            class_name,
+            prefix.as_deref().unwrap_or(""),
+            items.len(),
+            started_at.elapsed().as_millis()
+        );
+    }
 
     for parent_name in direct_buffer_parents(buffer_inheritance, class_name) {
+        let parent_started_at = Instant::now();
         let extra = fetch_members_recursive(
             ctx,
             &parent_name,
@@ -633,15 +660,43 @@ fn fetch_members_with_engine(
             false,
             declaration_context,
         )?;
+        let extra_len = extra.len();
 
         merge_completion_items(&mut items, extra, MAX_COMPLETION_ITEMS);
+        if log_enabled {
+            info!(
+                target: "ucore::completion",
+                "Completion member buffer-parent fetch: class={} parent={} extra_items={} total_items={} ms={}",
+                class_name,
+                parent_name,
+                extra_len,
+                items.len(),
+                parent_started_at.elapsed().as_millis()
+            );
+        }
     }
 
     let Some(engine_ctx) = engine_ctx else {
         return Ok(items);
     };
 
+    let roots_started_at = Instant::now();
     let mut roots = collect_engine_member_roots(ctx, engine_ctx, class_name, buffer_inheritance)?;
+    if log_enabled {
+        let summary = roots
+            .iter()
+            .map(|(name, assume)| format!("{}:{}", name, *assume as u8))
+            .collect::<Vec<_>>()
+            .join(",");
+        info!(
+            target: "ucore::completion",
+            "Completion member engine roots: class={} prefix={} roots=[{}] root_ms={}",
+            class_name,
+            prefix.as_deref().unwrap_or(""),
+            summary,
+            roots_started_at.elapsed().as_millis()
+        );
+    }
 
     if assume_engine_subclass_access {
         let resolved = resolve_typedef(ctx, class_name)?;
@@ -654,6 +709,7 @@ fn fetch_members_with_engine(
     }
 
     for (root_name, assume_subclass_access) in roots {
+        let engine_started_at = Instant::now();
         let extra = fetch_members_recursive(
             engine_ctx,
             &root_name,
@@ -667,6 +723,28 @@ fn fetch_members_with_engine(
         )?;
 
         merge_completion_items(&mut items, extra, MAX_COMPLETION_ITEMS);
+        if log_enabled {
+            info!(
+                target: "ucore::completion",
+                "Completion member engine fetch: class={} root={} assume_subclass={} added_total={} ms={}",
+                class_name,
+                root_name,
+                assume_subclass_access,
+                items.len(),
+                engine_started_at.elapsed().as_millis()
+            );
+        }
+    }
+
+    if log_enabled {
+        info!(
+            target: "ucore::completion",
+            "Completion member with-engine done: class={} prefix={} total_items={} total_ms={}",
+            class_name,
+            prefix.as_deref().unwrap_or(""),
+            items.len(),
+            started_at.elapsed().as_millis()
+        );
     }
 
     Ok(items)
@@ -2728,9 +2806,14 @@ fn fetch_members_from_hot_index(
     include_impl_members: bool,
     declaration_context: bool,
 ) -> Vec<Value> {
+    let log_enabled = completion_log_enabled();
+    let started_at = Instant::now();
     let mut seen = HashSet::new();
-    let mut matched = index
-        .collect_members_recursive_from_ids(class_ids, include_impl_members, usize::MAX)
+    let collect_started_at = Instant::now();
+    let raw_items = index.collect_members_recursive_from_ids(class_ids, include_impl_members, usize::MAX);
+    let collect_ms = collect_started_at.elapsed().as_millis();
+    let filter_started_at = Instant::now();
+    let mut matched = raw_items
         .into_iter()
         .filter_map(|item| hot_member_candidate(
             index,
@@ -2742,18 +2825,39 @@ fn fetch_members_from_hot_index(
             &mut seen,
         ))
         .collect::<Vec<_>>();
+    let filter_ms = filter_started_at.elapsed().as_millis();
 
+    let sort_started_at = Instant::now();
     matched.sort_by(|left, right| {
         left.sort_text
             .cmp(&right.sort_text)
             .then_with(|| left.label.cmp(&right.label))
     });
+    let sort_ms = sort_started_at.elapsed().as_millis();
 
-    matched
+    let raw_count = matched.len();
+    let values = matched
         .into_iter()
         .take(MAX_COMPLETION_ITEMS)
         .map(HotCompletionCandidate::into_value)
-        .collect()
+        .collect::<Vec<_>>();
+
+    if log_enabled {
+        info!(
+            target: "ucore::completion",
+            "Completion hot-index detail: class_ids={} prefix={} raw_matched={} returned={} collect_ms={} filter_ms={} sort_ms={} total_ms={}",
+            class_ids.len(),
+            prefix,
+            raw_count,
+            values.len(),
+            collect_ms,
+            filter_ms,
+            sort_ms,
+            started_at.elapsed().as_millis()
+        );
+    }
+
+    values
 }
 
 struct HotCompletionCandidate {
