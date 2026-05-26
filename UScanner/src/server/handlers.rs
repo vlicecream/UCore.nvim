@@ -552,6 +552,7 @@ pub async fn handle_refresh(
         "refresh request finished"
     );
 
+    state.invalidate_member_hot_index(&db_path_native);
     clear_completion_cache(state, &root_key);
 
     if let Ok(conn) = state.get_connection(&db_path_native) {
@@ -3978,6 +3979,7 @@ fn drop_db_connections(state: &AppState, db_path_native: &str, cache_db_path_uni
     state.invalidate_search_hot_index(db_path_native);
     state.invalidate_navigation_hot_index(db_path_native);
     state.invalidate_usage_hot_index(db_path_native);
+    state.invalidate_member_hot_index(db_path_native);
 
     if let Some(cache_path) = cache_db_path_unix {
         let mut cache_conns = state.persistent_cache_connections.lock();

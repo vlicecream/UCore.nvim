@@ -316,6 +316,7 @@ async fn handle_source_change(
         state.invalidate_search_hot_index(&db_path_for_cache);
         state.invalidate_navigation_hot_index(&db_path_for_cache);
         state.invalidate_usage_hot_index(&db_path_for_cache);
+        state.invalidate_member_hot_index(&db_path_for_cache);
 
         let cache = state.get_completion_cache(&project.root_key);
         let mut cache = cache.lock();
