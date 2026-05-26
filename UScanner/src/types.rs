@@ -213,6 +213,9 @@ pub struct ClassInfo {
     #[serde(skip)]
     pub range_end: usize,
 
+    #[serde(skip)]
+    pub is_synthetic_impl_scope: bool,
+
     pub members: Vec<MemberInfo>,
     pub is_final: bool,
     pub is_interface: bool,

@@ -526,6 +526,7 @@ fn collect_delegate_definitions(content_bytes: &[u8]) -> Vec<ClassInfo> {
             end_line,
             range_start: macro_match.start(),
             range_end: close_paren + 1,
+            is_synthetic_impl_scope: false,
             members: Vec::new(),
             is_final: false,
             is_interface: false,
@@ -806,6 +807,7 @@ fn collect_reflected_type_fallbacks(root: Node, content: &str) -> Vec<ClassInfo>
                 end_line: line_number_for_offset(content, range_end.saturating_sub(1)),
                 range_start: macro_start,
                 range_end,
+                is_synthetic_impl_scope: false,
                 members: Vec::new(),
                 is_final: header_text.split_whitespace().any(|token| token == "final"),
                 is_interface,
@@ -1124,6 +1126,7 @@ fn collect_class_like(
         end_line: parent.end_position().row + 1,
         range_start: parent.start_byte(),
         range_end: parent.end_byte(),
+        is_synthetic_impl_scope: false,
         members: Vec::new(),
         is_final: node_has_token(parent, content_bytes, "final"),
         is_interface: node_has_child_kind(parent, "unreal_interface_macro"),
@@ -1418,7 +1421,9 @@ fn attach_pending_members(
             .iter()
             .enumerate()
             .filter(|(_, class_info)| {
-                member_start >= class_info.range_start && member_end <= class_info.range_end
+                !class_info.is_synthetic_impl_scope
+                    && member_start >= class_info.range_start
+                    && member_end <= class_info.range_end
             })
             .min_by_key(|(_, class_info)| class_info.range_end - class_info.range_start)
             .map(|(index, _)| index);
@@ -1445,6 +1450,7 @@ fn find_or_create_impl_class(classes: &mut Vec<ClassInfo>, scope: &str) -> usize
         end_line: usize::MAX,
         range_start: 0,
         range_end: usize::MAX,
+        is_synthetic_impl_scope: true,
         members: Vec::new(),
         is_final: false,
         is_interface: false,
@@ -1787,6 +1793,37 @@ struct FZoraEquipValidationResult
                 .iter()
                 .all(|class_info| class_info.class_name != "UGameplayAbility"),
             "forward-declared template argument should not be indexed as a class"
+        );
+    }
+
+    #[test]
+    fn impl_scope_does_not_capture_local_variables_as_members() {
+        let language: tree_sitter::Language = tree_sitter_unreal_cpp::LANGUAGE.into();
+        let query = Query::new(&language, QUERY_STR).expect("query should compile");
+        let content = r#"
+FVector AActor::GetPlacementExtent() const
+{
+    FBox ActorBox(ForceInit);
+    ActorBox += RootComponent->GetPlacementExtent().GetBox();
+    return FVector();
+}
+"#;
+
+        let (classes, _, _) =
+            parse_content(content, "Actor.cpp", &language, &query).expect("parse should succeed");
+
+        let actor = classes
+            .iter()
+            .find(|class_info| class_info.class_name == "AActor")
+            .expect("AActor impl scope should be indexed");
+
+        assert!(
+            actor.members.iter().any(|member| member.name == "GetPlacementExtent"),
+            "out-of-class method implementation should remain indexed"
+        );
+        assert!(
+            actor.members.iter().all(|member| member.name != "ActorBox"),
+            "local variable ActorBox must not be indexed as an AActor member"
         );
     }
 }
