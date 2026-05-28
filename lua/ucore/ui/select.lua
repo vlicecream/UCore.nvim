@@ -132,6 +132,7 @@ local function open_input_window(opts)
 	opts = opts or {}
 	local title = tostring(opts.title or opts.prompt or "Input")
 	local default = tostring(opts.default or "")
+	local secret = opts.secret == true or opts.password == true
 	local width = math.max(32, math.min(vim.o.columns - 8, math.max(48, vim.fn.strdisplaywidth(default) + 8)))
 	local row = math.max(1, math.floor(vim.o.lines * 0.3))
 	local col = math.max(0, math.floor((vim.o.columns - width) / 2))
@@ -154,6 +155,14 @@ local function open_input_window(opts)
 	vim.bo[bufnr].modifiable = true
 	vim.bo[bufnr].filetype = "ucore_input"
 	vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { default })
+	if secret then
+		vim.api.nvim_set_option_value("conceallevel", 2, { win = winid })
+		vim.api.nvim_set_option_value("concealcursor", "nivc", { win = winid })
+		vim.api.nvim_buf_call(bufnr, function()
+			vim.cmd("syntax clear")
+			vim.cmd("syntax match UCoreInputSecret /./ conceal cchar=*")
+		end)
+	end
 
 	local done = false
 	local function finish(value)
@@ -185,11 +194,15 @@ local function open_input_window(opts)
 	vim.keymap.set("n", "<Esc>", cancel, keymap_opts)
 	vim.keymap.set("i", "<Esc>", cancel, keymap_opts)
 	vim.keymap.set("n", "q", cancel, keymap_opts)
+	for _, key in ipairs({ "i", "I", "a", "A", "o", "O", "s", "S", "c", "C" }) do
+		vim.keymap.set("n", key, "<Nop>", keymap_opts)
+	end
 
 	vim.api.nvim_win_set_cursor(winid, { 1, #default })
+	pcall(vim.cmd, "startinsert!")
 	vim.schedule(function()
 		if winid and vim.api.nvim_win_is_valid(winid) then
-			vim.cmd("startinsert!")
+			pcall(vim.cmd, "startinsert!")
 		end
 	end)
 end
