@@ -13,6 +13,9 @@ function! GetUnrealCppIndent() abort
     if l:line =~# '^\s*U[A-Z0-9_]\+\s*(.*)\s*$' && l:line !~# '(\s*$'
       return indent(l:lnum)
     endif
+    if l:line =~# ';\s*$' && l:line !~# '^\s*}'
+      return indent(l:lnum)
+    endif
   endif
 
   return cindent(v:lnum)
@@ -20,5 +23,6 @@ endfunction
 
 let b:did_indent = 1
 setlocal autoindent
+setlocal nosmartindent
 setlocal cindent
 setlocal indentexpr=GetUnrealCppIndent()
