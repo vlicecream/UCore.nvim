@@ -18,6 +18,7 @@ use crate::db;
 use crate::db::project_path::get_or_create_directory;
 use crate::db::text::TextIndexFile;
 use crate::query::goto::build_navigation_hot_index;
+use crate::query::macro_index::build_macro_hot_index;
 use crate::query::member_index::build_member_hot_index;
 use crate::query::search::build_search_hot_index;
 use crate::query::usage::build_usage_hot_index;
@@ -147,6 +148,7 @@ pub fn run_refresh(req: RefreshRequest, reporter: Arc<dyn ProgressReporter>) -> 
     let search_db_path = ctx.db_path_native.clone();
     let usage_db_path = ctx.db_path_native.clone();
     let member_db_path = ctx.db_path_native.clone();
+    let macro_db_path = ctx.db_path_native.clone();
 
     let nav_handle: thread::JoinHandle<Result<()>> = thread::spawn(move || {
         let conn = open_readonly_refresh_conn(&nav_db_path)?;
@@ -172,6 +174,12 @@ pub fn run_refresh(req: RefreshRequest, reporter: Arc<dyn ProgressReporter>) -> 
         runtime_index::save_member_index(&member_db_path, &member_index)?;
         Ok(())
     });
+    let macro_handle: thread::JoinHandle<Result<()>> = thread::spawn(move || {
+        let conn = open_readonly_refresh_conn(&macro_db_path)?;
+        let macro_index = build_macro_hot_index(&conn)?;
+        runtime_index::save_macro_index(&macro_db_path, &macro_index)?;
+        Ok(())
+    });
 
     nav_handle
         .join()
@@ -185,6 +193,9 @@ pub fn run_refresh(req: RefreshRequest, reporter: Arc<dyn ProgressReporter>) -> 
     member_handle
         .join()
         .map_err(|_| anyhow!("member-index thread panicked"))??;
+    macro_handle
+        .join()
+        .map_err(|_| anyhow!("macro-index thread panicked"))??;
     reporter.report("finalizing", 100, 100, "Runtime indexes ready");
 
     reporter.report("complete", 100, 100, "Refresh complete.");

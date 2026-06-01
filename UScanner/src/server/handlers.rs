@@ -1016,13 +1016,24 @@ fn handle_state_query(
                 .filter(|path| Path::new(path).is_file())
                 .and_then(|path| load_member_hot_index(&state, &path, "completion engine"));
             let member_index_ms = member_index_started_at.elapsed().as_millis();
+            let macro_index_started_at = Instant::now();
+            let project_macro_index = load_macro_hot_index(&state, project_db_path, "completion project");
+            let engine_macro_index = engine_db_path
+                .as_deref()
+                .map(normalize_to_native)
+                .filter(|path| Path::new(path).is_file())
+                .and_then(|path| load_macro_hot_index(&state, &path, "completion engine"));
+            let macro_index_ms = macro_index_started_at.elapsed().as_millis();
             if query_log_enabled() {
                 info!(
                     target: "ucore::completion",
-                    "Completion member indexes: project={} engine={} load_ms={}",
+                    "Completion indexes: member_project={} member_engine={} macro_project={} macro_engine={} member_ms={} macro_ms={}",
                     project_member_index.is_some(),
                     engine_member_index.is_some(),
-                    member_index_ms
+                    project_macro_index.is_some(),
+                    engine_macro_index.is_some(),
+                    member_index_ms,
+                    macro_index_ms
                 );
             }
 
@@ -1032,6 +1043,8 @@ fn handle_state_query(
                 engine_conn.as_ref(),
                 project_member_index.as_deref(),
                 engine_member_index.as_deref(),
+                project_macro_index.as_deref(),
+                engine_macro_index.as_deref(),
                 &content,
                 line,
                 character,
@@ -1043,7 +1056,7 @@ fn handle_state_query(
 
             info!(
                 target: "ucore::completion",
-                "Completion query handled: root={} file={} line={} char={} engine_db={} engine_open_ms={} member_index_ms={} core_ms={} total_ms={}",
+                "Completion query handled: root={} file={} line={} char={} engine_db={} engine_open_ms={} member_index_ms={} macro_index_ms={} core_ms={} total_ms={}",
                 root_key,
                 file_path_display,
                 line,
@@ -1051,6 +1064,7 @@ fn handle_state_query(
                 engine_conn.is_some(),
                 engine_open_ms,
                 member_index_ms,
+                macro_index_ms,
                 completion_core_ms,
                 completion_started_at.elapsed().as_millis(),
             );
@@ -3413,6 +3427,23 @@ fn load_member_hot_index(
         Err(err) => {
             warn!(
                 "Failed to open member hot index for {} ({}): {}",
+                db_path, label, err
+            );
+            None
+        }
+    }
+}
+
+fn load_macro_hot_index(
+    state: &AppState,
+    db_path: &str,
+    label: &str,
+) -> Option<Arc<query::macro_index::MacroHotIndex>> {
+    match state.get_macro_hot_index(db_path) {
+        Ok(index) => Some(index),
+        Err(err) => {
+            warn!(
+                "Failed to open macro hot index for {} ({}): {}",
                 db_path, label, err
             );
             None

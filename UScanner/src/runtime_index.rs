@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::query::goto::NavigationHotIndex;
+use crate::query::macro_index::MacroHotIndex;
 use crate::query::member_index::MemberHotIndex;
 use crate::query::search::SearchHotIndex;
 use crate::query::usage::UsageHotIndex;
@@ -18,6 +19,7 @@ pub const SEARCH_INDEX_VERSION: u32 = 3;
 pub const USAGE_INDEX_VERSION: u32 = 4;
 pub const ASSET_INDEX_VERSION: u32 = 1;
 pub const MEMBER_INDEX_VERSION: u32 = 2;
+pub const MACRO_INDEX_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AssetRuntimeIndex {
@@ -42,6 +44,7 @@ struct RuntimeIndexManifest {
     usage_version: Option<u32>,
     asset_version: Option<u32>,
     member_version: Option<u32>,
+    macro_version: Option<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -51,6 +54,7 @@ enum RuntimeIndexKind {
     Usage,
     Asset,
     Member,
+    Macro,
 }
 
 pub fn load_navigation_index(primary_db_path: &str) -> Result<Option<NavigationHotIndex>> {
@@ -138,6 +142,14 @@ pub fn save_member_index(primary_db_path: &str, index: &MemberHotIndex) -> Resul
     )
 }
 
+pub fn load_macro_index(primary_db_path: &str) -> Result<Option<MacroHotIndex>> {
+    load_index(primary_db_path, RuntimeIndexKind::Macro, MACRO_INDEX_VERSION)
+}
+
+pub fn save_macro_index(primary_db_path: &str, index: &MacroHotIndex) -> Result<()> {
+    save_index(primary_db_path, RuntimeIndexKind::Macro, MACRO_INDEX_VERSION, index)
+}
+
 fn load_index<T: DeserializeOwned>(
     primary_db_path: &str,
     kind: RuntimeIndexKind,
@@ -158,6 +170,7 @@ fn load_index<T: DeserializeOwned>(
         RuntimeIndexKind::Usage => manifest.usage_version == Some(expected_version),
         RuntimeIndexKind::Asset => manifest.asset_version == Some(expected_version),
         RuntimeIndexKind::Member => manifest.member_version == Some(expected_version),
+        RuntimeIndexKind::Macro => manifest.macro_version == Some(expected_version),
     };
     if !version_matches {
         return Ok(None);
@@ -217,6 +230,7 @@ fn save_index<T: Serialize>(
         RuntimeIndexKind::Usage => manifest.usage_version = Some(version),
         RuntimeIndexKind::Asset => manifest.asset_version = Some(version),
         RuntimeIndexKind::Member => manifest.member_version = Some(version),
+        RuntimeIndexKind::Macro => manifest.macro_version = Some(version),
     }
 
     let manifest_json = serde_json::to_vec_pretty(&manifest)?;
@@ -272,6 +286,7 @@ fn index_file_path(primary_db_path: &str, kind: RuntimeIndexKind) -> PathBuf {
         RuntimeIndexKind::Usage => "usage.idx",
         RuntimeIndexKind::Asset => "asset.idx",
         RuntimeIndexKind::Member => "member.idx",
+        RuntimeIndexKind::Macro => "macro.idx",
     };
     index_dir(primary_db_path).join(file_name)
 }
@@ -297,6 +312,7 @@ mod tests {
     use super::*;
     use crate::db;
     use crate::query::goto::build_navigation_hot_index;
+    use crate::query::macro_index::build_macro_hot_index;
     use crate::query::member_index::build_member_hot_index;
     use crate::query::search::build_search_hot_index;
     use crate::query::usage::build_usage_hot_index;
@@ -313,6 +329,19 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    fn insert_test_file(conn: &Connection) {
+        conn.execute("INSERT INTO strings (id, text) VALUES (1, 'C:'), (2, 'Macro.h')", [])
+            .unwrap();
+        conn.execute("INSERT INTO directories (id, parent_id, name_id) VALUES (1, NULL, 1)", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO files (id, directory_id, filename_id, extension, is_header)
+             VALUES (1, 1, 2, 'h', 1)",
+            [],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -425,6 +454,34 @@ mod tests {
         let loaded = load_member_index(db_path.to_string_lossy().as_ref())
             .unwrap()
             .expect("member index should load");
+
+        assert_eq!(loaded.size_hint(), index.size_hint());
+
+        let _ = fs::remove_dir_all(base.join(".ucore"));
+        let _ = fs::remove_file(&db_path);
+        let _ = fs::remove_dir(&base);
+    }
+
+    #[test]
+    fn save_and_load_macro_index_round_trips() {
+        let base = temp_base("macro");
+        fs::create_dir_all(&base).unwrap();
+        let db_path = base.join("ucore.db");
+        let conn = Connection::open(&db_path).unwrap();
+        db::init_db(&conn).unwrap();
+        insert_test_file(&conn);
+        conn.execute(
+            "INSERT INTO macro_definitions (name, is_function_like, parameters, detail, line_number, file_id)
+             VALUES ('UPROPERTY', 1, '...', '#define UPROPERTY(...)', 1, 1)",
+            [],
+        )
+        .unwrap();
+
+        let index = build_macro_hot_index(&conn).unwrap();
+        save_macro_index(db_path.to_string_lossy().as_ref(), &index).unwrap();
+        let loaded = load_macro_index(db_path.to_string_lossy().as_ref())
+            .unwrap()
+            .expect("macro index should load");
 
         assert_eq!(loaded.size_hint(), index.size_hint());
 

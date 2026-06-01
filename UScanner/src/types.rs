@@ -190,6 +190,11 @@ pub struct GameplayTagInfo {
 #[derive(Debug, Clone, Serialize)]
 pub struct MacroDefinitionInfo {
     pub name: String,
+    pub is_function_like: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
     pub line: usize,
 }
 

@@ -1,6 +1,7 @@
 use anyhow::Result;
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, OnceLock};
@@ -9,6 +10,7 @@ use tree_sitter::{Node, Parser, Point};
 use tracing::info;
 
 use crate::db::ensure_search_projections;
+use crate::query::macro_index::{MacroCandidate, MacroHotIndex};
 use crate::query::member_index::{HotMemberItem, MemberHotIndex, MemberKind};
 use crate::server::state::CompletionCache;
 
@@ -17,10 +19,12 @@ const MAX_MEMBER_ITEMS_PER_CLASS: usize = 96;
 const MAX_TYPEDEF_DEPTH: usize = 4;
 const MIN_GLOBAL_PREFIX_LEN: usize = 3;
 const MIN_ENGINE_GLOBAL_PREFIX_LEN: usize = 4;
+const MAX_MACRO_ITEMS: usize = 48;
 const COMPLETION_MATCH_NONE: usize = usize::MAX;
 const STRONG_MATCH_SCORE_OFFSET: i64 = 10;
 const STRONG_MATCH_TARGET: usize = 24;
 static COMPLETION_LOG_ENABLED: OnceLock<bool> = OnceLock::new();
+static UE_SPECIFIER_TABLE: OnceLock<UeSpecifierFile> = OnceLock::new();
 
 fn completion_log_enabled() -> bool {
     *COMPLETION_LOG_ENABLED.get_or_init(|| {
@@ -215,6 +219,8 @@ pub fn process_completion(
         None,
         None,
         None,
+        None,
+        None,
         content,
         line,
         character,
@@ -231,6 +237,8 @@ pub fn process_completion_with_engine(
     engine_conn: Option<&Connection>,
     member_index: Option<&MemberHotIndex>,
     engine_member_index: Option<&MemberHotIndex>,
+    macro_index: Option<&MacroHotIndex>,
+    engine_macro_index: Option<&MacroHotIndex>,
     content: &str,
     line: u32,
     character: u32,
@@ -568,6 +576,17 @@ pub fn process_completion_with_engine(
     let keyword_items = cpp_keyword_items(&prefix);
     merge_completion_items(&mut items, keyword_items, MAX_COMPLETION_ITEMS);
 
+    if looks_like_macro_prefix(&prefix) {
+        let project_macros = macro_completion_items(macro_index, &prefix, false);
+        let engine_macros = macro_completion_items(engine_macro_index, &prefix, project_macros.is_empty());
+        let mut macro_items = project_macros;
+        merge_completion_items(&mut macro_items, engine_macros, MAX_COMPLETION_ITEMS);
+        if macro_items.is_empty() {
+            macro_items = seed_macro_items(&prefix);
+        }
+        merge_completion_items(&mut items, macro_items, MAX_COMPLETION_ITEMS);
+    }
+
     if should_offer_ue_snippets(&prefix) {
         let snippets = ue_snippets(&prefix);
         merge_completion_items(&mut items, snippets, MAX_COMPLETION_ITEMS);
@@ -575,7 +594,8 @@ pub fn process_completion_with_engine(
 
     let prefix_len = prefix.chars().count();
     let has_class_context = current_class.is_some();
-    let suppress_globals_for_class_context = has_class_context && class_member_count > 0;
+    let suppress_globals_for_class_context =
+        has_class_context && class_member_count > 0 && !declaration_context;
 
     if prefix_len >= MIN_GLOBAL_PREFIX_LEN
         && strong_item_count(&items) < STRONG_MATCH_TARGET
@@ -3541,6 +3561,113 @@ fn is_known_type(ctx: &mut CompletionContext, name: &str) -> Result<bool> {
 // Global symbols, snippets, macro specifiers
 // -----------------------------------------------------------------------------
 
+fn looks_like_macro_prefix(prefix: &str) -> bool {
+    let trimmed = prefix.trim();
+    let Some(first) = trimmed.chars().next() else {
+        return false;
+    };
+    first == '_' || first.is_ascii_uppercase()
+}
+
+fn macro_completion_items(
+    index: Option<&MacroHotIndex>,
+    prefix: &str,
+    allow_seed_fallback: bool,
+) -> Vec<Value> {
+    let Some(index) = index else {
+        return if allow_seed_fallback {
+            seed_macro_items(prefix)
+        } else {
+            Vec::new()
+        };
+    };
+
+    let items = index
+        .lookup_by_prefix(prefix, MAX_MACRO_ITEMS)
+        .into_iter()
+        .map(macro_candidate_to_item)
+        .collect::<Vec<_>>();
+
+    if items.is_empty() && allow_seed_fallback {
+        seed_macro_items(prefix)
+    } else {
+        items
+    }
+}
+
+fn macro_candidate_to_item(candidate: MacroCandidate) -> Value {
+    let MacroCandidate {
+        name,
+        parameters,
+        detail,
+        is_function_like,
+    } = candidate;
+    let detail = detail.unwrap_or_else(|| "macro definition".to_string());
+    let (insert_text, insert_text_format) =
+        macro_completion_insert_text(&name, is_function_like, parameters.as_deref());
+    let sort_text = completion_sort_text(70, 15, &name);
+
+    json!({
+        "label": name.clone(),
+        "kind": 15,
+        "detail": detail,
+        "insertText": insert_text,
+        "insertTextFormat": insert_text_format,
+        "filterText": name,
+        "sortText": sort_text,
+        "score_offset": 18,
+    })
+}
+
+fn macro_completion_insert_text(
+    name: &str,
+    is_function_like: bool,
+    parameters: Option<&str>,
+) -> (String, i64) {
+    if !is_function_like {
+        return (name.to_string(), 1);
+    }
+
+    let parameters = parameters.unwrap_or("").trim();
+    let takes_placeholder = !parameters.is_empty() && !name.starts_with("GENERATED_");
+    if takes_placeholder {
+        (format!("{}(${{1}})${{0}}", name), 2)
+    } else {
+        (format!("{}()${{0}}", name), 2)
+    }
+}
+
+fn seed_macro_items(prefix: &str) -> Vec<Value> {
+    const SEEDS: [(&str, bool); 12] = [
+        ("UCLASS", true),
+        ("USTRUCT", true),
+        ("UENUM", true),
+        ("UINTERFACE", true),
+        ("UPROPERTY", true),
+        ("UFUNCTION", true),
+        ("UPARAM", true),
+        ("UMETA", true),
+        ("GENERATED_BODY", true),
+        ("GENERATED_UCLASS_BODY", true),
+        ("GENERATED_USTRUCT_BODY", true),
+        ("UE_DEPRECATED", true),
+    ];
+
+    let prefix_lc = prefix.to_ascii_lowercase();
+    SEEDS
+        .into_iter()
+        .filter(|(name, _)| name.to_ascii_lowercase().starts_with(&prefix_lc))
+        .map(|(name, is_function_like)| {
+            macro_candidate_to_item(MacroCandidate {
+                name: name.to_string(),
+                parameters: Some(if name.starts_with("GENERATED_") { String::new() } else { "...".to_string() }),
+                detail: Some("seed macro".to_string()),
+                is_function_like,
+            })
+        })
+        .collect()
+}
+
 /// Fetch global class/struct/enum completions.
 /// 获取全局 class/struct/enum 补全。
 fn fetch_global_symbols(conn: &Connection, prefix: &str) -> Result<Vec<Value>> {
@@ -4085,14 +4212,15 @@ fn macro_specifiers(macro_name: &str, prefix: &str, in_meta: bool) -> Option<Val
         specs
             .into_iter()
             .map(|spec| {
+                let sort_text = completion_sort_text(80, 12, &spec.label);
                 json!({
-                    "label": spec.label,
+                    "label": spec.label.clone(),
                     "kind": 12,
                     "detail": spec.detail,
                     "insertText": spec.insert_text,
                     "insertTextFormat": spec.insert_text_format,
                     "filterText": spec.label,
-                    "sortText": completion_sort_text(80, 12, spec.label),
+                    "sortText": sort_text,
                     "score_offset": 16,
                 })
             })
@@ -4145,188 +4273,115 @@ fn is_in_meta_argument(text_after_open: &str) -> bool {
     after_meta.starts_with('=') || after_meta.starts_with('(')
 }
 
-#[derive(Clone, Copy)]
-struct MacroSpecifierSpec {
-    label: &'static str,
-    detail: &'static str,
-    insert_text: &'static str,
-    insert_text_format: i64,
+#[derive(Debug, Deserialize, Default)]
+struct UeSpecifierFile {
+    #[serde(default)]
+    uclass: UeSpecifierSection,
+    #[serde(default)]
+    uproperty: UeSpecifierSection,
+    #[serde(default)]
+    ufunction: UeSpecifierSection,
+    #[serde(default)]
+    ustruct: UeSpecifierSection,
+    #[serde(default)]
+    uenum: UeSpecifierSection,
+    #[serde(default)]
+    uinterface: UeSpecifierSection,
+    #[serde(default)]
+    uparam: UeSpecifierSection,
+    #[serde(default)]
+    umeta: UeSpecifierSection,
 }
 
-fn macro_plain(label: &'static str, detail: &'static str) -> MacroSpecifierSpec {
-    MacroSpecifierSpec {
-        label,
-        detail,
-        insert_text: label,
-        insert_text_format: 1,
-    }
+#[derive(Debug, Deserialize, Default)]
+struct UeSpecifierSection {
+    #[serde(default)]
+    items: Vec<UeSpecifierEntry>,
+    #[serde(default)]
+    meta: UeSpecifierEntryList,
 }
 
-fn macro_snippet(
-    label: &'static str,
-    detail: &'static str,
-    insert_text: &'static str,
-) -> MacroSpecifierSpec {
-    MacroSpecifierSpec {
-        label,
-        detail,
-        insert_text,
-        insert_text_format: 2,
-    }
+#[derive(Debug, Deserialize, Default)]
+struct UeSpecifierEntryList {
+    #[serde(default)]
+    items: Vec<UeSpecifierEntry>,
 }
 
-fn macro_specifier_specs(macro_name: &str) -> Option<Vec<MacroSpecifierSpec>> {
-    Some(match macro_name {
-        "UPROPERTY" => vec![
-            macro_plain("EditAnywhere", "property specifier"),
-            macro_plain("EditDefaultsOnly", "property specifier"),
-            macro_plain("EditInstanceOnly", "property specifier"),
-            macro_plain("VisibleAnywhere", "property specifier"),
-            macro_plain("VisibleDefaultsOnly", "property specifier"),
-            macro_plain("VisibleInstanceOnly", "property specifier"),
-            macro_plain("BlueprintReadOnly", "property specifier"),
-            macro_plain("BlueprintReadWrite", "property specifier"),
-            macro_plain("BlueprintAssignable", "property specifier"),
-            macro_plain("BlueprintCallable", "property specifier"),
-            macro_plain("Config", "property specifier"),
-            macro_plain("GlobalConfig", "property specifier"),
-            macro_plain("Transient", "property specifier"),
-            macro_plain("DuplicateTransient", "property specifier"),
-            macro_plain("SaveGame", "property specifier"),
-            macro_plain("Instanced", "property specifier"),
-            macro_plain("Replicated", "property specifier"),
-            macro_snippet(
-                "ReplicatedUsing",
-                "property specifier",
-                "ReplicatedUsing=${1:OnRep_Function}",
-            ),
-            macro_snippet("Category", "property key", "Category=\"${1:Default}\""),
-            macro_snippet("meta", "metadata key", "meta=(${1})"),
-        ],
+#[derive(Debug, Deserialize, Clone)]
+struct UeSpecifierEntry {
+    name: String,
+    #[serde(default)]
+    doc: String,
+    #[serde(default)]
+    snippet: Option<String>,
+}
 
-        "UFUNCTION" => vec![
-            macro_plain("BlueprintCallable", "function specifier"),
-            macro_plain("BlueprintPure", "function specifier"),
-            macro_plain("BlueprintImplementableEvent", "function specifier"),
-            macro_plain("BlueprintNativeEvent", "function specifier"),
-            macro_plain("BlueprintAuthorityOnly", "function specifier"),
-            macro_plain("BlueprintCosmetic", "function specifier"),
-            macro_plain("CallInEditor", "function specifier"),
-            macro_plain("Client", "network specifier"),
-            macro_plain("Server", "network specifier"),
-            macro_plain("NetMulticast", "network specifier"),
-            macro_plain("Reliable", "network specifier"),
-            macro_plain("Unreliable", "network specifier"),
-            macro_plain("WithValidation", "network specifier"),
-            macro_plain("Exec", "function specifier"),
-            macro_snippet("Category", "function key", "Category=\"${1:Default}\""),
-            macro_snippet("meta", "metadata key", "meta=(${1})"),
-        ],
-
-        "UCLASS" | "UINTERFACE" => vec![
-            macro_plain("Blueprintable", "type specifier"),
-            macro_plain("BlueprintType", "type specifier"),
-            macro_plain("Abstract", "type specifier"),
-            macro_plain("NotBlueprintable", "type specifier"),
-            macro_plain("Config", "type specifier"),
-            macro_plain("DefaultConfig", "type specifier"),
-            macro_plain("EditInlineNew", "type specifier"),
-            macro_plain("CollapseCategories", "type specifier"),
-            macro_snippet("HideCategories", "type key", "HideCategories=\"${1:Category}\""),
-            macro_snippet("ShowCategories", "type key", "ShowCategories=\"${1:Category}\""),
-            macro_snippet("ClassGroup", "type key", "ClassGroup=\"${1:Group}\""),
-            macro_snippet("meta", "metadata key", "meta=(${1})"),
-        ],
-
-        "USTRUCT" => vec![
-            macro_plain("BlueprintType", "type specifier"),
-            macro_plain("Atomic", "type specifier"),
-            macro_plain("NoExport", "type specifier"),
-            macro_snippet("meta", "metadata key", "meta=(${1})"),
-        ],
-
-        "UENUM" => vec![
-            macro_plain("BlueprintType", "enum specifier"),
-            macro_snippet("ScriptName", "enum key", "ScriptName=\"${1:Name}\""),
-            macro_snippet("meta", "metadata key", "meta=(${1})"),
-        ],
-
-        "UPARAM" | "UMETA" => meta_specifier_specs(macro_name)?,
-
-        _ => return None,
+fn ue_specifier_table() -> &'static UeSpecifierFile {
+    UE_SPECIFIER_TABLE.get_or_init(|| {
+        toml::from_str(include_str!("../data/ue_specifiers/ue5.toml"))
+            .expect("ue5 specifier table should parse")
     })
 }
 
-fn meta_specifier_specs(macro_name: &str) -> Option<Vec<MacroSpecifierSpec>> {
-    let common = vec![
-        macro_snippet("DisplayName", "metadata key", "DisplayName=\"${1:Name}\""),
-        macro_snippet("ToolTip", "metadata key", "ToolTip=\"${1:Description}\""),
-        macro_snippet("ShortToolTip", "metadata key", "ShortToolTip=\"${1:Description}\""),
-        macro_plain("DeprecatedFunction", "metadata key"),
-        macro_snippet(
-            "DeprecationMessage",
-            "metadata key",
-            "DeprecationMessage=\"${1:Message}\"",
-        ),
-        macro_plain("DevelopmentOnly", "metadata key"),
-        macro_snippet("ScriptName", "metadata key", "ScriptName=\"${1:Name}\""),
-    ];
+fn macro_specifier_specs(macro_name: &str) -> Option<Vec<MacroSpecifierSpecOwned>> {
+    macro_specifier_entries(macro_name, false).map(entries_to_specs)
+}
 
-    let labels = match macro_name {
-        "UPROPERTY" => vec![
-            macro_snippet(
-                "AllowPrivateAccess",
-                "metadata key",
-                "AllowPrivateAccess=\"${1:true}\"",
-            ),
-            macro_snippet("ClampMin", "metadata key", "ClampMin=\"${1:0}\""),
-            macro_snippet("ClampMax", "metadata key", "ClampMax=\"${1:100}\""),
-            macro_snippet("UIMin", "metadata key", "UIMin=\"${1:0}\""),
-            macro_snippet("UIMax", "metadata key", "UIMax=\"${1:100}\""),
-            macro_snippet("Units", "metadata key", "Units=\"${1:cm}\""),
-            macro_snippet("EditCondition", "metadata key", "EditCondition=\"${1:bEnabled}\""),
-            macro_plain("EditConditionHides", "metadata key"),
-            macro_plain("BindWidget", "metadata key"),
-            macro_plain("BindWidgetOptional", "metadata key"),
-            macro_plain("ExposeOnSpawn", "metadata key"),
-            macro_plain("MakeEditWidget", "metadata key"),
-            macro_plain("MultiLine", "metadata key"),
-            macro_snippet("AllowedClasses", "metadata key", "AllowedClasses=\"${1:Class}\""),
-            macro_snippet("DisallowedClasses", "metadata key", "DisallowedClasses=\"${1:Class}\""),
-        ],
+fn meta_specifier_specs(macro_name: &str) -> Option<Vec<MacroSpecifierSpecOwned>> {
+    macro_specifier_entries(macro_name, true).map(entries_to_specs)
+}
 
-        "UFUNCTION" => vec![
-            macro_snippet("WorldContext", "metadata key", "WorldContext=\"${1:WorldContextObject}\""),
-            macro_plain("CallableWithoutWorldContext", "metadata key"),
-            macro_snippet("DefaultToSelf", "metadata key", "DefaultToSelf=\"${1:Target}\""),
-            macro_snippet("HidePin", "metadata key", "HidePin=\"${1:PinName}\""),
-            macro_plain("AdvancedDisplay", "metadata key"),
-            macro_snippet("AutoCreateRefTerm", "metadata key", "AutoCreateRefTerm=\"${1:Param}\""),
-            macro_snippet("DeterminesOutputType", "metadata key", "DeterminesOutputType=\"${1:ClassParam}\""),
-            macro_snippet("ExpandEnumAsExecs", "metadata key", "ExpandEnumAsExecs=\"${1:EnumParam}\""),
-            macro_plain("Latent", "metadata key"),
-            macro_snippet("LatentInfo", "metadata key", "LatentInfo=\"${1:LatentInfo}\""),
-            macro_snippet("CompactNodeTitle", "metadata key", "CompactNodeTitle=\"${1:Title}\""),
-            macro_snippet("Keywords", "metadata key", "Keywords=\"${1:Keyword1 Keyword2}\""),
-        ],
-
-        "UCLASS" | "UINTERFACE" => vec![
-            macro_plain("BlueprintSpawnableComponent", "metadata key"),
-            macro_plain("ChildCanTick", "metadata key"),
-            macro_plain("ChildCannotTick", "metadata key"),
-            macro_plain("ShowWorldContextPin", "metadata key"),
-            macro_plain("DontUseGenericSpawnObject", "metadata key"),
-        ],
-
-        "USTRUCT" => vec![
-            macro_snippet("HasNativeMake", "metadata key", "HasNativeMake=\"${1:Module.Function}\""),
-            macro_snippet("HasNativeBreak", "metadata key", "HasNativeBreak=\"${1:Module.Function}\""),
-        ],
-        "UENUM" | "UMETA" | "UPARAM" => Vec::new(),
+fn macro_specifier_entries(macro_name: &str, in_meta: bool) -> Option<Vec<UeSpecifierEntry>> {
+    let section = match macro_name {
+        "UCLASS" => &ue_specifier_table().uclass,
+        "UPROPERTY" => &ue_specifier_table().uproperty,
+        "UFUNCTION" => &ue_specifier_table().ufunction,
+        "USTRUCT" => &ue_specifier_table().ustruct,
+        "UENUM" => &ue_specifier_table().uenum,
+        "UINTERFACE" => &ue_specifier_table().uinterface,
+        "UPARAM" => &ue_specifier_table().uparam,
+        "UMETA" => &ue_specifier_table().umeta,
         _ => return None,
     };
 
-    Some(common.into_iter().chain(labels).collect())
+    let items = if in_meta {
+        &section.meta.items
+    } else {
+        &section.items
+    };
+
+    if items.is_empty() {
+        None
+    } else {
+        Some(items.clone())
+    }
+}
+
+#[derive(Clone)]
+struct MacroSpecifierSpecOwned {
+    label: String,
+    detail: String,
+    insert_text: String,
+    insert_text_format: i64,
+}
+
+fn entries_to_specs(entries: Vec<UeSpecifierEntry>) -> Vec<MacroSpecifierSpecOwned> {
+    entries
+        .into_iter()
+        .map(|entry| MacroSpecifierSpecOwned {
+            detail: if entry.doc.trim().is_empty() {
+                "Unreal specifier".to_string()
+            } else {
+                entry.doc
+            },
+            insert_text: entry
+                .snippet
+                .clone()
+                .unwrap_or_else(|| entry.name.clone()),
+            insert_text_format: if entry.snippet.is_some() { 2 } else { 1 },
+            label: entry.name,
+        })
+        .collect()
 }
 
 /// Unreal snippets and common helpers.
@@ -5418,6 +5473,7 @@ fn get_file_id_by_full_path(conn: &Connection, file_path: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::query::macro_index::build_macro_hot_index;
     use parking_lot::Mutex as ParkingLotMutex;
     use rusqlite::Connection;
     use std::sync::Arc;
@@ -5451,6 +5507,31 @@ mod tests {
             conn,
             Some(engine_conn),
             None,
+            None,
+            None,
+            None,
+            &content,
+            line,
+            character,
+            Some(TEST_FILE.to_string()),
+            None,
+            None,
+        )
+        .unwrap()
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+    }
+
+    fn completion_at_with_macro_index(conn: &Connection, source: &str) -> Vec<Value> {
+        let (content, line, character) = source_with_cursor(source);
+        let macro_index = build_macro_hot_index(conn).unwrap();
+        process_completion_with_engine(
+            conn,
+            None,
+            None,
+            None,
+            Some(&macro_index),
             None,
             &content,
             line,
@@ -5624,6 +5705,25 @@ mod tests {
              (class_id, name_id, type_id, access, return_type_id, line_number, file_id)
              VALUES (?, ?, ?, ?, ?, 1, ?)",
             rusqlite::params![class_id, name_id, type_id, access, return_type_id, file_id],
+        )
+        .unwrap();
+    }
+
+    fn insert_macro_definition(
+        conn: &Connection,
+        name: &str,
+        is_function_like: bool,
+        parameters: Option<&str>,
+        detail: Option<&str>,
+    ) {
+        let file_id: i64 = conn
+            .query_row("SELECT id FROM files LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO macro_definitions
+             (name, is_function_like, parameters, detail, line_number, file_id)
+             VALUES (?1, ?2, ?3, ?4, 1, ?5)",
+            rusqlite::params![name, is_function_like as i64, parameters, detail, file_id],
         )
         .unwrap();
     }
@@ -5833,6 +5933,53 @@ void Test() {
                 .get("insertTextFormat")
                 .and_then(|value| value.as_i64()),
             Some(2)
+        );
+    }
+
+    #[test]
+    fn macro_hot_index_offers_function_like_macros() {
+        let conn = test_db();
+        insert_macro_definition(
+            &conn,
+            "UPROPERTY",
+            true,
+            Some("..."),
+            Some("#define UPROPERTY(...)"),
+        );
+        insert_macro_definition(
+            &conn,
+            "GENERATED_BODY",
+            true,
+            Some("..."),
+            Some("#define GENERATED_BODY(...)"),
+        );
+
+        let items = completion_at_with_macro_index(
+            &conn,
+            r#"
+void Test() {
+    UPR/*cursor*/
+}
+"#,
+        );
+        let property = item_by_label(&items, "UPROPERTY").unwrap();
+        assert_eq!(
+            property.get("insertText").and_then(Value::as_str),
+            Some("UPROPERTY(${1})${0}")
+        );
+
+        let generated = completion_at_with_macro_index(
+            &conn,
+            r#"
+void Test() {
+    GEN/*cursor*/
+}
+"#,
+        );
+        let body = item_by_label(&generated, "GENERATED_BODY").unwrap();
+        assert_eq!(
+            body.get("insertText").and_then(Value::as_str),
+            Some("GENERATED_BODY()${0}")
         );
     }
 
@@ -6094,6 +6241,22 @@ int32 Value;
 
         assert!(has_label(&items, "AllowPrivateAccess"));
         assert!(!has_label(&items, "EditAnywhere"));
+    }
+
+    #[test]
+    fn meta_context_returns_widget_animation_metadata_keys() {
+        let conn = test_db();
+        let items = completion_at(
+            &conn,
+            r#"
+UPROPERTY(meta=(Bind/*cursor*/))
+UWidgetAnimation* Intro;
+"#,
+        );
+
+        assert!(has_label(&items, "BindWidget"));
+        assert!(has_label(&items, "BindWidgetAnim"));
+        assert!(has_label(&items, "BindWidgetAnimOptional"));
     }
 
     #[test]
@@ -6688,6 +6851,31 @@ class UMyAbility : public UGame/*cursor*/
         assert!(!has_label(&items, "CancelAbility"));
         assert!(!has_label(&items, "return"));
         assert!(!has_label(&items, "UPROPERTY"));
+    }
+
+    #[test]
+    fn declaration_context_keeps_global_type_candidates() {
+        let conn = test_db();
+        let file_id: i64 = conn
+            .query_row("SELECT id FROM files WHERE extension = 'cpp' LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        insert_class(&conn, "UWidgetAnimation", file_id);
+
+        let items = completion_at(
+            &conn,
+            r#"
+class UMyWidget
+{
+public:
+    void Build()
+    {
+        UWidg/*cursor*/
+    }
+};
+"#,
+        );
+
+        assert!(has_label(&items, "UWidgetAnimation"));
     }
 
     #[test]

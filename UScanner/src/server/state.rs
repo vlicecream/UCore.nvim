@@ -13,6 +13,7 @@ use tracing::{info, warn};
 use crate::db;
 use crate::diagnostics::{VisibilityKey, VisibilityScope};
 use crate::query::goto::{build_navigation_hot_index, NavigationHotIndex};
+use crate::query::macro_index::{build_macro_hot_index, MacroHotIndex};
 use crate::query::member_index::{build_member_hot_index, MemberHotIndex};
 use crate::query::search::{build_search_hot_index, SearchHotIndex};
 use crate::query::usage::{build_usage_hot_index, UsageHotIndex};
@@ -435,6 +436,7 @@ pub struct AppState {
     pub navigation_hot_indexes: Mutex<HashMap<String, Arc<NavigationHotIndex>>>,
     pub usage_hot_indexes: Mutex<HashMap<String, Arc<UsageHotIndex>>>,
     pub member_hot_indexes: Mutex<HashMap<String, Arc<MemberHotIndex>>>,
+    pub macro_hot_indexes: Mutex<HashMap<String, Arc<MacroHotIndex>>>,
 }
 
 impl AppState {
@@ -799,6 +801,43 @@ impl AppState {
         self.member_hot_indexes.lock().remove(db_path);
     }
 
+    pub fn get_macro_hot_index(&self, db_path: &str) -> Result<Arc<MacroHotIndex>> {
+        {
+            let caches = self.macro_hot_indexes.lock();
+            if let Some(index) = caches.get(db_path) {
+                return Ok(Arc::clone(index));
+            }
+        }
+
+        let started_at = Instant::now();
+        let (index, source) = if let Some(index) = runtime_index::load_macro_index(db_path)? {
+            (Arc::new(index), "runtime")
+        } else {
+            let conn = open_read_only_connection(db_path)?;
+            let index = Arc::new(build_macro_hot_index(&conn)?);
+            if let Err(err) = runtime_index::save_macro_index(db_path, index.as_ref()) {
+                warn!("Failed to persist macro runtime index for {}: {}", db_path, err);
+            }
+            (index, "db")
+        };
+        info!(
+            "Macro hot index ready: {} source={} in {} ms",
+            db_path,
+            source,
+            started_at.elapsed().as_millis()
+        );
+
+        let mut caches = self.macro_hot_indexes.lock();
+        let existing = caches
+            .entry(db_path.to_string())
+            .or_insert_with(|| Arc::clone(&index));
+        Ok(Arc::clone(existing))
+    }
+
+    pub fn invalidate_macro_hot_index(&self, db_path: &str) {
+        self.macro_hot_indexes.lock().remove(db_path);
+    }
+
     /// Drop cached DB connections for one project.
     /// 删除某个工程相关的缓存 DB 连接。
     pub fn drop_connections(&self, db_path: &str, cache_db_path: Option<&str>) {
@@ -808,6 +847,7 @@ impl AppState {
         self.navigation_hot_indexes.lock().remove(db_path);
         self.usage_hot_indexes.lock().remove(db_path);
         self.member_hot_indexes.lock().remove(db_path);
+        self.macro_hot_indexes.lock().remove(db_path);
 
         if let Some(cache_path) = cache_db_path {
             self.persistent_cache_connections.lock().remove(cache_path);

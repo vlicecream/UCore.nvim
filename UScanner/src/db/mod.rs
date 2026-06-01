@@ -18,7 +18,7 @@ use crate::types::{ParseResult, ProgressReporter};
 ///
 /// Increment this when table structures, indexes, or stored data semantics change.
 /// 当表结构、索引或存储语义变化时递增。
-pub const DB_VERSION: i32 = 27;
+pub const DB_VERSION: i32 = 28;
 
 /// Completion cache version.
 /// 补全缓存版本。
@@ -269,6 +269,9 @@ fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
         CREATE TABLE IF NOT EXISTS macro_definitions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
+            is_function_like INTEGER NOT NULL DEFAULT 0,
+            parameters TEXT,
+            detail TEXT,
             line_number INTEGER,
             file_id INTEGER NOT NULL,
             FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
@@ -779,8 +782,8 @@ fn save_to_db_bulk_chunk(
         )?;
 
         let mut stmt_macro = tx.prepare(
-            "INSERT INTO macro_definitions (name, line_number, file_id)
-             VALUES (?1, ?2, ?3)",
+            "INSERT INTO macro_definitions (name, is_function_like, parameters, detail, line_number, file_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )?;
 
         let mut stmt_search_file = tx.prepare(
@@ -1352,8 +1355,8 @@ pub fn save_to_db_incremental(
     )?;
 
     let mut stmt_macro = tx.prepare(
-        "INSERT INTO macro_definitions (name, line_number, file_id)
-         VALUES (?1, ?2, ?3)",
+        "INSERT INTO macro_definitions (name, is_function_like, parameters, detail, line_number, file_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
     )?;
 
     let mut stmt_search_file = tx.prepare(
@@ -2352,7 +2355,10 @@ fn save_macro_definitions(
 ) -> anyhow::Result<()> {
     for macro_info in macros {
         stmt_macro.execute(params![
-            macro_info.name,
+            &macro_info.name,
+            macro_info.is_function_like as i64,
+            macro_info.parameters.as_deref(),
+            macro_info.detail.as_deref(),
             macro_info.line as i64,
             file_id,
         ])?;

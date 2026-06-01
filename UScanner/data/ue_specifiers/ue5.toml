@@ -1,0 +1,205 @@
+[uclass]
+items = [
+  { name = "Blueprintable", doc = "Allow Blueprints to subclass this class." },
+  { name = "BlueprintType", doc = "Allow this type to be used as a Blueprint variable." },
+  { name = "Abstract", doc = "Cannot be instantiated directly." },
+  { name = "MinimalAPI", doc = "Export metadata only." },
+  { name = "NotBlueprintable", doc = "Block Blueprint subclassing." },
+  { name = "Placeable", doc = "Object can be placed in a level." },
+  { name = "NotPlaceable", doc = "Object cannot be placed in a level." },
+  { name = "DefaultToInstanced", doc = "" },
+  { name = "EditInlineNew", doc = "" },
+  { name = "Transient", doc = "" },
+  { name = "Config", snippet = "Config=${1:Game}" },
+  { name = "Within", snippet = "Within=${1:Outer}" },
+  { name = "ClassGroup", snippet = "ClassGroup=(${1:Common})" },
+  { name = "HideCategories", snippet = "HideCategories=(${1})" },
+  { name = "ShowCategories", snippet = "ShowCategories=(${1})" },
+  { name = "meta", snippet = "meta=(${1})" },
+]
+
+[uclass.meta]
+items = [
+  { name = "DisplayName", snippet = "DisplayName=\"${1}\"" },
+  { name = "ToolTip", snippet = "ToolTip=\"${1}\"" },
+  { name = "ShortToolTip", snippet = "ShortToolTip=\"${1}\"" },
+  { name = "BlueprintSpawnableComponent", doc = "" },
+  { name = "ChildCanTick", doc = "" },
+  { name = "ChildCannotTick", doc = "" },
+  { name = "DeprecatedNode", doc = "" },
+  { name = "RestrictedToClasses", snippet = "RestrictedToClasses=\"${1}\"" },
+  { name = "ShowWorldContextPin", doc = "" },
+]
+
+[uproperty]
+items = [
+  { name = "EditAnywhere", doc = "Editable on archetypes and instances." },
+  { name = "EditDefaultsOnly", doc = "Editable on archetypes only." },
+  { name = "EditInstanceOnly", doc = "Editable on instances only." },
+  { name = "VisibleAnywhere", doc = "Visible in editor, not editable." },
+  { name = "VisibleDefaultsOnly", doc = "" },
+  { name = "VisibleInstanceOnly", doc = "" },
+  { name = "BlueprintReadWrite", doc = "" },
+  { name = "BlueprintReadOnly", doc = "" },
+  { name = "BlueprintAssignable", doc = "" },
+  { name = "BlueprintCallable", doc = "" },
+  { name = "Transient", doc = "" },
+  { name = "Config", doc = "" },
+  { name = "GlobalConfig", doc = "" },
+  { name = "Replicated", doc = "" },
+  { name = "ReplicatedUsing", snippet = "ReplicatedUsing=${1:OnRep_Foo}" },
+  { name = "SaveGame", doc = "" },
+  { name = "Interp", doc = "" },
+  { name = "DuplicateTransient", doc = "" },
+  { name = "NonPIETransient", doc = "" },
+  { name = "TextExportTransient", doc = "" },
+  { name = "AssetRegistrySearchable", doc = "" },
+  { name = "Instanced", doc = "" },
+  { name = "SkipSerialization", doc = "" },
+  { name = "Category", snippet = "Category=\"${1:Default}\"" },
+  { name = "meta", snippet = "meta=(${1})" },
+]
+
+[uproperty.meta]
+items = [
+  { name = "BindWidget", doc = "Auto-bind to widget in Blueprint." },
+  { name = "BindWidgetOptional", doc = "Auto-bind if exists." },
+  { name = "BindWidgetAnim", doc = "Auto-bind to animation in Widget Blueprint." },
+  { name = "BindWidgetAnimOptional", doc = "Auto-bind to animation if exists." },
+  { name = "AllowPrivateAccess", snippet = "AllowPrivateAccess=\"${1:true}\"" },
+  { name = "AllowedClasses", snippet = "AllowedClasses=\"${1}\"" },
+  { name = "DisallowedClasses", snippet = "DisallowedClasses=\"${1}\"" },
+  { name = "ExposeOnSpawn", doc = "" },
+  { name = "ExposeFunctionCategories", snippet = "ExposeFunctionCategories=\"${1}\"" },
+  { name = "ClampMin", snippet = "ClampMin=\"${1:0}\"" },
+  { name = "ClampMax", snippet = "ClampMax=\"${1:100}\"" },
+  { name = "UIMin", snippet = "UIMin=\"${1:0}\"" },
+  { name = "UIMax", snippet = "UIMax=\"${1:100}\"" },
+  { name = "Units", snippet = "Units=\"${1:cm}\"" },
+  { name = "EditCondition", snippet = "EditCondition=\"${1}\"" },
+  { name = "InlineEditConditionToggle", doc = "" },
+  { name = "EditConditionHides", doc = "" },
+  { name = "DisplayName", snippet = "DisplayName=\"${1}\"" },
+  { name = "ToolTip", snippet = "ToolTip=\"${1}\"" },
+  { name = "ShortToolTip", snippet = "ShortToolTip=\"${1}\"" },
+  { name = "MakeStructureDefaultValue", snippet = "MakeStructureDefaultValue=\"${1}\"" },
+  { name = "GetOptions", snippet = "GetOptions=\"${1}\"" },
+  { name = "DisplayAfter", snippet = "DisplayAfter=\"${1}\"" },
+  { name = "DisplayPriority", snippet = "DisplayPriority=\"${1:1}\"" },
+  { name = "EditFixedSize", doc = "" },
+  { name = "TitleProperty", snippet = "TitleProperty=\"${1}\"" },
+  { name = "MultiLine", doc = "" },
+  { name = "PasswordField", doc = "" },
+]
+
+[ufunction]
+items = [
+  { name = "BlueprintCallable", doc = "" },
+  { name = "BlueprintPure", doc = "" },
+  { name = "BlueprintImplementableEvent", doc = "" },
+  { name = "BlueprintNativeEvent", doc = "" },
+  { name = "BlueprintAuthorityOnly", doc = "" },
+  { name = "BlueprintCosmetic", doc = "" },
+  { name = "Category", snippet = "Category=\"${1:Default}\"" },
+  { name = "Server", doc = "" },
+  { name = "Client", doc = "" },
+  { name = "NetMulticast", doc = "" },
+  { name = "Reliable", doc = "" },
+  { name = "Unreliable", doc = "" },
+  { name = "WithValidation", doc = "" },
+  { name = "Exec", doc = "" },
+  { name = "CallInEditor", doc = "" },
+  { name = "CustomThunk", doc = "" },
+  { name = "meta", snippet = "meta=(${1})" },
+]
+
+[ufunction.meta]
+items = [
+  { name = "WorldContext", snippet = "WorldContext=\"${1:WorldContextObject}\"" },
+  { name = "DefaultToSelf", snippet = "DefaultToSelf=\"${1}\"" },
+  { name = "HidePin", snippet = "HidePin=\"${1}\"" },
+  { name = "ExpandEnumAsExecs", snippet = "ExpandEnumAsExecs=\"${1}\"" },
+  { name = "AutoCreateRefTerm", snippet = "AutoCreateRefTerm=\"${1}\"" },
+  { name = "DeterminesOutputType", snippet = "DeterminesOutputType=\"${1}\"" },
+  { name = "DisplayName", snippet = "DisplayName=\"${1}\"" },
+  { name = "ToolTip", snippet = "ToolTip=\"${1}\"" },
+  { name = "ShortToolTip", snippet = "ShortToolTip=\"${1}\"" },
+  { name = "Keywords", snippet = "Keywords=\"${1}\"" },
+  { name = "AdvancedDisplay", snippet = "AdvancedDisplay=\"${1}\"" },
+  { name = "DeprecatedFunction", doc = "" },
+  { name = "DeprecationMessage", snippet = "DeprecationMessage=\"${1}\"" },
+  { name = "BlueprintInternalUseOnly", doc = "" },
+  { name = "CallableWithoutWorldContext", doc = "" },
+  { name = "Latent", doc = "" },
+  { name = "LatentInfo", snippet = "LatentInfo=\"${1:LatentInfo}\"" },
+  { name = "CompactNodeTitle", snippet = "CompactNodeTitle=\"${1}\"" },
+]
+
+[ustruct]
+items = [
+  { name = "BlueprintType", doc = "" },
+  { name = "NoExport", doc = "" },
+  { name = "Atomic", doc = "" },
+  { name = "Immutable", doc = "" },
+  { name = "HasDefaults", doc = "" },
+  { name = "HasNoOpConstructor", doc = "" },
+  { name = "IsAlwaysAccessible", doc = "" },
+  { name = "meta", snippet = "meta=(${1})" },
+]
+
+[ustruct.meta]
+items = [
+  { name = "DisplayName", snippet = "DisplayName=\"${1}\"" },
+  { name = "ToolTip", snippet = "ToolTip=\"${1}\"" },
+  { name = "HasNativeMake", snippet = "HasNativeMake=\"${1:Module.Function}\"" },
+  { name = "HasNativeBreak", snippet = "HasNativeBreak=\"${1:Module.Function}\"" },
+]
+
+[uenum]
+items = [
+  { name = "BlueprintType", doc = "" },
+  { name = "ScriptName", snippet = "ScriptName=\"${1:Name}\"" },
+  { name = "meta", snippet = "meta=(${1})" },
+]
+
+[uenum.meta]
+items = [
+  { name = "DisplayName", snippet = "DisplayName=\"${1}\"" },
+  { name = "ToolTip", snippet = "ToolTip=\"${1}\"" },
+]
+
+[uinterface]
+items = [
+  { name = "Blueprintable", doc = "" },
+  { name = "BlueprintType", doc = "" },
+  { name = "MinimalAPI", doc = "" },
+  { name = "NotBlueprintable", doc = "" },
+  { name = "CannotImplementInterfaceInBlueprint", doc = "" },
+  { name = "meta", snippet = "meta=(${1})" },
+]
+
+[uinterface.meta]
+items = [
+  { name = "DisplayName", snippet = "DisplayName=\"${1}\"" },
+  { name = "ToolTip", snippet = "ToolTip=\"${1}\"" },
+]
+
+[uparam]
+items = [
+  { name = "ref", doc = "" },
+  { name = "DisplayName", snippet = "DisplayName=\"${1}\"" },
+  { name = "meta", snippet = "meta=(${1})" },
+]
+
+[uparam.meta]
+items = [
+  { name = "DisplayName", snippet = "DisplayName=\"${1}\"" },
+  { name = "ToolTip", snippet = "ToolTip=\"${1}\"" },
+]
+
+[umeta]
+items = [
+  { name = "DisplayName", snippet = "DisplayName=\"${1}\"" },
+  { name = "ToolTip", snippet = "ToolTip=\"${1}\"" },
+  { name = "ShortToolTip", snippet = "ShortToolTip=\"${1}\"" },
+]

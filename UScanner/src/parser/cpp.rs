@@ -25,7 +25,6 @@ struct CleanRegexes {
 static CLEAN_REGEXES: OnceLock<CleanRegexes> = OnceLock::new();
 static GAMEPLAY_TAG_DEFINE_RE: OnceLock<Regex> = OnceLock::new();
 static GAMEPLAY_TAG_DECLARE_RE: OnceLock<Regex> = OnceLock::new();
-static MACRO_DEFINE_RE: OnceLock<Regex> = OnceLock::new();
 static DELEGATE_MACRO_START_RE: OnceLock<Regex> = OnceLock::new();
 
 fn get_clean_regexes() -> &'static CleanRegexes {
@@ -91,15 +90,6 @@ fn gameplay_tag_declare_re() -> &'static Regex {
             (?P<identifier>[A-Za-z_][A-Za-z0-9_]*)
             \s*\)
             "#,
-        )
-        .unwrap()
-    })
-}
-
-fn macro_define_re() -> &'static Regex {
-    MACRO_DEFINE_RE.get_or_init(|| {
-        Regex::new(
-            r#"(?m)^[ \t]*#[ \t]*define[ \t]+(?P<identifier>[A-Za-z_][A-Za-z0-9_]*)\b"#,
         )
         .unwrap()
     })
@@ -464,15 +454,99 @@ fn collect_macro_definitions(content_bytes: &[u8]) -> Vec<crate::types::MacroDef
     };
 
     let mut items = Vec::new();
+    let mut offset = 0usize;
 
-    for caps in macro_define_re().captures_iter(content) {
-        let (Some(full), Some(identifier)) = (caps.get(0), caps.name("identifier")) else {
+    while offset < content.len() {
+        let line_start = offset;
+        let line_end = content[offset..]
+            .find('\n')
+            .map(|index| offset + index)
+            .unwrap_or(content.len());
+        let physical_line = &content[line_start..line_end];
+        let next_offset = if line_end < content.len() {
+            line_end + 1
+        } else {
+            content.len()
+        };
+        offset = next_offset;
+
+        let trimmed = physical_line.trim_start();
+        let Some(after_hash) = trimmed.strip_prefix('#') else {
+            continue;
+        };
+        let after_hash = after_hash.trim_start();
+        let Some(after_define) = after_hash.strip_prefix("define") else {
             continue;
         };
 
+        if after_define
+            .chars()
+            .next()
+            .is_some_and(|ch| !ch.is_whitespace())
+        {
+            continue;
+        }
+
+        let mut logical = physical_line.to_string();
+        let mut continuation_offset = offset;
+        while logical.trim_end().ends_with('\\') && continuation_offset < content.len() {
+            let continuation_end = content[continuation_offset..]
+                .find('\n')
+                .map(|index| continuation_offset + index)
+                .unwrap_or(content.len());
+            logical.push('\n');
+            logical.push_str(&content[continuation_offset..continuation_end]);
+            continuation_offset = if continuation_end < content.len() {
+                continuation_end + 1
+            } else {
+                content.len()
+            };
+        }
+        offset = continuation_offset.max(offset);
+
+        let detail = logical.trim().chars().take(240).collect::<String>();
+        let after_define = after_define.trim_start();
+        let name_end = after_define
+            .char_indices()
+            .find(|(_, ch)| !matches!(ch, 'A'..='Z' | 'a'..='z' | '0'..='9' | '_'))
+            .map(|(index, _)| index)
+            .unwrap_or(after_define.len());
+        if name_end == 0 {
+            continue;
+        }
+
+        let name = &after_define[..name_end];
+        let rest = after_define[name_end..].trim_start();
+        let (is_function_like, parameters, detail) =
+            if let Some(after_open) = rest.strip_prefix('(') {
+                if let Some(close) = after_open.find(')') {
+                    let parameters = after_open[..close].trim().to_string();
+                    let body = after_open[close + 1..].trim();
+                    let detail = if body.is_empty() {
+                        detail.clone()
+                    } else {
+                        body.chars().take(240).collect()
+                    };
+                    (true, Some(parameters), Some(detail))
+                } else {
+                    continue;
+                }
+            } else {
+                let body = rest.trim();
+                let detail = if body.is_empty() {
+                    Some(detail.clone())
+                } else {
+                    Some(body.chars().take(240).collect())
+                };
+                (false, None, detail)
+            };
+
         items.push(crate::types::MacroDefinitionInfo {
-            name: identifier.as_str().to_string(),
-            line: line_number_for_offset(content, full.start()),
+            name: name.to_string(),
+            is_function_like,
+            parameters,
+            detail,
+            line: line_number_for_offset(content, line_start),
         });
     }
 
@@ -1619,12 +1693,18 @@ UE_DEFINE_GAMEPLAY_TAG_COMMENT(TAG_Status_Death, "Status.Death", "desc");
         let content = br#"
 #define SIMPLE_MACRO 1
  # define FUNCTION_LIKE(Value) (Value)
+#define GENERATED_BODY(...)
 "#;
 
         let macros = collect_macro_definitions(content);
-        assert_eq!(macros.len(), 2);
+        assert_eq!(macros.len(), 3);
         assert_eq!(macros[0].name, "SIMPLE_MACRO");
+        assert!(!macros[0].is_function_like);
         assert_eq!(macros[1].name, "FUNCTION_LIKE");
+        assert!(macros[1].is_function_like);
+        assert_eq!(macros[1].parameters.as_deref(), Some("Value"));
+        assert_eq!(macros[2].name, "GENERATED_BODY");
+        assert_eq!(macros[2].parameters.as_deref(), Some("..."));
     }
 
     #[test]

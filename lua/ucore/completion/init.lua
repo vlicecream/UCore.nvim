@@ -207,6 +207,107 @@ local function normalize_items(result)
 	return items
 end
 
+local function decode_completed_user_data()
+	local completed = vim.v.completed_item or {}
+	local user_data = completed.user_data
+	if type(user_data) ~= "string" or user_data == "" then
+		return nil, completed
+	end
+
+	local ok, item = pcall(vim.json.decode, user_data)
+	if not ok or type(item) ~= "table" then
+		return nil, completed
+	end
+
+	return item, completed
+end
+
+local function render_fallback_snippet(snippet)
+	local out = {}
+	local i = 1
+	local cursor_byte = nil
+
+	while i <= #snippet do
+		local brace_start, brace_end, index, default = snippet:find("^%${(%d+):([^}]*)}", i)
+		if brace_start then
+			table.insert(out, default or "")
+			if cursor_byte == nil and tonumber(index) == 1 then
+				cursor_byte = #table.concat(out, "")
+			end
+			i = brace_end + 1
+		else
+			local bare_start, bare_end, bare_index = snippet:find("^%${(%d+)}", i)
+			if bare_start then
+				if cursor_byte == nil and tonumber(bare_index) <= 1 then
+					cursor_byte = #table.concat(out, "")
+				end
+				i = bare_end + 1
+			else
+				local short_start, short_end, short_index = snippet:find("^%$(%d+)", i)
+				if short_start then
+					if cursor_byte == nil and tonumber(short_index) <= 1 then
+						cursor_byte = #table.concat(out, "")
+					end
+					i = short_end + 1
+				else
+					table.insert(out, snippet:sub(i, i))
+					i = i + 1
+				end
+			end
+		end
+	end
+
+	local text = table.concat(out, "")
+	return text, cursor_byte or #text
+end
+
+local function expand_completed_snippet()
+	local item, completed = decode_completed_user_data()
+	if not item then
+		return
+	end
+
+	if tonumber(item.insertTextFormat or item.insert_text_format) ~= INSERT_TEXT_FORMAT_SNIPPET then
+		return
+	end
+
+	local snippet = item.insertText or item.insert_text
+	if type(snippet) ~= "string" or snippet == "" then
+		return
+	end
+
+	local word = completed.word or completed.abbr or item.label or ""
+	if type(word) ~= "string" or word == "" then
+		return
+	end
+
+	vim.schedule(function()
+		if not is_insert_mode() then
+			return
+		end
+
+		local row, col = unpack(vim.api.nvim_win_get_cursor(0))
+		local start_col = math.max(col - #word, 0)
+		vim.api.nvim_buf_set_text(0, row - 1, start_col, row - 1, col, { "" })
+		vim.api.nvim_win_set_cursor(0, { row, start_col })
+
+		if vim.snippet and type(vim.snippet.expand) == "function" then
+			vim.snippet.expand(snippet)
+			return
+		end
+
+		local ok, luasnip = pcall(require, "luasnip")
+		if ok and type(luasnip.lsp_expand) == "function" then
+			luasnip.lsp_expand(snippet)
+			return
+		end
+
+		local text, cursor_byte = render_fallback_snippet(snippet)
+		vim.api.nvim_buf_set_text(0, row - 1, start_col, row - 1, start_col, vim.split(text, "\n", { plain = true }))
+		vim.api.nvim_win_set_cursor(0, { row, start_col + cursor_byte })
+	end)
+end
+
 -- Request completions from Rust for the current cursor position.
 -- 根据当前光标位置向 Rust 请求补全。
 function M.request(opts, callback)
@@ -459,6 +560,11 @@ function M.setup()
 	vim.api.nvim_create_autocmd({ "TextChangedI" }, {
 		group = group,
 		callback = schedule_auto_complete,
+	})
+
+	vim.api.nvim_create_autocmd({ "CompleteDone" }, {
+		group = group,
+		callback = expand_completed_snippet,
 	})
 end
 

@@ -57,6 +57,7 @@ async fn main() -> Result<()> {
         navigation_hot_indexes: Mutex::new(HashMap::new()),
         usage_hot_indexes: Mutex::new(HashMap::new()),
         member_hot_indexes: Mutex::new(HashMap::new()),
+        macro_hot_indexes: Mutex::new(HashMap::new()),
     });
 
     spawn_watch_event_loop(state.clone(), watch_rx);
