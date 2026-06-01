@@ -1,4 +1,5 @@
 use anyhow::Result;
+use blake3::Hasher;
 use regex::Regex;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
@@ -6,18 +7,35 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tree_sitter::Parser;
 use tracing::info;
 
 use crate::types::OpenBufferOverlay;
+use crate::query::member_index::MemberHotIndex;
 use crate::query::usage::UsageHotIndex;
 
 const PROJECT_TEXT_VISIBILITY_SCAN_LIMIT: usize = 64;
 const ENGINE_TEXT_VISIBILITY_SCAN_LIMIT: usize = 64;
 
 static DIAGNOSTICS_LOG_ENABLED: OnceLock<bool> = OnceLock::new();
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct VisibilityKey {
+    pub file_path: String,
+    pub include_block_hash: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct VisibilityScope {
+    pub project_visible_file_ids: Arc<HashSet<i64>>,
+    pub engine_visible_file_ids: Arc<HashSet<i64>>,
+    pub engine_seed_include_paths: Arc<HashSet<String>>,
+    pub include_paths: Arc<HashSet<String>>,
+    pub project_db_mtime_secs: u64,
+    pub engine_db_mtime_secs: u64,
+}
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -83,6 +101,9 @@ pub fn process_diagnostics(
         engine_conn,
         None,
         None,
+        None,
+        None,
+        None,
         content,
         file_path,
         open_files,
@@ -94,6 +115,9 @@ pub fn process_diagnostics_with_hot_indexes(
     engine_conn: Option<&Connection>,
     usage_hot_index: Option<&UsageHotIndex>,
     engine_usage_hot_index: Option<&UsageHotIndex>,
+    member_hot_index: Option<&MemberHotIndex>,
+    engine_member_hot_index: Option<&MemberHotIndex>,
+    visibility_scope: Option<&VisibilityScope>,
     content: &str,
     file_path: Option<String>,
     open_files: &[OpenBufferOverlay],
@@ -101,6 +125,8 @@ pub fn process_diagnostics_with_hot_indexes(
     let mut items = Vec::new();
     let log_enabled = diagnostics_log_enabled();
     let file_label = file_path.as_deref().unwrap_or("-");
+    let parsed_tree = parse_diagnostics_tree(content)?;
+    let parsed_root = parsed_tree.as_ref().map(|tree| tree.root_node());
 
     extend_diagnostic_phase(
         &mut items,
@@ -121,28 +147,28 @@ pub fn process_diagnostics_with_hot_indexes(
         "missing_return",
         file_label,
         log_enabled,
-        || missing_return_diagnostics(content, file_path.as_deref()),
+        || missing_return_diagnostics(content, file_path.as_deref(), parsed_root),
     )?;
     extend_diagnostic_phase(
         &mut items,
         "override_rules",
         file_label,
         log_enabled,
-        || override_diagnostics(conn, engine_conn, content, file_path.as_deref()),
+        || override_diagnostics(conn, engine_conn, content, file_path.as_deref(), parsed_root),
     )?;
     extend_diagnostic_phase(
         &mut items,
         "member_syntax",
         file_label,
         log_enabled,
-        || member_syntax_diagnostics(content, file_path.as_deref()),
+        || member_syntax_diagnostics(content, file_path.as_deref(), parsed_root),
     )?;
     extend_diagnostic_phase(
         &mut items,
         "super_calls",
         file_label,
         log_enabled,
-        || super_call_diagnostics(conn, engine_conn, content, file_path.as_deref()),
+        || super_call_diagnostics(conn, engine_conn, content, file_path.as_deref(), parsed_root),
     )?;
     extend_diagnostic_phase(
         &mut items,
@@ -155,8 +181,10 @@ pub fn process_diagnostics_with_hot_indexes(
                 engine_conn,
                 usage_hot_index,
                 engine_usage_hot_index,
+                visibility_scope,
                 content,
                 file_path.as_deref(),
+                parsed_root,
             )
         },
     )?;
@@ -165,42 +193,56 @@ pub fn process_diagnostics_with_hot_indexes(
         "unknown_symbols",
         file_label,
         log_enabled,
-        || unknown_symbol_diagnostics(conn, engine_conn, content, file_path.as_deref()),
+        || unknown_symbol_diagnostics(
+            conn,
+            engine_conn,
+            member_hot_index,
+            engine_member_hot_index,
+            content,
+            file_path.as_deref(),
+            parsed_root,
+        ),
     )?;
     extend_diagnostic_phase(
         &mut items,
         "incomplete_member_decl",
         file_label,
         log_enabled,
-        || incomplete_member_declaration_diagnostics(content, file_path.as_deref()),
+        || incomplete_member_declaration_diagnostics(content, file_path.as_deref(), parsed_root),
     )?;
     extend_diagnostic_phase(
         &mut items,
         "invalid_member_token",
         file_label,
         log_enabled,
-        || invalid_member_token_diagnostics(content, file_path.as_deref()),
+        || invalid_member_token_diagnostics(content, file_path.as_deref(), parsed_root),
     )?;
     extend_diagnostic_phase(
         &mut items,
         "invalid_expression_token",
         file_label,
         log_enabled,
-        || invalid_expression_token_diagnostics(content, file_path.as_deref()),
+        || invalid_expression_token_diagnostics(content, file_path.as_deref(), parsed_root),
     )?;
     extend_diagnostic_phase(
         &mut items,
         "duplicate_members",
         file_label,
         log_enabled,
-        || duplicate_member_diagnostics(content, file_path.as_deref()),
+        || duplicate_member_diagnostics(content, file_path.as_deref(), parsed_root),
     )?;
     extend_diagnostic_phase(
         &mut items,
         "missing_impl",
         file_label,
         log_enabled,
-        || missing_implementation_diagnostics(conn, content, file_path.as_deref(), open_files),
+        || missing_implementation_diagnostics(
+            conn,
+            content,
+            file_path.as_deref(),
+            open_files,
+            parsed_root,
+        ),
     )?;
     Ok(json!({ "items": items }))
 }
@@ -211,6 +253,72 @@ fn diagnostics_log_enabled() -> bool {
             .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "on" | "ON"))
             .unwrap_or(false)
     })
+}
+
+pub fn visibility_key_for_content(file_path: &str, content: &str) -> VisibilityKey {
+    VisibilityKey {
+        file_path: file_path.replace('\\', "/"),
+        include_block_hash: include_block_hash(content),
+    }
+}
+
+pub fn build_visibility_scope(
+    conn: &Connection,
+    engine_conn: Option<&Connection>,
+    usage_hot_index: Option<&UsageHotIndex>,
+    engine_usage_hot_index: Option<&UsageHotIndex>,
+    content: &str,
+    file_path: &str,
+    project_db_mtime_secs: u64,
+    engine_db_mtime_secs: u64,
+) -> Result<VisibilityScope> {
+    let include_paths = collect_include_paths(content);
+    let project_visible_file_ids =
+        reachable_project_file_ids(conn, usage_hot_index, file_path, &include_paths);
+    let engine_seed_include_paths =
+        collect_engine_seed_include_paths(conn, &project_visible_file_ids, &include_paths);
+    let engine_visible_file_ids = engine_conn
+        .map(|engine_conn| {
+            reachable_engine_file_ids(
+                engine_conn,
+                engine_usage_hot_index,
+                &engine_seed_include_paths,
+            )
+        })
+        .unwrap_or_default();
+
+    Ok(VisibilityScope {
+        project_visible_file_ids: Arc::new(project_visible_file_ids),
+        engine_visible_file_ids: Arc::new(engine_visible_file_ids),
+        engine_seed_include_paths: Arc::new(engine_seed_include_paths),
+        include_paths: Arc::new(include_paths),
+        project_db_mtime_secs,
+        engine_db_mtime_secs,
+    })
+}
+
+fn include_block_hash(content: &str) -> u64 {
+    let mut hasher = Hasher::new();
+    for (index, line) in content.lines().take(500).enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("#include") {
+            hasher.update(index.to_string().as_bytes());
+            hasher.update(trimmed.as_bytes());
+        }
+    }
+
+    let digest = hasher.finalize();
+    let bytes = digest.as_bytes();
+    let mut prefix = [0u8; 8];
+    prefix.copy_from_slice(&bytes[..8]);
+    u64::from_le_bytes(prefix)
+}
+
+fn parse_diagnostics_tree(content: &str) -> Result<Option<tree_sitter::Tree>> {
+    let mut parser = Parser::new();
+    let language: tree_sitter::Language = tree_sitter_unreal_cpp::LANGUAGE.into();
+    parser.set_language(&language)?;
+    Ok(parser.parse(content, None))
 }
 
 fn extend_diagnostic_phase<F>(
@@ -246,11 +354,6 @@ pub fn parse_build_diagnostics(output: &str) -> Value {
 }
 
 fn unreal_rule_diagnostics(content: &str, file_path: Option<&str>) -> Result<Vec<DiagnosticItem>> {
-    let mut parser = Parser::new();
-    let language: tree_sitter::Language = tree_sitter_unreal_cpp::LANGUAGE.into();
-    parser.set_language(&language)?;
-    let _tree = parser.parse(content, None);
-
     let mut items = Vec::new();
     let lines: Vec<&str> = content.lines().collect();
 
@@ -404,6 +507,7 @@ fn unreal_include_diagnostics(
 fn missing_return_diagnostics(
     content: &str,
     file_path: Option<&str>,
+    parsed_root: Option<tree_sitter::Node>,
 ) -> Result<Vec<DiagnosticItem>> {
     let Some(file_path) = file_path else {
         return Ok(Vec::new());
@@ -413,16 +517,12 @@ fn missing_return_diagnostics(
         return Ok(Vec::new());
     }
 
-    let mut parser = Parser::new();
-    let language: tree_sitter::Language = tree_sitter_unreal_cpp::LANGUAGE.into();
-    parser.set_language(&language)?;
-
-    let Some(tree) = parser.parse(content, None) else {
+    let Some(root) = parsed_root else {
         return Ok(Vec::new());
     };
 
     let mut items = Vec::new();
-    collect_missing_return_items(tree.root_node(), content, file_path, &mut items);
+    collect_missing_return_items(root, content, file_path, &mut items);
     Ok(items)
 }
 
@@ -431,6 +531,7 @@ fn override_diagnostics(
     engine_conn: Option<&Connection>,
     content: &str,
     file_path: Option<&str>,
+    parsed_root: Option<tree_sitter::Node>,
 ) -> Result<Vec<DiagnosticItem>> {
     let Some(file_path) = file_path else {
         return Ok(Vec::new());
@@ -440,11 +541,7 @@ fn override_diagnostics(
         return Ok(Vec::new());
     }
 
-    let mut parser = Parser::new();
-    let language: tree_sitter::Language = tree_sitter_unreal_cpp::LANGUAGE.into();
-    parser.set_language(&language)?;
-
-    let Some(tree) = parser.parse(content, None) else {
+    let Some(root) = parsed_root else {
         return Ok(Vec::new());
     };
 
@@ -452,7 +549,7 @@ fn override_diagnostics(
     collect_override_items(
         conn,
         engine_conn,
-        tree.root_node(),
+        root,
         content,
         file_path,
         &mut items,
@@ -465,6 +562,7 @@ fn super_call_diagnostics(
     engine_conn: Option<&Connection>,
     content: &str,
     file_path: Option<&str>,
+    parsed_root: Option<tree_sitter::Node>,
 ) -> Result<Vec<DiagnosticItem>> {
     let Some(file_path) = file_path else {
         return Ok(Vec::new());
@@ -474,15 +572,10 @@ fn super_call_diagnostics(
         return Ok(Vec::new());
     }
 
-    let mut parser = Parser::new();
-    let language: tree_sitter::Language = tree_sitter_unreal_cpp::LANGUAGE.into();
-    parser.set_language(&language)?;
-
-    let Some(tree) = parser.parse(content, None) else {
+    let Some(root) = parsed_root else {
         return Ok(Vec::new());
     };
 
-    let root = tree.root_node();
     let mut items = Vec::new();
     collect_super_call_items(conn, engine_conn, root, content, file_path, &mut items)?;
     Ok(items)
@@ -491,6 +584,7 @@ fn super_call_diagnostics(
 fn member_syntax_diagnostics(
     content: &str,
     file_path: Option<&str>,
+    parsed_root: Option<tree_sitter::Node>,
 ) -> Result<Vec<DiagnosticItem>> {
     let Some(file_path) = file_path else {
         return Ok(Vec::new());
@@ -500,15 +594,10 @@ fn member_syntax_diagnostics(
         return Ok(Vec::new());
     }
 
-    let mut parser = Parser::new();
-    let language: tree_sitter::Language = tree_sitter_unreal_cpp::LANGUAGE.into();
-    parser.set_language(&language)?;
-
-    let Some(tree) = parser.parse(content, None) else {
+    let Some(root) = parsed_root else {
         return Ok(Vec::new());
     };
 
-    let root = tree.root_node();
     let mut items = Vec::new();
     collect_member_syntax_items(root, content, file_path, &mut items);
     Ok(items)
@@ -519,8 +608,10 @@ fn missing_visible_type_diagnostics(
     engine_conn: Option<&Connection>,
     usage_hot_index: Option<&UsageHotIndex>,
     engine_usage_hot_index: Option<&UsageHotIndex>,
+    visibility_scope: Option<&VisibilityScope>,
     content: &str,
     file_path: Option<&str>,
+    parsed_root: Option<tree_sitter::Node>,
 ) -> Result<Vec<DiagnosticItem>> {
     let Some(file_path) = file_path else {
         return Ok(Vec::new());
@@ -530,30 +621,25 @@ fn missing_visible_type_diagnostics(
         return Ok(Vec::new());
     }
 
-    let mut parser = Parser::new();
-    let language: tree_sitter::Language = tree_sitter_unreal_cpp::LANGUAGE.into();
-    parser.set_language(&language)?;
-
-    let Some(tree) = parser.parse(content, None) else {
+    let Some(root) = parsed_root else {
         return Ok(Vec::new());
     };
 
-    let root = tree.root_node();
     let local_types = collect_local_type_visibility(root, content);
-    let include_paths = collect_include_paths(content);
-    let project_visible_file_ids =
-        reachable_project_file_ids(conn, usage_hot_index, file_path, &include_paths);
-    let engine_seed_include_paths =
-        collect_engine_seed_include_paths(conn, &project_visible_file_ids, &include_paths);
-    let engine_visible_file_ids = engine_conn
-        .map(|engine_conn| {
-            reachable_engine_file_ids(
-                engine_conn,
-                engine_usage_hot_index,
-                &engine_seed_include_paths,
-            )
-        })
-        .unwrap_or_default();
+    let scope = if let Some(scope) = visibility_scope {
+        scope.clone()
+    } else {
+        build_visibility_scope(
+            conn,
+            engine_conn,
+            usage_hot_index,
+            engine_usage_hot_index,
+            content,
+            file_path,
+            0,
+            0,
+        )?
+    };
     let mut seen = HashSet::new();
     let mut project_lookup_cache = HashMap::new();
     let mut engine_lookup_cache = HashMap::new();
@@ -570,10 +656,10 @@ fn missing_visible_type_diagnostics(
         content,
         file_path,
         &local_types,
-        &include_paths,
-        &engine_seed_include_paths,
-        &project_visible_file_ids,
-        &engine_visible_file_ids,
+        scope.include_paths.as_ref(),
+        scope.engine_seed_include_paths.as_ref(),
+        scope.project_visible_file_ids.as_ref(),
+        scope.engine_visible_file_ids.as_ref(),
         &mut project_lookup_cache,
         &mut engine_lookup_cache,
         &mut project_text_visibility_cache,
@@ -590,8 +676,11 @@ fn missing_visible_type_diagnostics(
 fn unknown_symbol_diagnostics(
     conn: &Connection,
     engine_conn: Option<&Connection>,
+    member_hot_index: Option<&MemberHotIndex>,
+    engine_member_hot_index: Option<&MemberHotIndex>,
     content: &str,
     file_path: Option<&str>,
+    parsed_root: Option<tree_sitter::Node>,
 ) -> Result<Vec<DiagnosticItem>> {
     let Some(file_path) = file_path else {
         return Ok(Vec::new());
@@ -601,21 +690,20 @@ fn unknown_symbol_diagnostics(
         return Ok(Vec::new());
     }
 
-    let mut parser = Parser::new();
-    let language: tree_sitter::Language = tree_sitter_unreal_cpp::LANGUAGE.into();
-    parser.set_language(&language)?;
-
-    let Some(tree) = parser.parse(content, None) else {
+    let Some(root) = parsed_root else {
         return Ok(Vec::new());
     };
 
-    let root = tree.root_node();
     let mut seen = HashSet::new();
     let mut items = Vec::new();
+    let mut member_lookup_cache = IndexedMemberLookupCache::default();
 
     collect_unknown_symbol_items(
         conn,
         engine_conn,
+        member_hot_index,
+        engine_member_hot_index,
+        &mut member_lookup_cache,
         root,
         content,
         file_path,
@@ -629,6 +717,9 @@ fn unknown_symbol_diagnostics(
 fn collect_unknown_symbol_items(
     conn: &Connection,
     engine_conn: Option<&Connection>,
+    member_hot_index: Option<&MemberHotIndex>,
+    engine_member_hot_index: Option<&MemberHotIndex>,
+    member_lookup_cache: &mut IndexedMemberLookupCache,
     node: tree_sitter::Node,
     content: &str,
     file_path: &str,
@@ -640,6 +731,9 @@ fn collect_unknown_symbol_items(
             collect_unknown_field_expression_item(
                 conn,
                 engine_conn,
+                member_hot_index,
+                engine_member_hot_index,
+                member_lookup_cache,
                 node,
                 content,
                 file_path,
@@ -651,6 +745,9 @@ fn collect_unknown_symbol_items(
             collect_unknown_qualified_identifier_item(
                 conn,
                 engine_conn,
+                member_hot_index,
+                engine_member_hot_index,
+                member_lookup_cache,
                 node,
                 content,
                 file_path,
@@ -662,6 +759,9 @@ fn collect_unknown_symbol_items(
             collect_unknown_identifier_item(
                 conn,
                 engine_conn,
+                member_hot_index,
+                engine_member_hot_index,
+                member_lookup_cache,
                 node,
                 content,
                 file_path,
@@ -677,6 +777,9 @@ fn collect_unknown_symbol_items(
         collect_unknown_symbol_items(
             conn,
             engine_conn,
+            member_hot_index,
+            engine_member_hot_index,
+            member_lookup_cache,
             child,
             content,
             file_path,
@@ -691,6 +794,9 @@ fn collect_unknown_symbol_items(
 fn collect_unknown_field_expression_item(
     conn: &Connection,
     engine_conn: Option<&Connection>,
+    member_hot_index: Option<&MemberHotIndex>,
+    engine_member_hot_index: Option<&MemberHotIndex>,
+    member_lookup_cache: &mut IndexedMemberLookupCache,
     node: tree_sitter::Node,
     content: &str,
     file_path: &str,
@@ -710,10 +816,32 @@ fn collect_unknown_field_expression_item(
     }
 
     if let Some(receiver_type) =
-        resolve_expression_type_for_diagnostics(conn, engine_conn, receiver, content)?
+        resolve_expression_type_for_diagnostics(
+            conn,
+            engine_conn,
+            member_hot_index,
+            engine_member_hot_index,
+            member_lookup_cache,
+            receiver,
+            content,
+        )?
     {
-        if !member_exists_across_dbs(conn, engine_conn, &receiver_type, field_name)? {
-            if should_suppress_member_diagnostic(conn, engine_conn, &receiver_type)? {
+        if !member_exists_across_dbs(
+            conn,
+            engine_conn,
+            member_hot_index,
+            engine_member_hot_index,
+            member_lookup_cache,
+            &receiver_type,
+            field_name,
+        )? {
+            if should_suppress_member_diagnostic(
+                conn,
+                engine_conn,
+                member_hot_index,
+                engine_member_hot_index,
+                &receiver_type,
+            )? {
                 return Ok(());
             }
             push_unknown_symbol_item(
@@ -734,7 +862,16 @@ fn collect_unknown_field_expression_item(
     if receiver.kind() == "identifier" {
         let receiver_name = node_text(receiver, content).trim();
         if !receiver_name.is_empty()
-            && !identifier_usage_is_known(conn, engine_conn, receiver, content, receiver_name)?
+            && !identifier_usage_is_known(
+                conn,
+                engine_conn,
+                member_hot_index,
+                engine_member_hot_index,
+                member_lookup_cache,
+                receiver,
+                content,
+                receiver_name,
+            )?
         {
             push_unknown_symbol_item(
                 items,
@@ -756,6 +893,9 @@ fn collect_unknown_field_expression_item(
 fn collect_unknown_qualified_identifier_item(
     conn: &Connection,
     engine_conn: Option<&Connection>,
+    member_hot_index: Option<&MemberHotIndex>,
+    engine_member_hot_index: Option<&MemberHotIndex>,
+    member_lookup_cache: &mut IndexedMemberLookupCache,
     node: tree_sitter::Node,
     content: &str,
     file_path: &str,
@@ -795,8 +935,22 @@ fn collect_unknown_qualified_identifier_item(
     };
 
     if let Some(scope_name) = resolved_scope {
-        if !member_exists_across_dbs(conn, engine_conn, &scope_name, member_name)? {
-            if should_suppress_member_diagnostic(conn, engine_conn, &scope_name)? {
+        if !member_exists_across_dbs(
+            conn,
+            engine_conn,
+            member_hot_index,
+            engine_member_hot_index,
+            member_lookup_cache,
+            &scope_name,
+            member_name,
+        )? {
+            if should_suppress_member_diagnostic(
+                conn,
+                engine_conn,
+                member_hot_index,
+                engine_member_hot_index,
+                &scope_name,
+            )? {
                 return Ok(());
             }
             push_unknown_symbol_item(
@@ -819,6 +973,9 @@ fn collect_unknown_qualified_identifier_item(
 fn collect_unknown_identifier_item(
     conn: &Connection,
     engine_conn: Option<&Connection>,
+    member_hot_index: Option<&MemberHotIndex>,
+    engine_member_hot_index: Option<&MemberHotIndex>,
+    member_lookup_cache: &mut IndexedMemberLookupCache,
     node: tree_sitter::Node,
     content: &str,
     file_path: &str,
@@ -829,7 +986,16 @@ fn collect_unknown_identifier_item(
     if name.is_empty()
         || is_ignored_unknown_symbol_name(name)
         || !is_unknown_identifier_usage_candidate(node, content)
-        || identifier_usage_is_known(conn, engine_conn, node, content, name)?
+        || identifier_usage_is_known(
+            conn,
+            engine_conn,
+            member_hot_index,
+            engine_member_hot_index,
+            member_lookup_cache,
+            node,
+            content,
+            name,
+        )?
     {
         return Ok(());
     }
@@ -948,6 +1114,9 @@ fn is_unknown_identifier_usage_candidate(node: tree_sitter::Node, content: &str)
 fn identifier_usage_is_known(
     conn: &Connection,
     engine_conn: Option<&Connection>,
+    member_hot_index: Option<&MemberHotIndex>,
+    engine_member_hot_index: Option<&MemberHotIndex>,
+    member_lookup_cache: &mut IndexedMemberLookupCache,
     node: tree_sitter::Node,
     content: &str,
     name: &str,
@@ -971,7 +1140,15 @@ fn identifier_usage_is_known(
     }
 
     if let Some(class_name) = find_enclosing_class_name(node, content) {
-        if member_exists_across_dbs(conn, engine_conn, &class_name, name)? {
+        if member_exists_across_dbs(
+            conn,
+            engine_conn,
+            member_hot_index,
+            engine_member_hot_index,
+            member_lookup_cache,
+            &class_name,
+            name,
+        )? {
             return Ok(true);
         }
     }
@@ -1033,9 +1210,101 @@ fn identifier_is_call_target(node: tree_sitter::Node) -> bool {
         .is_some_and(|function_node| same_node(function_node, node))
 }
 
+#[derive(Default)]
+struct IndexedMemberLookupCache {
+    class_members: HashMap<String, IndexedClassMembers>,
+}
+
+#[derive(Default)]
+struct IndexedClassMembers {
+    project_exists: bool,
+    engine_exists: bool,
+    member_names: HashSet<String>,
+    member_types: HashMap<String, String>,
+}
+
+impl IndexedClassMembers {
+    fn exists(&self) -> bool {
+        self.project_exists || self.engine_exists
+    }
+}
+
+fn normalized_member_lookup_name(class_name: &str) -> String {
+    crate::parser::cpp::clean_type_string(class_name).trim().to_string()
+}
+
+fn indexed_class_members<'a>(
+    member_hot_index: Option<&MemberHotIndex>,
+    engine_member_hot_index: Option<&MemberHotIndex>,
+    cache: &'a mut IndexedMemberLookupCache,
+    class_name: &str,
+) -> Option<&'a IndexedClassMembers> {
+    let normalized = normalized_member_lookup_name(class_name);
+    if normalized.is_empty() {
+        return None;
+    }
+
+    if !cache.class_members.contains_key(&normalized) {
+        let mut snapshot = IndexedClassMembers::default();
+
+        if let Some(index) = member_hot_index {
+            populate_indexed_class_members(index, &normalized, true, &mut snapshot);
+        }
+        if let Some(index) = engine_member_hot_index {
+            populate_indexed_class_members(index, &normalized, false, &mut snapshot);
+        }
+
+        cache.class_members.insert(normalized.clone(), snapshot);
+    }
+
+    cache
+        .class_members
+        .get(&normalized)
+        .filter(|snapshot| snapshot.exists())
+}
+
+fn populate_indexed_class_members(
+    index: &MemberHotIndex,
+    class_name: &str,
+    is_project: bool,
+    snapshot: &mut IndexedClassMembers,
+) {
+    let class_ids = index.class_ids_by_name(class_name);
+    if class_ids.is_empty() {
+        return;
+    }
+
+    if is_project {
+        snapshot.project_exists = true;
+    } else {
+        snapshot.engine_exists = true;
+    }
+
+    for item in index.collect_members_recursive(class_name, true, usize::MAX) {
+        if let crate::query::member_index::HotMemberItem::Member { entry, .. } = item {
+            let name = index.member_name(entry).trim();
+            if name.is_empty() {
+                continue;
+            }
+
+            snapshot.member_names.insert(name.to_string());
+            if let Some(member_type) = index
+                .member_return_type(entry)
+                .map(crate::parser::cpp::clean_type_string)
+                .filter(|text| !text.trim().is_empty())
+            {
+                snapshot.member_types.entry(name.to_string()).or_insert(member_type);
+            }
+        }
+    }
+}
+
 fn resolve_expression_type_for_diagnostics(
     conn: &Connection,
     engine_conn: Option<&Connection>,
+    member_hot_index: Option<&MemberHotIndex>,
+    engine_member_hot_index: Option<&MemberHotIndex>,
+    member_lookup_cache: &mut IndexedMemberLookupCache,
     node: tree_sitter::Node,
     content: &str,
 ) -> Result<Option<String>> {
@@ -1073,12 +1342,28 @@ fn resolve_expression_type_for_diagnostics(
 
             if let Some(class_name) = find_enclosing_class_name(node, content) {
                 if let Some(member_type) =
-                    member_type_across_dbs(conn, engine_conn, &class_name, name)?
+                    member_type_across_dbs(
+                        conn,
+                        engine_conn,
+                        member_hot_index,
+                        engine_member_hot_index,
+                        member_lookup_cache,
+                        &class_name,
+                        name,
+                    )?
                 {
                     return Ok(Some(member_type));
                 }
 
-                if member_exists_across_dbs(conn, engine_conn, &class_name, name)? {
+                if member_exists_across_dbs(
+                    conn,
+                    engine_conn,
+                    member_hot_index,
+                    engine_member_hot_index,
+                    member_lookup_cache,
+                    &class_name,
+                    name,
+                )? {
                     return Ok(Some(class_name));
                 }
             }
@@ -1104,11 +1389,27 @@ fn resolve_expression_type_for_diagnostics(
                 return Ok(None);
             };
             let receiver_type =
-                resolve_expression_type_for_diagnostics(conn, engine_conn, receiver, content)?;
+                resolve_expression_type_for_diagnostics(
+                    conn,
+                    engine_conn,
+                    member_hot_index,
+                    engine_member_hot_index,
+                    member_lookup_cache,
+                    receiver,
+                    content,
+                )?;
             let Some(receiver_type) = receiver_type else {
                 return Ok(None);
             };
-            member_type_across_dbs(conn, engine_conn, &receiver_type, node_text(field, content).trim())
+            member_type_across_dbs(
+                conn,
+                engine_conn,
+                member_hot_index,
+                engine_member_hot_index,
+                member_lookup_cache,
+                &receiver_type,
+                node_text(field, content).trim(),
+            )
         }
         "qualified_identifier" => {
             let Some(scope) = node.child_by_field_name("scope") else {
@@ -1121,12 +1422,28 @@ fn resolve_expression_type_for_diagnostics(
             let scope_name = if node_text(scope, content).trim() == "ThisClass" {
                 find_enclosing_class_name(node, content)
             } else {
-                resolve_expression_type_for_diagnostics(conn, engine_conn, scope, content)?
+                resolve_expression_type_for_diagnostics(
+                    conn,
+                    engine_conn,
+                    member_hot_index,
+                    engine_member_hot_index,
+                    member_lookup_cache,
+                    scope,
+                    content,
+                )?
             };
             let Some(scope_name) = scope_name else {
                 return Ok(None);
             };
-            member_type_across_dbs(conn, engine_conn, &scope_name, node_text(name_node, content).trim())
+            member_type_across_dbs(
+                conn,
+                engine_conn,
+                member_hot_index,
+                engine_member_hot_index,
+                member_lookup_cache,
+                &scope_name,
+                node_text(name_node, content).trim(),
+            )
         }
         _ => Ok(None),
     }
@@ -1135,9 +1452,21 @@ fn resolve_expression_type_for_diagnostics(
 fn member_exists_across_dbs(
     conn: &Connection,
     engine_conn: Option<&Connection>,
+    member_hot_index: Option<&MemberHotIndex>,
+    engine_member_hot_index: Option<&MemberHotIndex>,
+    member_lookup_cache: &mut IndexedMemberLookupCache,
     class_name: &str,
     member_name: &str,
 ) -> Result<bool> {
+    if let Some(snapshot) = indexed_class_members(
+        member_hot_index,
+        engine_member_hot_index,
+        member_lookup_cache,
+        class_name,
+    ) {
+        return Ok(snapshot.member_names.contains(member_name));
+    }
+
     if member_exists_on_class_or_bases(conn, class_name, member_name)? {
         return Ok(true);
     }
@@ -1177,9 +1506,21 @@ fn member_exists_on_class_or_bases(
 fn member_type_across_dbs(
     conn: &Connection,
     engine_conn: Option<&Connection>,
+    member_hot_index: Option<&MemberHotIndex>,
+    engine_member_hot_index: Option<&MemberHotIndex>,
+    member_lookup_cache: &mut IndexedMemberLookupCache,
     class_name: &str,
     member_name: &str,
 ) -> Result<Option<String>> {
+    if let Some(snapshot) = indexed_class_members(
+        member_hot_index,
+        engine_member_hot_index,
+        member_lookup_cache,
+        class_name,
+    ) {
+        return Ok(snapshot.member_types.get(member_name).cloned());
+    }
+
     if let Some(member_type) = member_type_on_class_or_bases(conn, class_name, member_name)? {
         return Ok(Some(member_type));
     }
@@ -1213,6 +1554,8 @@ fn looks_like_unreal_external_type(name: &str) -> bool {
 fn should_suppress_member_diagnostic(
     conn: &Connection,
     engine_conn: Option<&Connection>,
+    member_hot_index: Option<&MemberHotIndex>,
+    engine_member_hot_index: Option<&MemberHotIndex>,
     class_name: &str,
 ) -> Result<bool> {
     let normalized = crate::parser::cpp::clean_type_string(class_name);
@@ -1221,6 +1564,20 @@ fn should_suppress_member_diagnostic(
     }
 
     if normalized.contains('<') {
+        return Ok(true);
+    }
+
+    let project_index_has_class = member_hot_index
+        .map(|index| !index.class_ids_by_name(&normalized).is_empty())
+        .unwrap_or(false);
+    if project_index_has_class {
+        return Ok(false);
+    }
+
+    let engine_index_has_class = engine_member_hot_index
+        .map(|index| !index.class_ids_by_name(&normalized).is_empty())
+        .unwrap_or(false);
+    if engine_index_has_class {
         return Ok(true);
     }
 
@@ -1695,6 +2052,7 @@ fn missing_implementation_diagnostics(
     content: &str,
     file_path: Option<&str>,
     open_files: &[OpenBufferOverlay],
+    parsed_root: Option<tree_sitter::Node>,
 ) -> Result<Vec<DiagnosticItem>> {
     let Some(header_path) = file_path else {
         return Ok(Vec::new());
@@ -1704,15 +2062,10 @@ fn missing_implementation_diagnostics(
         return Ok(Vec::new());
     }
 
-    let mut parser = Parser::new();
-    let language: tree_sitter::Language = tree_sitter_unreal_cpp::LANGUAGE.into();
-    parser.set_language(&language)?;
-
-    let Some(tree) = parser.parse(content, None) else {
+    let Some(root) = parsed_root else {
         return Ok(Vec::new());
     };
 
-    let root = tree.root_node();
     let overlay_texts = open_file_texts(open_files);
     let source_candidates = header_to_source_candidates(header_path);
     let source_texts = source_candidates
@@ -1758,6 +2111,7 @@ fn open_file_texts(open_files: &[OpenBufferOverlay]) -> HashMap<String, String> 
 fn incomplete_member_declaration_diagnostics(
     content: &str,
     file_path: Option<&str>,
+    parsed_root: Option<tree_sitter::Node>,
 ) -> Result<Vec<DiagnosticItem>> {
     let Some(header_path) = file_path else {
         return Ok(Vec::new());
@@ -1767,15 +2121,10 @@ fn incomplete_member_declaration_diagnostics(
         return Ok(Vec::new());
     }
 
-    let mut parser = Parser::new();
-    let language: tree_sitter::Language = tree_sitter_unreal_cpp::LANGUAGE.into();
-    parser.set_language(&language)?;
-
-    let Some(tree) = parser.parse(content, None) else {
+    let Some(root) = parsed_root else {
         return Ok(Vec::new());
     };
 
-    let root = tree.root_node();
     let mut items = Vec::new();
     collect_incomplete_member_decl_items(root, content, header_path, &mut items);
     Ok(items)
@@ -1784,6 +2133,7 @@ fn incomplete_member_declaration_diagnostics(
 fn invalid_member_token_diagnostics(
     content: &str,
     file_path: Option<&str>,
+    parsed_root: Option<tree_sitter::Node>,
 ) -> Result<Vec<DiagnosticItem>> {
     let Some(header_path) = file_path else {
         return Ok(Vec::new());
@@ -1793,15 +2143,10 @@ fn invalid_member_token_diagnostics(
         return Ok(Vec::new());
     }
 
-    let mut parser = Parser::new();
-    let language: tree_sitter::Language = tree_sitter_unreal_cpp::LANGUAGE.into();
-    parser.set_language(&language)?;
-
-    let Some(tree) = parser.parse(content, None) else {
+    let Some(root) = parsed_root else {
         return Ok(Vec::new());
     };
 
-    let root = tree.root_node();
     let mut items = Vec::new();
     collect_invalid_member_token_items(root, content, header_path, &mut items);
     Ok(items)
@@ -1810,6 +2155,7 @@ fn invalid_member_token_diagnostics(
 fn invalid_expression_token_diagnostics(
     content: &str,
     file_path: Option<&str>,
+    parsed_root: Option<tree_sitter::Node>,
 ) -> Result<Vec<DiagnosticItem>> {
     let Some(file_path) = file_path else {
         return Ok(Vec::new());
@@ -1819,15 +2165,10 @@ fn invalid_expression_token_diagnostics(
         return Ok(Vec::new());
     }
 
-    let mut parser = Parser::new();
-    let language: tree_sitter::Language = tree_sitter_unreal_cpp::LANGUAGE.into();
-    parser.set_language(&language)?;
-
-    let Some(tree) = parser.parse(content, None) else {
+    let Some(root) = parsed_root else {
         return Ok(Vec::new());
     };
 
-    let root = tree.root_node();
     let mut items = Vec::new();
     collect_invalid_expression_token_items(root, content, file_path, &mut items);
     Ok(items)
@@ -2042,6 +2383,7 @@ fn collect_duplicate_member_items(
 fn duplicate_member_diagnostics(
     content: &str,
     file_path: Option<&str>,
+    parsed_root: Option<tree_sitter::Node>,
 ) -> Result<Vec<DiagnosticItem>> {
     let Some(file_path) = file_path else {
         return Ok(Vec::new());
@@ -2051,17 +2393,13 @@ fn duplicate_member_diagnostics(
         return Ok(Vec::new());
     }
 
-    let mut parser = Parser::new();
-    let language: tree_sitter::Language = tree_sitter_unreal_cpp::LANGUAGE.into();
-    parser.set_language(&language)?;
-
-    let Some(tree) = parser.parse(content, None) else {
+    let Some(root) = parsed_root else {
         return Ok(Vec::new());
     };
 
     let mut items = Vec::new();
     let mut seen = HashMap::new();
-    collect_duplicate_member_items(tree.root_node(), content, file_path, &mut seen, &mut items);
+    collect_duplicate_member_items(root, content, file_path, &mut seen, &mut items);
     Ok(items)
 }
 

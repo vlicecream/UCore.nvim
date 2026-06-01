@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::db;
+use crate::diagnostics::{VisibilityKey, VisibilityScope};
 use crate::query::goto::{build_navigation_hot_index, NavigationHotIndex};
 use crate::query::member_index::{build_member_hot_index, MemberHotIndex};
 use crate::query::search::{build_search_hot_index, SearchHotIndex};
@@ -21,6 +22,7 @@ use crate::types::{ConfigCache, PhaseInfo, Progress, ProgressPlan, ProgressRepor
 const COMPLETION_CACHE_CAPACITY: usize = 50_000;
 const DIAGNOSTICS_CACHE_CAPACITY: usize = 512;
 const DIAGNOSTICS_CACHE_TTL: Duration = Duration::from_millis(1500);
+const VISIBILITY_CACHE_CAPACITY: usize = 256;
 const NAVIGATION_CACHE_CAPACITY: usize = 1024;
 const NAVIGATION_CACHE_TTL: Duration = Duration::from_millis(2000);
 const PRIMARY_DB_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -305,6 +307,57 @@ impl DiagnosticsCache {
     }
 }
 
+/// In-memory visibility scope cache keyed by (file_path, include block hash).
+/// 可见性范围缓存，key 是 (file_path, include block hash)。
+pub struct VisibilityCache {
+    lru: LruCache<VisibilityKey, Arc<VisibilityScope>>,
+}
+
+impl VisibilityCache {
+    pub fn new() -> Self {
+        Self {
+            lru: LruCache::new(NonZeroUsize::new(VISIBILITY_CACHE_CAPACITY).unwrap()),
+        }
+    }
+
+    pub fn get(
+        &mut self,
+        key: &VisibilityKey,
+        project_db_mtime_secs: u64,
+        engine_db_mtime_secs: u64,
+    ) -> Option<Arc<VisibilityScope>> {
+        let scope = self.lru.get(key)?.clone();
+        if scope.project_db_mtime_secs != project_db_mtime_secs
+            || scope.engine_db_mtime_secs != engine_db_mtime_secs
+        {
+            self.lru.pop(key);
+            return None;
+        }
+
+        Some(scope)
+    }
+
+    pub fn put(&mut self, key: VisibilityKey, scope: Arc<VisibilityScope>) {
+        self.lru.put(key, scope);
+    }
+
+    pub fn invalidate_file(&mut self, file_path: &str) {
+        let keys = self
+            .lru
+            .iter()
+            .filter_map(|(key, _)| (key.file_path == file_path).then_some(key.clone()))
+            .collect::<Vec<_>>();
+
+        for key in keys {
+            self.lru.pop(&key);
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.lru.clear();
+    }
+}
+
 /// In-memory navigation cache keyed by request signature.
 /// 内存导航缓存，key 是请求签名。
 pub struct NavigationCache {
@@ -376,6 +429,7 @@ pub struct AppState {
     pub config_caches: Mutex<HashMap<String, ConfigCache>>,
     pub completion_caches: Mutex<HashMap<String, Arc<Mutex<CompletionCache>>>>,
     pub diagnostics_caches: Mutex<HashMap<String, Arc<Mutex<DiagnosticsCache>>>>,
+    pub visibility_caches: Mutex<HashMap<String, Arc<Mutex<VisibilityCache>>>>,
     pub navigation_caches: Mutex<HashMap<String, Arc<Mutex<NavigationCache>>>>,
     pub search_hot_indexes: Mutex<HashMap<String, Arc<SearchHotIndex>>>,
     pub navigation_hot_indexes: Mutex<HashMap<String, Arc<NavigationHotIndex>>>,
@@ -565,6 +619,36 @@ impl AppState {
             .or_insert_with(|| Arc::clone(&cache));
 
         Arc::clone(existing)
+    }
+
+    pub fn get_visibility_cache(&self, project_root: &str) -> Arc<Mutex<VisibilityCache>> {
+        {
+            let caches = self.visibility_caches.lock();
+            if let Some(cache) = caches.get(project_root) {
+                return Arc::clone(cache);
+            }
+        }
+
+        let cache = Arc::new(Mutex::new(VisibilityCache::new()));
+
+        let mut caches = self.visibility_caches.lock();
+        let existing = caches
+            .entry(project_root.to_string())
+            .or_insert_with(|| Arc::clone(&cache));
+
+        Arc::clone(existing)
+    }
+
+    pub fn invalidate_visibility_for_project(&self, project_root: &str) {
+        if let Some(cache) = self.visibility_caches.lock().get(project_root).cloned() {
+            cache.lock().clear();
+        }
+    }
+
+    pub fn invalidate_visibility_for_file(&self, project_root: &str, file_path: &str) {
+        if let Some(cache) = self.visibility_caches.lock().get(project_root).cloned() {
+            cache.lock().invalidate_file(file_path);
+        }
     }
 
     pub fn get_search_hot_index(&self, db_path: &str) -> Result<Arc<SearchHotIndex>> {

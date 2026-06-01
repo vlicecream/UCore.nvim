@@ -451,7 +451,7 @@ pub async fn handle_setup(state: Arc<AppState>, params: &Value) -> Result<Value>
     let db_path_native = normalize_to_native(&req.db_path);
     let cache_db_path_unix = req.cache_db_path.as_ref().map(|p| normalize_to_unix(p));
 
-    drop_db_connections(&state, &db_path_native, cache_db_path_unix.as_deref());
+    drop_db_connections(&state, &root_key, &db_path_native, cache_db_path_unix.as_deref());
 
     let readiness = ensure_database_ready(db_path_native.clone(), req.project_root.clone()).await?;
     info!(
@@ -527,7 +527,7 @@ pub async fn handle_refresh(
             .and_then(|ctx| ctx.cache_db_path.clone())
     };
 
-    drop_db_connections(state, &db_path_native, cache_path.as_deref());
+    drop_db_connections(state, &root_key, &db_path_native, cache_path.as_deref());
 
     req.db_path = Some(db_path_unix.clone());
     let _ = state.save_registry();
@@ -553,6 +553,7 @@ pub async fn handle_refresh(
     );
 
     state.invalidate_member_hot_index(&db_path_native);
+    state.invalidate_visibility_for_project(&root_key);
     clear_completion_cache(state, &root_key);
 
     if let Ok(conn) = state.get_connection(&db_path_native) {
@@ -1118,12 +1119,56 @@ fn handle_state_query(
                 .map(normalize_to_native)
                 .filter(|path| Path::new(path).is_file())
                 .and_then(|path| state.get_usage_hot_index(&path).ok());
+            let member_hot_index = state.get_member_hot_index(project_db_path).ok();
+            let engine_member_hot_index = engine_db_path
+                .as_deref()
+                .map(normalize_to_native)
+                .filter(|path| Path::new(path).is_file())
+                .and_then(|path| state.get_member_hot_index(&path).ok());
+            let visibility_cache = state.get_visibility_cache(root_key);
+            let project_db_mtime_secs = file_mtime_secs(project_db_path);
+            let engine_db_mtime_secs = engine_db_path
+                .as_deref()
+                .map(normalize_to_native)
+                .filter(|path| Path::new(path).is_file())
+                .map(|path| file_mtime_secs(&path))
+                .unwrap_or(0);
+            let visibility_scope = file_path
+                .as_deref()
+                .map(|path| -> Result<Arc<crate::diagnostics::VisibilityScope>> {
+                    let key = crate::diagnostics::visibility_key_for_content(path, &content);
+
+                    if let Some(scope) = visibility_cache.lock().get(
+                        &key,
+                        project_db_mtime_secs,
+                        engine_db_mtime_secs,
+                    ) {
+                        return Ok(scope);
+                    }
+
+                    let scope = Arc::new(crate::diagnostics::build_visibility_scope(
+                        conn,
+                        engine_conn.as_ref(),
+                        usage_hot_index.as_deref(),
+                        engine_usage_hot_index.as_deref(),
+                        &content,
+                        path,
+                        project_db_mtime_secs,
+                        engine_db_mtime_secs,
+                    )?);
+                    visibility_cache.lock().put(key, Arc::clone(&scope));
+                    Ok(scope)
+                })
+                .transpose()?;
 
             let value = crate::diagnostics::process_diagnostics_with_hot_indexes(
                 conn,
                 engine_conn.as_ref(),
                 usage_hot_index.as_deref(),
                 engine_usage_hot_index.as_deref(),
+                member_hot_index.as_deref(),
+                engine_member_hot_index.as_deref(),
+                visibility_scope.as_deref(),
                 &content,
                 file_path,
                 &open_files,
@@ -3980,7 +4025,12 @@ async fn ensure_database_ready(db_path_native: String, project_root: String) -> 
 
 /// Remove cached database connections before refresh/setup.
 /// setup 或 refresh 前移除旧 DB 连接缓存。
-fn drop_db_connections(state: &AppState, db_path_native: &str, cache_db_path_unix: Option<&str>) {
+fn drop_db_connections(
+    state: &AppState,
+    root_key: &str,
+    db_path_native: &str,
+    cache_db_path_unix: Option<&str>,
+) {
     let mut conns = state.connections.lock();
     conns.remove(db_path_native);
     drop(conns);
@@ -3989,11 +4039,21 @@ fn drop_db_connections(state: &AppState, db_path_native: &str, cache_db_path_uni
     state.invalidate_navigation_hot_index(db_path_native);
     state.invalidate_usage_hot_index(db_path_native);
     state.invalidate_member_hot_index(db_path_native);
+    state.invalidate_visibility_for_project(root_key);
 
     if let Some(cache_path) = cache_db_path_unix {
         let mut cache_conns = state.persistent_cache_connections.lock();
         cache_conns.remove(&normalize_to_native(cache_path));
     }
+}
+
+fn file_mtime_secs(path: &str) -> u64 {
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 /// Insert or update project context for refresh.
