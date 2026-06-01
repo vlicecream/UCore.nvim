@@ -31,6 +31,9 @@ function M.dispatch(args)
 		end,
 		signature = actions.signature_help,
 		blueprint = actions.blueprint,
+		editing = function()
+			actions.editing(tail)
+		end,
 		rename = function()
 			actions.rename(tail)
 		end,
@@ -66,6 +69,7 @@ function M.register()
 				"goto",
 				"signature",
 				"blueprint",
+				"editing",
 				"rename",
 				"install",
 				"new",

@@ -6,6 +6,7 @@ local bootstrap = require("ucore.bootstrap")
 local navigation = require("ucore.navigation")
 local explorer = require("ucore.explorer")
 local install = require("ucore.install")
+local editing = require("ucore.editing")
 
 local M = {}
 local FIND_PAGE_SIZE = 50
@@ -385,6 +386,39 @@ function M.rename(tail)
 		return require("ucore.assist").rename()
 	end
 	require("ucore.assist").rename(new_name)
+end
+
+function M.editing(tail)
+	local sub = (tail or ""):match("^%s*(%S+)")
+	sub = sub and sub:lower() or "info"
+
+	if sub == "info" then
+		vim.notify(table.concat(editing.info(), "\n"), vim.log.levels.INFO, {
+			title = "UCore editing info",
+			timeout = 12000,
+		})
+		return
+	end
+
+	if sub == "fix" then
+		vim.notify(table.concat(editing.fix(), "\n"), vim.log.levels.INFO, {
+			title = "UCore editing fix",
+			timeout = 12000,
+		})
+		return
+	end
+
+	if sub == "help" then
+		print([[
+UCore editing subcommands:
+  :UCore editing info   Show current indent/filetype state
+  :UCore editing fix    Reapply Unreal editing settings to current buffer
+  :UCore editing help   Show this help
+]])
+		return
+	end
+
+	vim.notify("Unknown UCore editing subcommand: " .. sub .. "\nSee :UCore editing help", vim.log.levels.WARN)
 end
 
 function M.install(tail)
@@ -816,6 +850,7 @@ UCore commands:
   :UCore goto         Navigation subcommands (see :UCore goto help)
   :UCore signature    Show signature help for current call
   :UCore blueprint    Show related Blueprint assets for symbol under cursor
+  :UCore editing      Show or reapply Unreal editing settings
   :UCore rename       Rename symbol under cursor
   :UCore install      Install Unreal source access plugin
   :UCore help         Show this help

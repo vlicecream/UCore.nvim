@@ -346,7 +346,9 @@ local function default_values()
 			indent = {
 				enable = true,
 				inherit_cpp = true,
-				fallback_cindent = true,
+				fallback_cindent = false,
+				unreal_macro_keep_indent = true,
+				semicolon_keep_indent = true,
 			},
 		},
 

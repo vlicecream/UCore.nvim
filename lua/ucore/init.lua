@@ -51,10 +51,14 @@ function M.reset()
 	pcall(function()
 		require("ucore.bridge").reset()
 	end)
+	pcall(function()
+		require("ucore.filetype").reset()
+	end)
 
 	clear_augroup("UCoreAutopairs")
 	clear_augroup("UCoreBridge")
 	clear_augroup("UCoreEditing")
+	clear_augroup("UCoreFiletype")
 	clear_augroup("UCoreLifecycle")
 	pcall(vim.api.nvim_del_user_command, "UCore")
 	initialized = false
@@ -68,6 +72,7 @@ function M.setup(opts)
 	end
 
 	require("ucore.config").setup(opts)
+	require("ucore.filetype").setup()
 	require("ucore.output").setup()
 	require("ucore.commands").register()
 	require("ucore.completion").setup()

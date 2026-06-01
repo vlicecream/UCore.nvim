@@ -10,6 +10,12 @@ local function valid_buffer(bufnr)
 	return bufnr and vim.api.nvim_buf_is_valid(bufnr) and vim.bo[bufnr].buftype == ""
 end
 
+local function apply_indent_globals()
+	local indent = config.values.editing.indent or {}
+	vim.g.ucore_indent_unreal_macro = indent.unreal_macro_keep_indent == false and 0 or 1
+	vim.g.ucore_indent_semicolon = indent.semicolon_keep_indent == false and 0 or 1
+end
+
 function M.apply_indent(bufnr)
 	if config.values.editing.indent.enable == false then
 		return
@@ -21,19 +27,19 @@ function M.apply_indent(bufnr)
 	end
 
 	vim.api.nvim_buf_call(bufnr, function()
+		apply_indent_globals()
 		pcall(vim.cmd, "filetype plugin indent on")
 
 		if config.values.editing.indent.inherit_cpp ~= false then
 			pcall(vim.cmd, "runtime! indent/unreal_cpp.vim")
 		end
 
-		if config.values.editing.indent.fallback_cindent ~= false then
-			-- Some distros install a tree-sitter indentexpr for unknown filetypes.
-			-- unreal_cpp should fall back to stock C++ indentation instead.
-			vim.bo.autoindent = true
-			vim.bo.smartindent = false
-			vim.bo.cindent = true
-		end
+		-- Keep the buffer on indentexpr-driven indentation so `;` and
+		-- closed Unreal macros do not trigger an extra cindent pass.
+		vim.bo[bufnr].autoindent = true
+		vim.bo[bufnr].smartindent = false
+		vim.bo[bufnr].cindent = config.values.editing.indent.fallback_cindent == true
+		vim.bo[bufnr].indentkeys = "0{,0},0),0],!^F,o,O,e"
 	end)
 end
 
@@ -74,7 +80,7 @@ function M.info(bufnr)
 		end
 	end
 
-	return {
+	local lines = {
 		"buffer: " .. tostring(bufnr),
 		"name: " .. vim.api.nvim_buf_get_name(bufnr),
 		"filetype: " .. tostring(vim.bo[bufnr].filetype),
@@ -90,10 +96,31 @@ function M.info(bufnr)
 		"b:disable_autoformat: " .. tostring(vim.b[bufnr].disable_autoformat),
 		"b:ucore_autoformat_disabled: " .. tostring(vim.b[bufnr].ucore_autoformat_disabled),
 		"b:did_indent: " .. tostring(vim.b[bufnr].did_indent),
+		"g:ucore_indent_unreal_macro: " .. tostring(vim.g.ucore_indent_unreal_macro),
+		"g:ucore_indent_semicolon: " .. tostring(vim.g.ucore_indent_semicolon),
 		"nvim-autopairs available: " .. tostring(ok_autopairs),
 		"ucore autopairs rules: " .. tostring(rule_count),
 		"insert <CR> map: " .. (type(cr_map) == "table" and tostring(cr_map.rhs or cr_map.callback or "") or tostring(cr_map)),
 	}
+
+	local expected = vim.bo[bufnr].filetype == "unreal_cpp"
+		and vim.bo[bufnr].indentexpr == "GetUnrealCppIndent()"
+		and vim.bo[bufnr].cindent == false
+		and not tostring(vim.bo[bufnr].indentkeys):find(";", 1, true)
+	if not expected then
+		table.insert(lines, "status: mismatch")
+		table.insert(lines, "hint: run :UCore editing fix")
+	else
+		table.insert(lines, "status: ok")
+	end
+
+	return lines
+end
+
+function M.fix(bufnr)
+	bufnr = bufnr or vim.api.nvim_get_current_buf()
+	M.apply_buffer_settings(bufnr)
+	return M.info(bufnr)
 end
 
 function M.setup()
@@ -101,6 +128,7 @@ function M.setup()
 		return
 	end
 
+	apply_indent_globals()
 	local group = vim.api.nvim_create_augroup("UCoreEditing", { clear = true })
 	vim.api.nvim_create_autocmd({ "FileType", "BufEnter" }, {
 		group = group,
