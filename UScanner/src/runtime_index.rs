@@ -14,7 +14,7 @@ use crate::query::usage::UsageHotIndex;
 
 const RUNTIME_INDEX_SCHEMA_VERSION: u32 = 1;
 pub const NAVIGATION_INDEX_VERSION: u32 = 2;
-pub const SEARCH_INDEX_VERSION: u32 = 2;
+pub const SEARCH_INDEX_VERSION: u32 = 3;
 pub const USAGE_INDEX_VERSION: u32 = 4;
 pub const ASSET_INDEX_VERSION: u32 = 1;
 pub const MEMBER_INDEX_VERSION: u32 = 2;

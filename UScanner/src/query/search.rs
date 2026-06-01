@@ -35,55 +35,57 @@ use tracing::info;
 use crate::db::ensure_search_projections;
 use crate::db::project_path::PATH_CTE;
 use crate::db::text;
+use crate::query::member_index::{StrId, StringPool};
 
 const FIND_FUZZY_FALLBACK_LIMIT: usize = 256;
 static FAST_FIND_LOG_ENABLED: OnceLock<bool> = OnceLock::new();
 
 #[derive(Clone, Serialize, Deserialize)]
 struct SymbolHotEntry {
-    name: String,
-    kind: String,
-    owner_name: Option<String>,
-    path: String,
+    name: StrId,
+    kind: StrId,
+    owner_name: StrId,
+    path: StrId,
     line_number: Option<i64>,
-    module_name: Option<String>,
-    name_lc: String,
-    compact_name: String,
-    owner_name_lc: String,
-    module_name_lc: String,
+    module_name: StrId,
+    name_lc: StrId,
+    compact_name: StrId,
+    owner_name_lc: StrId,
+    module_name_lc: StrId,
     kind_rank: i64,
     is_class_like: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 struct FileHotEntry {
-    basename: String,
-    path: String,
-    module_name: Option<String>,
-    module_root: Option<String>,
-    basename_lc: String,
-    path_lc: String,
+    basename: StrId,
+    path: StrId,
+    module_name: StrId,
+    module_root: StrId,
+    basename_lc: StrId,
+    path_lc: StrId,
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct SearchHotIndex {
+    pool: StringPool,
     symbols: Vec<SymbolHotEntry>,
     files: Vec<FileHotEntry>,
     symbol_exact: HashMap<String, Vec<usize>>,
     symbol_compact_exact: HashMap<String, Vec<usize>>,
     symbol_qualified_exact: HashMap<String, Vec<usize>>,
-    symbol_name_prefix: Vec<(String, usize)>,
-    symbol_compact_prefix: Vec<(String, usize)>,
+    symbol_name_prefix: Vec<usize>,
+    symbol_compact_prefix: Vec<usize>,
     symbol_token_exact: HashMap<String, Vec<usize>>,
-    symbol_token_prefix: Vec<(String, usize)>,
+    symbol_token_prefix: Vec<(StrId, usize)>,
     symbol_owner_exact: HashMap<String, Vec<usize>>,
-    symbol_owner_prefix: Vec<(String, usize)>,
+    symbol_owner_prefix: Vec<usize>,
     symbol_module_exact: HashMap<String, Vec<usize>>,
-    symbol_module_prefix: Vec<(String, usize)>,
+    symbol_module_prefix: Vec<usize>,
     file_basename_exact: HashMap<String, Vec<usize>>,
     file_path_exact: HashMap<String, Vec<usize>>,
-    file_basename_prefix: Vec<(String, usize)>,
-    file_path_prefix: Vec<(String, usize)>,
+    file_basename_prefix: Vec<usize>,
+    file_path_prefix: Vec<usize>,
 }
 
 fn fast_find_log_enabled() -> bool {
@@ -95,6 +97,92 @@ fn fast_find_log_enabled() -> bool {
 }
 
 impl SearchHotIndex {
+    fn text(&self, id: StrId) -> &str {
+        self.pool.get(id).unwrap_or("")
+    }
+
+    fn symbol_name(&self, entry: &SymbolHotEntry) -> &str {
+        self.text(entry.name)
+    }
+
+    fn symbol_kind(&self, entry: &SymbolHotEntry) -> &str {
+        self.text(entry.kind)
+    }
+
+    fn symbol_owner_name(&self, entry: &SymbolHotEntry) -> Option<&str> {
+        self.pool.get(entry.owner_name)
+    }
+
+    fn symbol_path(&self, entry: &SymbolHotEntry) -> &str {
+        self.text(entry.path)
+    }
+
+    fn symbol_module_name(&self, entry: &SymbolHotEntry) -> Option<&str> {
+        self.pool.get(entry.module_name)
+    }
+
+    fn symbol_name_lc(&self, entry: &SymbolHotEntry) -> &str {
+        self.text(entry.name_lc)
+    }
+
+    fn symbol_compact_name(&self, entry: &SymbolHotEntry) -> &str {
+        self.text(entry.compact_name)
+    }
+
+    fn symbol_owner_name_lc(&self, entry: &SymbolHotEntry) -> &str {
+        self.text(entry.owner_name_lc)
+    }
+
+    fn symbol_module_name_lc(&self, entry: &SymbolHotEntry) -> &str {
+        self.text(entry.module_name_lc)
+    }
+
+    fn file_basename(&self, entry: &FileHotEntry) -> &str {
+        self.text(entry.basename)
+    }
+
+    fn file_path(&self, entry: &FileHotEntry) -> &str {
+        self.text(entry.path)
+    }
+
+    fn file_module_name(&self, entry: &FileHotEntry) -> Option<&str> {
+        self.pool.get(entry.module_name)
+    }
+
+    fn file_module_root(&self, entry: &FileHotEntry) -> Option<&str> {
+        self.pool.get(entry.module_root)
+    }
+
+    fn file_basename_lc(&self, entry: &FileHotEntry) -> &str {
+        self.text(entry.basename_lc)
+    }
+
+    fn file_path_lc(&self, entry: &FileHotEntry) -> &str {
+        self.text(entry.path_lc)
+    }
+
+    fn symbol_value(&self, entry: &SymbolHotEntry) -> Value {
+        json!({
+            "name": self.symbol_name(entry),
+            "type": self.symbol_kind(entry),
+            "class_name": self.symbol_owner_name(entry),
+            "path": self.symbol_path(entry),
+            "line": entry.line_number,
+            "module_name": self.symbol_module_name(entry),
+        })
+    }
+
+    fn file_value(&self, entry: &FileHotEntry) -> Value {
+        json!({
+            "name": self.file_basename(entry),
+            "type": "file",
+            "path": self.file_path(entry),
+            "line": 1,
+            "module_name": self.file_module_name(entry),
+            "module_root": self.file_module_root(entry),
+        })
+    }
+
     fn query_plan(
         &self,
         pattern: &str,
@@ -181,6 +269,7 @@ impl SearchHotIndex {
                 &self.file_basename_prefix,
                 &prefix,
                 target,
+                SearchHotIndex::file_basename_lc,
             );
             self.merge_file_prefix(
                 &mut results,
@@ -188,6 +277,7 @@ impl SearchHotIndex {
                 &self.file_path_prefix,
                 &prefix,
                 target,
+                SearchHotIndex::file_path_lc,
             );
         }
 
@@ -219,6 +309,7 @@ impl SearchHotIndex {
                 &compact,
                 class_only,
                 target,
+                SearchHotIndex::symbol_compact_name,
             );
         }
         self.merge_symbol_prefix(
@@ -228,6 +319,7 @@ impl SearchHotIndex {
             prefix,
             class_only,
             target,
+            SearchHotIndex::symbol_name_lc,
         );
         if identifier_query && out.len() < target {
             let compact = compact_identifier(query_text);
@@ -257,6 +349,7 @@ impl SearchHotIndex {
                 prefix,
                 class_only,
                 target,
+                SearchHotIndex::symbol_owner_name_lc,
             );
             self.merge_symbol_exact_map(
                 out,
@@ -273,6 +366,7 @@ impl SearchHotIndex {
                 prefix,
                 class_only,
                 target,
+                SearchHotIndex::symbol_module_name_lc,
             );
         }
     }
@@ -332,6 +426,7 @@ impl SearchHotIndex {
                 &query,
                 true,
                 target,
+                SearchHotIndex::symbol_name_lc,
             );
             if !compact.is_empty() {
                 self.merge_symbol_prefix(
@@ -341,6 +436,7 @@ impl SearchHotIndex {
                     &compact,
                     true,
                     target,
+                    SearchHotIndex::symbol_compact_name,
                 );
             }
             if !results.is_empty() {
@@ -358,7 +454,7 @@ impl SearchHotIndex {
                 class_only,
                 target,
             );
-            self.merge_symbol_prefix(
+            self.merge_symbol_token_prefix(
                 &mut results,
                 &mut seen,
                 &self.symbol_token_prefix,
@@ -430,7 +526,7 @@ impl SearchHotIndex {
             if class_only && !entry.is_class_like {
                 continue;
             }
-            let value = symbol_hot_entry_to_value(entry);
+            let value = self.symbol_value(entry);
             let key = find_result_identity(&value);
             if seen.insert(key) {
                 out.push(value);
@@ -442,7 +538,38 @@ impl SearchHotIndex {
         &self,
         out: &mut Vec<Value>,
         seen: &mut HashSet<String>,
-        sorted: &[(String, usize)],
+        sorted: &[usize],
+        prefix: &str,
+        class_only: bool,
+        limit: usize,
+        key_of: for<'a> fn(&'a SearchHotIndex, &'a SymbolHotEntry) -> &'a str,
+    ) {
+        if prefix.is_empty() || out.len() >= limit {
+            return;
+        }
+
+        let mut index = lower_bound_symbol_prefix(self, sorted, prefix, key_of);
+        while index < sorted.len() && key_of(self, &self.symbols[sorted[index]]).starts_with(prefix) {
+            if out.len() >= limit {
+                break;
+            }
+            let entry = &self.symbols[sorted[index]];
+            if !class_only || entry.is_class_like {
+                let value = self.symbol_value(entry);
+                let key = find_result_identity(&value);
+                if seen.insert(key) {
+                    out.push(value);
+                }
+            }
+            index += 1;
+        }
+    }
+
+    fn merge_symbol_token_prefix(
+        &self,
+        out: &mut Vec<Value>,
+        seen: &mut HashSet<String>,
+        sorted: &[(StrId, usize)],
         prefix: &str,
         class_only: bool,
         limit: usize,
@@ -451,14 +578,14 @@ impl SearchHotIndex {
             return;
         }
 
-        let mut index = lower_bound_prefix(sorted, prefix);
-        while index < sorted.len() && sorted[index].0.starts_with(prefix) {
+        let mut index = lower_bound_token_prefix(&self.pool, sorted, prefix);
+        while index < sorted.len() && self.text(sorted[index].0).starts_with(prefix) {
             if out.len() >= limit {
                 break;
             }
             let entry = &self.symbols[sorted[index].1];
             if !class_only || entry.is_class_like {
-                let value = symbol_hot_entry_to_value(entry);
+                let value = self.symbol_value(entry);
                 let key = find_result_identity(&value);
                 if seen.insert(key) {
                     out.push(value);
@@ -490,16 +617,16 @@ impl SearchHotIndex {
                 continue;
             }
 
-            let raw_match = entry.name_lc.contains(query);
+            let raw_match = self.symbol_name_lc(entry).contains(query);
             let compact_match = !raw_contains_only
                 && !compact_query.is_empty()
                 && compact_query.len() >= 4
-                && entry.compact_name.contains(compact_query);
+                && self.symbol_compact_name(entry).contains(compact_query);
             if !raw_match && !compact_match {
                 continue;
             }
 
-            let value = symbol_hot_entry_to_value(entry);
+            let value = self.symbol_value(entry);
             let key = find_result_identity(&value);
             if seen.insert(key) {
                 out.push(value);
@@ -542,7 +669,7 @@ impl SearchHotIndex {
             if out.len() >= limit {
                 break;
             }
-            let value = file_hot_entry_to_value(&self.files[index]);
+            let value = self.file_value(&self.files[index]);
             let key = find_result_identity(&value);
             if seen.insert(key) {
                 out.push(value);
@@ -554,20 +681,21 @@ impl SearchHotIndex {
         &self,
         out: &mut Vec<Value>,
         seen: &mut HashSet<String>,
-        sorted: &[(String, usize)],
+        sorted: &[usize],
         prefix: &str,
         limit: usize,
+        key_of: for<'a> fn(&'a SearchHotIndex, &'a FileHotEntry) -> &'a str,
     ) {
         if prefix.is_empty() || out.len() >= limit {
             return;
         }
 
-        let mut index = lower_bound_prefix(sorted, prefix);
-        while index < sorted.len() && sorted[index].0.starts_with(prefix) {
+        let mut index = lower_bound_file_prefix(self, sorted, prefix, key_of);
+        while index < sorted.len() && key_of(self, &self.files[sorted[index]]).starts_with(prefix) {
             if out.len() >= limit {
                 break;
             }
-            let value = file_hot_entry_to_value(&self.files[sorted[index].1]);
+            let value = self.file_value(&self.files[sorted[index]]);
             let key = find_result_identity(&value);
             if seen.insert(key) {
                 out.push(value);
@@ -577,12 +705,50 @@ impl SearchHotIndex {
     }
 }
 
-fn lower_bound_prefix(sorted: &[(String, usize)], prefix: &str) -> usize {
+fn lower_bound_symbol_prefix(
+    index: &SearchHotIndex,
+    sorted: &[usize],
+    prefix: &str,
+    key_of: for<'a> fn(&'a SearchHotIndex, &'a SymbolHotEntry) -> &'a str,
+) -> usize {
     let mut left = 0usize;
     let mut right = sorted.len();
     while left < right {
         let mid = (left + right) / 2;
-        if sorted[mid].0.as_str() < prefix {
+        if key_of(index, &index.symbols[sorted[mid]]) < prefix {
+            left = mid + 1;
+        } else {
+            right = mid;
+        }
+    }
+    left
+}
+
+fn lower_bound_file_prefix(
+    index: &SearchHotIndex,
+    sorted: &[usize],
+    prefix: &str,
+    key_of: for<'a> fn(&'a SearchHotIndex, &'a FileHotEntry) -> &'a str,
+) -> usize {
+    let mut left = 0usize;
+    let mut right = sorted.len();
+    while left < right {
+        let mid = (left + right) / 2;
+        if key_of(index, &index.files[sorted[mid]]) < prefix {
+            left = mid + 1;
+        } else {
+            right = mid;
+        }
+    }
+    left
+}
+
+fn lower_bound_token_prefix(pool: &StringPool, sorted: &[(StrId, usize)], prefix: &str) -> usize {
+    let mut left = 0usize;
+    let mut right = sorted.len();
+    while left < right {
+        let mid = (left + right) / 2;
+        if pool.get(sorted[mid].0).unwrap_or("") < prefix {
             left = mid + 1;
         } else {
             right = mid;
@@ -606,31 +772,18 @@ impl HotQueryPlan {
     }
 }
 
-fn symbol_hot_entry_to_value(entry: &SymbolHotEntry) -> Value {
-    json!({
-        "name": entry.name,
-        "type": entry.kind,
-        "class_name": entry.owner_name,
-        "path": entry.path,
-        "line": entry.line_number,
-        "module_name": entry.module_name,
-    })
+fn pool_text(pool: &StringPool, id: StrId) -> &str {
+    pool.get(id).unwrap_or("")
 }
 
-fn file_hot_entry_to_value(entry: &FileHotEntry) -> Value {
-    json!({
-        "name": entry.basename,
-        "type": "file",
-        "path": entry.path,
-        "line": 1,
-        "module_name": entry.module_name,
-        "module_root": entry.module_root,
-    })
+fn intern_optional(pool: &mut StringPool, text: Option<&str>) -> StrId {
+    text.map(|text| pool.intern(text)).unwrap_or(StrId::NONE)
 }
 
 pub fn build_search_hot_index(conn: &Connection) -> anyhow::Result<SearchHotIndex> {
     ensure_search_projections(conn)?;
 
+    let mut pool = StringPool::new();
     let mut symbols = Vec::new();
     let mut stmt = conn.prepare(
         r#"
@@ -652,17 +805,24 @@ pub fn build_search_hot_index(conn: &Connection) -> anyhow::Result<SearchHotInde
         "#,
     )?;
     let rows = stmt.query_map([], |row| {
+        let path = normalize_path(&row.get::<_, String>(3)?);
         Ok(SymbolHotEntry {
-            name: row.get(0)?,
-            kind: row.get(1)?,
-            owner_name: row.get(2)?,
-            path: normalize_path(&row.get::<_, String>(3)?),
+            name: pool.intern(&row.get::<_, String>(0)?),
+            kind: pool.intern(&row.get::<_, String>(1)?),
+            owner_name: intern_optional(&mut pool, row.get::<_, Option<String>>(2)?.as_deref()),
+            path: pool.intern(&path),
             line_number: row.get(4)?,
-            module_name: row.get(5)?,
-            name_lc: row.get(6)?,
-            compact_name: row.get(7)?,
-            owner_name_lc: row.get::<_, Option<String>>(8)?.unwrap_or_default(),
-            module_name_lc: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
+            module_name: intern_optional(&mut pool, row.get::<_, Option<String>>(5)?.as_deref()),
+            name_lc: pool.intern(&row.get::<_, String>(6)?),
+            compact_name: pool.intern(&row.get::<_, String>(7)?),
+            owner_name_lc: intern_optional(
+                &mut pool,
+                row.get::<_, Option<String>>(8)?.as_deref(),
+            ),
+            module_name_lc: intern_optional(
+                &mut pool,
+                row.get::<_, Option<String>>(9)?.as_deref(),
+            ),
             kind_rank: row.get(10)?,
             is_class_like: row.get::<_, i64>(11)? != 0,
         })
@@ -691,13 +851,17 @@ pub fn build_search_hot_index(conn: &Connection) -> anyhow::Result<SearchHotInde
         PATH_CTE
     ))?;
     let rows = stmt.query_map([], |row| {
+        let path = normalize_path(&row.get::<_, String>(1)?);
+        let module_root = row
+            .get::<_, Option<String>>(3)?
+            .map(|path| normalize_path(&path));
         Ok(FileHotEntry {
-            basename: row.get(0)?,
-            path: normalize_path(&row.get::<_, String>(1)?),
-            module_name: row.get(2)?,
-            module_root: row.get::<_, Option<String>>(3)?.map(|p| normalize_path(&p)),
-            basename_lc: row.get(4)?,
-            path_lc: row.get(5)?,
+            basename: pool.intern(&row.get::<_, String>(0)?),
+            path: pool.intern(&path),
+            module_name: intern_optional(&mut pool, row.get::<_, Option<String>>(2)?.as_deref()),
+            module_root: intern_optional(&mut pool, module_root.as_deref()),
+            basename_lc: pool.intern(&row.get::<_, String>(4)?),
+            path_lc: pool.intern(&row.get::<_, String>(5)?),
         })
     })?;
     for row in rows {
@@ -716,69 +880,74 @@ pub fn build_search_hot_index(conn: &Connection) -> anyhow::Result<SearchHotInde
     let mut symbol_module_exact = HashMap::<String, Vec<usize>>::new();
     let mut symbol_module_prefix = Vec::new();
     for (index, entry) in symbols.iter().enumerate() {
-        symbol_exact.entry(entry.name_lc.clone()).or_default().push(index);
-        if !entry.compact_name.is_empty() {
+        let name_lc = pool_text(&pool, entry.name_lc);
+        let compact_name = pool_text(&pool, entry.compact_name);
+        let owner_name_lc = pool_text(&pool, entry.owner_name_lc);
+        let module_name_lc = pool_text(&pool, entry.module_name_lc);
+
+        symbol_exact.entry(name_lc.to_string()).or_default().push(index);
+        if !compact_name.is_empty() {
             symbol_compact_exact
-                .entry(entry.compact_name.clone())
+                .entry(compact_name.to_string())
                 .or_default()
                 .push(index);
-            symbol_compact_prefix.push((entry.compact_name.clone(), index));
+            symbol_compact_prefix.push(index);
         }
-        if !entry.owner_name_lc.is_empty() {
+        if !owner_name_lc.is_empty() {
             symbol_owner_exact
-                .entry(entry.owner_name_lc.clone())
+                .entry(owner_name_lc.to_string())
                 .or_default()
                 .push(index);
-            symbol_owner_prefix.push((entry.owner_name_lc.clone(), index));
+            symbol_owner_prefix.push(index);
         }
-        if !entry.module_name_lc.is_empty() {
+        if !module_name_lc.is_empty() {
             symbol_module_exact
-                .entry(entry.module_name_lc.clone())
+                .entry(module_name_lc.to_string())
                 .or_default()
                 .push(index);
-            symbol_module_prefix.push((entry.module_name_lc.clone(), index));
+            symbol_module_prefix.push(index);
         }
-        if !entry.owner_name_lc.is_empty() {
+        if !owner_name_lc.is_empty() {
             symbol_qualified_exact
-                .entry(format!("{}::{}", entry.owner_name_lc, entry.name_lc))
+                .entry(format!("{}::{}", owner_name_lc, name_lc))
                 .or_default()
                 .push(index);
         }
-        for token in identifier_search_tokens(&entry.name) {
+        for token in identifier_search_tokens(pool_text(&pool, entry.name)) {
             symbol_token_exact.entry(token.clone()).or_default().push(index);
-            symbol_token_prefix.push((token, index));
+            symbol_token_prefix.push((pool.intern(&token), index));
         }
-        symbol_name_prefix.push((entry.name_lc.clone(), index));
+        symbol_name_prefix.push(index);
     }
     symbol_name_prefix.sort_unstable_by(|left, right| {
-        left.0
-            .cmp(&right.0)
-            .then_with(|| symbols[left.1].kind_rank.cmp(&symbols[right.1].kind_rank))
-            .then_with(|| symbols[left.1].path.cmp(&symbols[right.1].path))
+        pool_text(&pool, symbols[*left].name_lc)
+            .cmp(pool_text(&pool, symbols[*right].name_lc))
+            .then_with(|| symbols[*left].kind_rank.cmp(&symbols[*right].kind_rank))
+            .then_with(|| pool_text(&pool, symbols[*left].path).cmp(pool_text(&pool, symbols[*right].path)))
     });
     symbol_compact_prefix.sort_unstable_by(|left, right| {
-        left.0
-            .cmp(&right.0)
-            .then_with(|| symbols[left.1].kind_rank.cmp(&symbols[right.1].kind_rank))
-            .then_with(|| symbols[left.1].path.cmp(&symbols[right.1].path))
+        pool_text(&pool, symbols[*left].compact_name)
+            .cmp(pool_text(&pool, symbols[*right].compact_name))
+            .then_with(|| symbols[*left].kind_rank.cmp(&symbols[*right].kind_rank))
+            .then_with(|| pool_text(&pool, symbols[*left].path).cmp(pool_text(&pool, symbols[*right].path)))
     });
     symbol_token_prefix.sort_unstable_by(|left, right| {
-        left.0
-            .cmp(&right.0)
+        pool_text(&pool, left.0)
+            .cmp(pool_text(&pool, right.0))
             .then_with(|| symbols[left.1].kind_rank.cmp(&symbols[right.1].kind_rank))
-            .then_with(|| symbols[left.1].path.cmp(&symbols[right.1].path))
+            .then_with(|| pool_text(&pool, symbols[left.1].path).cmp(pool_text(&pool, symbols[right.1].path)))
     });
     symbol_owner_prefix.sort_unstable_by(|left, right| {
-        left.0
-            .cmp(&right.0)
-            .then_with(|| symbols[left.1].kind_rank.cmp(&symbols[right.1].kind_rank))
-            .then_with(|| symbols[left.1].path.cmp(&symbols[right.1].path))
+        pool_text(&pool, symbols[*left].owner_name_lc)
+            .cmp(pool_text(&pool, symbols[*right].owner_name_lc))
+            .then_with(|| symbols[*left].kind_rank.cmp(&symbols[*right].kind_rank))
+            .then_with(|| pool_text(&pool, symbols[*left].path).cmp(pool_text(&pool, symbols[*right].path)))
     });
     symbol_module_prefix.sort_unstable_by(|left, right| {
-        left.0
-            .cmp(&right.0)
-            .then_with(|| symbols[left.1].kind_rank.cmp(&symbols[right.1].kind_rank))
-            .then_with(|| symbols[left.1].path.cmp(&symbols[right.1].path))
+        pool_text(&pool, symbols[*left].module_name_lc)
+            .cmp(pool_text(&pool, symbols[*right].module_name_lc))
+            .then_with(|| symbols[*left].kind_rank.cmp(&symbols[*right].kind_rank))
+            .then_with(|| pool_text(&pool, symbols[*left].path).cmp(pool_text(&pool, symbols[*right].path)))
     });
 
     let mut file_basename_exact = HashMap::<String, Vec<usize>>::new();
@@ -787,21 +956,29 @@ pub fn build_search_hot_index(conn: &Connection) -> anyhow::Result<SearchHotInde
     let mut file_path_prefix = Vec::with_capacity(files.len());
     for (index, entry) in files.iter().enumerate() {
         file_basename_exact
-            .entry(entry.basename_lc.clone())
+            .entry(pool_text(&pool, entry.basename_lc).to_string())
             .or_default()
             .push(index);
-        file_path_exact.entry(entry.path_lc.clone()).or_default().push(index);
-        file_basename_prefix.push((entry.basename_lc.clone(), index));
-        file_path_prefix.push((entry.path_lc.clone(), index));
+        file_path_exact
+            .entry(pool_text(&pool, entry.path_lc).to_string())
+            .or_default()
+            .push(index);
+        file_basename_prefix.push(index);
+        file_path_prefix.push(index);
     }
     file_basename_prefix.sort_unstable_by(|left, right| {
-        left.0.cmp(&right.0).then_with(|| files[left.1].path.cmp(&files[right.1].path))
+        pool_text(&pool, files[*left].basename_lc)
+            .cmp(pool_text(&pool, files[*right].basename_lc))
+            .then_with(|| pool_text(&pool, files[*left].path).cmp(pool_text(&pool, files[*right].path)))
     });
     file_path_prefix.sort_unstable_by(|left, right| {
-        left.0.cmp(&right.0).then_with(|| files[left.1].basename.cmp(&files[right.1].basename))
+        pool_text(&pool, files[*left].path_lc)
+            .cmp(pool_text(&pool, files[*right].path_lc))
+            .then_with(|| pool_text(&pool, files[*left].basename).cmp(pool_text(&pool, files[*right].basename)))
     });
 
     Ok(SearchHotIndex {
+        pool,
         symbols,
         files,
         symbol_exact,
