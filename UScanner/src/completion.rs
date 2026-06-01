@@ -9,7 +9,7 @@ use tree_sitter::{Node, Parser, Point};
 use tracing::info;
 
 use crate::db::ensure_search_projections;
-use crate::query::member_index::{HotMemberItem, MemberHotIndex};
+use crate::query::member_index::{HotMemberItem, MemberHotIndex, MemberKind};
 use crate::server::state::CompletionCache;
 
 const MAX_COMPLETION_ITEMS: usize = 128;
@@ -2945,92 +2945,101 @@ fn hot_member_candidate(
 ) -> Option<HotCompletionCandidate> {
     match item {
         HotMemberItem::Member { entry, class_rank } => {
-            let match_rank = completion_match_rank(&entry.name, prefix);
+            let name = index.member_name(entry);
+            let owner_class_name = index.member_owner_class_name(entry).unwrap_or("");
+            let return_type = index.member_return_type(entry);
+            let member_detail_text = index.member_detail(entry);
+            let match_rank = completion_match_rank(name, prefix);
             if match_rank == COMPLETION_MATCH_NONE {
                 return None;
             }
 
             if !index.is_member_accessible(
-                &entry.owner_class_name,
+                entry.owner_class_id,
                 accessor_class,
-                entry.access.as_deref(),
+                entry.flags,
                 assume_subclass_access,
             ) {
                 return None;
             }
 
-            let kind = completion_kind(&entry.member_type);
-            let function_detail = if entry.member_type == "function" {
-                entry.detail.as_deref()
+            let kind = match entry.kind {
+                MemberKind::Function => 2,
+                MemberKind::Property | MemberKind::Variable => 5,
+                _ => 1,
+            };
+            let function_detail = if entry.kind == MemberKind::Function {
+                member_detail_text
             } else {
                 None
             };
-            let detail = if entry.member_type == "function" {
+            let detail = if entry.kind == MemberKind::Function {
                 function_completion_detail(
-                    entry.return_type.as_deref(),
+                    return_type,
                     function_detail,
-                    Some(&entry.owner_class_name),
+                    Some(owner_class_name),
                 )
             } else {
-                member_detail(entry.return_type.as_deref(), &entry.owner_class_name)
+                member_detail(return_type, owner_class_name)
             };
-            let dedupe_key = format!("{}:{}", entry.name, detail);
+            let dedupe_key = format!("{}:{}", name, detail);
             if !seen.insert(dedupe_key) {
                 return None;
             }
 
-            let insert_text = if entry.member_type == "function" {
+            let insert_text = if entry.kind == MemberKind::Function {
                 if declaration_context {
-                    let should_override = entry.owner_class_name != accessor_class && !entry.is_static;
+                    let should_override = owner_class_name != accessor_class && !entry.is_static();
                     function_declaration_insert_text(
-                        entry.return_type.as_deref(),
-                        &entry.name,
+                        return_type,
+                        name,
                         function_detail,
                         should_override,
                     )
                 } else {
-                    function_snippet_text(&entry.name, function_detail)
+                    function_snippet_text(name, function_detail)
                 }
             } else {
-                entry.name.clone()
+                name.to_string()
             };
-            let insert_text_format = if entry.member_type == "function" && !declaration_context {
+            let insert_text_format = if entry.kind == MemberKind::Function && !declaration_context {
                 2
             } else {
                 1
             };
 
             Some(HotCompletionCandidate {
-                label: entry.name.clone(),
+                label: name.to_string(),
                 kind,
                 detail,
-                documentation: entry.detail.clone().unwrap_or_default(),
+                documentation: member_detail_text.unwrap_or_default().to_string(),
                 insert_text,
                 insert_text_format,
-                sort_text: completion_sort_text(class_rank * 1000 + match_rank, kind, &entry.name),
+                sort_text: completion_sort_text(class_rank * 1000 + match_rank, kind, name),
                 score_offset: completion_score_offset(match_rank),
-                source_class: Some(entry.owner_class_name.clone()),
+                source_class: Some(owner_class_name.to_string()),
             })
         }
         HotMemberItem::EnumValue { entry, class_rank } => {
-            let match_rank = completion_match_rank(&entry.name, prefix);
+            let name = index.enum_value_name(entry);
+            let match_rank = completion_match_rank(name, prefix);
             if match_rank == COMPLETION_MATCH_NONE {
                 return None;
             }
 
-            if !seen.insert(format!("enum:{}", entry.name)) {
+            if !seen.insert(format!("enum:{}", name)) {
                 return None;
             }
 
             let kind = 20;
             Some(HotCompletionCandidate {
-                label: entry.name.clone(),
+                label: name.to_string(),
                 kind,
                 detail: "enum item".to_string(),
                 documentation: String::new(),
-                insert_text: entry.name.clone(),
+                insert_text: name.to_string(),
                 insert_text_format: 1,
-                sort_text: completion_sort_text(class_rank * 1000 + match_rank, kind, &entry.name),
+                sort_text: completion_sort_text(class_rank * 1000 + match_rank, kind, name),
                 score_offset: completion_score_offset(match_rank),
                 source_class: None,
             })
