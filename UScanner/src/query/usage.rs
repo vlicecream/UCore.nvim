@@ -45,6 +45,7 @@ pub struct UsageHotIndex {
     all_file_ids: Vec<i64>,
     defs_by_name: HashMap<String, Vec<i64>>,
     calls_by_name_lc: HashMap<String, Vec<CallSiteHotEntry>>,
+    includes_forward: HashMap<i64, Vec<i64>>,
     include_reverse: HashMap<i64, Vec<i64>>,
     member_defs_by_key: HashMap<String, Vec<i64>>,
     member_decls_by_key: HashMap<String, Vec<MemberDeclHotEntry>>,
@@ -107,6 +108,7 @@ pub fn build_usage_hot_index(conn: &Connection) -> Result<UsageHotIndex> {
 
     let mut defs_by_name = HashMap::<String, Vec<i64>>::new();
     let mut calls_by_name_lc = HashMap::<String, Vec<CallSiteHotEntry>>::new();
+    let mut includes_forward = HashMap::<i64, Vec<i64>>::new();
     let mut include_reverse = HashMap::<i64, Vec<i64>>::new();
     let mut member_defs_by_key = HashMap::<String, Vec<i64>>::new();
     let mut member_decls_by_key = HashMap::<String, Vec<MemberDeclHotEntry>>::new();
@@ -209,16 +211,18 @@ pub fn build_usage_hot_index(conn: &Connection) -> Result<UsageHotIndex> {
     }
 
     let mut stmt = conn.prepare(
-        "SELECT resolved_file_id, file_id FROM file_includes WHERE resolved_file_id IS NOT NULL"
+        "SELECT file_id, resolved_file_id FROM file_includes WHERE resolved_file_id IS NOT NULL"
     )?;
     let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
     for row in rows {
-        let (resolved_id, file_id) = row?;
+        let (file_id, resolved_id) = row?;
+        includes_forward.entry(file_id).or_default().push(resolved_id);
         include_reverse.entry(resolved_id).or_default().push(file_id);
     }
 
     dedupe_id_map(&mut defs_by_name);
     dedupe_call_site_map(&mut calls_by_name_lc);
+    dedupe_i64_id_map(&mut includes_forward);
     dedupe_i64_id_map(&mut include_reverse);
     dedupe_id_map(&mut member_defs_by_key);
     dedupe_definition_map(&mut function_defs_by_name);
@@ -240,6 +244,7 @@ pub fn build_usage_hot_index(conn: &Connection) -> Result<UsageHotIndex> {
         all_file_ids,
         defs_by_name,
         calls_by_name_lc,
+        includes_forward,
         include_reverse,
         member_defs_by_key,
         member_decls_by_key,
@@ -912,6 +917,7 @@ impl UsageHotIndex {
             + self.all_file_ids.len()
             + self.defs_by_name.len()
             + self.calls_by_name_lc.len()
+            + self.includes_forward.len()
             + self.include_reverse.len()
             + self.member_defs_by_key.len()
             + self.member_decls_by_key.len()
@@ -970,7 +976,7 @@ impl UsageHotIndex {
         Some(ids)
     }
 
-    fn find_file_id(&self, file_path: &str) -> Option<i64> {
+    pub fn find_file_id(&self, file_path: &str) -> Option<i64> {
         let normalized = normalize_path(file_path);
         self.file_ids_by_path.get(&normalized).copied().or_else(|| {
             let filename = Path::new(file_path).file_name()?.to_str()?;
@@ -982,6 +988,13 @@ impl UsageHotIndex {
                     .map(|_| *file_id)
             })
         })
+    }
+
+    pub fn direct_include_file_ids(&self, file_id: i64) -> &[i64] {
+        self.includes_forward
+            .get(&file_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     fn get_file_paths_by_ids(&self, ids: &[i64]) -> Option<Vec<String>> {

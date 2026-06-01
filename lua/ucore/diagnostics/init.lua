@@ -18,6 +18,7 @@ local try_include_symbol
 local float_sequence = 0
 local float_winid = nil
 local last_float_key = nil
+local DIAGNOSTICS_INFLIGHT_TIMEOUT_MS = 30000
 
 local severity_map = {
 	error = vim.diagnostic.severity.ERROR,
@@ -364,16 +365,28 @@ function M.refresh(bufnr, opts)
 		return
 	end
 
-	if active_requests[bufnr] then
-		pending_refreshes[bufnr] = opts
-		return
-	end
-
 	refresh_sequences[bufnr] = (refresh_sequences[bufnr] or 0) + 1
 	local sequence = refresh_sequences[bufnr]
 	local changedtick = vim.api.nvim_buf_get_changedtick(bufnr)
 	local open_files, overlay_snapshots = open_file_overlays(root, bufnr)
-	active_requests[bufnr] = true
+	local in_flight = active_requests[bufnr]
+	if in_flight then
+		local age_ms = vim.loop.now() - (in_flight.started_at or 0)
+		if age_ms <= DIAGNOSTICS_INFLIGHT_TIMEOUT_MS then
+			pending_refreshes[bufnr] = {
+				opts = opts,
+				changedtick = changedtick,
+			}
+			return
+		end
+
+		active_requests[bufnr] = nil
+	end
+
+	active_requests[bufnr] = {
+		started_at = vim.loop.now(),
+		changedtick = changedtick,
+	}
 
 	remote.get_diagnostics(root, {
 		content = current_content(bufnr),
@@ -386,9 +399,16 @@ function M.refresh(bufnr, opts)
 		pending_refreshes[bufnr] = nil
 		if pending then
 			vim.schedule(function()
-				if vim.api.nvim_buf_is_valid(bufnr) then
-					M.refresh(bufnr, pending)
+				if not vim.api.nvim_buf_is_valid(bufnr) then
+					return
 				end
+
+				local current_tick = vim.api.nvim_buf_get_changedtick(bufnr)
+				if pending.changedtick ~= current_tick and not (pending.opts and pending.opts.force) then
+					return
+				end
+
+				M.refresh(bufnr, pending.opts or {})
 			end)
 		end
 
@@ -1846,7 +1866,7 @@ local function schedule_refresh(args)
 	local stable_refresh = event == "BufWritePost" or event == "InsertLeave" or event == "BufReadPost"
 	local delay = stable_refresh
 			and (diagnostics_config.debounce_ms or 300)
-		or (diagnostics_config.live_debounce_ms or 80)
+		or (diagnostics_config.live_debounce_ms or 250)
 	local refresh_opts = {
 		silent = true,
 		force = true,

@@ -333,8 +333,8 @@ local function default_values()
 			float_on_cursor = true,
 			float_in_insert = false,
 			float_delay_ms = 200,
-			update_in_insert = true,
-			live_debounce_ms = 80,
+			update_in_insert = false,
+			live_debounce_ms = 250,
 			debounce_ms = 300,
 		},
 

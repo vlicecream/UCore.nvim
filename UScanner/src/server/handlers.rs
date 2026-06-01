@@ -1112,9 +1112,18 @@ fn handle_state_query(
                 None => None,
             };
 
-            let value = crate::diagnostics::process_diagnostics(
+            let usage_hot_index = state.get_usage_hot_index(project_db_path).ok();
+            let engine_usage_hot_index = engine_db_path
+                .as_deref()
+                .map(normalize_to_native)
+                .filter(|path| Path::new(path).is_file())
+                .and_then(|path| state.get_usage_hot_index(&path).ok());
+
+            let value = crate::diagnostics::process_diagnostics_with_hot_indexes(
                 conn,
                 engine_conn.as_ref(),
+                usage_hot_index.as_deref(),
+                engine_usage_hot_index.as_deref(),
                 &content,
                 file_path,
                 &open_files,

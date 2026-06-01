@@ -12,6 +12,7 @@ use tree_sitter::Parser;
 use tracing::info;
 
 use crate::types::OpenBufferOverlay;
+use crate::query::usage::UsageHotIndex;
 
 const PROJECT_TEXT_VISIBILITY_SCAN_LIMIT: usize = 64;
 const ENGINE_TEXT_VISIBILITY_SCAN_LIMIT: usize = 64;
@@ -77,6 +78,26 @@ pub fn process_diagnostics(
     file_path: Option<String>,
     open_files: &[OpenBufferOverlay],
 ) -> Result<Value> {
+    process_diagnostics_with_hot_indexes(
+        conn,
+        engine_conn,
+        None,
+        None,
+        content,
+        file_path,
+        open_files,
+    )
+}
+
+pub fn process_diagnostics_with_hot_indexes(
+    conn: &Connection,
+    engine_conn: Option<&Connection>,
+    usage_hot_index: Option<&UsageHotIndex>,
+    engine_usage_hot_index: Option<&UsageHotIndex>,
+    content: &str,
+    file_path: Option<String>,
+    open_files: &[OpenBufferOverlay],
+) -> Result<Value> {
     let mut items = Vec::new();
     let log_enabled = diagnostics_log_enabled();
     let file_label = file_path.as_deref().unwrap_or("-");
@@ -132,6 +153,8 @@ pub fn process_diagnostics(
             missing_visible_type_diagnostics(
                 conn,
                 engine_conn,
+                usage_hot_index,
+                engine_usage_hot_index,
                 content,
                 file_path.as_deref(),
             )
@@ -494,6 +517,8 @@ fn member_syntax_diagnostics(
 fn missing_visible_type_diagnostics(
     conn: &Connection,
     engine_conn: Option<&Connection>,
+    usage_hot_index: Option<&UsageHotIndex>,
+    engine_usage_hot_index: Option<&UsageHotIndex>,
     content: &str,
     file_path: Option<&str>,
 ) -> Result<Vec<DiagnosticItem>> {
@@ -516,11 +541,18 @@ fn missing_visible_type_diagnostics(
     let root = tree.root_node();
     let local_types = collect_local_type_visibility(root, content);
     let include_paths = collect_include_paths(content);
-    let project_visible_file_ids = reachable_project_file_ids(conn, file_path, &include_paths);
+    let project_visible_file_ids =
+        reachable_project_file_ids(conn, usage_hot_index, file_path, &include_paths);
     let engine_seed_include_paths =
         collect_engine_seed_include_paths(conn, &project_visible_file_ids, &include_paths);
     let engine_visible_file_ids = engine_conn
-        .map(|engine_conn| reachable_engine_file_ids(engine_conn, &engine_seed_include_paths))
+        .map(|engine_conn| {
+            reachable_engine_file_ids(
+                engine_conn,
+                engine_usage_hot_index,
+                &engine_seed_include_paths,
+            )
+        })
         .unwrap_or_default();
     let mut seen = HashSet::new();
     let mut project_lookup_cache = HashMap::new();
@@ -3345,12 +3377,16 @@ fn include_path_from_file_path(file_path: &str) -> Option<String> {
 
 fn reachable_project_file_ids(
     conn: &Connection,
+    usage_hot_index: Option<&UsageHotIndex>,
     file_path: &str,
     include_paths: &HashSet<String>,
 ) -> HashSet<i64> {
     let mut roots = Vec::new();
 
-    if let Some(root_id) = get_file_id_by_full_path(conn, file_path) {
+    if let Some(root_id) = usage_hot_index
+        .and_then(|index| index.find_file_id(file_path))
+        .or_else(|| get_file_id_by_full_path(conn, file_path))
+    {
         roots.push(root_id);
     }
 
@@ -3358,16 +3394,20 @@ fn reachable_project_file_ids(
         roots.extend(file_ids_by_include_path(conn, include_path));
     }
 
-    reachable_file_ids_from_roots(conn, roots)
+    reachable_file_ids_from_roots(conn, usage_hot_index, roots)
 }
 
-fn reachable_engine_file_ids(conn: &Connection, include_paths: &HashSet<String>) -> HashSet<i64> {
+fn reachable_engine_file_ids(
+    conn: &Connection,
+    usage_hot_index: Option<&UsageHotIndex>,
+    include_paths: &HashSet<String>,
+) -> HashSet<i64> {
     let mut roots = Vec::new();
     for include_path in include_paths {
         roots.extend(file_ids_by_include_path(conn, include_path));
     }
 
-    reachable_file_ids_from_roots(conn, roots)
+    reachable_file_ids_from_roots(conn, usage_hot_index, roots)
 }
 
 fn visible_type_declared_in_files(
@@ -3504,7 +3544,11 @@ fn type_forward_declared_in_file_set(
     Ok(false)
 }
 
-fn reachable_file_ids_from_roots(conn: &Connection, roots: Vec<i64>) -> HashSet<i64> {
+fn reachable_file_ids_from_roots(
+    conn: &Connection,
+    usage_hot_index: Option<&UsageHotIndex>,
+    roots: Vec<i64>,
+) -> HashSet<i64> {
     if roots.is_empty() {
         return HashSet::new();
     }
@@ -3514,6 +3558,15 @@ fn reachable_file_ids_from_roots(conn: &Connection, roots: Vec<i64>) -> HashSet<
 
     while let Some(file_id) = queue.pop_front() {
         if !included.insert(file_id) {
+            continue;
+        }
+
+        if let Some(index) = usage_hot_index {
+            for &id in index.direct_include_file_ids(file_id) {
+                if !included.contains(&id) {
+                    queue.push_back(id);
+                }
+            }
             continue;
         }
 
