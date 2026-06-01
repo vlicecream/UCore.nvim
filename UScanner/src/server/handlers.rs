@@ -1008,27 +1008,13 @@ fn handle_state_query(
             };
             let engine_open_ms = engine_open_started_at.elapsed().as_millis();
             let member_index_started_at = Instant::now();
-            let project_member_index = match state.get_member_hot_index(project_db_path) {
-                Ok(index) => Some(index),
-                Err(err) => {
-                    warn!("Failed to open project member hot index for {}: {}", project_db_path, err);
-                    None
-                }
-            };
-            let engine_member_index = match engine_db_path
+            let project_member_index =
+                load_member_hot_index(&state, project_db_path, "completion project");
+            let engine_member_index = engine_db_path
                 .as_deref()
                 .map(normalize_to_native)
                 .filter(|path| Path::new(path).is_file())
-            {
-                Some(path) => match state.get_member_hot_index(&path) {
-                    Ok(index) => Some(index),
-                    Err(err) => {
-                        warn!("Failed to open engine member hot index for {}: {}", path, err);
-                        None
-                    }
-                },
-                None => None,
-            };
+                .and_then(|path| load_member_hot_index(&state, &path, "completion engine"));
             let member_index_ms = member_index_started_at.elapsed().as_millis();
             if query_log_enabled() {
                 info!(
@@ -1113,18 +1099,20 @@ fn handle_state_query(
                 None => None,
             };
 
-            let usage_hot_index = state.get_usage_hot_index(project_db_path).ok();
+            let usage_hot_index =
+                load_usage_hot_index(&state, project_db_path, "diagnostics project");
             let engine_usage_hot_index = engine_db_path
                 .as_deref()
                 .map(normalize_to_native)
                 .filter(|path| Path::new(path).is_file())
-                .and_then(|path| state.get_usage_hot_index(&path).ok());
-            let member_hot_index = state.get_member_hot_index(project_db_path).ok();
+                .and_then(|path| load_usage_hot_index(&state, &path, "diagnostics engine"));
+            let member_hot_index =
+                load_member_hot_index(&state, project_db_path, "diagnostics project");
             let engine_member_hot_index = engine_db_path
                 .as_deref()
                 .map(normalize_to_native)
                 .filter(|path| Path::new(path).is_file())
-                .and_then(|path| state.get_member_hot_index(&path).ok());
+                .and_then(|path| load_member_hot_index(&state, &path, "diagnostics engine"));
             let visibility_cache = state.get_visibility_cache(root_key);
             let project_db_mtime_secs = file_mtime_secs(project_db_path);
             let engine_db_mtime_secs = engine_db_path
@@ -3407,6 +3395,26 @@ fn load_usage_hot_index(
         Ok(index) => Some(index),
         Err(err) => {
             warn!("Failed to open usage hot index for {} ({}): {}", db_path, label, err);
+            None
+        }
+    }
+}
+
+fn load_member_hot_index(
+    state: &AppState,
+    db_path: &str,
+    label: &str,
+) -> Option<Arc<query::member_index::MemberHotIndex>> {
+    if is_engine_db_path(db_path) {
+        return None;
+    }
+    match state.get_member_hot_index(db_path) {
+        Ok(index) => Some(index),
+        Err(err) => {
+            warn!(
+                "Failed to open member hot index for {} ({}): {}",
+                db_path, label, err
+            );
             None
         }
     }
