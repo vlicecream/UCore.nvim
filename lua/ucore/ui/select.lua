@@ -165,31 +165,17 @@ local function open_input_window(opts)
 	end
 
 	local done = false
-	local result = nil
 	local function finish(value)
 		if done then
 			return
 		end
 		done = true
-		result = value
 		if winid and vim.api.nvim_win_is_valid(winid) then
 			vim.api.nvim_win_close(winid, true)
 		end
 		local callback = opts.on_confirm or opts.callback
 		if type(callback) == "function" then
 			callback(value)
-		end
-	end
-
-	local chars = vim.fn.split(default, "\\zs")
-	local cursor = #chars
-	local function redraw_line()
-		if not vim.api.nvim_buf_is_valid(bufnr) then
-			return
-		end
-		vim.api.nvim_buf_set_lines(bufnr, 0, 1, false, { table.concat(chars) })
-		if winid and vim.api.nvim_win_is_valid(winid) then
-			vim.api.nvim_win_set_cursor(winid, { 1, cursor })
 		end
 	end
 
@@ -213,50 +199,6 @@ local function open_input_window(opts)
 	end
 
 	vim.api.nvim_win_set_cursor(winid, { 1, #default })
-	if opts.blocking == true then
-		while not done and winid and vim.api.nvim_win_is_valid(winid) do
-			local ok_key, key = pcall(vim.fn.getcharstr)
-			if not ok_key then
-				cancel()
-				break
-			end
-
-			local name = vim.fn.keytrans(key)
-			if name == "<Esc>" then
-				cancel()
-			elseif name == "<CR>" or name == "<NL>" then
-				finish(table.concat(chars))
-			elseif name == "<BS>" or name == "<Del>" then
-				if cursor > 0 then
-					table.remove(chars, cursor)
-					cursor = cursor - 1
-					redraw_line()
-				end
-			elseif name == "<Left>" then
-				cursor = math.max(0, cursor - 1)
-				redraw_line()
-			elseif name == "<Right>" then
-				cursor = math.min(#chars, cursor + 1)
-				redraw_line()
-			elseif name == "<Home>" then
-				cursor = 0
-				redraw_line()
-			elseif name == "<End>" then
-				cursor = #chars
-				redraw_line()
-			elseif name == "<C-U>" then
-				chars = {}
-				cursor = 0
-				redraw_line()
-			elseif not name:match("^<.*>$") then
-				table.insert(chars, cursor + 1, key)
-				cursor = cursor + 1
-				redraw_line()
-			end
-		end
-		return result
-	end
-
 	pcall(vim.cmd, "startinsert!")
 	vim.schedule(function()
 		if winid and vim.api.nvim_win_is_valid(winid) then
@@ -1694,12 +1636,6 @@ function M.input(opts, callback)
 	if callback ~= nil then
 		opts.callback = callback
 	end
-	return open_input_window(opts)
-end
-
-function M.input_sync(opts)
-	opts = opts or {}
-	opts.blocking = true
 	return open_input_window(opts)
 end
 
