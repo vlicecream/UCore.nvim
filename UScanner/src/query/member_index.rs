@@ -1,8 +1,9 @@
 use anyhow::Result;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use std::convert::TryFrom;
+use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::convert::TryFrom;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub struct StrId(pub u32);
@@ -76,7 +77,7 @@ pub struct MemberHotIndex {
     enum_ranges: Vec<MemberRange>,
     parents: Vec<ParentEntry>,
     parent_ranges: Vec<MemberRange>,
-    class_ids_by_name: HashMap<String, Vec<i32>>,
+    class_ids_by_name: HashMap<String, SmallVec<[i32; 2]>>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -448,7 +449,7 @@ impl MemberHotIndex {
 pub fn build_member_hot_index(conn: &Connection) -> Result<MemberHotIndex> {
     let mut pool = StringPool::new();
     let mut class_names = vec![StrId::NONE];
-    let mut class_ids_by_name = HashMap::<String, Vec<i32>>::new();
+    let mut class_ids_by_name = HashMap::<String, SmallVec<[i32; 2]>>::new();
 
     let mut stmt = conn.prepare(
         r#"
