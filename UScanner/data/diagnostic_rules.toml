@@ -1,0 +1,14 @@
+[finalize]
+max_per_file = 500
+max_per_line = 5
+dedupe_window_cols = 4
+suppress_tail_lines = 1
+suppress_inside_preproc_if_zero = true
+
+[syntax_errors]
+enabled = true
+
+[bad_characters]
+enabled = true
+full_width_severity = "error"
+invisible_severity = "warning"

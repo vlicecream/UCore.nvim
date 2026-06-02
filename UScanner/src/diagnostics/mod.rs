@@ -2,6 +2,7 @@ use anyhow::Result;
 use blake3::Hasher;
 use regex::Regex;
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::Deserialize;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -16,11 +17,15 @@ use crate::types::OpenBufferOverlay;
 use crate::query::member_index::MemberHotIndex;
 use crate::query::usage::UsageHotIndex;
 
+mod finalize;
+mod phases;
+
 const PROJECT_TEXT_VISIBILITY_SCAN_LIMIT: usize = 64;
 const ENGINE_TEXT_VISIBILITY_SCAN_LIMIT: usize = 64;
 
 static DIAGNOSTICS_LOG_ENABLED: OnceLock<bool> = OnceLock::new();
 static BUILTIN_DIAGNOSTIC_KNOWN_NAMES: OnceLock<DiagnosticKnownNames> = OnceLock::new();
+static DIAGNOSTIC_RULES: OnceLock<DiagnosticRulesFile> = OnceLock::new();
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct VisibilityKey {
@@ -64,6 +69,114 @@ struct DiagnosticSuppressMember {
     classes: Vec<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Default)]
+pub(crate) struct DiagnosticRulesFile {
+    #[serde(default)]
+    pub finalize: FinalizeRules,
+    #[serde(default)]
+    pub syntax_errors: PhaseEnabled,
+    #[serde(default)]
+    pub bad_characters: BadCharactersRules,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct FinalizeRules {
+    #[serde(default = "default_max_per_file")]
+    pub max_per_file: usize,
+    #[serde(default = "default_max_per_line")]
+    pub max_per_line: usize,
+    #[serde(default = "default_dedupe_window_cols")]
+    pub dedupe_window_cols: u32,
+    #[serde(default = "default_suppress_tail_lines")]
+    pub suppress_tail_lines: usize,
+    #[serde(default = "default_true")]
+    pub suppress_inside_preproc_if_zero: bool,
+}
+
+impl Default for FinalizeRules {
+    fn default() -> Self {
+        Self {
+            max_per_file: default_max_per_file(),
+            max_per_line: default_max_per_line(),
+            dedupe_window_cols: default_dedupe_window_cols(),
+            suppress_tail_lines: default_suppress_tail_lines(),
+            suppress_inside_preproc_if_zero: default_true(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct PhaseEnabled {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for PhaseEnabled {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct BadCharactersRules {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_error_severity")]
+    pub full_width_severity: SeverityConfig,
+    #[serde(default = "default_warning_severity")]
+    pub invisible_severity: SeverityConfig,
+}
+
+impl Default for BadCharactersRules {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            full_width_severity: default_error_severity(),
+            invisible_severity: default_warning_severity(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum SeverityConfig {
+    #[default]
+    Error,
+    Warning,
+    Information,
+    Hint,
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+const fn default_max_per_file() -> usize {
+    500
+}
+
+const fn default_max_per_line() -> usize {
+    5
+}
+
+const fn default_dedupe_window_cols() -> u32 {
+    4
+}
+
+const fn default_suppress_tail_lines() -> usize {
+    1
+}
+
+const fn default_error_severity() -> SeverityConfig {
+    SeverityConfig::Error
+}
+
+const fn default_warning_severity() -> SeverityConfig {
+    SeverityConfig::Warning
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DiagnosticSeverity {
@@ -71,6 +184,17 @@ pub enum DiagnosticSeverity {
     Warning,
     Information,
     Hint,
+}
+
+impl From<SeverityConfig> for DiagnosticSeverity {
+    fn from(value: SeverityConfig) -> Self {
+        match value {
+            SeverityConfig::Error => Self::Error,
+            SeverityConfig::Warning => Self::Warning,
+            SeverityConfig::Information => Self::Information,
+            SeverityConfig::Hint => Self::Hint,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -87,7 +211,7 @@ pub struct DiagnosticItem {
 }
 
 impl DiagnosticItem {
-    fn new(
+    pub(crate) fn new(
         file_path: Option<&str>,
         line: u32,
         character: u32,
@@ -109,7 +233,7 @@ impl DiagnosticItem {
         }
     }
 
-    fn with_end(mut self, end_line: u32, end_character: u32) -> Self {
+    pub(crate) fn with_end(mut self, end_line: u32, end_character: u32) -> Self {
         self.end_line = end_line;
         self.end_character = end_character.max(self.character.saturating_add(1));
         self
@@ -153,8 +277,35 @@ pub fn process_diagnostics_with_hot_indexes(
     let log_enabled = diagnostics_log_enabled();
     let file_label = file_path.as_deref().unwrap_or("-");
     let known_names = effective_diagnostic_known_names(file_path.as_deref());
+    let rules = diagnostic_rules();
     let parsed_tree = parse_diagnostics_tree(content)?;
     let parsed_root = parsed_tree.as_ref().map(|tree| tree.root_node());
+
+    if rules.syntax_errors.enabled {
+        extend_diagnostic_phase(
+            &mut items,
+            "syntax_errors",
+            file_label,
+            log_enabled,
+            || phases::syntax_errors::collect(content, file_path.as_deref(), parsed_root),
+        )?;
+    }
+    if rules.bad_characters.enabled {
+        extend_diagnostic_phase(
+            &mut items,
+            "bad_characters",
+            file_label,
+            log_enabled,
+            || {
+                phases::bad_characters::collect(
+                    content,
+                    file_path.as_deref(),
+                    parsed_root,
+                    &rules.bad_characters,
+                )
+            },
+        )?;
+    }
 
     extend_diagnostic_phase(
         &mut items,
@@ -273,6 +424,12 @@ pub fn process_diagnostics_with_hot_indexes(
             parsed_root,
         ),
     )?;
+    let items = finalize::finalize_diagnostics(
+        items,
+        content,
+        file_path.as_deref(),
+        &rules.finalize,
+    );
     Ok(json!({ "items": items }))
 }
 
@@ -284,9 +441,15 @@ fn diagnostics_log_enabled() -> bool {
     })
 }
 
+fn diagnostic_rules() -> &'static DiagnosticRulesFile {
+    DIAGNOSTIC_RULES.get_or_init(|| {
+        toml::from_str(include_str!("../../data/diagnostic_rules.toml")).unwrap_or_default()
+    })
+}
+
 fn builtin_diagnostic_known_names() -> &'static DiagnosticKnownNames {
     BUILTIN_DIAGNOSTIC_KNOWN_NAMES.get_or_init(|| {
-        parse_diagnostic_known_names(include_str!("../data/diagnostic_known.toml"))
+        parse_diagnostic_known_names(include_str!("../../data/diagnostic_known.toml"))
             .unwrap_or_default()
     })
 }
@@ -6907,6 +7070,57 @@ mod tests {
         let items = value["items"].as_array().unwrap();
         assert!(!items.iter().any(|item| item["code"] == "UECPP008"));
         assert!(!items.iter().any(|item| item["code"] == "UECPP009"));
+    }
+
+    #[test]
+    fn syntax_errors_reports_missing_semicolon() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "void Run()\n{\n    int32 Value = 1\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| item["code"] == "UECPP-SYN-001"));
+    }
+
+    #[test]
+    fn bad_characters_reports_full_width_punctuation() {
+        let content = "void Run（）\n{\n}\n";
+        let tree = parse_diagnostics_tree(content).unwrap();
+        let items = phases::bad_characters::collect(
+            content,
+            Some("C:/Project/Source/Game/Private/Test.cpp"),
+            tree.as_ref().map(|tree| tree.root_node()),
+            &diagnostic_rules().bad_characters,
+        )
+        .unwrap();
+
+        assert!(items.iter().any(|item| item.code == "UECPP-CHR-001"));
+    }
+
+    #[test]
+    fn bad_characters_ignores_string_and_comment_literals() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "void Run()\n{\n    // （ comment\n    const TCHAR* Text = TEXT(\"（demo）\");\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-CHR-001"));
     }
 
     #[test]
