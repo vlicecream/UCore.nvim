@@ -31,6 +31,14 @@ enabled = true
 severity_incompatible = "error"
 severity_narrowing = "warning"
 
+[template]
+enabled = true
+severity_deduction_fail = "error"
+severity_explicit_arity_mismatch = "error"
+severity_non_type_mismatch = "error"
+severity_sfinae_rejected = "error"
+severity_specialization_conflict = "error"
+
 [preproc]
 enabled = true
 expand_macros = true

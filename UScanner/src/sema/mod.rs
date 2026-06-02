@@ -7,6 +7,7 @@ pub mod lookup;
 pub mod overload;
 pub mod scope;
 pub mod symbol;
+pub mod template;
 pub mod types;
 
 use std::collections::HashMap;
@@ -77,6 +78,33 @@ mod tests {
         let sema = build_sema(root, content);
         let node = find_identifier(root, "Count", content).unwrap();
         let ty = type_of_expression(&sema, node)
+            .and_then(|id| sema.render_type(id))
+            .unwrap();
+        assert_eq!(ty, "int32");
+    }
+
+    #[test]
+    fn sema_expr_resolves_template_call_return_type() {
+        let content =
+            "template<typename T> T Id(T Value) { return Value; } void Test() { Id<int32>(1); }";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+
+        fn find_call(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+            if node.kind() == "call_expression" {
+                return Some(node);
+            }
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if let Some(found) = find_call(child) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+
+        let call = find_call(root).unwrap();
+        let ty = type_of_expression(&sema, call)
             .and_then(|id| sema.render_type(id))
             .unwrap();
         assert_eq!(ty, "int32");
@@ -269,7 +297,19 @@ impl SemaContext {
                 .unwrap_or("unknown")
                 .to_string(),
             TypeKind::Typedef { name, .. } => name.clone(),
-            TypeKind::Template { base, .. } => base.clone(),
+            TypeKind::Template { base, args } => {
+                let rendered_args = args
+                    .iter()
+                    .map(|arg| match arg {
+                        types::TemplateArg::Type(type_id) => self
+                            .render_type(*type_id)
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        types::TemplateArg::Value(value) => value.clone(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{base}<{rendered_args}>")
+            }
             TypeKind::Dependent(name) => name.clone(),
             TypeKind::Auto => "auto".to_string(),
             TypeKind::Unknown => "unknown".to_string(),

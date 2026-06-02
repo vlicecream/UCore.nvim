@@ -69,6 +69,13 @@ fn type_of_field_expression(ctx: &SemaContext, node: Node) -> Option<TypeId> {
 
 fn type_of_call_expression(ctx: &SemaContext, node: Node) -> Option<TypeId> {
     let callee = node.child_by_field_name("function").or_else(|| node.child(0))?;
+    let template_index = build_template_index_for_node(node, ctx)?;
+    if is_template_callee(callee) {
+        return template_index.infer_call_return_type(node, ctx);
+    }
+    if let Some(type_id) = template_index.infer_call_return_type(node, ctx) {
+        return Some(type_id);
+    }
     let arg_types = call_argument_types(ctx, node);
     match callee.kind() {
         "identifier" | "qualified_identifier" => {
@@ -113,6 +120,27 @@ fn type_of_call_expression(ctx: &SemaContext, node: Node) -> Option<TypeId> {
             Some(*return_t)
         }
     }
+}
+
+fn is_template_callee(callee: Node) -> bool {
+    match callee.kind() {
+        "template_function" | "template_method" => true,
+        "field_expression" => callee
+            .child_by_field_name("field")
+            .is_some_and(|field| matches!(field.kind(), "template_function" | "template_method")),
+        _ => false,
+    }
+}
+
+fn build_template_index_for_node(
+    node: Node,
+    ctx: &SemaContext,
+) -> Option<crate::sema::template::TemplateIndex> {
+    let mut root = node;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    Some(crate::sema::template::TemplateIndex::collect(root, ctx))
 }
 
 fn type_of_binary_expression(ctx: &SemaContext, node: Node) -> Option<TypeId> {

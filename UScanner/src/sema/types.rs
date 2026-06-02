@@ -118,6 +118,10 @@ impl TypeArena {
     pub fn get(&self, id: TypeId) -> Option<&TypeKind> {
         self.types.get(id.0 as usize)
     }
+
+    pub fn find(&self, kind: &TypeKind) -> Option<TypeId> {
+        self.interned.get(kind).copied()
+    }
 }
 
 pub fn compat_rank(value: Compat) -> u8 {

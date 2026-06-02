@@ -86,6 +86,8 @@ pub(crate) struct DiagnosticRulesFile {
     #[serde(default)]
     pub type_check: TypeCheckRules,
     #[serde(default)]
+    pub template: TemplateRules,
+    #[serde(default)]
     pub preproc: PreprocRules,
 }
 
@@ -214,6 +216,35 @@ impl Default for TypeCheckRules {
             enabled: default_true(),
             severity_incompatible: default_error_severity(),
             severity_narrowing: default_warning_severity(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct TemplateRules {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_error_severity")]
+    pub severity_deduction_fail: SeverityConfig,
+    #[serde(default = "default_error_severity")]
+    pub severity_explicit_arity_mismatch: SeverityConfig,
+    #[serde(default = "default_error_severity")]
+    pub severity_non_type_mismatch: SeverityConfig,
+    #[serde(default = "default_error_severity")]
+    pub severity_sfinae_rejected: SeverityConfig,
+    #[serde(default = "default_error_severity")]
+    pub severity_specialization_conflict: SeverityConfig,
+}
+
+impl Default for TemplateRules {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            severity_deduction_fail: default_error_severity(),
+            severity_explicit_arity_mismatch: default_error_severity(),
+            severity_non_type_mismatch: default_error_severity(),
+            severity_sfinae_rejected: default_error_severity(),
+            severity_specialization_conflict: default_error_severity(),
         }
     }
 }
@@ -515,6 +546,23 @@ pub fn process_diagnostics_with_hot_indexes(
                     expanded_root.or(parsed_root),
                     expanded_sema_ctx.as_ref().or(sema_ctx.as_ref()),
                     &rules.type_check,
+                )?;
+                Ok(remap_diagnostics_to_original(items, preprocessed.as_ref()))
+            },
+        )?;
+    }
+    if rules.template.enabled {
+        extend_diagnostic_phase(
+            &mut items,
+            "template_check",
+            file_label,
+            log_enabled,
+            || {
+                let items = phases::template_check::collect(
+                    file_path.as_deref(),
+                    expanded_root.or(parsed_root),
+                    expanded_sema_ctx.as_ref().or(sema_ctx.as_ref()),
+                    &rules.template,
                 )?;
                 Ok(remap_diagnostics_to_original(items, preprocessed.as_ref()))
             },
@@ -7495,6 +7543,193 @@ mod tests {
 
         let items = value["items"].as_array().unwrap();
         assert!(items.iter().any(|item| item["code"] == "UECPP-DF-005"));
+    }
+
+    #[test]
+    fn template_check_reports_deduction_fail() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "template<typename T>\nvoid Pair(T A, T B) {}\nvoid Test()\n{\n    Pair(1, \"x\");\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| item["code"] == "UECPP-TPL-001"));
+    }
+
+    #[test]
+    fn template_check_reports_explicit_arity_mismatch() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "template<typename T>\nT Id(T Value) { return Value; }\nvoid Test()\n{\n    Id<int32, float>(1);\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| item["code"] == "UECPP-TPL-002"));
+    }
+
+    #[test]
+    fn template_check_reports_non_type_arg_mismatch() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "template<int N>\nvoid Sized() {}\nvoid Test()\n{\n    Sized<int32>();\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| item["code"] == "UECPP-TPL-003"));
+    }
+
+    #[test]
+    fn template_check_reports_class_template_non_type_arg_mismatch() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "template<int N>\nstruct Sized {};\nvoid Test()\n{\n    Sized<int32> Value;\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| item["code"] == "UECPP-TPL-003"));
+    }
+
+    #[test]
+    fn template_check_reports_simple_sfinae_rejection() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "template<typename T>\nstd::enable_if_t<false, T> Only(T Value) { return Value; }\nvoid Test()\n{\n    Only(1);\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| item["code"] == "UECPP-TPL-004"));
+    }
+
+    #[test]
+    fn template_check_reports_specialization_conflict_with_real_location() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "template<typename T>\nvoid Spec(T Value) {}\ntemplate<>\nvoid Spec<int32>(int32 Value) {}\ntemplate<>\nvoid Spec<int32>(int32 Value) {}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        let tpl_items = items
+            .iter()
+            .filter(|item| item["code"] == "UECPP-TPL-005")
+            .collect::<Vec<_>>();
+        assert_eq!(tpl_items.len(), 2);
+        assert!(tpl_items.iter().all(|item| item["line"].as_u64().unwrap_or(0) > 0));
+    }
+
+    #[test]
+    fn overload_check_ignores_template_function_calls_and_defers_to_template_phase() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "template<typename T>\nT Id(T Value) { return Value; }\nvoid Test()\n{\n    Id<int32>(1);\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-001"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-003"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-TPL-001"));
+    }
+
+    #[test]
+    fn type_check_uses_template_return_type_for_valid_return() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "template<typename T>\nT Id(T Value) { return Value; }\nint32 Test()\n{\n    return Id<int32>(1);\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-007"));
+    }
+
+    #[test]
+    fn type_check_uses_template_return_type_for_invalid_return() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "template<typename T>\nT Id(T Value) { return Value; }\nbool Test()\n{\n    return Id<int32>(1);\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| item["code"] == "UECPP-EXPR-007"));
+    }
+
+    #[test]
+    fn type_check_uses_class_template_ctor_deduction_for_valid_return() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "template<typename T>\nstruct Box { Box(T Value) {} };\nBox<int32> Test()\n{\n    return Box(1);\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-007"));
     }
 
     #[test]

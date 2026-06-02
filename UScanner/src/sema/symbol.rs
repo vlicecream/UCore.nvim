@@ -160,6 +160,10 @@ impl SymbolTable {
         self.class_names.get(id.0 as usize).map(String::as_str)
     }
 
+    pub fn class_id_by_name(&self, name: &str) -> Option<ClassId> {
+        self.class_ids_by_name.get(name).copied()
+    }
+
     pub fn set_class_scope(&mut self, class_id: ClassId, scope_id: ScopeId) {
         self.class_scopes.insert(class_id, scope_id);
     }

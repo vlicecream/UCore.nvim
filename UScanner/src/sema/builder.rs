@@ -306,7 +306,7 @@ impl<'a> SemaBuilder<'a> {
                     .map(|name| self.node_text(name).trim().to_string())
                     .unwrap_or_else(|| self.node_text(node).trim().to_string());
                 let mut args = Vec::new();
-                if let Some(arg_list) = find_descendant(node, "template_argument_list") {
+                if let Some(arg_list) = node.child_by_field_name("arguments") {
                     let mut cursor = arg_list.walk();
                     for child in arg_list.children(&mut cursor) {
                         match child.kind() {
@@ -315,6 +315,17 @@ impl<'a> SemaBuilder<'a> {
                             | "template_type"
                             | "qualified_identifier" => {
                                 args.push(TemplateArg::Type(self.resolve_type_node(child)));
+                            }
+                            "number_literal"
+                            | "char_literal"
+                            | "true"
+                            | "false"
+                            | "identifier"
+                            | "field_identifier" => {
+                                let text = self.node_text(child).trim().to_string();
+                                if !text.is_empty() {
+                                    args.push(TemplateArg::Value(text));
+                                }
                             }
                             _ => {}
                         }

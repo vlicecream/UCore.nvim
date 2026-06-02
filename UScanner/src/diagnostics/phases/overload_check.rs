@@ -50,6 +50,16 @@ fn call_diagnostic_item(
     rules: &OverloadRules,
 ) -> Option<DiagnosticItem> {
     let callee = node.child_by_field_name("function").or_else(|| node.child(0))?;
+    if is_template_callee(callee) {
+        return None;
+    }
+    if let Some(template_index) = build_template_index_for_node(node, sema_ctx) {
+        if template_index.analyze_call(node, sema_ctx).is_some()
+            || template_index.infer_call_return_type(node, sema_ctx).is_some()
+        {
+            return None;
+        }
+    }
     let candidates = resolve_callee_symbols(sema_ctx, callee)?;
     if candidates.is_empty() {
         return None;
@@ -95,6 +105,27 @@ fn call_diagnostic_item(
             ))
         }
     }
+}
+
+fn is_template_callee(callee: Node) -> bool {
+    match callee.kind() {
+        "template_function" | "template_method" => true,
+        "field_expression" => callee
+            .child_by_field_name("field")
+            .is_some_and(|field| matches!(field.kind(), "template_method" | "template_function")),
+        _ => false,
+    }
+}
+
+fn build_template_index_for_node(
+    node: Node,
+    ctx: &SemaContext,
+) -> Option<crate::sema::template::TemplateIndex> {
+    let mut root = node;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    Some(crate::sema::template::TemplateIndex::collect(root, ctx))
 }
 
 fn resolve_callee_symbols(sema_ctx: &SemaContext, callee: Node) -> Option<Vec<crate::sema::symbol::SymbolId>> {
