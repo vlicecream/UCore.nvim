@@ -167,8 +167,8 @@ local function dispatch_latest()
 
 		local callback_started_ms = debug.now_ms()
 		request.callback({
-			is_incomplete_forward = false,
-			is_incomplete_backward = false,
+			is_incomplete_forward = true,
+			is_incomplete_backward = true,
 			items = blink_items,
 		})
 		debug.log(
