@@ -1,6 +1,7 @@
 pub mod condition_eval;
 pub mod expand;
 pub mod macro_table;
+pub mod tokenizer;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -8,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use ignore::WalkBuilder;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub use condition_eval::evaluate_condition;
 pub use expand::{preprocess_source, preprocess_source_with_resolver};
@@ -16,7 +17,7 @@ pub use macro_table::MacroTable;
 
 static PREPROCESSOR_CONFIGS: OnceLock<Mutex<HashMap<String, PreprocessorConfigFile>>> = OnceLock::new();
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PreprocessResult {
     pub expanded_source: String,
     pub inactive_lines: HashSet<u32>,
@@ -117,6 +118,32 @@ pub fn default_macro_table() -> MacroTable {
     default_macro_table_for_file("preprocessor.toml")
 }
 
+pub fn preprocess_source_cached_with_resolver(
+    source: &str,
+    base_macros: &MacroTable,
+    include_resolver: Option<&IncludeResolver>,
+    current_file: Option<&str>,
+) -> PreprocessResult {
+    let Some(cache_path) = preprocess_cache_path(source, base_macros, current_file) else {
+        return expand::preprocess_source_with_resolver(source, base_macros, include_resolver);
+    };
+
+    if let Ok(text) = fs::read_to_string(&cache_path) {
+        if let Ok(cached) = serde_json::from_str::<PreprocessResult>(&text) {
+            return cached;
+        }
+    }
+
+    let result = expand::preprocess_source_with_resolver(source, base_macros, include_resolver);
+    if let Some(parent) = cache_path.parent() {
+        let _ = fs::create_dir_all(parent);
+        if let Ok(text) = serde_json::to_string(&result) {
+            let _ = fs::write(cache_path, text);
+        }
+    }
+    result
+}
+
 pub fn default_macro_table_for_file(file_name: &str) -> MacroTable {
     let parsed = default_preprocessor_config_for_file(file_name);
 
@@ -168,6 +195,30 @@ fn load_preprocessor_config(file_name: &str) -> PreprocessorConfigFile {
     let mut parsed = toml::from_str(&text).unwrap_or_default();
     merge_include_roots(&mut parsed);
     parsed
+}
+
+fn preprocess_cache_path(
+    source: &str,
+    base_macros: &MacroTable,
+    current_file: Option<&str>,
+) -> Option<PathBuf> {
+    let current_file = current_file?;
+    let project_root = find_project_root_for_file(Path::new(current_file))
+        .or_else(|| find_engine_embedded_project_root(Path::new(current_file)))?;
+    let mtime = fs::metadata(current_file)
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|value| value.as_secs())
+        .unwrap_or(0);
+    let defines_hash = base_macros.defines_hash();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(current_file.replace('\\', "/").as_bytes());
+    hasher.update(&mtime.to_le_bytes());
+    hasher.update(source.as_bytes());
+    hasher.update(defines_hash.as_bytes());
+    let file_name = format!("{}.json", hasher.finalize().to_hex());
+    Some(project_root.join(".ucore").join("preproc").join(file_name))
 }
 
 fn merge_include_roots(config: &mut PreprocessorConfigFile) {
@@ -309,7 +360,8 @@ fn is_engine_root(path: &Path) -> bool {
 mod tests {
     use super::{
         default_include_resolver_for_file, default_macro_table, default_macro_table_for_file,
-        default_preprocessor_config_for_file, preprocess_source, preprocess_source_with_resolver,
+        default_preprocessor_config_for_file, preprocess_source,
+        preprocess_source_cached_with_resolver, preprocess_source_with_resolver,
     };
     use std::fs;
     use std::path::Path;
@@ -425,6 +477,49 @@ mod tests {
         let result =
             preprocess_source_with_resolver(source, &default_macro_table(), Some(&resolver));
         assert!(result.expanded_source.contains("int32 Value = 1;"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn preproc_caches_expanded_output_on_disk() {
+        let root = std::env::temp_dir().join(format!(
+            "ucore_preproc_cache_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let file = root.join("Source/MyGame/Private/Test.cpp");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(root.join("MyGame.uproject"), "{}").unwrap();
+        fs::write(&file, "#define VALUE 7\nint32 Answer = VALUE;\n").unwrap();
+
+        let resolver =
+            default_include_resolver_for_file("preprocessor.toml", Some(&file.to_string_lossy()));
+        let source = "#define VALUE 7\nint32 Answer = VALUE;\n";
+        let result = preprocess_source_cached_with_resolver(
+            source,
+            &default_macro_table(),
+            Some(&resolver),
+            Some(&file.to_string_lossy()),
+        );
+        assert!(result.expanded_source.contains("int32 Answer = 7;"));
+
+        let cache_dir = root.join(".ucore").join("preproc");
+        let entries = fs::read_dir(&cache_dir)
+            .unwrap()
+            .flatten()
+            .collect::<Vec<_>>();
+        assert!(!entries.is_empty());
+
+        let result_again = preprocess_source_cached_with_resolver(
+            source,
+            &default_macro_table(),
+            Some(&resolver),
+            Some(&file.to_string_lossy()),
+        );
+        assert_eq!(result.expanded_source, result_again.expanded_source);
 
         let _ = fs::remove_dir_all(root);
     }

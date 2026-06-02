@@ -114,5 +114,11 @@ fn suppressed_lines_inside_preproc(
     let macros = crate::preproc::default_macro_table_for_file(&preproc_rules.config_file);
     let resolver =
         crate::preproc::default_include_resolver_for_file(&preproc_rules.config_file, file_path);
-    crate::preproc::preprocess_source_with_resolver(content, &macros, Some(&resolver)).inactive_lines
+    crate::preproc::preprocess_source_cached_with_resolver(
+        content,
+        &macros,
+        Some(&resolver),
+        file_path,
+    )
+    .inactive_lines
 }

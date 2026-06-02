@@ -449,10 +449,11 @@ pub fn process_diagnostics_with_hot_indexes(
     let preproc_resolver =
         preproc::default_include_resolver_for_file(&rules.preproc.config_file, file_path.as_deref());
     let preprocessed = if rules.preproc.enabled && rules.preproc.expand_macros {
-        Some(preproc::preprocess_source_with_resolver(
+        Some(preproc::preprocess_source_cached_with_resolver(
             content,
             &preproc_macros,
             Some(&preproc_resolver),
+            file_path.as_deref(),
         ))
     } else {
         None

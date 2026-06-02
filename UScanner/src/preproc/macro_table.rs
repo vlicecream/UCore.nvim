@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use super::tokenizer::first_identifier;
+
 const MAX_EXPANSION_DEPTH: usize = 16;
 
 #[derive(Clone, Debug, Default)]
@@ -63,6 +65,21 @@ impl MacroTable {
         self.object_like.get(name).map(String::as_str)
     }
 
+    pub fn defines_hash(&self) -> String {
+        let mut entries = self
+            .object_like
+            .iter()
+            .map(|(name, value)| format!("o:{name}={value}"))
+            .chain(self.function_like.iter().map(|(name, value)| {
+                format!("f:{name}({})={}", value.params.join(","), value.body)
+            }))
+            .collect::<Vec<_>>();
+        entries.sort();
+        blake3::hash(entries.join("\n").as_bytes())
+            .to_hex()
+            .to_string()
+    }
+
     pub fn define_from_assignment(&mut self, text: &str) {
         let trimmed = text.trim();
         if trimmed.is_empty() {
@@ -84,13 +101,12 @@ impl MacroTable {
             return;
         }
 
+        let Some(name_token) = first_identifier(trimmed) else {
+            return;
+        };
         let chars = trimmed.chars().collect::<Vec<_>>();
-        let mut index = 0usize;
-        let mut name = String::new();
-        while index < chars.len() && (chars[index].is_ascii_alphanumeric() || chars[index] == '_') {
-            name.push(chars[index]);
-            index += 1;
-        }
+        let mut index = trimmed[..name_token.end].chars().count();
+        let name = name_token.text.to_string();
 
         if name.is_empty() {
             return;

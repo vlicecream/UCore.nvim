@@ -1,4 +1,5 @@
 use super::condition_eval::evaluate_condition;
+use super::tokenizer::parse_directive;
 use super::{IncludeResolver, MacroTable, PreprocessResult};
 
 #[derive(Clone, Copy, Debug)]
@@ -25,9 +26,10 @@ pub fn preprocess_source_with_resolver(
 
     for (line_index, line) in source.lines().enumerate() {
         let trimmed = line.trim_start();
+        let directive = parse_directive(trimmed);
         let active = stack.iter().all(|frame| frame.current_active);
 
-        if let Some(rest) = directive_body(trimmed, "if ") {
+        if let Some(rest) = directive_body(directive.as_ref(), "if") {
             let condition = active && evaluate_condition(rest, &macros, include_resolver);
             stack.push(ConditionalFrame {
                 parent_active: active,
@@ -38,7 +40,7 @@ pub fn preprocess_source_with_resolver(
             output.push('\n');
             continue;
         }
-        if let Some(rest) = directive_body(trimmed, "ifdef ") {
+        if let Some(rest) = directive_body(directive.as_ref(), "ifdef") {
             let condition = active && macros.is_defined(rest.trim());
             stack.push(ConditionalFrame {
                 parent_active: active,
@@ -49,7 +51,7 @@ pub fn preprocess_source_with_resolver(
             output.push('\n');
             continue;
         }
-        if let Some(rest) = directive_body(trimmed, "ifndef ") {
+        if let Some(rest) = directive_body(directive.as_ref(), "ifndef") {
             let condition = active && !macros.is_defined(rest.trim());
             stack.push(ConditionalFrame {
                 parent_active: active,
@@ -60,7 +62,7 @@ pub fn preprocess_source_with_resolver(
             output.push('\n');
             continue;
         }
-        if let Some(rest) = directive_body(trimmed, "elif ") {
+        if let Some(rest) = directive_body(directive.as_ref(), "elif") {
             if let Some(top) = stack.last_mut() {
                 let cond = !top.branch_taken
                     && top.parent_active
@@ -72,7 +74,7 @@ pub fn preprocess_source_with_resolver(
             output.push('\n');
             continue;
         }
-        if trimmed.starts_with("#else") {
+        if directive.as_ref().is_some_and(|directive| directive.name == "else") {
             if let Some(top) = stack.last_mut() {
                 top.current_active = top.parent_active && !top.branch_taken;
                 top.branch_taken = true;
@@ -81,7 +83,7 @@ pub fn preprocess_source_with_resolver(
             output.push('\n');
             continue;
         }
-        if trimmed.starts_with("#endif") {
+        if directive.as_ref().is_some_and(|directive| directive.name == "endif") {
             stack.pop();
             line_column_maps.push(vec![0]);
             output.push('\n');
@@ -89,7 +91,7 @@ pub fn preprocess_source_with_resolver(
         }
 
         let active = stack.iter().all(|frame| frame.current_active);
-        if let Some(rest) = directive_body(trimmed, "define ") {
+        if let Some(rest) = directive_body(directive.as_ref(), "define") {
             if active {
                 macros.define_from_directive(rest);
             }
@@ -97,7 +99,7 @@ pub fn preprocess_source_with_resolver(
             output.push('\n');
             continue;
         }
-        if let Some(rest) = directive_body(trimmed, "undef ") {
+        if let Some(rest) = directive_body(directive.as_ref(), "undef") {
             if active {
                 macros.undefine(rest.trim());
             }
@@ -124,7 +126,10 @@ pub fn preprocess_source_with_resolver(
     }
 }
 
-fn directive_body<'a>(trimmed: &'a str, directive: &str) -> Option<&'a str> {
-    let body = trimmed.strip_prefix('#')?.trim_start();
-    body.strip_prefix(directive)
+fn directive_body<'a>(
+    directive: Option<&super::tokenizer::Directive<'a>>,
+    expected: &str,
+) -> Option<&'a str> {
+    let directive = directive?;
+    (directive.name == expected).then_some(directive.body)
 }
