@@ -78,6 +78,8 @@ pub(crate) struct DiagnosticRulesFile {
     pub syntax_errors: PhaseEnabled,
     #[serde(default)]
     pub bad_characters: BadCharactersRules,
+    #[serde(default)]
+    pub dataflow: DataflowRules,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -140,6 +142,29 @@ impl Default for BadCharactersRules {
     }
 }
 
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct DataflowRules {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_hint_severity")]
+    pub unused_locals_severity: SeverityConfig,
+    #[serde(default = "default_warning_severity")]
+    pub uninit_locals_severity: SeverityConfig,
+    #[serde(default = "default_hint_severity")]
+    pub shadow_severity: SeverityConfig,
+}
+
+impl Default for DataflowRules {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            unused_locals_severity: default_hint_severity(),
+            uninit_locals_severity: default_warning_severity(),
+            shadow_severity: default_hint_severity(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum SeverityConfig {
@@ -176,6 +201,10 @@ const fn default_error_severity() -> SeverityConfig {
 
 const fn default_warning_severity() -> SeverityConfig {
     SeverityConfig::Warning
+}
+
+const fn default_hint_severity() -> SeverityConfig {
+    SeverityConfig::Hint
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -344,6 +373,15 @@ pub fn process_diagnostics_with_hot_indexes(
         log_enabled,
         || member_syntax_diagnostics(content, file_path.as_deref(), parsed_root),
     )?;
+    if rules.dataflow.enabled {
+        extend_diagnostic_phase(
+            &mut items,
+            "dataflow",
+            file_label,
+            log_enabled,
+            || phases::dataflow::collect(content, file_path.as_deref(), parsed_root, sema_ctx.as_ref(), &rules.dataflow),
+        )?;
+    }
     extend_diagnostic_phase(
         &mut items,
         "super_calls",
@@ -7161,6 +7199,60 @@ mod tests {
 
         let items = value["items"].as_array().unwrap();
         assert!(!items.iter().any(|item| item["code"] == "UECPP-CHR-001"));
+    }
+
+    #[test]
+    fn dataflow_warns_on_unused_local() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "void Run()\n{\n    int32 Value = 1;\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| item["code"] == "UECPP-DF-001"));
+    }
+
+    #[test]
+    fn dataflow_warns_on_uninitialized_local_use() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "void Run()\n{\n    int32 Value;\n    Value;\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| item["code"] == "UECPP-DF-002"));
+    }
+
+    #[test]
+    fn dataflow_warns_on_shadowed_local() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "void Run()\n{\n    int32 Value = 0;\n    {\n        int32 Value = 1;\n        Value;\n    }\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| item["code"] == "UECPP-DF-003"));
     }
 
     #[test]

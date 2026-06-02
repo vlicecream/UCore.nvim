@@ -1,5 +1,7 @@
 pub mod builtin;
 pub mod builder;
+pub mod cfg;
+pub mod dataflow;
 pub mod expr;
 pub mod lookup;
 pub mod overload;
@@ -99,6 +101,24 @@ impl SemaContext {
     pub fn lookup_name_at_node(&self, node: Node, name: &str) -> Vec<SymbolId> {
         let scope = self.scope_for_node(node);
         lookup::lookup_name(self, scope, name)
+    }
+
+    pub fn lookup_name_in_parent_scopes(&self, node: Node, name: &str) -> Vec<SymbolId> {
+        let mut current = self.scopes.get(self.scope_for_node(node)).and_then(|scope| scope.parent);
+        while let Some(scope_id) = current {
+            let Some(scope) = self.scopes.get(scope_id) else {
+                break;
+            };
+            if let Some(ids) = scope.symbols.get(name) {
+                return ids.clone();
+            }
+            current = scope.parent;
+        }
+        Vec::new()
+    }
+
+    pub fn resolve_symbol_at_node(&self, node: Node, name: &str) -> Option<SymbolId> {
+        self.lookup_name_at_node(node, name).into_iter().next()
     }
 
     pub fn type_of_identifier_at_node(&self, node: Node, name: &str) -> Option<TypeId> {

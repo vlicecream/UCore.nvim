@@ -12,3 +12,9 @@ enabled = true
 enabled = true
 full_width_severity = "error"
 invisible_severity = "warning"
+
+[dataflow]
+enabled = true
+unused_locals_severity = "hint"
+uninit_locals_severity = "warning"
+shadow_severity = "hint"

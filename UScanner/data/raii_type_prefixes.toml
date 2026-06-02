@@ -1,0 +1,6 @@
+prefixes = [
+  "FScope",
+  "FScoped",
+  "TGuardValue",
+  "FGuardValue",
+]
