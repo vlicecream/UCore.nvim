@@ -57,6 +57,17 @@ pub enum TypeKind {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compat {
+    Same,
+    DerivedToBase,
+    PointerToVoid,
+    NumericPromote,
+    NumericConvert,
+    NullptrToPointer,
+    Incompatible,
+}
+
 pub struct TypeArena {
     types: Vec<TypeKind>,
     interned: HashMap<TypeKind, TypeId>,
@@ -106,5 +117,17 @@ impl TypeArena {
 
     pub fn get(&self, id: TypeId) -> Option<&TypeKind> {
         self.types.get(id.0 as usize)
+    }
+}
+
+pub fn compat_rank(value: Compat) -> u8 {
+    match value {
+        Compat::Same => 5,
+        Compat::DerivedToBase => 4,
+        Compat::PointerToVoid => 3,
+        Compat::NumericPromote => 2,
+        Compat::NumericConvert => 1,
+        Compat::NullptrToPointer => 1,
+        Compat::Incompatible => 0,
     }
 }

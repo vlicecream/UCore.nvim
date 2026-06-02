@@ -15,13 +15,14 @@ use tree_sitter::Node;
 
 use scope::{ScopeId, ScopeTree};
 use symbol::{Access, Storage, SymbolId, SymbolKind, SymbolTable};
-use types::{BuiltinType, TypeArena, TypeId, TypeKind};
+use types::{BuiltinType, Compat, TypeArena, TypeId, TypeKind};
 
 pub struct SemaContext {
     pub types: TypeArena,
     pub symbols: SymbolTable,
     pub scopes: ScopeTree,
     pub node_scopes: HashMap<(usize, usize), ScopeId>,
+    pub scope_owner_symbols: HashMap<ScopeId, SymbolId>,
     source: Option<String>,
     pub(crate) cached_char_t: Option<TypeId>,
     pub(crate) cached_char_ptr_t: Option<TypeId>,
@@ -127,6 +128,98 @@ impl SemaContext {
             .find_map(|symbol_id| self.symbol_type(symbol_id))
     }
 
+    pub fn lookup_class_member_type(&self, class_type: TypeId, member_name: &str) -> Option<TypeId> {
+        self.lookup_class_member_symbols(class_type, member_name)
+            .into_iter()
+            .find_map(|symbol_id| self.symbol_type(symbol_id))
+    }
+
+    pub fn lookup_member_on_class_id(&self, class_id: symbol::ClassId, member_name: &str) -> Option<TypeId> {
+        self.lookup_member_on_class_id_symbols(class_id, member_name)
+            .into_iter()
+            .find_map(|symbol_id| self.symbol_type(symbol_id))
+    }
+
+    pub fn lookup_class_member_symbols(&self, class_type: TypeId, member_name: &str) -> Vec<SymbolId> {
+        let Some(class_id) = self.class_id_for_type(class_type) else {
+            return Vec::new();
+        };
+        self.lookup_member_on_class_id_symbols(class_id, member_name)
+    }
+
+    pub fn class_id_for_type(&self, type_id: TypeId) -> Option<symbol::ClassId> {
+        match self.types.get(type_id)? {
+            TypeKind::Class(class_id) => Some(*class_id),
+            TypeKind::Pointer { pointee, .. } => self.class_id_for_type(*pointee),
+            TypeKind::Reference { referent, .. } => self.class_id_for_type(*referent),
+            _ => None,
+        }
+    }
+
+    pub fn enclosing_function_return_type(&self, node: Node) -> Option<TypeId> {
+        let mut scope_id = Some(self.scope_for_node(node));
+        while let Some(current) = scope_id {
+            if let Some(symbol_id) = self.scope_owner_symbols.get(&current).copied() {
+                let symbol = self.symbols.get(symbol_id)?;
+                match &symbol.kind {
+                    SymbolKind::Function { decls } => {
+                        let fn_type = decls.first()?.type_id;
+                        let TypeKind::Function { return_t, .. } = self.types.get(fn_type)? else {
+                            return None;
+                        };
+                        return Some(*return_t);
+                    }
+                    SymbolKind::Method { type_id, .. } => {
+                        let TypeKind::Function { return_t, .. } = self.types.get(*type_id)? else {
+                            return None;
+                        };
+                        return Some(*return_t);
+                    }
+                    _ => {}
+                }
+            }
+            scope_id = self.scopes.get(current).and_then(|scope| scope.parent);
+        }
+        None
+    }
+
+    fn lookup_member_on_class_id_symbols(
+        &self,
+        class_id: symbol::ClassId,
+        member_name: &str,
+    ) -> Vec<SymbolId> {
+        let mut results = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        self.collect_member_symbols(class_id, member_name, &mut visited, &mut results);
+        results
+    }
+
+    fn collect_member_symbols(
+        &self,
+        class_id: symbol::ClassId,
+        member_name: &str,
+        visited: &mut std::collections::HashSet<symbol::ClassId>,
+        results: &mut Vec<SymbolId>,
+    ) {
+        if !visited.insert(class_id) {
+            return;
+        }
+
+        if let Some(scope_id) = self.symbols.class_scope(class_id) {
+            if let Some(scope) = self.scopes.get(scope_id) {
+                if let Some(ids) = scope.symbols.get(member_name) {
+                    results.extend(ids.iter().copied());
+                }
+            }
+        }
+
+        for parent in self.symbols.class_parents(class_id) {
+            if let Some(TypeKind::Class(parent_id)) = self.types.get(*parent) {
+                self.collect_member_symbols(*parent_id, member_name, visited, results);
+            }
+        }
+    }
+
     pub fn symbol_type(&self, symbol_id: SymbolId) -> Option<TypeId> {
         let symbol = self.symbols.get(symbol_id)?;
         match &symbol.kind {
@@ -213,5 +306,100 @@ impl SemaContext {
 
     pub(crate) fn types_pointer_to_char(&self) -> TypeId {
         self.cached_char_ptr_t.unwrap_or(self.types.unknown_t)
+    }
+
+    pub fn check_compat(&self, from: TypeId, to: TypeId) -> Compat {
+        if from == to {
+            return Compat::Same;
+        }
+
+        let from_ty = self.types.get(from);
+        let to_ty = self.types.get(to);
+        match (from_ty, to_ty) {
+            (Some(TypeKind::Builtin(from_builtin)), Some(TypeKind::Builtin(to_builtin))) => {
+                if is_numeric(*from_builtin) && is_numeric(*to_builtin) {
+                    if numeric_rank(*from_builtin) <= numeric_rank(*to_builtin) {
+                        Compat::NumericPromote
+                    } else {
+                        Compat::NumericConvert
+                    }
+                } else {
+                    Compat::Incompatible
+                }
+            }
+            (
+                Some(TypeKind::Pointer { pointee: from_pointee, .. }),
+                Some(TypeKind::Pointer { pointee: to_pointee, .. }),
+            ) => {
+                if from_pointee == to_pointee {
+                    Compat::Same
+                } else if matches!(self.types.get(*to_pointee), Some(TypeKind::Builtin(BuiltinType::Void))) {
+                    Compat::PointerToVoid
+                } else if self.is_class_derived_from(*from_pointee, *to_pointee) {
+                    Compat::DerivedToBase
+                } else {
+                    Compat::Incompatible
+                }
+            }
+            (
+                Some(TypeKind::Reference { referent: from_ref, .. }),
+                Some(TypeKind::Reference { referent: to_ref, .. }),
+            ) => self.check_compat(*from_ref, *to_ref),
+            (
+                Some(TypeKind::Class(from_class)),
+                Some(TypeKind::Class(to_class)),
+            ) if self.is_class_derived_from_class(*from_class, *to_class) => Compat::DerivedToBase,
+            _ => Compat::Incompatible,
+        }
+    }
+
+    fn is_class_derived_from(&self, from_type: TypeId, to_type: TypeId) -> bool {
+        let (Some(TypeKind::Class(from_class)), Some(TypeKind::Class(to_class))) =
+            (self.types.get(from_type), self.types.get(to_type))
+        else {
+            return false;
+        };
+        self.is_class_derived_from_class(*from_class, *to_class)
+    }
+
+    fn is_class_derived_from_class(
+        &self,
+        from_class: symbol::ClassId,
+        to_class: symbol::ClassId,
+    ) -> bool {
+        if from_class == to_class {
+            return true;
+        }
+
+        for parent in self.symbols.class_parents(from_class) {
+            if let Some(TypeKind::Class(parent_class)) = self.types.get(*parent) {
+                if *parent_class == to_class || self.is_class_derived_from_class(*parent_class, to_class) {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+}
+
+fn is_numeric(kind: BuiltinType) -> bool {
+    matches!(
+        kind,
+        BuiltinType::Char
+            | BuiltinType::Int32
+            | BuiltinType::UInt32
+            | BuiltinType::Float
+            | BuiltinType::Double
+    )
+}
+
+fn numeric_rank(kind: BuiltinType) -> u8 {
+    match kind {
+        BuiltinType::Char => 1,
+        BuiltinType::Int32 | BuiltinType::UInt32 => 2,
+        BuiltinType::Float => 3,
+        BuiltinType::Double => 4,
+        BuiltinType::Void | BuiltinType::Bool => 0,
     }
 }

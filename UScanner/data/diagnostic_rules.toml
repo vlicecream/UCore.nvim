@@ -18,3 +18,13 @@ enabled = true
 unused_locals_severity = "hint"
 uninit_locals_severity = "warning"
 shadow_severity = "hint"
+
+[overload_check]
+enabled = true
+severity_no_match = "error"
+severity_ambiguous = "error"
+
+[type_check]
+enabled = true
+severity_incompatible = "error"
+severity_narrowing = "warning"

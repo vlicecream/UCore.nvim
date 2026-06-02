@@ -11,7 +11,7 @@ pub(crate) fn finalize_diagnostics(
     let total_lines = content.lines().count().max(1) as u32;
     let suppressed_if_zero = rules
         .suppress_inside_preproc_if_zero
-        .then(|| suppressed_lines_inside_if_zero(content))
+        .then(|| suppressed_lines_inside_preproc(content))
         .unwrap_or_default();
 
     let mut deduped = HashMap::<(Option<String>, u32, u32, &'static str), DiagnosticItem>::new();
@@ -105,90 +105,6 @@ fn severity_rank(severity: &DiagnosticSeverity) -> u8 {
     }
 }
 
-#[derive(Clone, Copy)]
-enum PreprocFrameKind {
-    IfZero,
-    Other,
-}
-
-#[derive(Clone, Copy)]
-struct PreprocFrame {
-    kind: PreprocFrameKind,
-    suppressing: bool,
-}
-
-fn suppressed_lines_inside_if_zero(content: &str) -> HashSet<u32> {
-    let mut suppressed = HashSet::new();
-    let mut stack = Vec::<PreprocFrame>::new();
-
-    for (index, line) in content.lines().enumerate() {
-        let trimmed = line.trim_start();
-        if let Some(rest) = trimmed.strip_prefix("#if") {
-            let rest = rest.trim_start();
-            let frame = if rest == "0" {
-                PreprocFrame {
-                    kind: PreprocFrameKind::IfZero,
-                    suppressing: true,
-                }
-            } else {
-                PreprocFrame {
-                    kind: PreprocFrameKind::Other,
-                    suppressing: parent_suppressed(&stack),
-                }
-            };
-            stack.push(frame);
-            continue;
-        }
-        if trimmed.starts_with("#ifdef") || trimmed.starts_with("#ifndef") {
-            stack.push(PreprocFrame {
-                kind: PreprocFrameKind::Other,
-                suppressing: parent_suppressed(&stack),
-            });
-            continue;
-        }
-        if trimmed.starts_with("#elif") {
-            let parent = parent_suppressed_without_top(&stack);
-            if let Some(top) = stack.last_mut() {
-                top.suppressing = match top.kind {
-                    PreprocFrameKind::IfZero => {
-                        let expr = trimmed.trim_start_matches("#elif").trim();
-                        !matches!(expr, "1" | "true" | "TRUE")
-                    }
-                    PreprocFrameKind::Other => parent,
-                };
-            }
-            continue;
-        }
-        if trimmed.starts_with("#else") {
-            let parent = parent_suppressed_without_top(&stack);
-            if let Some(top) = stack.last_mut() {
-                top.suppressing = match top.kind {
-                    PreprocFrameKind::IfZero => !top.suppressing && !parent,
-                    PreprocFrameKind::Other => parent,
-                };
-            }
-            continue;
-        }
-        if trimmed.starts_with("#endif") {
-            stack.pop();
-            continue;
-        }
-
-        if stack.iter().any(|frame| frame.suppressing) {
-            suppressed.insert(index as u32);
-        }
-    }
-
-    suppressed
-}
-
-fn parent_suppressed(stack: &[PreprocFrame]) -> bool {
-    stack.iter().any(|frame| frame.suppressing)
-}
-
-fn parent_suppressed_without_top(stack: &[PreprocFrame]) -> bool {
-    stack
-        .split_last()
-        .map(|(_, rest)| rest.iter().any(|frame| frame.suppressing))
-        .unwrap_or(false)
+fn suppressed_lines_inside_preproc(content: &str) -> HashSet<u32> {
+    crate::preproc::preprocess_source(content, &crate::preproc::default_macro_table()).inactive_lines
 }

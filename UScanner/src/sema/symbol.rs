@@ -103,6 +103,7 @@ pub struct SymbolTable {
     class_ids_by_name: HashMap<SymStr, ClassId>,
     enum_ids_by_name: HashMap<SymStr, EnumId>,
     class_scopes: HashMap<ClassId, ScopeId>,
+    class_parents: HashMap<ClassId, Vec<TypeId>>,
 }
 
 impl SymbolTable {
@@ -114,6 +115,7 @@ impl SymbolTable {
             class_ids_by_name: HashMap::new(),
             enum_ids_by_name: HashMap::new(),
             class_scopes: HashMap::new(),
+            class_parents: HashMap::new(),
         }
     }
 
@@ -164,6 +166,17 @@ impl SymbolTable {
 
     pub fn class_scope(&self, class_id: ClassId) -> Option<ScopeId> {
         self.class_scopes.get(&class_id).copied()
+    }
+
+    pub fn set_class_parents(&mut self, class_id: ClassId, parents: Vec<TypeId>) {
+        self.class_parents.insert(class_id, parents);
+    }
+
+    pub fn class_parents(&self, class_id: ClassId) -> &[TypeId] {
+        self.class_parents
+            .get(&class_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     pub fn enum_name(&self, id: EnumId) -> Option<&str> {

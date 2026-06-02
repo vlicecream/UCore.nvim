@@ -1,0 +1,6 @@
+[defines]
+predefined = [
+    "UE_BUILD_DEVELOPMENT=1",
+    "WITH_EDITOR=1",
+    "PLATFORM_WINDOWS=1",
+]

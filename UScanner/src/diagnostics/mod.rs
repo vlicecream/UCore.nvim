@@ -80,6 +80,10 @@ pub(crate) struct DiagnosticRulesFile {
     pub bad_characters: BadCharactersRules,
     #[serde(default)]
     pub dataflow: DataflowRules,
+    #[serde(default)]
+    pub overload_check: OverloadRules,
+    #[serde(default)]
+    pub type_check: TypeCheckRules,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -161,6 +165,46 @@ impl Default for DataflowRules {
             unused_locals_severity: default_hint_severity(),
             uninit_locals_severity: default_warning_severity(),
             shadow_severity: default_hint_severity(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct OverloadRules {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_error_severity")]
+    pub severity_no_match: SeverityConfig,
+    #[serde(default = "default_error_severity")]
+    pub severity_ambiguous: SeverityConfig,
+}
+
+impl Default for OverloadRules {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            severity_no_match: default_error_severity(),
+            severity_ambiguous: default_error_severity(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct TypeCheckRules {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_error_severity")]
+    pub severity_incompatible: SeverityConfig,
+    #[serde(default = "default_warning_severity")]
+    pub severity_narrowing: SeverityConfig,
+}
+
+impl Default for TypeCheckRules {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            severity_incompatible: default_error_severity(),
+            severity_narrowing: default_warning_severity(),
         }
     }
 }
@@ -380,6 +424,24 @@ pub fn process_diagnostics_with_hot_indexes(
             file_label,
             log_enabled,
             || phases::dataflow::collect(content, file_path.as_deref(), parsed_root, sema_ctx.as_ref(), &rules.dataflow),
+        )?;
+    }
+    if rules.overload_check.enabled {
+        extend_diagnostic_phase(
+            &mut items,
+            "overload_check",
+            file_label,
+            log_enabled,
+            || phases::overload_check::collect(file_path.as_deref(), parsed_root, sema_ctx.as_ref(), &rules.overload_check),
+        )?;
+    }
+    if rules.type_check.enabled {
+        extend_diagnostic_phase(
+            &mut items,
+            "type_check",
+            file_label,
+            log_enabled,
+            || phases::type_check::collect(file_path.as_deref(), parsed_root, sema_ctx.as_ref(), &rules.type_check),
         )?;
     }
     extend_diagnostic_phase(
@@ -7253,6 +7315,96 @@ mod tests {
 
         let items = value["items"].as_array().unwrap();
         assert!(items.iter().any(|item| item["code"] == "UECPP-DF-003"));
+    }
+
+    #[test]
+    fn overload_check_reports_no_matching_overload() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "void Run(int32 Value) {}\nvoid Run(float Value) {}\nvoid Test()\n{\n    Run(\"demo\");\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| item["code"] == "UECPP-EXPR-001"));
+    }
+
+    #[test]
+    fn overload_check_reports_ambiguous_call() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "void Run(int32 Value) {}\nvoid Run(uint32 Value) {}\nvoid Test()\n{\n    char Value = 'a';\n    Run(Value);\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| item["code"] == "UECPP-EXPR-002"));
+    }
+
+    #[test]
+    fn type_check_reports_incompatible_assignment() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "void Test()\n{\n    int32 Value = 0;\n    Value = \"demo\";\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| item["code"] == "UECPP-EXPR-008"));
+    }
+
+    #[test]
+    fn type_check_reports_incompatible_return() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "int32 Test()\n{\n    return \"demo\";\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| item["code"] == "UECPP-EXPR-007"));
+    }
+
+    #[test]
+    fn type_check_reports_arrow_on_non_pointer() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "class UFoo\n{\npublic:\n    int32 Count;\n    void Test()\n    {\n        Count->ToString();\n    }\n};\n",
+            Some("C:/Project/Source/Game/Public/Test.h".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| item["code"] == "UECPP-EXPR-011"));
     }
 
     #[test]

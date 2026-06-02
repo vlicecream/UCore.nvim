@@ -17,6 +17,7 @@ pub fn build_sema(root: Node, source: &str) -> SemaContext {
         symbols: SymbolTable::new(),
         scopes: ScopeTree::new(),
         node_scopes: HashMap::new(),
+        scope_owner_symbols: HashMap::new(),
     };
     let global = builder.scopes.global;
     builder.attach_scope(root, global);
@@ -30,6 +31,7 @@ struct SemaBuilder<'a> {
     symbols: SymbolTable,
     scopes: ScopeTree,
     node_scopes: HashMap<(usize, usize), ScopeId>,
+    scope_owner_symbols: HashMap<ScopeId, super::symbol::SymbolId>,
 }
 
 impl<'a> SemaBuilder<'a> {
@@ -39,6 +41,7 @@ impl<'a> SemaBuilder<'a> {
             symbols: self.symbols,
             scopes: self.scopes,
             node_scopes: self.node_scopes,
+            scope_owner_symbols: self.scope_owner_symbols,
             source: Some(self.source.to_string()),
             cached_char_t: None,
             cached_char_ptr_t: None,
@@ -57,7 +60,9 @@ impl<'a> SemaBuilder<'a> {
                     .unwrap_or_else(|| "<anonymous>".to_string());
                 let child_scope = self.scopes.add_scope(Some(scope_id), ScopeKind::Namespace);
                 self.attach_scope(node, child_scope);
-                self.add_symbol(scope_id, name, SymbolKind::Namespace { children: child_scope });
+                let symbol_id =
+                    self.add_symbol(scope_id, name, SymbolKind::Namespace { children: child_scope });
+                self.scope_owner_symbols.insert(child_scope, symbol_id);
                 self.walk_children(node, child_scope, current_class);
                 return;
             }
@@ -69,20 +74,23 @@ impl<'a> SemaBuilder<'a> {
                     let name = self.node_text(name_node).trim().to_string();
                     if !name.is_empty() {
                         let class_id = self.symbols.new_class_id(&name);
+                        let parents = collect_parent_types(self, node);
                         let type_id = self.types.intern(TypeKind::Class(class_id));
                         let class_scope = self.scopes.add_scope(Some(scope_id), ScopeKind::Class);
                         self.symbols.set_class_scope(class_id, class_scope);
+                        self.symbols.set_class_parents(class_id, parents.clone());
                         self.attach_scope(node, class_scope);
-                        self.add_symbol(
+                        let symbol_id = self.add_symbol(
                             scope_id,
                             name,
                             SymbolKind::Class {
                                 class_id,
                                 type_id,
-                                parents: Vec::new(),
+                                parents,
                                 is_struct: node.kind().contains("struct"),
                             },
                         );
+                        self.scope_owner_symbols.insert(class_scope, symbol_id);
                         self.walk_children(node, class_scope, Some(class_id));
                         return;
                     }
@@ -196,10 +204,11 @@ impl<'a> SemaBuilder<'a> {
                 }],
             }
         };
-        self.add_symbol(scope_id, name, kind);
+        let symbol_id = self.add_symbol(scope_id, name, kind);
 
         let fn_scope = self.scopes.add_scope(Some(scope_id), ScopeKind::Function);
         self.attach_scope(node, fn_scope);
+        self.scope_owner_symbols.insert(fn_scope, symbol_id);
         self.register_parameters(declarator, fn_scope, current_class);
 
         if let Some(body) = find_descendant(node, "compound_statement") {
@@ -320,11 +329,17 @@ impl<'a> SemaBuilder<'a> {
         }
     }
 
-    fn add_symbol(&mut self, scope_id: ScopeId, name: String, kind: SymbolKind) {
+    fn add_symbol(
+        &mut self,
+        scope_id: ScopeId,
+        name: String,
+        kind: SymbolKind,
+    ) -> super::symbol::SymbolId {
         let symbol_id = self.symbols.add_symbol(name.clone(), scope_id, kind);
         if let Some(scope) = self.scopes.get_mut(scope_id) {
             scope.symbols.entry(name).or_default().push(symbol_id);
         }
+        symbol_id
     }
 
     fn attach_scope(&mut self, node: Node, scope_id: ScopeId) {
@@ -422,6 +437,24 @@ fn apply_declarator_wrappers(
 fn class_like_name_node(node: Node) -> Option<Node> {
     node.child_by_field_name("name")
         .or_else(|| find_direct_child_by_kind(node, &["type_identifier", "identifier"]))
+}
+
+fn collect_parent_types(builder: &mut SemaBuilder<'_>, node: Node) -> Vec<TypeId> {
+    let Some(base_clause) = find_descendant(node, "base_class_clause") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut cursor = base_clause.walk();
+    for child in base_clause.children(&mut cursor) {
+        if matches!(
+            child.kind(),
+            "type_identifier" | "qualified_identifier" | "template_type"
+        ) {
+            let type_id = builder.resolve_type_node(child);
+            out.push(type_id);
+        }
+    }
+    out
 }
 
 fn find_direct_child_by_kind<'a>(node: Node<'a>, kinds: &[&str]) -> Option<Node<'a>> {

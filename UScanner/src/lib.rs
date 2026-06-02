@@ -9,6 +9,7 @@ pub mod db;
 pub mod diagnostics;
 pub mod edit;
 pub mod parser;
+pub mod preproc;
 pub mod query;
 pub mod refresh;
 pub mod runtime_index;
