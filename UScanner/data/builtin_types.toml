@@ -1,0 +1,21 @@
+[aliases]
+void = ["void"]
+bool = ["bool"]
+char = ["char", "ANSICHAR", "TCHAR"]
+int32 = ["int", "int32"]
+uint32 = ["uint32"]
+float = ["float"]
+double = ["double"]
+
+[ue5]
+known_types = [
+  "TArray", "TMap", "TSet", "TQueue", "TWeakObjectPtr", "TSubclassOf",
+  "TSharedPtr", "TSharedRef", "TWeakPtr", "TUniquePtr", "TObjectPtr", "TSoftObjectPtr",
+  "FString", "FName", "FText", "FVector", "FRotator", "FQuat",
+  "FTransform", "FColor", "FLinearColor", "FBox", "FBoxSphereBounds",
+]
+suppress_member = [
+  "TArray", "TMap", "TSet", "TQueue", "TSubclassOf", "TWeakObjectPtr",
+  "TSharedPtr", "TSharedRef", "TWeakPtr", "TUniquePtr", "TObjectPtr", "TSoftObjectPtr",
+  "FString", "FName",
+]

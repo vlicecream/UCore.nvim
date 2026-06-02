@@ -71,6 +71,32 @@ struct DiagnosticSuppressMember {
     classes: Vec<String>,
 }
 
+#[derive(serde::Deserialize, Default)]
+struct BuiltinTypesKnownFile {
+    #[serde(default)]
+    ue5: BuiltinTypesKnownProfile,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct BuiltinTypesKnownProfile {
+    #[serde(default)]
+    known_types: Vec<String>,
+    #[serde(default)]
+    suppress_member: Vec<String>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct KnownMacrosFile {
+    #[serde(default)]
+    ue5: KnownMacrosProfile,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct KnownMacrosProfile {
+    #[serde(default)]
+    known_macros: Vec<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Default)]
 pub(crate) struct DiagnosticRulesFile {
     #[serde(default)]
@@ -595,20 +621,20 @@ pub fn process_diagnostics_with_hot_indexes(
     )?;
     extend_diagnostic_phase(
         &mut items,
-        "unknown_symbols",
+        "name_lookup",
         file_label,
         log_enabled,
-        || unknown_symbol_diagnostics(
-            conn,
-            engine_conn,
-            member_hot_index,
-            engine_member_hot_index,
-            sema_ctx.as_ref(),
-            &known_names,
-            content,
-            file_path.as_deref(),
-            parsed_root,
-        ),
+        || phases::name_lookup::collect(
+                conn,
+                engine_conn,
+                member_hot_index,
+                engine_member_hot_index,
+                sema_ctx.as_ref(),
+                &known_names,
+                content,
+                file_path.as_deref(),
+                parsed_root,
+            ),
     )?;
     extend_diagnostic_phase(
         &mut items,
@@ -677,8 +703,11 @@ fn diagnostic_rules() -> &'static DiagnosticRulesFile {
 
 fn builtin_diagnostic_known_names() -> &'static DiagnosticKnownNames {
     BUILTIN_DIAGNOSTIC_KNOWN_NAMES.get_or_init(|| {
-        parse_diagnostic_known_names(include_str!("../../data/diagnostic_known.toml"))
-            .unwrap_or_default()
+        let mut known = parse_diagnostic_known_names(include_str!("../../data/diagnostic_known.toml"))
+            .unwrap_or_default();
+        merge_builtin_type_known_names(&mut known);
+        merge_known_macros(&mut known);
+        known
     })
 }
 
@@ -733,6 +762,40 @@ fn parse_diagnostic_known_names(text: &str) -> Option<DiagnosticKnownNames> {
             .filter(|name| !name.is_empty())
             .collect(),
     })
+}
+
+fn merge_builtin_type_known_names(known: &mut DiagnosticKnownNames) {
+    let parsed: BuiltinTypesKnownFile =
+        toml::from_str(include_str!("../../data/builtin_types.toml")).unwrap_or_default();
+    known.ignored_unknown_names.extend(
+        parsed
+            .ue5
+            .known_types
+            .into_iter()
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty()),
+    );
+    known.suppress_member_classes.extend(
+        parsed
+            .ue5
+            .suppress_member
+            .into_iter()
+            .map(|name| crate::parser::cpp::clean_type_string(&name))
+            .filter(|name| !name.is_empty()),
+    );
+}
+
+fn merge_known_macros(known: &mut DiagnosticKnownNames) {
+    let parsed: KnownMacrosFile =
+        toml::from_str(include_str!("../../data/known_macros.toml")).unwrap_or_default();
+    known.ignored_unknown_names.extend(
+        parsed
+            .ue5
+            .known_macros
+            .into_iter()
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty()),
+    );
 }
 
 pub fn visibility_key_for_content(file_path: &str, content: &str) -> VisibilityKey {
@@ -7266,6 +7329,48 @@ mod tests {
         let items = value["items"].as_array().unwrap();
         assert!(!items.iter().any(|item| item["code"] == "UECPP008"));
         assert!(!items.iter().any(|item| item["code"] == "UECPP009"));
+    }
+
+    #[test]
+    fn builtin_types_toml_suppresses_soft_object_ptr_member_diagnostic() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "void Run(TSoftObjectPtr<UObject> Ptr)\n{\n    Ptr.Get();\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP009"));
+    }
+
+    #[test]
+    fn known_macros_toml_suppresses_generated_ustruct_body_identifier() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "USTRUCT()\nstruct FMyData\n{\n    GENERATED_USTRUCT_BODY()\n    int32 Value;\n};\n",
+            Some("C:/Project/Source/Game/Public/Test.h".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| {
+            item["code"] == "UECPP008"
+                && item["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("GENERATED_USTRUCT_BODY")
+        }));
     }
 
     #[test]

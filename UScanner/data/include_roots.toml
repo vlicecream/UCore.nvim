@@ -1,0 +1,8 @@
+[include_paths]
+project_search_dirs = ["Source/${ProjectName}", "Source"]
+engine_search_dirs = [
+  "Engine/Source/Runtime",
+  "Engine/Source/Developer",
+  "Engine/Source/Editor",
+  "Engine/Plugins",
+]

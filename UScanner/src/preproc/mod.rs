@@ -165,7 +165,26 @@ fn load_preprocessor_config(file_name: &str) -> PreprocessorConfigFile {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let path = Path::new(manifest_dir).join("data").join(file_name);
     let text = fs::read_to_string(path).unwrap_or_else(|_| default_text.to_string());
-    toml::from_str(&text).unwrap_or_default()
+    let mut parsed = toml::from_str(&text).unwrap_or_default();
+    merge_include_roots(&mut parsed);
+    parsed
+}
+
+fn merge_include_roots(config: &mut PreprocessorConfigFile) {
+    let roots: PreprocessorConfigFile =
+        toml::from_str(include_str!("../../data/include_roots.toml")).unwrap_or_default();
+
+    for dir in roots.include_paths.project_search_dirs {
+        if !config.include_paths.project_search_dirs.iter().any(|existing| existing == &dir) {
+            config.include_paths.project_search_dirs.push(dir);
+        }
+    }
+
+    for dir in roots.include_paths.engine_search_dirs {
+        if !config.include_paths.engine_search_dirs.iter().any(|existing| existing == &dir) {
+            config.include_paths.engine_search_dirs.push(dir);
+        }
+    }
 }
 
 fn normalize_include_operand(include: &str) -> String {
