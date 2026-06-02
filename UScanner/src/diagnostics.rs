@@ -20,6 +20,7 @@ const PROJECT_TEXT_VISIBILITY_SCAN_LIMIT: usize = 64;
 const ENGINE_TEXT_VISIBILITY_SCAN_LIMIT: usize = 64;
 
 static DIAGNOSTICS_LOG_ENABLED: OnceLock<bool> = OnceLock::new();
+static BUILTIN_DIAGNOSTIC_KNOWN_NAMES: OnceLock<DiagnosticKnownNames> = OnceLock::new();
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct VisibilityKey {
@@ -35,6 +36,32 @@ pub struct VisibilityScope {
     pub include_paths: Arc<HashSet<String>>,
     pub project_db_mtime_secs: u64,
     pub engine_db_mtime_secs: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct DiagnosticKnownNames {
+    ignored_unknown_names: HashSet<String>,
+    suppress_member_classes: HashSet<String>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct DiagnosticKnownFile {
+    #[serde(default)]
+    ue5: DiagnosticKnownProfile,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct DiagnosticKnownProfile {
+    #[serde(default)]
+    ignored_unknown_names: Vec<String>,
+    #[serde(default)]
+    suppress_member: DiagnosticSuppressMember,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct DiagnosticSuppressMember {
+    #[serde(default)]
+    classes: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -125,6 +152,7 @@ pub fn process_diagnostics_with_hot_indexes(
     let mut items = Vec::new();
     let log_enabled = diagnostics_log_enabled();
     let file_label = file_path.as_deref().unwrap_or("-");
+    let known_names = effective_diagnostic_known_names(file_path.as_deref());
     let parsed_tree = parse_diagnostics_tree(content)?;
     let parsed_root = parsed_tree.as_ref().map(|tree| tree.root_node());
 
@@ -198,6 +226,7 @@ pub fn process_diagnostics_with_hot_indexes(
             engine_conn,
             member_hot_index,
             engine_member_hot_index,
+            &known_names,
             content,
             file_path.as_deref(),
             parsed_root,
@@ -252,6 +281,66 @@ fn diagnostics_log_enabled() -> bool {
         std::env::var("UCORE_QUERY_LOG")
             .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "on" | "ON"))
             .unwrap_or(false)
+    })
+}
+
+fn builtin_diagnostic_known_names() -> &'static DiagnosticKnownNames {
+    BUILTIN_DIAGNOSTIC_KNOWN_NAMES.get_or_init(|| {
+        parse_diagnostic_known_names(include_str!("../data/diagnostic_known.toml"))
+            .unwrap_or_default()
+    })
+}
+
+fn effective_diagnostic_known_names(file_path: Option<&str>) -> DiagnosticKnownNames {
+    let mut known = builtin_diagnostic_known_names().clone();
+
+    let Some(file_path) = file_path else {
+        return known;
+    };
+
+    if let Some(user_known) = load_project_diagnostic_known_names(file_path) {
+        known
+            .ignored_unknown_names
+            .extend(user_known.ignored_unknown_names);
+        known
+            .suppress_member_classes
+            .extend(user_known.suppress_member_classes);
+    }
+
+    known
+}
+
+fn load_project_diagnostic_known_names(file_path: &str) -> Option<DiagnosticKnownNames> {
+    let mut current = Path::new(file_path).parent();
+    while let Some(dir) = current {
+        let candidate = dir.join(".ucore").join("known.toml");
+        if candidate.is_file() {
+            let text = fs::read_to_string(candidate).ok()?;
+            return parse_diagnostic_known_names(&text);
+        }
+        current = dir.parent();
+    }
+    None
+}
+
+fn parse_diagnostic_known_names(text: &str) -> Option<DiagnosticKnownNames> {
+    let parsed: DiagnosticKnownFile = toml::from_str(text).ok()?;
+    Some(DiagnosticKnownNames {
+        ignored_unknown_names: parsed
+            .ue5
+            .ignored_unknown_names
+            .into_iter()
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .collect(),
+        suppress_member_classes: parsed
+            .ue5
+            .suppress_member
+            .classes
+            .into_iter()
+            .map(|name| crate::parser::cpp::clean_type_string(&name))
+            .filter(|name| !name.is_empty())
+            .collect(),
     })
 }
 
@@ -645,8 +734,6 @@ fn missing_visible_type_diagnostics(
     let mut engine_lookup_cache = HashMap::new();
     let mut project_text_visibility_cache = HashMap::new();
     let mut engine_text_visibility_cache = HashMap::new();
-    let mut project_text_forward_decl_cache = HashMap::new();
-    let mut engine_text_forward_decl_cache = HashMap::new();
     let mut items = Vec::new();
 
     collect_missing_visible_type_items(
@@ -664,8 +751,6 @@ fn missing_visible_type_diagnostics(
         &mut engine_lookup_cache,
         &mut project_text_visibility_cache,
         &mut engine_text_visibility_cache,
-        &mut project_text_forward_decl_cache,
-        &mut engine_text_forward_decl_cache,
         &mut seen,
         &mut items,
     )?;
@@ -678,6 +763,7 @@ fn unknown_symbol_diagnostics(
     engine_conn: Option<&Connection>,
     member_hot_index: Option<&MemberHotIndex>,
     engine_member_hot_index: Option<&MemberHotIndex>,
+    known_names: &DiagnosticKnownNames,
     content: &str,
     file_path: Option<&str>,
     parsed_root: Option<tree_sitter::Node>,
@@ -698,14 +784,15 @@ fn unknown_symbol_diagnostics(
     let mut items = Vec::new();
     let mut member_lookup_cache = IndexedMemberLookupCache::default();
 
-    collect_unknown_symbol_items(
-        conn,
-        engine_conn,
-        member_hot_index,
-        engine_member_hot_index,
-        &mut member_lookup_cache,
-        root,
-        content,
+        collect_unknown_symbol_items(
+            conn,
+            engine_conn,
+            member_hot_index,
+            engine_member_hot_index,
+            known_names,
+            &mut member_lookup_cache,
+            root,
+            content,
         file_path,
         &mut seen,
         &mut items,
@@ -719,6 +806,7 @@ fn collect_unknown_symbol_items(
     engine_conn: Option<&Connection>,
     member_hot_index: Option<&MemberHotIndex>,
     engine_member_hot_index: Option<&MemberHotIndex>,
+    known_names: &DiagnosticKnownNames,
     member_lookup_cache: &mut IndexedMemberLookupCache,
     node: tree_sitter::Node,
     content: &str,
@@ -733,6 +821,7 @@ fn collect_unknown_symbol_items(
                 engine_conn,
                 member_hot_index,
                 engine_member_hot_index,
+                known_names,
                 member_lookup_cache,
                 node,
                 content,
@@ -747,6 +836,7 @@ fn collect_unknown_symbol_items(
                 engine_conn,
                 member_hot_index,
                 engine_member_hot_index,
+                known_names,
                 member_lookup_cache,
                 node,
                 content,
@@ -761,6 +851,7 @@ fn collect_unknown_symbol_items(
                 engine_conn,
                 member_hot_index,
                 engine_member_hot_index,
+                known_names,
                 member_lookup_cache,
                 node,
                 content,
@@ -779,6 +870,7 @@ fn collect_unknown_symbol_items(
             engine_conn,
             member_hot_index,
             engine_member_hot_index,
+            known_names,
             member_lookup_cache,
             child,
             content,
@@ -796,6 +888,7 @@ fn collect_unknown_field_expression_item(
     engine_conn: Option<&Connection>,
     member_hot_index: Option<&MemberHotIndex>,
     engine_member_hot_index: Option<&MemberHotIndex>,
+    known_names: &DiagnosticKnownNames,
     member_lookup_cache: &mut IndexedMemberLookupCache,
     node: tree_sitter::Node,
     content: &str,
@@ -811,7 +904,7 @@ fn collect_unknown_field_expression_item(
     };
 
     let field_name = node_text(field, content).trim();
-    if field_name.is_empty() || is_ignored_unknown_symbol_name(field_name) {
+    if field_name.is_empty() || is_ignored_unknown_symbol_name(field_name, known_names) {
         return Ok(());
     }
 
@@ -840,6 +933,7 @@ fn collect_unknown_field_expression_item(
                 engine_conn,
                 member_hot_index,
                 engine_member_hot_index,
+                known_names,
                 &receiver_type,
             )? {
                 return Ok(());
@@ -867,6 +961,7 @@ fn collect_unknown_field_expression_item(
                 engine_conn,
                 member_hot_index,
                 engine_member_hot_index,
+                known_names,
                 member_lookup_cache,
                 receiver,
                 content,
@@ -895,6 +990,7 @@ fn collect_unknown_qualified_identifier_item(
     engine_conn: Option<&Connection>,
     member_hot_index: Option<&MemberHotIndex>,
     engine_member_hot_index: Option<&MemberHotIndex>,
+    known_names: &DiagnosticKnownNames,
     member_lookup_cache: &mut IndexedMemberLookupCache,
     node: tree_sitter::Node,
     content: &str,
@@ -910,7 +1006,7 @@ fn collect_unknown_qualified_identifier_item(
     };
 
     let member_name = node_text(name_node, content).trim();
-    if member_name.is_empty() || is_ignored_unknown_symbol_name(member_name) {
+    if member_name.is_empty() || is_ignored_unknown_symbol_name(member_name, known_names) {
         return Ok(());
     }
 
@@ -949,6 +1045,7 @@ fn collect_unknown_qualified_identifier_item(
                 engine_conn,
                 member_hot_index,
                 engine_member_hot_index,
+                known_names,
                 &scope_name,
             )? {
                 return Ok(());
@@ -975,6 +1072,7 @@ fn collect_unknown_identifier_item(
     engine_conn: Option<&Connection>,
     member_hot_index: Option<&MemberHotIndex>,
     engine_member_hot_index: Option<&MemberHotIndex>,
+    known_names: &DiagnosticKnownNames,
     member_lookup_cache: &mut IndexedMemberLookupCache,
     node: tree_sitter::Node,
     content: &str,
@@ -984,13 +1082,14 @@ fn collect_unknown_identifier_item(
 ) -> Result<()> {
     let name = node_text(node, content).trim();
     if name.is_empty()
-        || is_ignored_unknown_symbol_name(name)
+        || is_ignored_unknown_symbol_name(name, known_names)
         || !is_unknown_identifier_usage_candidate(node, content)
         || identifier_usage_is_known(
             conn,
             engine_conn,
             member_hot_index,
             engine_member_hot_index,
+            known_names,
             member_lookup_cache,
             node,
             content,
@@ -1116,12 +1215,17 @@ fn identifier_usage_is_known(
     engine_conn: Option<&Connection>,
     member_hot_index: Option<&MemberHotIndex>,
     engine_member_hot_index: Option<&MemberHotIndex>,
+    known_names: &DiagnosticKnownNames,
     member_lookup_cache: &mut IndexedMemberLookupCache,
     node: tree_sitter::Node,
     content: &str,
     name: &str,
 ) -> Result<bool> {
     if matches!(name, "this" | "Super" | "nullptr" | "true" | "false") {
+        return Ok(true);
+    }
+
+    if is_ignored_unknown_symbol_name(name, known_names) {
         return Ok(true);
     }
 
@@ -1556,6 +1660,7 @@ fn should_suppress_member_diagnostic(
     engine_conn: Option<&Connection>,
     member_hot_index: Option<&MemberHotIndex>,
     engine_member_hot_index: Option<&MemberHotIndex>,
+    known_names: &DiagnosticKnownNames,
     class_name: &str,
 ) -> Result<bool> {
     let normalized = crate::parser::cpp::clean_type_string(class_name);
@@ -1563,7 +1668,7 @@ fn should_suppress_member_diagnostic(
         return Ok(false);
     }
 
-    if normalized.contains('<') {
+    if normalized.contains('<') || known_names.suppress_member_classes.contains(&normalized) {
         return Ok(true);
     }
 
@@ -1591,7 +1696,10 @@ fn should_suppress_member_diagnostic(
         }
     }
 
-    Ok(looks_like_unreal_external_type(&normalized))
+    Ok(
+        known_names.suppress_member_classes.contains(&normalized)
+            || looks_like_unreal_external_type(&normalized),
+    )
 }
 
 fn member_type_on_class_or_bases(
@@ -1711,13 +1819,14 @@ fn enum_value_exists(conn: &Connection, name: &str) -> Result<bool> {
     Ok(conn.query_row(sql, [name], |_row| Ok(())).is_ok())
 }
 
-fn is_ignored_unknown_symbol_name(name: &str) -> bool {
+fn is_ignored_unknown_symbol_name(name: &str, known_names: &DiagnosticKnownNames) -> bool {
     matches!(
         name,
         "this" | "Super" | "ThisClass" | "nullptr" | "true" | "false"
     ) || name
         .chars()
         .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+        || known_names.ignored_unknown_names.contains(name)
 }
 
 fn same_node(left: tree_sitter::Node, right: tree_sitter::Node) -> bool {
@@ -1737,10 +1846,8 @@ fn collect_missing_visible_type_items(
     engine_visible_file_ids: &HashSet<i64>,
     project_lookup_cache: &mut HashMap<String, TypeVisibilityMatch>,
     engine_lookup_cache: &mut HashMap<String, TypeVisibilityMatch>,
-    project_text_visibility_cache: &mut HashMap<String, bool>,
-    engine_text_visibility_cache: &mut HashMap<String, bool>,
-    project_text_forward_decl_cache: &mut HashMap<String, bool>,
-    engine_text_forward_decl_cache: &mut HashMap<String, bool>,
+    project_text_visibility_cache: &mut HashMap<String, TypeVisibility>,
+    engine_text_visibility_cache: &mut HashMap<String, TypeVisibility>,
     seen: &mut HashSet<(u32, u32, String)>,
     items: &mut Vec<DiagnosticItem>,
 ) -> Result<()> {
@@ -1804,26 +1911,16 @@ fn collect_missing_visible_type_items(
             Some(include_paths),
         )?;
 
-        let project_visible = project_match.visible
-            || (project_match.exists
-                && visible_type_declared_in_files(
-                    conn,
-                    &reference.name,
-                    project_visible_file_ids,
-                    project_text_visibility_cache,
-                    PROJECT_TEXT_VISIBILITY_SCAN_LIMIT,
-                )?);
+        let project_text_visibility = visible_type_text_visibility_in_files(
+            conn,
+            &reference.name,
+            project_visible_file_ids,
+            project_text_visibility_cache,
+            PROJECT_TEXT_VISIBILITY_SCAN_LIMIT,
+        )?;
+        let project_visibility = max_visibility(project_match.visibility, project_text_visibility);
 
-        let project_forward_declared = !reference.requires_complete
-            && visible_type_forward_declared_in_files(
-                conn,
-                &reference.name,
-                project_visible_file_ids,
-                project_text_forward_decl_cache,
-                PROJECT_TEXT_VISIBILITY_SCAN_LIMIT,
-            )?;
-
-        if project_visible || project_forward_declared {
+        if type_visibility_satisfies(project_visibility, reference.requires_complete) {
             continue;
         }
 
@@ -1839,34 +1936,44 @@ fn collect_missing_visible_type_items(
             TypeVisibilityMatch::default()
         };
 
-        let engine_visible = if let Some(engine_conn) = engine_conn {
-            engine_match.visible
-                || (engine_match.exists
-                    && visible_type_declared_in_files(
-                        engine_conn,
-                        &reference.name,
-                        engine_visible_file_ids,
-                        engine_text_visibility_cache,
-                        ENGINE_TEXT_VISIBILITY_SCAN_LIMIT,
-                    )?)
+        let engine_text_visibility = if let Some(engine_conn) = engine_conn {
+            visible_type_text_visibility_in_files(
+                engine_conn,
+                &reference.name,
+                engine_visible_file_ids,
+                engine_text_visibility_cache,
+                ENGINE_TEXT_VISIBILITY_SCAN_LIMIT,
+            )?
         } else {
-            false
+            TypeVisibility::Unknown
         };
+        let engine_visibility = max_visibility(engine_match.visibility, engine_text_visibility);
 
-        let engine_forward_declared = if let Some(engine_conn) = engine_conn {
-            !reference.requires_complete
-                && visible_type_forward_declared_in_files(
-                    engine_conn,
-                    &reference.name,
-                    engine_visible_file_ids,
-                    engine_text_forward_decl_cache,
-                    ENGINE_TEXT_VISIBILITY_SCAN_LIMIT,
-                )?
-        } else {
-            false
-        };
+        if type_visibility_satisfies(engine_visibility, reference.requires_complete) {
+            continue;
+        }
 
-        if engine_visible || engine_forward_declared {
+        if reference.requires_complete
+            && matches!(
+                max_visibility(project_visibility, engine_visibility),
+                TypeVisibility::ForwardOnly
+            )
+        {
+            items.push(
+                DiagnosticItem::new(
+                    Some(file_path),
+                    reference.line,
+                    reference.character,
+                    DiagnosticSeverity::Error,
+                    "UCore",
+                    "UECPP005",
+                    format!(
+                        "Type {} is only forward-declared here and needs a full definition.",
+                        reference.name
+                    ),
+                )
+                .with_end(reference.end_line, reference.end_character),
+            );
             continue;
         }
 
@@ -1906,8 +2013,6 @@ fn collect_missing_visible_type_items(
             engine_lookup_cache,
             project_text_visibility_cache,
             engine_text_visibility_cache,
-            project_text_forward_decl_cache,
-            engine_text_forward_decl_cache,
             seen,
             items,
         )?;
@@ -1919,7 +2024,35 @@ fn collect_missing_visible_type_items(
 #[derive(Clone, Debug, Default)]
 struct TypeVisibilityMatch {
     exists: bool,
-    visible: bool,
+    visibility: TypeVisibility,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum TypeVisibility {
+    #[default]
+    Unknown,
+    ForwardOnly,
+    FullyVisible,
+}
+
+fn type_visibility_satisfies(visibility: TypeVisibility, requires_complete: bool) -> bool {
+    match visibility {
+        TypeVisibility::FullyVisible => true,
+        TypeVisibility::ForwardOnly => !requires_complete,
+        TypeVisibility::Unknown => false,
+    }
+}
+
+fn max_visibility(left: TypeVisibility, right: TypeVisibility) -> TypeVisibility {
+    match (left, right) {
+        (TypeVisibility::FullyVisible, _) | (_, TypeVisibility::FullyVisible) => {
+            TypeVisibility::FullyVisible
+        }
+        (TypeVisibility::ForwardOnly, _) | (_, TypeVisibility::ForwardOnly) => {
+            TypeVisibility::ForwardOnly
+        }
+        _ => TypeVisibility::Unknown,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2235,7 +2368,7 @@ fn invalid_member_token_line(
         return None;
     }
 
-    if is_ignored_unknown_symbol_name(trimmed) {
+    if is_ignored_unknown_symbol_name(trimmed, builtin_diagnostic_known_names()) {
         return None;
     }
 
@@ -2262,7 +2395,7 @@ fn invalid_expression_token_line(line: &str) -> Option<&str> {
     let token = trimmed.trim_end_matches(';').trim();
     if token.is_empty()
         || !token.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == ':')
-        || is_ignored_unknown_symbol_name(token)
+        || is_ignored_unknown_symbol_name(token, builtin_diagnostic_known_names())
     {
         return None;
     }
@@ -2349,34 +2482,116 @@ fn collect_duplicate_member_items(
     seen: &mut HashMap<(String, String), (u32, u32)>,
     items: &mut Vec<DiagnosticItem>,
 ) {
-    if let Some(class_name) = find_enclosing_class_name(node, content) {
-        if let Some(name_node) = find_name_node(node) {
-            let name = node_text(name_node, content).trim().to_string();
-            if !name.is_empty() && matches!(node.kind(), "field_declaration" | "declaration" | "function_definition" | "unreal_function_declaration") {
-                let key = (class_name, name.clone());
-                let start = name_node.start_position();
-                let end = name_node.end_position();
-                if seen.insert(key.clone(), (start.row as u32, start.column as u32)).is_some() {
-                    items.push(
-                        DiagnosticItem::new(
-                            Some(file_path),
-                            start.row as u32,
-                            start.column as u32,
-                            DiagnosticSeverity::Error,
-                            "UCore",
-                            "UECPP016",
-                            format!("Duplicate member declaration {} in {}.", key.1, key.0),
-                        )
-                        .with_end(end.row as u32, end.column as u32),
-                    );
+    if is_member_declaration_node(node) {
+        if is_direct_class_member(node) {
+            if let Some(class_name) = find_enclosing_class_name(node, content) {
+                if let Some(name_node) = find_top_level_declarator_name(node) {
+                    let name = node_text(name_node, content).trim().to_string();
+                    if !name.is_empty() {
+                        let key = (class_name, name.clone());
+                        let start = name_node.start_position();
+                        let end = name_node.end_position();
+                        if seen
+                            .insert(key.clone(), (start.row as u32, start.column as u32))
+                            .is_some()
+                        {
+                            items.push(
+                                DiagnosticItem::new(
+                                    Some(file_path),
+                                    start.row as u32,
+                                    start.column as u32,
+                                    DiagnosticSeverity::Error,
+                                    "UCore",
+                                    "UECPP016",
+                                    format!("Duplicate member declaration {} in {}.", key.1, key.0),
+                                )
+                                .with_end(end.row as u32, end.column as u32),
+                            );
+                        }
+                    }
                 }
             }
+            return;
         }
     }
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         collect_duplicate_member_items(child, content, file_path, seen, items);
+    }
+}
+
+fn is_member_declaration_node(node: tree_sitter::Node) -> bool {
+    matches!(
+        node.kind(),
+        "field_declaration"
+            | "function_definition"
+            | "unreal_function_definition"
+            | "unreal_function_declaration"
+            | "declaration"
+    )
+}
+
+fn is_direct_class_member(node: tree_sitter::Node) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        match parent.kind() {
+            "field_declaration_list" | "unreal_class_body" | "unreal_struct_body" => return true,
+            "argument_list"
+            | "preproc_call"
+            | "preproc_arg"
+            | "unreal_property_attributes"
+            | "unreal_function_attributes"
+            | "compound_statement"
+            | "field_initializer_list"
+            | "init_declarator"
+            | "default_argument"
+            | "parameter_list"
+            | "template_argument_list"
+            | "template_parameter_list"
+            | "lambda_expression" => return false,
+            _ => current = parent.parent(),
+        }
+    }
+
+    false
+}
+
+fn find_top_level_declarator_name(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    let declarator_owner = match node.kind() {
+        "unreal_reflected_property" => {
+            find_direct_child_by_kind(node, &["field_declaration", "declaration"]).unwrap_or(node)
+        }
+        "unreal_reflected_function"
+        | "unreal_function_declaration"
+        | "unreal_function_definition" => find_direct_child_by_kind(
+            node,
+            &["function_definition", "declaration", "function_declarator"],
+        )
+        .unwrap_or(node),
+        _ => node,
+    };
+
+    let declarator = declarator_owner
+        .child_by_field_name("declarator")
+        .or_else(|| find_child_by_field(declarator_owner, "declarator"))?;
+    peel_declarator_to_name(declarator).or_else(|| find_name_node(declarator))
+}
+
+fn peel_declarator_to_name(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    match node.kind() {
+        "field_identifier" | "identifier" => Some(node),
+        "init_declarator"
+        | "function_declarator"
+        | "pointer_declarator"
+        | "reference_declarator"
+        | "array_declarator"
+        | "parenthesized_declarator"
+        | "bitfield_clause" => node
+            .child_by_field_name("declarator")
+            .or_else(|| find_child_by_field(node, "declarator"))
+            .and_then(peel_declarator_to_name),
+        _ => None,
     }
 }
 
@@ -2782,7 +2997,7 @@ fn collect_missing_field_semicolon_items(
         if name.is_empty()
             || type_part.is_empty()
             || !name.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-            || is_ignored_unknown_symbol_name(name)
+            || is_ignored_unknown_symbol_name(name, builtin_diagnostic_known_names())
         {
             continue;
         }
@@ -3635,6 +3850,7 @@ fn lookup_type_visibility(
         r#"
         SELECT
             c.file_id,
+            c.decl_kind,
             CASE
                 WHEN dp.full_path IS NULL OR sf.text IS NULL THEN ''
                 ELSE dp.full_path || '/' || sf.text
@@ -3655,20 +3871,31 @@ fn lookup_type_visibility(
         matched.exists = true;
 
         let file_id: Option<i64> = row.get(0)?;
-        let full_path: String = row.get(1)?;
+        let decl_kind: String = row.get(1)?;
+        let full_path: String = row.get(2)?;
+        let row_visibility = if decl_kind.eq_ignore_ascii_case("forward") {
+            TypeVisibility::ForwardOnly
+        } else {
+            TypeVisibility::FullyVisible
+        };
 
         if let (Some(visible_file_ids), Some(file_id)) = (visible_file_ids, file_id) {
             if visible_file_ids.contains(&file_id) {
-                matched.visible = true;
-                return Ok(matched);
+                matched.visibility = max_visibility(matched.visibility, row_visibility);
+                if matches!(matched.visibility, TypeVisibility::FullyVisible) {
+                    return Ok(matched);
+                }
+                continue;
             }
         }
 
         if let Some(include_paths) = include_paths {
             if let Some(include_path) = include_path_from_file_path(&full_path) {
                 if include_paths.contains(&include_path) {
-                    matched.visible = true;
-                    return Ok(matched);
+                    matched.visibility = max_visibility(matched.visibility, row_visibility);
+                    if matches!(matched.visibility, TypeVisibility::FullyVisible) {
+                        return Ok(matched);
+                    }
                 }
             }
         }
@@ -3778,6 +4005,43 @@ fn visible_type_forward_declared_in_files(
     let declared = type_forward_declared_in_file_set(conn, type_name, visible_file_ids, scan_limit)?;
     cache.insert(type_name.to_string(), declared);
     Ok(declared)
+}
+
+fn visible_type_text_visibility_in_files(
+    conn: &Connection,
+    type_name: &str,
+    visible_file_ids: &HashSet<i64>,
+    cache: &mut HashMap<String, TypeVisibility>,
+    scan_limit: usize,
+) -> Result<TypeVisibility> {
+    if let Some(cached) = cache.get(type_name) {
+        return Ok(*cached);
+    }
+
+    let mut declared_cache = HashMap::new();
+    let mut forward_cache = HashMap::new();
+    let visibility = if visible_type_declared_in_files(
+        conn,
+        type_name,
+        visible_file_ids,
+        &mut declared_cache,
+        scan_limit,
+    )? {
+        TypeVisibility::FullyVisible
+    } else if visible_type_forward_declared_in_files(
+        conn,
+        type_name,
+        visible_file_ids,
+        &mut forward_cache,
+        scan_limit,
+    )? {
+        TypeVisibility::ForwardOnly
+    } else {
+        TypeVisibility::Unknown
+    };
+
+    cache.insert(type_name.to_string(), visibility);
+    Ok(visibility)
 }
 
 fn type_declared_in_file_set(
@@ -3905,6 +4169,13 @@ fn reachable_file_ids_from_roots(
                     queue.push_back(id);
                 }
             }
+
+            for id in unresolved_include_fallback_ids(conn, file_id) {
+                if !included.contains(&id) {
+                    queue.push_back(id);
+                }
+            }
+
             continue;
         }
 
@@ -3917,6 +4188,12 @@ fn reachable_file_ids_from_roots(
                         queue.push_back(id);
                     }
                 }
+            }
+        }
+
+        for id in unresolved_include_fallback_ids(conn, file_id) {
+            if !included.contains(&id) {
+                queue.push_back(id);
             }
         }
     }
@@ -3981,6 +4258,85 @@ fn file_ids_by_include_path(conn: &Connection, include_path: &str) -> Vec<i64> {
         Ok(rows) => rows.filter_map(|row| row.ok()).collect(),
         Err(_) => Vec::new(),
     }
+}
+
+fn unresolved_include_fallback_ids(conn: &Connection, file_id: i64) -> Vec<i64> {
+    let mut stmt = match conn.prepare_cached(
+        r#"
+        SELECT s.text
+        FROM file_includes fi
+        JOIN strings s ON fi.include_path_id = s.id
+        WHERE fi.file_id = ?1
+          AND fi.resolved_file_id IS NULL
+        "#,
+    ) {
+        Ok(stmt) => stmt,
+        Err(_) => return Vec::new(),
+    };
+
+    let module_id = file_module_id(conn, file_id);
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    if let Ok(rows) = stmt.query_map([file_id], |row| row.get::<_, String>(0)) {
+        for include_path in rows.filter_map(|row| row.ok()) {
+            for candidate in resolve_include_fallback(conn, &include_path, module_id) {
+                if seen.insert(candidate) {
+                    out.push(candidate);
+                }
+            }
+        }
+    }
+
+    out
+}
+
+fn resolve_include_fallback(
+    conn: &Connection,
+    include_path: &str,
+    current_module_id: Option<i64>,
+) -> Vec<i64> {
+    let basename = Path::new(include_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .trim();
+    if basename.is_empty() {
+        return Vec::new();
+    }
+
+    let mut stmt = match conn.prepare_cached(
+        "SELECT file_id, module_id FROM search_files WHERE basename = ?1 ORDER BY path",
+    ) {
+        Ok(stmt) => stmt,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut same_module = Vec::new();
+    let mut others = Vec::new();
+    if let Ok(rows) = stmt.query_map([basename], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
+    }) {
+        for (file_id, module_id) in rows.filter_map(|row| row.ok()) {
+            if current_module_id.is_some() && current_module_id == module_id {
+                same_module.push(file_id);
+            } else {
+                others.push(file_id);
+            }
+        }
+    }
+
+    same_module.extend(others);
+    same_module
+}
+
+fn file_module_id(conn: &Connection, file_id: i64) -> Option<i64> {
+    conn.query_row(
+        "SELECT module_id FROM search_files WHERE file_id = ?1 LIMIT 1",
+        [file_id],
+        |row| row.get::<_, Option<i64>>(0),
+    )
+    .ok()
+    .flatten()
 }
 
 #[derive(Clone, Debug)]
@@ -4571,6 +4927,15 @@ fn find_child_by_field<'a>(node: tree_sitter::Node<'a>, field: &str) -> Option<t
     node.child_by_field_name(field)
 }
 
+fn find_direct_child_by_kind<'a>(
+    node: tree_sitter::Node<'a>,
+    kinds: &[&str],
+) -> Option<tree_sitter::Node<'a>> {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .find(|child| kinds.iter().any(|kind| child.kind() == *kind))
+}
+
 fn find_child_by_type<'a>(node: tree_sitter::Node<'a>, kind: &str) -> Option<tree_sitter::Node<'a>> {
     let mut cursor = node.walk();
 
@@ -4623,7 +4988,7 @@ fn find_enclosing_class_name(node: tree_sitter::Node, content: &str) -> Option<S
                 | "unreal_reflected_class_declaration"
                 | "unreal_reflected_struct_declaration"
         ) {
-            if let Some(name_node) = parent.child_by_field_name("name") {
+            if let Some(name_node) = find_class_like_name_node(parent) {
                 return Some(node_text(name_node, content).trim().to_string());
             }
         }
@@ -4645,6 +5010,11 @@ fn find_enclosing_class_name(node: tree_sitter::Node, content: &str) -> Option<S
     }
 
     None
+}
+
+fn find_class_like_name_node(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    node.child_by_field_name("name")
+        .or_else(|| find_direct_child_by_kind(node, &["type_identifier", "identifier"]))
 }
 
 fn enclosing_class_base_names(node: tree_sitter::Node, content: &str) -> Vec<String> {
@@ -4969,7 +5339,7 @@ mod tests {
     fn insert_class(conn: &Connection, name: &str) -> i64 {
         let name_id = insert_string(conn, name);
         conn.execute(
-            "INSERT INTO classes (name_id, symbol_type, line_number, end_line_number) VALUES (?, 'class', 1, 1)",
+            "INSERT INTO classes (name_id, symbol_type, decl_kind, line_number, end_line_number) VALUES (?, 'class', 'full', 1, 1)",
             [name_id],
         )
         .unwrap();
@@ -4979,7 +5349,17 @@ mod tests {
     fn insert_class_in_file(conn: &Connection, name: &str, file_id: i64) -> i64 {
         let name_id = insert_string(conn, name);
         conn.execute(
-            "INSERT INTO classes (name_id, file_id, symbol_type, line_number, end_line_number) VALUES (?, ?, 'class', 1, 1)",
+            "INSERT INTO classes (name_id, file_id, symbol_type, decl_kind, line_number, end_line_number) VALUES (?, ?, 'class', 'full', 1, 1)",
+            rusqlite::params![name_id, file_id],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn insert_forward_decl_in_file(conn: &Connection, name: &str, file_id: i64) -> i64 {
+        let name_id = insert_string(conn, name);
+        conn.execute(
+            "INSERT INTO classes (name_id, file_id, symbol_type, decl_kind, line_number, end_line_number) VALUES (?, ?, 'class', 'forward', 1, 1)",
             rusqlite::params![name_id, file_id],
         )
         .unwrap();
@@ -5436,6 +5816,63 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_does_not_misfire_on_uproperty_macro_args() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "UCLASS()\nclass UMinimalistMenuWidget : public UWidget\n{\n    GENERATED_BODY()\npublic:\n    UPROPERTY(EditAnywhere, Category = Accept)\n    uint8 bIsAcceptHandler : 1 = false;\n\n    UPROPERTY(EditAnywhere, Category = Accept)\n    uint8 bIsAcceptActionDisplayed : 1 = false;\n};\n",
+            Some("C:/Project/Source/Game/Public/MinimalistMenuWidget.h".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP016"));
+    }
+
+    #[test]
+    fn duplicate_real_collision_is_reported() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "UCLASS()\nclass UThing : public UObject\n{\n    GENERATED_BODY()\n    UPROPERTY() int32 X;\n    UPROPERTY() int32 X;\n};\n",
+            Some("C:/Project/Source/Game/Public/Thing.h".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert_eq!(
+            items.iter().filter(|item| item["code"] == "UECPP016").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn duplicate_ignores_function_scope_locals() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "class AThing\n{\npublic:\n    int32 X;\n    void Run()\n    {\n        int32 X = 0;\n    }\n};\n",
+            Some("C:/Project/Source/Game/Public/Thing.h".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP016"));
+    }
+
+    #[test]
     fn does_not_warn_on_forward_declaration_itself() {
         let conn = Connection::open_in_memory().unwrap();
         crate::db::init_db(&conn).unwrap();
@@ -5480,9 +5917,6 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         crate::db::init_db(&conn).unwrap();
 
-        let class_id = insert_class(&conn, "UMyDependency");
-        insert_impl_member(&conn, class_id, "DoThing", "()", Some("void"));
-
         let root = temp_project_path("forward_declared_via_include");
         let public_dir = root.join("Source/Game/Public");
         std::fs::create_dir_all(&public_dir).unwrap();
@@ -5497,6 +5931,7 @@ mod tests {
 
         let current_file_id = insert_file_at_path(&conn, &actor_header, true);
         let shared_file_id = insert_file_at_path(&conn, &shared_header, true);
+        insert_forward_decl_in_file(&conn, "UMyDependency", shared_file_id);
         insert_include_edge(&conn, current_file_id, "SharedTypes.h", shared_file_id);
 
         let value = process_diagnostics(
@@ -5510,6 +5945,78 @@ mod tests {
 
         let items = value["items"].as_array().unwrap();
         assert!(!items.iter().any(|item| item["code"] == "UECPP004"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP005"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn does_not_warn_when_full_definition_is_visible_via_included_header() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let root = temp_project_path("full_definition_via_include");
+        let public_dir = root.join("Source/Game/Public");
+        std::fs::create_dir_all(&public_dir).unwrap();
+        let shared_header = public_dir.join("Bar.h");
+        let actor_header = public_dir.join("X.h");
+        std::fs::write(&shared_header, "class FFoo {};\n").unwrap();
+        std::fs::write(
+            &actor_header,
+            "class FFoo;\n#include \"Bar.h\"\nvoid Use(FFoo& Value);\n",
+        )
+        .unwrap();
+
+        let current_file_id = insert_file_at_path(&conn, &actor_header, true);
+        let shared_file_id = insert_file_at_path(&conn, &shared_header, true);
+        insert_class_in_file(&conn, "FFoo", shared_file_id);
+        insert_include_edge(&conn, current_file_id, "Bar.h", shared_file_id);
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "class FFoo;\n#include \"Bar.h\"\nvoid Use(FFoo& Value);\n",
+            Some(actor_header.to_string_lossy().to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP004"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP005"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_known_toml_suppresses_custom_identifier() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let root = temp_project_path("known_toml");
+        let ucore_dir = root.join(".ucore");
+        let source_dir = root.join("Source/Game/Public");
+        std::fs::create_dir_all(&ucore_dir).unwrap();
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::write(
+            ucore_dir.join("known.toml"),
+            "[ue5]\nignored_unknown_names = [\"MyCustomMacro\"]\n",
+        )
+        .unwrap();
+        let header = source_dir.join("MyActor.h");
+        std::fs::write(&header, "void Run() { MyCustomMacro(Value); }\n").unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "void Run() { MyCustomMacro(Value); }\n",
+            Some(header.to_string_lossy().to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["message"] == "Unknown identifier MyCustomMacro."));
 
         let _ = std::fs::remove_dir_all(root);
     }

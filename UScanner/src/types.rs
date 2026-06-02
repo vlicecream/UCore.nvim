@@ -209,6 +209,7 @@ pub struct ClassInfo {
 
     pub base_classes: Vec<String>,
     pub symbol_type: String,
+    pub decl_kind: String,
     pub line: usize,
     pub end_line: usize,
 

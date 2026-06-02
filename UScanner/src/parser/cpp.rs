@@ -596,6 +596,7 @@ fn collect_delegate_definitions(content_bytes: &[u8]) -> Vec<ClassInfo> {
             namespace: None,
             base_classes: Vec::new(),
             symbol_type: delegate_symbol_type(macro_name).to_string(),
+            decl_kind: "full".to_string(),
             line,
             end_line,
             range_start: macro_match.start(),
@@ -877,6 +878,7 @@ fn collect_reflected_type_fallbacks(root: Node, content: &str) -> Vec<ClassInfo>
                 namespace,
                 base_classes,
                 symbol_type: symbol_type.to_string(),
+                decl_kind: "full".to_string(),
                 line: line_number_for_offset(content, macro_start),
                 end_line: line_number_for_offset(content, range_end.saturating_sub(1)),
                 range_start: macro_start,
@@ -1196,6 +1198,11 @@ fn collect_class_like(
         namespace,
         base_classes: Vec::new(),
         symbol_type: symbol_type.to_string(),
+        decl_kind: if parent.child_by_field_name("body").is_some() {
+            "full".to_string()
+        } else {
+            "forward".to_string()
+        },
         line: parent.start_position().row + 1,
         end_line: parent.end_position().row + 1,
         range_start: parent.start_byte(),
@@ -1220,15 +1227,38 @@ fn find_class_like_container(node: Node) -> Option<Node> {
                 | "unreal_reflected_struct_declaration"
                 | "unreal_reflected_enum_declaration"
         ) {
-            return candidate
-                .child_by_field_name("body")
-                .map(|_| candidate);
+            return should_index_class_like_container(candidate).then_some(candidate);
         }
 
         current = candidate.parent();
     }
 
     None
+}
+
+fn should_index_class_like_container(node: Node) -> bool {
+    if node.child_by_field_name("body").is_some() {
+        return true;
+    }
+
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        match parent.kind() {
+            "template_argument_list"
+            | "template_parameter_list"
+            | "parameter_list"
+            | "type_descriptor"
+            | "sized_type_specifier" => return false,
+            "declaration"
+            | "field_declaration"
+            | "translation_unit"
+            | "namespace_definition"
+            | "linkage_specification" => return true,
+            _ => current = parent.parent(),
+        }
+    }
+
+    false
 }
 
 /// Attach a base class to the current class.
@@ -1520,6 +1550,7 @@ fn find_or_create_impl_class(classes: &mut Vec<ClassInfo>, scope: &str) -> usize
         namespace: None,
         base_classes: Vec::new(),
         symbol_type: "class".to_string(),
+        decl_kind: "full".to_string(),
         line: 1,
         end_line: usize::MAX,
         range_start: 0,

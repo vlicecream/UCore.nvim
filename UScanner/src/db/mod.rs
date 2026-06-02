@@ -18,7 +18,7 @@ use crate::types::{ParseResult, ProgressReporter};
 ///
 /// Increment this when table structures, indexes, or stored data semantics change.
 /// 当表结构、索引或存储语义变化时递增。
-pub const DB_VERSION: i32 = 28;
+pub const DB_VERSION: i32 = 29;
 
 /// Completion cache version.
 /// 补全缓存版本。
@@ -161,6 +161,7 @@ fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
             line_number INTEGER,
             end_line_number INTEGER,
             symbol_type TEXT DEFAULT 'class',
+            decl_kind TEXT NOT NULL DEFAULT 'full',
             FOREIGN KEY(name_id) REFERENCES strings(id),
             FOREIGN KEY(namespace_id) REFERENCES strings(id),
             FOREIGN KEY(base_class_id) REFERENCES strings(id),
@@ -741,8 +742,8 @@ fn save_to_db_bulk_chunk(
 
         let mut stmt_class = tx.prepare(
             "INSERT INTO classes
-             (name_id, namespace_id, base_class_id, file_id, line_number, symbol_type, end_line_number)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             (name_id, namespace_id, base_class_id, file_id, line_number, symbol_type, decl_kind, end_line_number)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )?;
 
         let mut stmt_inheritance = tx.prepare(
@@ -1314,8 +1315,8 @@ pub fn save_to_db_incremental(
 
     let mut stmt_class = tx.prepare(
         "INSERT INTO classes
-         (name_id, namespace_id, base_class_id, file_id, line_number, symbol_type, end_line_number)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+         (name_id, namespace_id, base_class_id, file_id, line_number, symbol_type, decl_kind, end_line_number)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
     )?;
 
     let mut stmt_inheritance = tx.prepare(
@@ -2143,6 +2144,7 @@ fn save_classes(
             file_id,
             class_info.line as i64,
             class_info.symbol_type,
+            class_info.decl_kind,
             class_info.end_line as i64,
         ])?;
 
