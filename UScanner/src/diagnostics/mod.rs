@@ -224,8 +224,8 @@ pub(crate) struct PreprocRules {
     pub enabled: bool,
     #[serde(default = "default_true")]
     pub expand_macros: bool,
-    #[serde(default = "default_predefined_macros_file")]
-    pub predefined_macros_file: String,
+    #[serde(default = "default_preprocessor_config_file", alias = "predefined_macros_file")]
+    pub config_file: String,
 }
 
 impl Default for PreprocRules {
@@ -233,7 +233,7 @@ impl Default for PreprocRules {
         Self {
             enabled: default_true(),
             expand_macros: default_true(),
-            predefined_macros_file: default_predefined_macros_file(),
+            config_file: default_preprocessor_config_file(),
         }
     }
 }
@@ -280,8 +280,8 @@ const fn default_hint_severity() -> SeverityConfig {
     SeverityConfig::Hint
 }
 
-fn default_predefined_macros_file() -> String {
-    "predefined_macros.toml".to_string()
+fn default_preprocessor_config_file() -> String {
+    "preprocessor.toml".to_string()
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -388,10 +388,14 @@ pub fn process_diagnostics_with_hot_indexes(
     let parsed_tree = parse_diagnostics_tree(content)?;
     let parsed_root = parsed_tree.as_ref().map(|tree| tree.root_node());
     let sema_ctx = parsed_root.map(|root| crate::sema::builder::build_sema(root, content));
+    let preproc_macros = preproc::default_macro_table_for_file(&rules.preproc.config_file);
+    let preproc_resolver =
+        preproc::default_include_resolver_for_file(&rules.preproc.config_file, file_path.as_deref());
     let preprocessed = if rules.preproc.enabled && rules.preproc.expand_macros {
-        Some(preproc::preprocess_source(
+        Some(preproc::preprocess_source_with_resolver(
             content,
-            &preproc::default_macro_table_for_file(&rules.preproc.predefined_macros_file),
+            &preproc_macros,
+            Some(&preproc_resolver),
         ))
     } else {
         None
@@ -604,6 +608,7 @@ pub fn process_diagnostics_with_hot_indexes(
         content,
         file_path.as_deref(),
         &rules.finalize,
+        &rules.preproc,
     );
     Ok(json!({ "items": items }))
 }
@@ -1494,6 +1499,15 @@ fn push_unknown_symbol_item(
 
 fn is_unknown_identifier_usage_candidate(node: tree_sitter::Node, content: &str) -> bool {
     if node.kind() != "identifier" {
+        return false;
+    }
+
+    if content
+        .lines()
+        .nth(node.start_position().row as usize)
+        .map(str::trim_start)
+        .is_some_and(|line| line.starts_with('#'))
+    {
         return false;
     }
 
@@ -7481,6 +7495,35 @@ mod tests {
 
         let items = value["items"].as_array().unwrap();
         assert!(items.iter().any(|item| item["code"] == "UECPP-DF-005"));
+    }
+
+    #[test]
+    fn finalize_suppresses_inactive_has_include_branch() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let root = temp_project_path("preproc_has_include_finalize");
+        let file = root.join("Source/MyGame/Private/Test.cpp");
+        let header = root.join("Source/MyGame/Public/MyHeader.h");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(header.parent().unwrap()).unwrap();
+        std::fs::write(root.join("MyGame.uproject"), "{}").unwrap();
+        std::fs::write(&header, "// header").unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "#if __has_include(\"MyHeader.h\")\nint32 Value = 1;\n#else\nxxxxx;\n#endif\n",
+            Some(file.to_string_lossy().replace('\\', "/")),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP008"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-SYN-010"));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

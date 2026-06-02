@@ -22,6 +22,10 @@ fn collect_syntax_items(
     file_path: Option<&str>,
     items: &mut Vec<DiagnosticItem>,
 ) {
+    if is_preprocessor_directive_line(content, node.start_position().row as usize) {
+        return;
+    }
+
     if node.is_missing() {
         items.push(build_missing_item(node, content, file_path));
     } else if node.is_error() {
@@ -32,6 +36,14 @@ fn collect_syntax_items(
     for child in node.children(&mut cursor) {
         collect_syntax_items(child, content, file_path, items);
     }
+}
+
+fn is_preprocessor_directive_line(content: &str, row: usize) -> bool {
+    content
+        .lines()
+        .nth(row)
+        .map(str::trim_start)
+        .is_some_and(|line| line.starts_with('#'))
 }
 
 fn build_missing_item(

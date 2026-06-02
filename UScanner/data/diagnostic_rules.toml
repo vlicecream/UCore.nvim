@@ -34,4 +34,4 @@ severity_narrowing = "warning"
 [preproc]
 enabled = true
 expand_macros = true
-predefined_macros_file = "predefined_macros.toml"
+config_file = "preprocessor.toml"

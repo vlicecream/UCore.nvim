@@ -1,17 +1,18 @@
 use std::collections::{HashMap, HashSet};
 
-use super::{DiagnosticItem, DiagnosticSeverity, FinalizeRules};
+use super::{DiagnosticItem, DiagnosticSeverity, FinalizeRules, PreprocRules};
 
 pub(crate) fn finalize_diagnostics(
     items: Vec<DiagnosticItem>,
     content: &str,
     file_path: Option<&str>,
     rules: &FinalizeRules,
+    preproc_rules: &PreprocRules,
 ) -> Vec<DiagnosticItem> {
     let total_lines = content.lines().count().max(1) as u32;
     let suppressed_if_zero = rules
         .suppress_inside_preproc_if_zero
-        .then(|| suppressed_lines_inside_preproc(content))
+        .then(|| suppressed_lines_inside_preproc(content, file_path, preproc_rules))
         .unwrap_or_default();
 
     let mut deduped = HashMap::<(Option<String>, u32, u32, &'static str), DiagnosticItem>::new();
@@ -105,6 +106,13 @@ fn severity_rank(severity: &DiagnosticSeverity) -> u8 {
     }
 }
 
-fn suppressed_lines_inside_preproc(content: &str) -> HashSet<u32> {
-    crate::preproc::preprocess_source(content, &crate::preproc::default_macro_table()).inactive_lines
+fn suppressed_lines_inside_preproc(
+    content: &str,
+    file_path: Option<&str>,
+    preproc_rules: &PreprocRules,
+) -> HashSet<u32> {
+    let macros = crate::preproc::default_macro_table_for_file(&preproc_rules.config_file);
+    let resolver =
+        crate::preproc::default_include_resolver_for_file(&preproc_rules.config_file, file_path);
+    crate::preproc::preprocess_source_with_resolver(content, &macros, Some(&resolver)).inactive_lines
 }
