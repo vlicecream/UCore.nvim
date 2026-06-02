@@ -3419,9 +3419,6 @@ fn load_member_hot_index(
     db_path: &str,
     label: &str,
 ) -> Option<Arc<query::member_index::MemberHotIndex>> {
-    if is_engine_db_path(db_path) {
-        return None;
-    }
     match state.get_member_hot_index(db_path) {
         Ok(index) => Some(index),
         Err(err) => {
