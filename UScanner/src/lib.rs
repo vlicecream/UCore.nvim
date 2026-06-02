@@ -12,6 +12,7 @@ pub mod parser;
 pub mod query;
 pub mod refresh;
 pub mod runtime_index;
+pub mod sema;
 pub mod server;
 pub mod types;
 pub mod uasset;

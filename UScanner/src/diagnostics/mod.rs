@@ -16,6 +16,7 @@ use tracing::info;
 use crate::types::OpenBufferOverlay;
 use crate::query::member_index::MemberHotIndex;
 use crate::query::usage::UsageHotIndex;
+use crate::sema::SemaContext;
 
 mod finalize;
 mod phases;
@@ -280,6 +281,7 @@ pub fn process_diagnostics_with_hot_indexes(
     let rules = diagnostic_rules();
     let parsed_tree = parse_diagnostics_tree(content)?;
     let parsed_root = parsed_tree.as_ref().map(|tree| tree.root_node());
+    let sema_ctx = parsed_root.map(|root| crate::sema::builder::build_sema(root, content));
 
     if rules.syntax_errors.enabled {
         extend_diagnostic_phase(
@@ -377,6 +379,7 @@ pub fn process_diagnostics_with_hot_indexes(
             engine_conn,
             member_hot_index,
             engine_member_hot_index,
+            sema_ctx.as_ref(),
             &known_names,
             content,
             file_path.as_deref(),
@@ -926,6 +929,7 @@ fn unknown_symbol_diagnostics(
     engine_conn: Option<&Connection>,
     member_hot_index: Option<&MemberHotIndex>,
     engine_member_hot_index: Option<&MemberHotIndex>,
+    sema_ctx: Option<&SemaContext>,
     known_names: &DiagnosticKnownNames,
     content: &str,
     file_path: Option<&str>,
@@ -952,6 +956,7 @@ fn unknown_symbol_diagnostics(
             engine_conn,
             member_hot_index,
             engine_member_hot_index,
+            sema_ctx,
             known_names,
             &mut member_lookup_cache,
             root,
@@ -969,6 +974,7 @@ fn collect_unknown_symbol_items(
     engine_conn: Option<&Connection>,
     member_hot_index: Option<&MemberHotIndex>,
     engine_member_hot_index: Option<&MemberHotIndex>,
+    sema_ctx: Option<&SemaContext>,
     known_names: &DiagnosticKnownNames,
     member_lookup_cache: &mut IndexedMemberLookupCache,
     node: tree_sitter::Node,
@@ -984,6 +990,7 @@ fn collect_unknown_symbol_items(
                 engine_conn,
                 member_hot_index,
                 engine_member_hot_index,
+                sema_ctx,
                 known_names,
                 member_lookup_cache,
                 node,
@@ -999,6 +1006,7 @@ fn collect_unknown_symbol_items(
                 engine_conn,
                 member_hot_index,
                 engine_member_hot_index,
+                sema_ctx,
                 known_names,
                 member_lookup_cache,
                 node,
@@ -1014,6 +1022,7 @@ fn collect_unknown_symbol_items(
                 engine_conn,
                 member_hot_index,
                 engine_member_hot_index,
+                sema_ctx,
                 known_names,
                 member_lookup_cache,
                 node,
@@ -1033,6 +1042,7 @@ fn collect_unknown_symbol_items(
             engine_conn,
             member_hot_index,
             engine_member_hot_index,
+            sema_ctx,
             known_names,
             member_lookup_cache,
             child,
@@ -1051,6 +1061,7 @@ fn collect_unknown_field_expression_item(
     engine_conn: Option<&Connection>,
     member_hot_index: Option<&MemberHotIndex>,
     engine_member_hot_index: Option<&MemberHotIndex>,
+    sema_ctx: Option<&SemaContext>,
     known_names: &DiagnosticKnownNames,
     member_lookup_cache: &mut IndexedMemberLookupCache,
     node: tree_sitter::Node,
@@ -1077,6 +1088,7 @@ fn collect_unknown_field_expression_item(
             engine_conn,
             member_hot_index,
             engine_member_hot_index,
+            sema_ctx,
             member_lookup_cache,
             receiver,
             content,
@@ -1124,6 +1136,7 @@ fn collect_unknown_field_expression_item(
                 engine_conn,
                 member_hot_index,
                 engine_member_hot_index,
+                sema_ctx,
                 known_names,
                 member_lookup_cache,
                 receiver,
@@ -1153,6 +1166,7 @@ fn collect_unknown_qualified_identifier_item(
     engine_conn: Option<&Connection>,
     member_hot_index: Option<&MemberHotIndex>,
     engine_member_hot_index: Option<&MemberHotIndex>,
+    _sema_ctx: Option<&SemaContext>,
     known_names: &DiagnosticKnownNames,
     member_lookup_cache: &mut IndexedMemberLookupCache,
     node: tree_sitter::Node,
@@ -1235,6 +1249,7 @@ fn collect_unknown_identifier_item(
     engine_conn: Option<&Connection>,
     member_hot_index: Option<&MemberHotIndex>,
     engine_member_hot_index: Option<&MemberHotIndex>,
+    sema_ctx: Option<&SemaContext>,
     known_names: &DiagnosticKnownNames,
     member_lookup_cache: &mut IndexedMemberLookupCache,
     node: tree_sitter::Node,
@@ -1252,6 +1267,7 @@ fn collect_unknown_identifier_item(
             engine_conn,
             member_hot_index,
             engine_member_hot_index,
+            sema_ctx,
             known_names,
             member_lookup_cache,
             node,
@@ -1378,6 +1394,7 @@ fn identifier_usage_is_known(
     engine_conn: Option<&Connection>,
     member_hot_index: Option<&MemberHotIndex>,
     engine_member_hot_index: Option<&MemberHotIndex>,
+    sema_ctx: Option<&SemaContext>,
     known_names: &DiagnosticKnownNames,
     member_lookup_cache: &mut IndexedMemberLookupCache,
     node: tree_sitter::Node,
@@ -1389,6 +1406,10 @@ fn identifier_usage_is_known(
     }
 
     if is_ignored_unknown_symbol_name(name, known_names) {
+        return Ok(true);
+    }
+
+    if sema_ctx.is_some_and(|ctx| ctx.symbol_exists_at_node(node, name)) {
         return Ok(true);
     }
 
@@ -1571,10 +1592,19 @@ fn resolve_expression_type_for_diagnostics(
     engine_conn: Option<&Connection>,
     member_hot_index: Option<&MemberHotIndex>,
     engine_member_hot_index: Option<&MemberHotIndex>,
+    sema_ctx: Option<&SemaContext>,
     member_lookup_cache: &mut IndexedMemberLookupCache,
     node: tree_sitter::Node,
     content: &str,
 ) -> Result<Option<String>> {
+    if let Some(local_type) = sema_ctx
+        .and_then(|ctx| crate::sema::expr::type_of_expression(ctx, node))
+        .and_then(|type_id| sema_ctx.and_then(|ctx| ctx.render_type(type_id)))
+        .filter(|text| text != "unknown")
+    {
+        return Ok(Some(local_type));
+    }
+
     match node.kind() {
         "identifier" | "field_identifier" => {
             let name = node_text(node, content).trim();
@@ -1599,6 +1629,14 @@ fn resolve_expression_type_for_diagnostics(
                     }
                 }
                 return Ok(None);
+            }
+
+            if let Some(local_type) = sema_ctx
+                .and_then(|ctx| ctx.type_of_identifier_at_node(node, name))
+                .and_then(|type_id| sema_ctx.and_then(|ctx| ctx.render_type(type_id)))
+                .filter(|text| text != "unknown")
+            {
+                return Ok(Some(local_type));
             }
 
             if let Some(local_type) =
@@ -1661,6 +1699,7 @@ fn resolve_expression_type_for_diagnostics(
                     engine_conn,
                     member_hot_index,
                     engine_member_hot_index,
+                    sema_ctx,
                     member_lookup_cache,
                     receiver,
                     content,
@@ -1694,6 +1733,7 @@ fn resolve_expression_type_for_diagnostics(
                     engine_conn,
                     member_hot_index,
                     engine_member_hot_index,
+                    sema_ctx,
                     member_lookup_cache,
                     scope,
                     content,
