@@ -6,6 +6,7 @@ use tree_sitter::Node;
 
 use super::cfg::{build_cfg, Cfg};
 use super::symbol::{Storage, SymbolId, SymbolKind};
+use super::types::TypeKind;
 use super::SemaContext;
 
 static RAII_PREFIXES: OnceLock<RaiiPrefixesFile> = OnceLock::new();
@@ -55,6 +56,7 @@ fn analyze_function(function_node: Node, source: &str, sema: &SemaContext) -> Da
     let cfg = build_cfg(function_node);
     let mut issues = Vec::new();
     let mut states = HashMap::<SymbolId, LocalVarState>::new();
+    let mut constant_values = HashMap::<SymbolId, i64>::new();
     let mut order = Vec::<SymbolId>::new();
 
     if let Some(body) = find_descendant(function_node, "compound_statement") {
@@ -64,10 +66,30 @@ fn analyze_function(function_node: Node, source: &str, sema: &SemaContext) -> Da
             source,
             sema,
             &mut states,
+            &mut constant_values,
             &mut order,
             &mut active_stack,
             &mut issues,
         );
+
+        if function_requires_return_value(function_node, sema)
+            && !statement_guarantees_return(body)
+        {
+            if let Some(name_node) = function_name_node(function_node) {
+                let name = node_text(name_node, source).trim();
+                issues.push(DataflowIssue {
+                    code: "UECPP-DF-004",
+                    message: format!(
+                        "Non-void function {} can reach the end without returning a value.",
+                        name
+                    ),
+                    line: name_node.start_position().row as u32,
+                    character: name_node.start_position().column as u32,
+                    end_line: name_node.end_position().row as u32,
+                    end_character: name_node.end_position().column as u32,
+                });
+            }
+        }
     }
 
     for symbol_id in order {
@@ -94,6 +116,7 @@ fn analyze_block(
     source: &str,
     sema: &SemaContext,
     states: &mut HashMap<SymbolId, LocalVarState>,
+    constant_values: &mut HashMap<SymbolId, i64>,
     order: &mut Vec<SymbolId>,
     active_stack: &mut Vec<HashSet<SymbolId>>,
     issues: &mut Vec<DataflowIssue>,
@@ -102,7 +125,16 @@ fn analyze_block(
 
     let mut cursor = block.walk();
     for child in block.children(&mut cursor) {
-        analyze_node(child, source, sema, states, order, active_stack, issues);
+        analyze_node(
+            child,
+            source,
+            sema,
+            states,
+            constant_values,
+            order,
+            active_stack,
+            issues,
+        );
     }
 
     active_stack.pop();
@@ -113,29 +145,99 @@ fn analyze_node(
     source: &str,
     sema: &SemaContext,
     states: &mut HashMap<SymbolId, LocalVarState>,
+    constant_values: &mut HashMap<SymbolId, i64>,
     order: &mut Vec<SymbolId>,
     active_stack: &mut Vec<HashSet<SymbolId>>,
     issues: &mut Vec<DataflowIssue>,
 ) {
     match node.kind() {
-        "compound_statement" => analyze_block(node, source, sema, states, order, active_stack, issues),
+        "compound_statement" => analyze_block(
+            node,
+            source,
+            sema,
+            states,
+            constant_values,
+            order,
+            active_stack,
+            issues,
+        ),
         "declaration" => {
-            handle_declaration(node, source, sema, states, order, active_stack, issues);
-            analyze_declaration_initializer(node, source, sema, states, order, active_stack, issues);
+            handle_declaration(
+                node,
+                source,
+                sema,
+                states,
+                constant_values,
+                order,
+                active_stack,
+                issues,
+            );
+            analyze_declaration_initializer(
+                node,
+                source,
+                sema,
+                states,
+                constant_values,
+                order,
+                active_stack,
+                issues,
+            );
         }
         "parameter_declaration" => {
             handle_parameter(node, source, sema, states, active_stack, issues);
         }
         "assignment_expression" => {
-            handle_assignment(node, source, sema, states, order, active_stack, issues);
+            handle_assignment(
+                node,
+                source,
+                sema,
+                states,
+                constant_values,
+                order,
+                active_stack,
+                issues,
+            );
         }
-        "if_statement" | "for_statement" | "while_statement" | "switch_statement" => {
-            walk_children(node, source, sema, states, order, active_stack, issues);
+        "if_statement" | "while_statement" | "for_statement" | "do_statement" => {
+            if let Some(condition) = control_condition_node(node) {
+                if let Some(value) = evaluate_const_expr(condition, source, sema, constant_values) {
+                    issues.push(DataflowIssue {
+                        code: "UECPP-DF-005",
+                        message: format!(
+                            "Condition is always {}.",
+                            if value == 0 { "false" } else { "true" }
+                        ),
+                        line: condition.start_position().row as u32,
+                        character: condition.start_position().column as u32,
+                        end_line: condition.end_position().row as u32,
+                        end_character: condition.end_position().column as u32,
+                    });
+                }
+            }
+            walk_children(
+                node,
+                source,
+                sema,
+                states,
+                constant_values,
+                order,
+                active_stack,
+                issues,
+            );
         }
         "identifier" => {
             handle_identifier_use(node, source, sema, states, issues);
         }
-        _ => walk_children(node, source, sema, states, order, active_stack, issues),
+        _ => walk_children(
+            node,
+            source,
+            sema,
+            states,
+            constant_values,
+            order,
+            active_stack,
+            issues,
+        ),
     }
 }
 
@@ -144,6 +246,7 @@ fn handle_declaration(
     source: &str,
     sema: &SemaContext,
     states: &mut HashMap<SymbolId, LocalVarState>,
+    constant_values: &mut HashMap<SymbolId, i64>,
     order: &mut Vec<SymbolId>,
     active_stack: &mut [HashSet<SymbolId>],
     issues: &mut Vec<DataflowIssue>,
@@ -179,24 +282,31 @@ fn handle_declaration(
     let type_name = node
         .child_by_field_name("type")
         .map(|type_node| crate::parser::cpp::clean_type_string(node_text(type_node, source)));
-    let track_unused = !name.starts_with('_')
-        && !is_raii_type(type_name.as_deref().unwrap_or_default());
+    let track_unused = !name.starts_with('_') && !is_raii_type(type_name.as_deref().unwrap_or_default());
 
-        states.insert(
-            symbol_id,
-            LocalVarState {
-                name: name.clone(),
-                decl_line: name_node.start_position().row as u32,
-                decl_col: name_node.start_position().column as u32,
-                decl_end_col: name_node.end_position().column as u32,
-                initialized,
-                used: false,
-                track_unused,
+    states.insert(
+        symbol_id,
+        LocalVarState {
+            name: name.clone(),
+            decl_line: name_node.start_position().row as u32,
+            decl_col: name_node.start_position().column as u32,
+            decl_end_col: name_node.end_position().column as u32,
+            initialized,
+            used: false,
+            track_unused,
         },
     );
     order.push(symbol_id);
     if let Some(active) = active_stack.last_mut() {
         active.insert(symbol_id);
+    }
+
+    if is_const_like_declaration(node, source) {
+        if let Some(initializer) = initializer_expression(node) {
+            if let Some(value) = evaluate_const_expr(initializer, source, sema, constant_values) {
+                constant_values.insert(symbol_id, value);
+            }
+        }
     }
 }
 
@@ -255,6 +365,7 @@ fn handle_assignment(
     source: &str,
     sema: &SemaContext,
     states: &mut HashMap<SymbolId, LocalVarState>,
+    constant_values: &mut HashMap<SymbolId, i64>,
     order: &mut Vec<SymbolId>,
     active_stack: &mut Vec<HashSet<SymbolId>>,
     issues: &mut Vec<DataflowIssue>,
@@ -263,7 +374,16 @@ fn handle_assignment(
     let rhs = node.child_by_field_name("right").or_else(|| node.child(2));
 
     if let Some(rhs) = rhs {
-        analyze_node(rhs, source, sema, states, order, active_stack, issues);
+        analyze_node(
+            rhs,
+            source,
+            sema,
+            states,
+            constant_values,
+            order,
+            active_stack,
+            issues,
+        );
     }
 
     if let Some(lhs) = lhs {
@@ -273,9 +393,19 @@ fn handle_assignment(
                 if let Some(state) = states.get_mut(&symbol_id) {
                     state.initialized = true;
                 }
+                constant_values.remove(&symbol_id);
             }
         } else {
-            analyze_node(lhs, source, sema, states, order, active_stack, issues);
+            analyze_node(
+                lhs,
+                source,
+                sema,
+                states,
+                constant_values,
+                order,
+                active_stack,
+                issues,
+            );
         }
     }
 }
@@ -321,13 +451,23 @@ fn walk_children(
     source: &str,
     sema: &SemaContext,
     states: &mut HashMap<SymbolId, LocalVarState>,
+    constant_values: &mut HashMap<SymbolId, i64>,
     order: &mut Vec<SymbolId>,
     active_stack: &mut Vec<HashSet<SymbolId>>,
     issues: &mut Vec<DataflowIssue>,
 ) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        analyze_node(child, source, sema, states, order, active_stack, issues);
+        analyze_node(
+            child,
+            source,
+            sema,
+            states,
+            constant_values,
+            order,
+            active_stack,
+            issues,
+        );
     }
 }
 
@@ -336,6 +476,7 @@ fn analyze_declaration_initializer(
     source: &str,
     sema: &SemaContext,
     states: &mut HashMap<SymbolId, LocalVarState>,
+    constant_values: &mut HashMap<SymbolId, i64>,
     order: &mut Vec<SymbolId>,
     active_stack: &mut Vec<HashSet<SymbolId>>,
     issues: &mut Vec<DataflowIssue>,
@@ -348,7 +489,16 @@ fn analyze_declaration_initializer(
         if matches!(child.kind(), "identifier" | "field_identifier") {
             continue;
         }
-        analyze_node(child, source, sema, states, order, active_stack, issues);
+        analyze_node(
+            child,
+            source,
+            sema,
+            states,
+            constant_values,
+            order,
+            active_stack,
+            issues,
+        );
     }
 }
 
@@ -360,6 +510,217 @@ fn collect_functions(node: Node, visit: &mut impl FnMut(Node)) {
     for child in node.children(&mut cursor) {
         collect_functions(child, visit);
     }
+}
+
+fn function_requires_return_value(function_node: Node, sema: &SemaContext) -> bool {
+    if node_text(function_node, sema.source().unwrap_or_default()).contains("[[noreturn]]") {
+        return false;
+    }
+
+    let Some(return_type) = sema.enclosing_function_return_type(function_node) else {
+        return false;
+    };
+    !matches!(
+        sema.types.get(return_type),
+        Some(TypeKind::Builtin(super::types::BuiltinType::Void))
+            | Some(TypeKind::Auto)
+            | Some(TypeKind::Unknown)
+    )
+}
+
+fn statement_guarantees_return(node: Node) -> bool {
+    match node.kind() {
+        "return_statement" | "co_return_statement" | "throw_statement" => true,
+        "compound_statement" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if statement_guarantees_return(child) {
+                    return true;
+                }
+            }
+            false
+        }
+        "else_clause" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if statement_guarantees_return(child) {
+                    return true;
+                }
+            }
+            false
+        }
+        "if_statement" => {
+            let Some(consequence) = node.child_by_field_name("consequence") else {
+                return false;
+            };
+            let Some(alternative) = node.child_by_field_name("alternative") else {
+                return false;
+            };
+            statement_guarantees_return(consequence) && statement_guarantees_return(alternative)
+        }
+        _ => false,
+    }
+}
+
+fn control_condition_node(node: Node) -> Option<Node> {
+    node.child_by_field_name("condition").or_else(|| {
+        let mut cursor = node.walk();
+        node.children(&mut cursor).find(|child| child.kind() == "condition_clause")
+    }).and_then(|condition| {
+        if condition.kind() == "condition_clause" {
+            condition.named_child(0)
+        } else {
+            Some(condition)
+        }
+    })
+}
+
+fn evaluate_const_expr(
+    node: Node,
+    source: &str,
+    sema: &SemaContext,
+    constant_values: &HashMap<SymbolId, i64>,
+) -> Option<i64> {
+    match node.kind() {
+        "true" => Some(1),
+        "false" | "null" => Some(0),
+        "number_literal" => parse_numeric_literal(node_text(node, source)),
+        "identifier" | "field_identifier" => {
+            let name = node_text(node, source).trim();
+            let symbol_id = sema.resolve_symbol_at_node(node, name)?;
+            constant_values.get(&symbol_id).copied()
+        }
+        "parenthesized_expression" => node.named_child(0).and_then(|inner| {
+            evaluate_const_expr(inner, source, sema, constant_values)
+        }),
+        "unary_expression" => {
+            let operand = node
+                .child_by_field_name("argument")
+                .or_else(|| {
+                    let index = node.named_child_count().saturating_sub(1);
+                    u32::try_from(index).ok().and_then(|value| node.named_child(value))
+                })?;
+            let value = evaluate_const_expr(operand, source, sema, constant_values)?;
+            let text = node_text(node, source).trim_start();
+            if text.starts_with('!') {
+                Some(i64::from(value == 0))
+            } else if text.starts_with('-') {
+                Some(-value)
+            } else if text.starts_with('+') {
+                Some(value)
+            } else {
+                None
+            }
+        }
+        "binary_expression" => {
+            let left = node.child_by_field_name("left").or_else(|| node.child(0))?;
+            let right = node.child_by_field_name("right").or_else(|| node.child(2))?;
+            let left_value = evaluate_const_expr(left, source, sema, constant_values)?;
+            let right_value = evaluate_const_expr(right, source, sema, constant_values)?;
+            match operator_text(node, source)?.as_str() {
+                "||" => Some(i64::from(left_value != 0 || right_value != 0)),
+                "&&" => Some(i64::from(left_value != 0 && right_value != 0)),
+                "==" => Some(i64::from(left_value == right_value)),
+                "!=" => Some(i64::from(left_value != right_value)),
+                "<" => Some(i64::from(left_value < right_value)),
+                "<=" => Some(i64::from(left_value <= right_value)),
+                ">" => Some(i64::from(left_value > right_value)),
+                ">=" => Some(i64::from(left_value >= right_value)),
+                "+" => Some(left_value + right_value),
+                "-" => Some(left_value - right_value),
+                "*" => Some(left_value * right_value),
+                "/" => (right_value != 0).then_some(left_value / right_value),
+                "%" => (right_value != 0).then_some(left_value % right_value),
+                _ => None,
+            }
+        }
+        "conditional_expression" => {
+            let condition = node.child_by_field_name("condition")?;
+            let consequence = node.child_by_field_name("consequence")?;
+            let alternative = node.child_by_field_name("alternative")?;
+            let value = evaluate_const_expr(condition, source, sema, constant_values)?;
+            if value != 0 {
+                evaluate_const_expr(consequence, source, sema, constant_values)
+            } else {
+                evaluate_const_expr(alternative, source, sema, constant_values)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn parse_numeric_literal(text: &str) -> Option<i64> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let unsigned = trimmed.trim_end_matches(|ch: char| ch.is_ascii_alphabetic());
+    if unsigned.starts_with("0x") || unsigned.starts_with("0X") {
+        i64::from_str_radix(
+            unsigned.trim_start_matches("0x").trim_start_matches("0X"),
+            16,
+        )
+        .ok()
+    } else if let Ok(value) = unsigned.parse::<i64>() {
+        Some(value)
+    } else if let Ok(value) = unsigned.parse::<f64>() {
+        Some(i64::from(value != 0.0))
+    } else {
+        None
+    }
+}
+
+fn operator_text(node: Node, source: &str) -> Option<String> {
+    if let Some(operator) = node.child_by_field_name("operator") {
+        return Some(node_text(operator, source).to_string());
+    }
+
+    let text = node_text(node, source);
+    for operator in ["||", "&&", "==", "!=", "<=", ">=", "<", ">", "+", "-", "*", "/", "%"] {
+        if text.contains(operator) {
+            return Some(operator.to_string());
+        }
+    }
+    None
+}
+
+fn initializer_expression(node: Node) -> Option<Node> {
+    let declarator = node.child_by_field_name("declarator")?;
+    find_initializer_expression(declarator)
+}
+
+fn find_initializer_expression(node: Node) -> Option<Node> {
+    if node.kind() == "init_declarator" {
+        let inner_declarator = node.child_by_field_name("declarator");
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if inner_declarator.is_some_and(|decl| decl.byte_range() == child.byte_range()) {
+                continue;
+            }
+            return Some(child);
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if let Some(found) = find_initializer_expression(child) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn is_const_like_declaration(node: Node, source: &str) -> bool {
+    let text = node_text(node, source);
+    text.contains("constexpr ") || text.contains(" const ") || text.starts_with("const ")
+}
+
+fn function_name_node(node: Node) -> Option<Node> {
+    let declarator = node
+        .child_by_field_name("declarator")
+        .or_else(|| find_descendant(node, "function_declarator"))?;
+    find_name_node(declarator)
 }
 
 fn find_descendant<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {

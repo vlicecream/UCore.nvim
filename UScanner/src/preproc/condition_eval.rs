@@ -1,7 +1,7 @@
-use super::MacroTable;
+use super::{IncludeResolver, MacroTable};
 
-pub fn evaluate_condition(expr: &str, macros: &MacroTable) -> bool {
-    let tokens = tokenize(expr, macros);
+pub fn evaluate_condition(expr: &str, macros: &MacroTable, include_resolver: Option<&IncludeResolver>) -> bool {
+    let tokens = tokenize(expr, macros, include_resolver);
     let mut parser = Parser { tokens: &tokens, index: 0 };
     parser.parse_expr() != 0
 }
@@ -160,7 +160,7 @@ impl Parser<'_> {
     }
 }
 
-fn tokenize(expr: &str, macros: &MacroTable) -> Vec<Token> {
+fn tokenize(expr: &str, macros: &MacroTable, include_resolver: Option<&IncludeResolver>) -> Vec<Token> {
     let mut tokens = Vec::new();
     let chars = expr.chars().collect::<Vec<_>>();
     let mut index = 0usize;
@@ -199,6 +199,13 @@ fn tokenize(expr: &str, macros: &MacroTable) -> Vec<Token> {
                 let (name, consumed) = parse_defined_operand(&chars[index..]);
                 index += consumed;
                 tokens.push(Token::Number(i64::from(macros.is_defined(&name))));
+            } else if ident == "__has_include" {
+                let (include, consumed) = parse_has_include_operand(&chars[index..]);
+                index += consumed;
+                let present = include_resolver
+                    .map(|resolver| resolver.has_include(&include))
+                    .unwrap_or(false);
+                tokens.push(Token::Number(i64::from(present)));
             } else if ident == "true" || ident == "TRUE" {
                 tokens.push(Token::Number(1));
             } else if ident == "false" || ident == "FALSE" {
@@ -323,24 +330,106 @@ fn parse_defined_operand(chars: &[char]) -> (String, usize) {
     (chars[start..index].iter().collect::<String>(), index)
 }
 
+fn parse_has_include_operand(chars: &[char]) -> (String, usize) {
+    let mut index = 0usize;
+    while index < chars.len() && chars[index].is_whitespace() {
+        index += 1;
+    }
+    if chars.get(index).copied() != Some('(') {
+        return (String::new(), index);
+    }
+
+    index += 1;
+    while index < chars.len() && chars[index].is_whitespace() {
+        index += 1;
+    }
+    if index >= chars.len() {
+        return (String::new(), index);
+    }
+
+    let opener = chars[index];
+    let closer = match opener {
+        '"' => '"',
+        '<' => '>',
+        _ => ')',
+    };
+
+    let mut value = String::new();
+    if opener == '"' || opener == '<' {
+        index += 1;
+        while index < chars.len() && chars[index] != closer {
+            value.push(chars[index]);
+            index += 1;
+        }
+        if index < chars.len() && chars[index] == closer {
+            index += 1;
+        }
+    } else {
+        while index < chars.len() && chars[index] != ')' {
+            value.push(chars[index]);
+            index += 1;
+        }
+    }
+
+    while index < chars.len() && chars[index].is_whitespace() {
+        index += 1;
+    }
+    if chars.get(index).copied() == Some(')') {
+        index += 1;
+    }
+
+    (value.trim().to_string(), index)
+}
+
 #[cfg(test)]
 mod tests {
     use super::evaluate_condition;
-    use crate::preproc::MacroTable;
+    use crate::preproc::{default_include_resolver_for_file, MacroTable};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn condition_eval_handles_defined_and_boolean_operators() {
         let mut macros = MacroTable::default();
         macros.define("FOO", "1");
         macros.define("BAR", "0");
-        assert!(evaluate_condition("defined(FOO) && !defined(BAZ)", &macros));
-        assert!(!evaluate_condition("defined(BAR) && BAR", &macros));
+        assert!(evaluate_condition("defined(FOO) && !defined(BAZ)", &macros, None));
+        assert!(!evaluate_condition("defined(BAR) && BAR", &macros, None));
     }
 
     #[test]
     fn condition_eval_handles_relational_math() {
         let mut macros = MacroTable::default();
         macros.define("VALUE", "7");
-        assert!(evaluate_condition("VALUE * 2 >= 14", &macros));
+        assert!(evaluate_condition("VALUE * 2 >= 14", &macros, None));
+    }
+
+    #[test]
+    fn condition_eval_handles_has_include() {
+        let root = std::env::temp_dir().join(format!(
+            "ucore_condition_has_include_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let file = root.join("Source/MyGame/Private/Test.cpp");
+        let header = root.join("Source/MyGame/Public/MyHeader.h");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::create_dir_all(header.parent().unwrap()).unwrap();
+        fs::write(root.join("MyGame.uproject"), "{}").unwrap();
+        fs::write(&file, "").unwrap();
+        fs::write(&header, "// header").unwrap();
+
+        let resolver =
+            default_include_resolver_for_file("preprocessor.toml", Some(&file.to_string_lossy()));
+        let macros = MacroTable::default();
+        assert!(evaluate_condition(
+            "__has_include(\"MyHeader.h\")",
+            &macros,
+            Some(&resolver)
+        ));
+
+        let _ = fs::remove_dir_all(root);
     }
 }

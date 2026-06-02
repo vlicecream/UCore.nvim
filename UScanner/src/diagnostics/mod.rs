@@ -14,6 +14,7 @@ use tree_sitter::Parser;
 use tracing::info;
 
 use crate::types::OpenBufferOverlay;
+use crate::preproc;
 use crate::query::member_index::MemberHotIndex;
 use crate::query::usage::UsageHotIndex;
 use crate::sema::SemaContext;
@@ -84,6 +85,8 @@ pub(crate) struct DiagnosticRulesFile {
     pub overload_check: OverloadRules,
     #[serde(default)]
     pub type_check: TypeCheckRules,
+    #[serde(default)]
+    pub preproc: PreprocRules,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -156,6 +159,10 @@ pub(crate) struct DataflowRules {
     pub uninit_locals_severity: SeverityConfig,
     #[serde(default = "default_hint_severity")]
     pub shadow_severity: SeverityConfig,
+    #[serde(default = "default_error_severity")]
+    pub missing_return_severity: SeverityConfig,
+    #[serde(default = "default_hint_severity")]
+    pub constant_condition_severity: SeverityConfig,
 }
 
 impl Default for DataflowRules {
@@ -165,6 +172,8 @@ impl Default for DataflowRules {
             unused_locals_severity: default_hint_severity(),
             uninit_locals_severity: default_warning_severity(),
             shadow_severity: default_hint_severity(),
+            missing_return_severity: default_error_severity(),
+            constant_condition_severity: default_hint_severity(),
         }
     }
 }
@@ -209,6 +218,26 @@ impl Default for TypeCheckRules {
     }
 }
 
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct PreprocRules {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub expand_macros: bool,
+    #[serde(default = "default_predefined_macros_file")]
+    pub predefined_macros_file: String,
+}
+
+impl Default for PreprocRules {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            expand_macros: default_true(),
+            predefined_macros_file: default_predefined_macros_file(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum SeverityConfig {
@@ -249,6 +278,10 @@ const fn default_warning_severity() -> SeverityConfig {
 
 const fn default_hint_severity() -> SeverityConfig {
     SeverityConfig::Hint
+}
+
+fn default_predefined_macros_file() -> String {
+    "predefined_macros.toml".to_string()
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -355,6 +388,24 @@ pub fn process_diagnostics_with_hot_indexes(
     let parsed_tree = parse_diagnostics_tree(content)?;
     let parsed_root = parsed_tree.as_ref().map(|tree| tree.root_node());
     let sema_ctx = parsed_root.map(|root| crate::sema::builder::build_sema(root, content));
+    let preprocessed = if rules.preproc.enabled && rules.preproc.expand_macros {
+        Some(preproc::preprocess_source(
+            content,
+            &preproc::default_macro_table_for_file(&rules.preproc.predefined_macros_file),
+        ))
+    } else {
+        None
+    };
+    let expanded_tree = preprocessed
+        .as_ref()
+        .map(|result| parse_diagnostics_tree(&result.expanded_source))
+        .transpose()?
+        .flatten();
+    let expanded_root = expanded_tree.as_ref().map(|tree| tree.root_node());
+    let expanded_sema_ctx = preprocessed
+        .as_ref()
+        .zip(expanded_root)
+        .map(|(result, root)| crate::sema::builder::build_sema(root, &result.expanded_source));
 
     if rules.syntax_errors.enabled {
         extend_diagnostic_phase(
@@ -398,13 +449,6 @@ pub fn process_diagnostics_with_hot_indexes(
     )?;
     extend_diagnostic_phase(
         &mut items,
-        "missing_return",
-        file_label,
-        log_enabled,
-        || missing_return_diagnostics(content, file_path.as_deref(), parsed_root),
-    )?;
-    extend_diagnostic_phase(
-        &mut items,
         "override_rules",
         file_label,
         log_enabled,
@@ -423,7 +467,19 @@ pub fn process_diagnostics_with_hot_indexes(
             "dataflow",
             file_label,
             log_enabled,
-            || phases::dataflow::collect(content, file_path.as_deref(), parsed_root, sema_ctx.as_ref(), &rules.dataflow),
+            || {
+                let items = phases::dataflow::collect(
+                    preprocessed
+                        .as_ref()
+                        .map(|result| result.expanded_source.as_str())
+                        .unwrap_or(content),
+                    file_path.as_deref(),
+                    expanded_root.or(parsed_root),
+                    expanded_sema_ctx.as_ref().or(sema_ctx.as_ref()),
+                    &rules.dataflow,
+                )?;
+                Ok(remap_diagnostics_to_original(items, preprocessed.as_ref()))
+            },
         )?;
     }
     if rules.overload_check.enabled {
@@ -432,7 +488,15 @@ pub fn process_diagnostics_with_hot_indexes(
             "overload_check",
             file_label,
             log_enabled,
-            || phases::overload_check::collect(file_path.as_deref(), parsed_root, sema_ctx.as_ref(), &rules.overload_check),
+            || {
+                let items = phases::overload_check::collect(
+                    file_path.as_deref(),
+                    expanded_root.or(parsed_root),
+                    expanded_sema_ctx.as_ref().or(sema_ctx.as_ref()),
+                    &rules.overload_check,
+                )?;
+                Ok(remap_diagnostics_to_original(items, preprocessed.as_ref()))
+            },
         )?;
     }
     if rules.type_check.enabled {
@@ -441,7 +505,15 @@ pub fn process_diagnostics_with_hot_indexes(
             "type_check",
             file_label,
             log_enabled,
-            || phases::type_check::collect(file_path.as_deref(), parsed_root, sema_ctx.as_ref(), &rules.type_check),
+            || {
+                let items = phases::type_check::collect(
+                    file_path.as_deref(),
+                    expanded_root.or(parsed_root),
+                    expanded_sema_ctx.as_ref().or(sema_ctx.as_ref()),
+                    &rules.type_check,
+                )?;
+                Ok(remap_diagnostics_to_original(items, preprocessed.as_ref()))
+            },
         )?;
     }
     extend_diagnostic_phase(
@@ -704,6 +776,27 @@ where
     Ok(())
 }
 
+fn remap_diagnostics_to_original(
+    items: Vec<DiagnosticItem>,
+    preprocessed: Option<&preproc::PreprocessResult>,
+) -> Vec<DiagnosticItem> {
+    let Some(preprocessed) = preprocessed else {
+        return items;
+    };
+
+    items
+        .into_iter()
+        .map(|item| {
+            let mut mapped = item;
+            let start = preprocessed.map_column(mapped.line, mapped.character);
+            let end = preprocessed.map_column(mapped.end_line, mapped.end_character);
+            mapped.character = start;
+            mapped.end_character = end.max(start.saturating_add(1));
+            mapped
+        })
+        .collect()
+}
+
 pub fn parse_build_diagnostics(output: &str) -> Value {
     json!({ "items": build_log_diagnostics(output) })
 }
@@ -856,28 +949,6 @@ fn unreal_include_diagnostics(
     if is_source_file(file_path) {
         items.extend(source_first_include_diagnostics(conn, content, file_path)?);
     }
-    Ok(items)
-}
-
-fn missing_return_diagnostics(
-    content: &str,
-    file_path: Option<&str>,
-    parsed_root: Option<tree_sitter::Node>,
-) -> Result<Vec<DiagnosticItem>> {
-    let Some(file_path) = file_path else {
-        return Ok(Vec::new());
-    };
-
-    if !is_cpp_source_or_header(file_path) {
-        return Ok(Vec::new());
-    }
-
-    let Some(root) = parsed_root else {
-        return Ok(Vec::new());
-    };
-
-    let mut items = Vec::new();
-    collect_missing_return_items(root, content, file_path, &mut items);
     Ok(items)
 }
 
@@ -2368,119 +2439,6 @@ struct TypeReference {
     requires_complete: bool,
     source_start_line: u32,
     source_end_line: u32,
-}
-
-fn collect_missing_return_items(
-    node: tree_sitter::Node,
-    content: &str,
-    file_path: &str,
-    items: &mut Vec<DiagnosticItem>,
-) {
-    if let Some(item) = missing_return_item(node, content, file_path) {
-        items.push(item);
-    }
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_missing_return_items(child, content, file_path, items);
-    }
-}
-
-fn missing_return_item(
-    node: tree_sitter::Node,
-    content: &str,
-    file_path: &str,
-) -> Option<DiagnosticItem> {
-    if !matches!(node.kind(), "function_definition" | "unreal_function_definition") {
-        return None;
-    }
-
-    let declarator = find_child_by_field(node, "declarator")?;
-    let name_node = find_name_node(declarator)?;
-    let name = node_text(name_node, content).trim().to_string();
-    if name.is_empty() {
-        return None;
-    }
-
-    let return_type = find_child_by_field(node, "type")
-        .map(|type_node| node_text(type_node, content).to_string())
-        .unwrap_or_else(|| extract_prefix_type(node, Some(declarator), content));
-    let normalized_return = normalize_space(&return_type);
-
-    if normalized_return.is_empty()
-        || normalized_return == "void"
-        || normalized_return == "auto"
-        || normalized_return.ends_with("decltype(auto)")
-    {
-        return None;
-    }
-
-    let body = find_child_by_type(node, "compound_statement")?;
-    if block_guarantees_return(body) {
-        return None;
-    }
-
-    let start = name_node.start_position();
-    let end = name_node.end_position();
-    Some(
-        DiagnosticItem::new(
-            Some(file_path),
-            start.row as u32,
-            start.column as u32,
-            DiagnosticSeverity::Error,
-            "UCore",
-            "UECPP003",
-            format!(
-                "Non-void function {} can reach the end without returning a value.",
-                name
-            ),
-        )
-        .with_end(end.row as u32, end.column as u32),
-    )
-}
-
-fn block_guarantees_return(node: tree_sitter::Node) -> bool {
-    match node.kind() {
-        "return_statement" => return true,
-        "compound_statement" => {
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                if statement_guarantees_return(child) {
-                    return true;
-                }
-            }
-            return false;
-        }
-        _ => {}
-    }
-
-    statement_guarantees_return(node)
-}
-
-fn statement_guarantees_return(node: tree_sitter::Node) -> bool {
-    match node.kind() {
-        "return_statement" => true,
-        "compound_statement" => block_guarantees_return(node),
-        "else_clause" => {
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                if statement_guarantees_return(child) {
-                    return true;
-                }
-            }
-            false
-        }
-        "if_statement" => {
-            let Some(consequence) = node.child_by_field_name("consequence") else {
-                return false;
-            };
-            let Some(alternative) = node.child_by_field_name("alternative") else {
-                return false;
-            };
-            statement_guarantees_return(consequence) && statement_guarantees_return(alternative)
-        }
-        _ => false,
-    }
 }
 
 fn missing_implementation_diagnostics(
@@ -5866,7 +5824,7 @@ mod tests {
         )
         .unwrap();
         let items = value["items"].as_array().unwrap();
-        assert!(items.iter().any(|item| item["code"] == "UECPP003"));
+        assert!(items.iter().any(|item| item["code"] == "UECPP-DF-004"));
     }
 
     #[test]
@@ -5882,7 +5840,7 @@ mod tests {
         )
         .unwrap();
         let items = value["items"].as_array().unwrap();
-        assert!(!items.iter().any(|item| item["code"] == "UECPP003"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-DF-004"));
     }
 
     #[test]
@@ -5898,7 +5856,43 @@ mod tests {
         )
         .unwrap();
         let items = value["items"].as_array().unwrap();
-        assert!(!items.iter().any(|item| item["code"] == "UECPP003"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-DF-004"));
+    }
+
+    #[test]
+    fn dataflow_warns_on_always_true_condition() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "void Run()\n{\n    if (true)\n    {\n    }\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| item["code"] == "UECPP-DF-005"));
+    }
+
+    #[test]
+    fn dataflow_warns_on_constexpr_like_condition() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "void Run()\n{\n    const bool bAlways = false;\n    while (bAlways)\n    {\n    }\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| item["code"] == "UECPP-DF-005"));
     }
 
     #[test]
@@ -7405,6 +7399,88 @@ mod tests {
 
         let items = value["items"].as_array().unwrap();
         assert!(items.iter().any(|item| item["code"] == "UECPP-EXPR-011"));
+    }
+
+    #[test]
+    fn preproc_expansion_drives_overload_diagnostics() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "#define TEXTVAL \"demo\"\nvoid Run(int32 Value) {}\nvoid Test()\n{\n    Run(TEXTVAL);\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| item["code"] == "UECPP-EXPR-001"));
+    }
+
+    #[test]
+    fn preproc_expansion_drives_type_check_diagnostics() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "#define BADVAL \"demo\"\nint32 Test()\n{\n    return BADVAL;\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        let item = items
+            .iter()
+            .find(|item| item["code"] == "UECPP-EXPR-007")
+            .unwrap();
+        assert_eq!(item["character"].as_u64(), Some(11));
+        assert_eq!(item["end_character"].as_u64(), Some(17));
+    }
+
+    #[test]
+    fn preproc_function_macro_drives_type_check_and_maps_original_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "#define BADRET() \"demo\"\nint32 Test()\n{\n    return BADRET();\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        let item = items
+            .iter()
+            .find(|item| item["code"] == "UECPP-EXPR-007")
+            .unwrap();
+        assert_eq!(item["character"].as_u64(), Some(11));
+        assert_eq!(item["end_character"].as_u64(), Some(19));
+    }
+
+    #[test]
+    fn preproc_expansion_drives_dataflow_constant_condition() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "#define ALWAYS 1\nvoid Test()\n{\n    if (ALWAYS)\n    {\n    }\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| item["code"] == "UECPP-DF-005"));
     }
 
     #[test]

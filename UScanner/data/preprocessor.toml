@@ -1,0 +1,15 @@
+[defines]
+predefined = [
+    "UE_BUILD_DEVELOPMENT=1",
+    "WITH_EDITOR=1",
+    "PLATFORM_WINDOWS=1",
+]
+
+[include_paths]
+project_search_dirs = ["Source/${ProjectName}", "Source"]
+engine_search_dirs = [
+    "Engine/Source/Runtime",
+    "Engine/Source/Developer",
+    "Engine/Source/Editor",
+    "Engine/Plugins",
+]

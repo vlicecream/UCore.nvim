@@ -1,5 +1,5 @@
 use super::condition_eval::evaluate_condition;
-use super::{MacroTable, PreprocessResult};
+use super::{IncludeResolver, MacroTable, PreprocessResult};
 
 #[derive(Clone, Copy, Debug)]
 struct ConditionalFrame {
@@ -9,9 +9,18 @@ struct ConditionalFrame {
 }
 
 pub fn preprocess_source(source: &str, base_macros: &MacroTable) -> PreprocessResult {
+    preprocess_source_with_resolver(source, base_macros, None)
+}
+
+pub fn preprocess_source_with_resolver(
+    source: &str,
+    base_macros: &MacroTable,
+    include_resolver: Option<&IncludeResolver>,
+) -> PreprocessResult {
     let mut macros = base_macros.clone();
     let mut inactive_lines = std::collections::HashSet::new();
     let mut output = String::with_capacity(source.len());
+    let mut line_column_maps = Vec::new();
     let mut stack = Vec::<ConditionalFrame>::new();
 
     for (line_index, line) in source.lines().enumerate() {
@@ -19,12 +28,13 @@ pub fn preprocess_source(source: &str, base_macros: &MacroTable) -> PreprocessRe
         let active = stack.iter().all(|frame| frame.current_active);
 
         if let Some(rest) = directive_body(trimmed, "if ") {
-            let condition = active && evaluate_condition(rest, &macros);
+            let condition = active && evaluate_condition(rest, &macros, include_resolver);
             stack.push(ConditionalFrame {
                 parent_active: active,
                 current_active: condition,
                 branch_taken: condition,
             });
+            line_column_maps.push(vec![0]);
             output.push('\n');
             continue;
         }
@@ -35,6 +45,7 @@ pub fn preprocess_source(source: &str, base_macros: &MacroTable) -> PreprocessRe
                 current_active: condition,
                 branch_taken: condition,
             });
+            line_column_maps.push(vec![0]);
             output.push('\n');
             continue;
         }
@@ -45,15 +56,19 @@ pub fn preprocess_source(source: &str, base_macros: &MacroTable) -> PreprocessRe
                 current_active: condition,
                 branch_taken: condition,
             });
+            line_column_maps.push(vec![0]);
             output.push('\n');
             continue;
         }
         if let Some(rest) = directive_body(trimmed, "elif ") {
             if let Some(top) = stack.last_mut() {
-                let cond = !top.branch_taken && top.parent_active && evaluate_condition(rest, &macros);
+                let cond = !top.branch_taken
+                    && top.parent_active
+                    && evaluate_condition(rest, &macros, include_resolver);
                 top.current_active = cond;
                 top.branch_taken |= cond;
             }
+            line_column_maps.push(vec![0]);
             output.push('\n');
             continue;
         }
@@ -62,11 +77,13 @@ pub fn preprocess_source(source: &str, base_macros: &MacroTable) -> PreprocessRe
                 top.current_active = top.parent_active && !top.branch_taken;
                 top.branch_taken = true;
             }
+            line_column_maps.push(vec![0]);
             output.push('\n');
             continue;
         }
         if trimmed.starts_with("#endif") {
             stack.pop();
+            line_column_maps.push(vec![0]);
             output.push('\n');
             continue;
         }
@@ -76,6 +93,7 @@ pub fn preprocess_source(source: &str, base_macros: &MacroTable) -> PreprocessRe
             if active {
                 macros.define_from_directive(rest);
             }
+            line_column_maps.push(vec![0]);
             output.push('\n');
             continue;
         }
@@ -83,14 +101,18 @@ pub fn preprocess_source(source: &str, base_macros: &MacroTable) -> PreprocessRe
             if active {
                 macros.undefine(rest.trim());
             }
+            line_column_maps.push(vec![0]);
             output.push('\n');
             continue;
         }
 
         if active {
-            output.push_str(&macros.expand_line(line));
+            let (expanded, column_map) = macros.expand_line_with_map(line);
+            output.push_str(&expanded);
+            line_column_maps.push(column_map);
         } else {
             inactive_lines.insert(line_index as u32);
+            line_column_maps.push(vec![0]);
         }
         output.push('\n');
     }
@@ -98,6 +120,7 @@ pub fn preprocess_source(source: &str, base_macros: &MacroTable) -> PreprocessRe
     PreprocessResult {
         expanded_source: output,
         inactive_lines,
+        line_column_maps,
     }
 }
 

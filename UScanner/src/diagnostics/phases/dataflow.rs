@@ -24,6 +24,8 @@ pub(crate) fn collect(
                 "UECPP-DF-001" => DiagnosticSeverity::from(rules.unused_locals_severity),
                 "UECPP-DF-002" => DiagnosticSeverity::from(rules.uninit_locals_severity),
                 "UECPP-DF-003" => DiagnosticSeverity::from(rules.shadow_severity),
+                "UECPP-DF-004" => DiagnosticSeverity::from(rules.missing_return_severity),
+                "UECPP-DF-005" => DiagnosticSeverity::from(rules.constant_condition_severity),
                 _ => DiagnosticSeverity::Warning,
             };
             items.push(

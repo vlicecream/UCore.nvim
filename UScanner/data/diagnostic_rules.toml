@@ -18,6 +18,8 @@ enabled = true
 unused_locals_severity = "hint"
 uninit_locals_severity = "warning"
 shadow_severity = "hint"
+missing_return_severity = "error"
+constant_condition_severity = "hint"
 
 [overload_check]
 enabled = true
@@ -28,3 +30,8 @@ severity_ambiguous = "error"
 enabled = true
 severity_incompatible = "error"
 severity_narrowing = "warning"
+
+[preproc]
+enabled = true
+expand_macros = true
+predefined_macros_file = "predefined_macros.toml"
