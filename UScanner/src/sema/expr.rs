@@ -38,6 +38,11 @@ pub fn type_of_expression(ctx: &SemaContext, node: Node) -> Option<TypeId> {
             let inner = node.named_child(0)?;
             type_of_expression(ctx, inner)
         }
+        "subscript_expression" => type_of_subscript_expression(ctx, node),
+        "conditional_expression" => type_of_conditional_expression(ctx, node),
+        "cast_expression" => type_of_cast_expression(ctx, node),
+        "new_expression" => type_of_new_expression(ctx, node),
+        "lambda_expression" => type_of_lambda_expression(ctx, node),
         "assignment_expression" => {
             let lhs = node.child_by_field_name("left").or_else(|| node.child(0))?;
             type_of_expression(ctx, lhs)
@@ -65,6 +70,118 @@ fn type_of_field_expression(ctx: &SemaContext, node: Node) -> Option<TypeId> {
     }
 
     None
+}
+
+fn type_of_subscript_expression(ctx: &SemaContext, node: Node) -> Option<TypeId> {
+    let receiver = node.child_by_field_name("argument").or_else(|| node.child(0))?;
+    let receiver_ty = type_of_expression(ctx, receiver)?;
+    element_type_for_subscript(ctx, receiver_ty)
+}
+
+fn element_type_for_subscript(ctx: &SemaContext, type_id: TypeId) -> Option<TypeId> {
+    match ctx.types.get(type_id)? {
+        TypeKind::Array { elem, .. } => Some(*elem),
+        TypeKind::Pointer { pointee, .. } => Some(*pointee),
+        TypeKind::Reference { referent, .. } => element_type_for_subscript(ctx, *referent),
+        _ => None,
+    }
+}
+
+fn type_of_conditional_expression(ctx: &SemaContext, node: Node) -> Option<TypeId> {
+    let consequence = node.child_by_field_name("consequence");
+    let alternative = node.child_by_field_name("alternative")?;
+    let consequence_ty = consequence.and_then(|child| type_of_expression(ctx, child));
+    let alternative_ty = type_of_expression(ctx, alternative);
+    choose_common_type(ctx, consequence_ty, alternative_ty)
+}
+
+fn choose_common_type(
+    ctx: &SemaContext,
+    left: Option<TypeId>,
+    right: Option<TypeId>,
+) -> Option<TypeId> {
+    match (left, right) {
+        (Some(left), Some(right)) if left == right => Some(left),
+        (Some(left), Some(right)) => {
+            match (ctx.check_compat(left, right), ctx.check_compat(right, left)) {
+                (super::types::Compat::Incompatible, super::types::Compat::Incompatible) => None,
+                (super::types::Compat::Incompatible, _) => Some(left),
+                (_, super::types::Compat::Incompatible) => Some(right),
+                (left_rank, right_rank) => {
+                    if super::types::compat_rank(left_rank) >= super::types::compat_rank(right_rank) {
+                        Some(right)
+                    } else {
+                        Some(left)
+                    }
+                }
+            }
+        }
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    }
+}
+
+fn type_of_cast_expression(ctx: &SemaContext, node: Node) -> Option<TypeId> {
+    let type_node = node.child_by_field_name("type")?;
+    ctx.resolve_existing_type_node(type_node)
+}
+
+fn type_of_new_expression(ctx: &SemaContext, node: Node) -> Option<TypeId> {
+    let type_node = node.child_by_field_name("type")?;
+    let pointee = ctx.resolve_existing_type_node(type_node)?;
+    ctx.find_pointer_type(pointee).or(Some(ctx.types.unknown_t))
+}
+
+fn type_of_lambda_expression(ctx: &SemaContext, node: Node) -> Option<TypeId> {
+    let declarator = node.child_by_field_name("declarator");
+    let return_t = declarator
+        .and_then(|decl| find_descendant(decl, "trailing_return_type"))
+        .and_then(|trailing| trailing.named_child(0))
+        .and_then(|type_node| ctx.resolve_existing_type_node(type_node))
+        .unwrap_or(ctx.types.void_t);
+
+    let params = declarator
+        .and_then(|decl| find_descendant(decl, "parameter_list"))
+        .map(|params| parameter_types(ctx, params))
+        .unwrap_or_default();
+
+    ctx.find_function_type(return_t, params, false, false)
+        .or(Some(ctx.types.unknown_t))
+}
+
+fn parameter_types(ctx: &SemaContext, params: Node) -> Vec<TypeId> {
+    let mut out = Vec::new();
+    let mut cursor = params.walk();
+    for child in params.children(&mut cursor) {
+        if child.kind() != "parameter_declaration" {
+            continue;
+        }
+        let Some(type_node) = child.child_by_field_name("type") else {
+            continue;
+        };
+        let Some(mut type_id) = ctx.resolve_existing_type_node(type_node) else {
+            continue;
+        };
+        let mut declarator = child.child_by_field_name("declarator");
+        while let Some(node) = declarator {
+            match node.kind() {
+                "pointer_declarator" => {
+                    type_id = ctx.find_pointer_type(type_id).unwrap_or(ctx.types.unknown_t);
+                }
+                "reference_declarator" => {
+                    type_id = ctx.find_reference_type(type_id).unwrap_or(ctx.types.unknown_t);
+                }
+                "array_declarator" => {
+                    type_id = ctx.find_array_type(type_id).unwrap_or(ctx.types.unknown_t);
+                }
+                _ => {}
+            }
+            declarator = node.child_by_field_name("declarator");
+        }
+        out.push(type_id);
+    }
+    out
 }
 
 fn type_of_call_expression(ctx: &SemaContext, node: Node) -> Option<TypeId> {

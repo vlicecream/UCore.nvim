@@ -49,6 +49,7 @@ fn type_diagnostic_item(
     match node.kind() {
         "assignment_expression" => assignment_item(node, file_path, sema_ctx, rules),
         "return_statement" => return_item(node, file_path, sema_ctx, rules),
+        "cast_expression" => cast_item(node, file_path, sema_ctx),
         "binary_expression" => binary_item(node, file_path, sema_ctx, rules),
         "unary_expression" => unary_item(node, file_path, sema_ctx, rules),
         "field_expression" => field_item(node, file_path, sema_ctx),
@@ -66,7 +67,7 @@ fn assignment_item(
     let right = node.child_by_field_name("right").or_else(|| node.child(2))?;
     let left_ty = crate::sema::expr::type_of_expression(sema_ctx, left)?;
     let right_ty = crate::sema::expr::type_of_expression(sema_ctx, right)?;
-    let compat = sema_ctx.check_compat(right_ty, left_ty);
+    let compat = contextual_compat(sema_ctx, right, right_ty, left_ty);
     build_compat_item(
         file_path,
         node,
@@ -81,6 +82,28 @@ fn assignment_item(
     )
 }
 
+fn cast_item(node: Node, file_path: Option<&str>, sema_ctx: &SemaContext) -> Option<DiagnosticItem> {
+    let type_node = node.child_by_field_name("type")?;
+    let value_node = node.child_by_field_name("value")?;
+    let source_ty = crate::sema::expr::type_of_expression(sema_ctx, value_node)?;
+    let target_ty = sema_ctx.resolve_existing_type_node(type_node)?;
+    if sema_ctx.check_compat(source_ty, target_ty) != Compat::Incompatible {
+        return None;
+    }
+
+    Some(diagnostic_for_range(
+        file_path,
+        node,
+        DiagnosticSeverity::Warning,
+        "UECPP-EXPR-005",
+        format!(
+            "Cast target is incompatible with the source type. From {} to {}.",
+            render_type(sema_ctx, source_ty),
+            render_type(sema_ctx, target_ty)
+        ),
+    ))
+}
+
 fn return_item(
     node: Node,
     file_path: Option<&str>,
@@ -90,7 +113,7 @@ fn return_item(
     let value = node.named_child(0)?;
     let expr_ty = crate::sema::expr::type_of_expression(sema_ctx, value)?;
     let return_ty = sema_ctx.enclosing_function_return_type(node)?;
-    let compat = sema_ctx.check_compat(expr_ty, return_ty);
+    let compat = contextual_compat(sema_ctx, value, expr_ty, return_ty);
     build_compat_item(
         file_path,
         value,
@@ -180,6 +203,40 @@ fn field_item(node: Node, file_path: Option<&str>, sema_ctx: &SemaContext) -> Op
         ));
     }
     None
+}
+
+fn contextual_compat(
+    sema_ctx: &SemaContext,
+    value_node: Node,
+    from_ty: TypeId,
+    to_ty: TypeId,
+) -> Compat {
+    if from_ty == sema_ctx.types.unknown_t {
+        if let Some(compat) = new_expression_pointer_compat(sema_ctx, value_node, to_ty) {
+            return compat;
+        }
+    }
+    sema_ctx.check_compat(from_ty, to_ty)
+}
+
+fn new_expression_pointer_compat(
+    sema_ctx: &SemaContext,
+    node: Node,
+    target_ty: TypeId,
+) -> Option<Compat> {
+    if node.kind() != "new_expression" {
+        return None;
+    }
+    let type_node = node.child_by_field_name("type")?;
+    let pointee_ty = sema_ctx.resolve_existing_type_node(type_node)?;
+    let TypeKind::Pointer {
+        pointee: target_pointee,
+        ..
+    } = sema_ctx.types.get(target_ty)?
+    else {
+        return Some(Compat::Incompatible);
+    };
+    Some(sema_ctx.check_compat(pointee_ty, *target_pointee))
 }
 
 fn build_compat_item(

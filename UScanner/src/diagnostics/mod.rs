@@ -7552,6 +7552,24 @@ mod tests {
     }
 
     #[test]
+    fn type_check_reports_incompatible_cast() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "class FString {};\nvoid Test()\n{\n    (FString)1;\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| item["code"] == "UECPP-EXPR-005"));
+    }
+
+    #[test]
     fn type_check_reports_arrow_on_non_pointer() {
         let conn = Connection::open_in_memory().unwrap();
         crate::db::init_db(&conn).unwrap();
@@ -7567,6 +7585,42 @@ mod tests {
 
         let items = value["items"].as_array().unwrap();
         assert!(items.iter().any(|item| item["code"] == "UECPP-EXPR-011"));
+    }
+
+    #[test]
+    fn type_check_uses_conditional_expression_type_for_return() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "bool Test()\n{\n    return true ? 1 : 2;\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| item["code"] == "UECPP-EXPR-007"));
+    }
+
+    #[test]
+    fn type_check_uses_new_expression_pointer_type_for_return() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "class UObject {};\nUObject* Make()\n{\n    return new UObject();\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-007"));
     }
 
     #[test]

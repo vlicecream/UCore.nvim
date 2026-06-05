@@ -122,6 +122,13 @@ impl TypeArena {
     pub fn find(&self, kind: &TypeKind) -> Option<TypeId> {
         self.interned.get(kind).copied()
     }
+
+    pub fn iter(&self) -> impl Iterator<Item = (TypeId, &TypeKind)> {
+        self.types
+            .iter()
+            .enumerate()
+            .map(|(index, kind)| (TypeId(index as u32), kind))
+    }
 }
 
 pub fn compat_rank(value: Compat) -> u8 {

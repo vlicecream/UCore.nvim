@@ -62,6 +62,22 @@ mod tests {
         None
     }
 
+    fn find_first_kind<'a>(
+        node: tree_sitter::Node<'a>,
+        kind: &str,
+    ) -> Option<tree_sitter::Node<'a>> {
+        if node.kind() == kind {
+            return Some(node);
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if let Some(found) = find_first_kind(child, kind) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
     #[test]
     fn sema_lookup_resolves_local_variable() {
         let content = "void Run() { int32 Value = 1; Value; }";
@@ -109,6 +125,19 @@ mod tests {
             .unwrap();
         assert_eq!(ty, "int32");
     }
+
+    #[test]
+    fn sema_expr_resolves_subscript_element_type() {
+        let content = "int32 Test(int32* Values) { return Values[0]; }";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+        let node = find_first_kind(root, "subscript_expression").unwrap();
+        let ty = type_of_expression(&sema, node)
+            .and_then(|id| sema.render_type(id))
+            .unwrap();
+        assert_eq!(ty, "int32");
+    }
+
 }
 
 impl SemaContext {
@@ -316,6 +345,66 @@ impl SemaContext {
         })
     }
 
+    pub fn resolve_existing_type_text(&self, raw: &str) -> Option<TypeId> {
+        let clean = crate::parser::cpp::clean_type_string(raw);
+        self.resolve_existing_clean_type(&clean)
+    }
+
+    pub fn resolve_existing_type_node(&self, node: Node) -> Option<TypeId> {
+        let source = self.source()?;
+        let range = node.byte_range();
+        if range.end > source.len()
+            || !source.is_char_boundary(range.start)
+            || !source.is_char_boundary(range.end)
+        {
+            return None;
+        }
+        self.resolve_existing_type_text(&source[range.start..range.end])
+    }
+
+    pub fn find_pointer_type(&self, pointee: TypeId) -> Option<TypeId> {
+        self.types.find(&TypeKind::Pointer {
+            pointee,
+            cv: types::CvQual::default(),
+        }).or_else(|| {
+            let rendered = self.render_type(pointee)?;
+            self.types.iter().find_map(|(type_id, kind)| match kind {
+                TypeKind::Pointer { pointee, .. }
+                    if self.render_type(*pointee).as_deref() == Some(rendered.as_str()) =>
+                {
+                    Some(type_id)
+                }
+                _ => None,
+            })
+        })
+    }
+
+    pub fn find_reference_type(&self, referent: TypeId) -> Option<TypeId> {
+        self.types.find(&TypeKind::Reference {
+            referent,
+            kind: types::RefKind::LValue,
+        })
+    }
+
+    pub fn find_array_type(&self, elem: TypeId) -> Option<TypeId> {
+        self.types.find(&TypeKind::Array { elem, size: None })
+    }
+
+    pub fn find_function_type(
+        &self,
+        return_t: TypeId,
+        params: Vec<TypeId>,
+        is_variadic: bool,
+        is_const_member: bool,
+    ) -> Option<TypeId> {
+        self.types.find(&TypeKind::Function {
+            return_t,
+            params,
+            is_variadic,
+            is_const_member,
+        })
+    }
+
     pub fn symbol_exists_at_node(&self, node: Node, name: &str) -> bool {
         self.lookup_name_at_node(node, name).into_iter().any(|symbol_id| {
             self.symbols
@@ -421,6 +510,93 @@ impl SemaContext {
 
         false
     }
+
+    fn resolve_existing_clean_type(&self, clean: &str) -> Option<TypeId> {
+        let clean = clean.trim();
+        if clean.is_empty() {
+            return None;
+        }
+
+        if let Some(inner) = clean.strip_suffix("[]") {
+            let elem = self.resolve_existing_clean_type(inner)?;
+            return self.find_array_type(elem);
+        }
+        if let Some(inner) = clean.strip_suffix('&') {
+            let referent = self.resolve_existing_clean_type(inner.trim_end())?;
+            return self.find_reference_type(referent);
+        }
+        if let Some(inner) = clean.strip_suffix('*') {
+            let pointee = self.resolve_existing_clean_type(inner.trim_end())?;
+            return self.find_pointer_type(pointee);
+        }
+        if let Some(template_type) = self.resolve_existing_template_type(clean) {
+            return Some(template_type);
+        }
+
+        match clean {
+            "void" => Some(self.types.void_t),
+            "bool" => Some(self.types.bool_t),
+            "char" | "ANSICHAR" | "TCHAR" => Some(self.types_char()),
+            "int" | "int32" => Some(self.types.int32_t),
+            "uint32" => Some(self.types.uint32_t),
+            "float" => Some(self.types.float_t),
+            "double" => Some(self.types.double_t),
+            _ => self
+                .symbols
+                .class_id_by_name(clean)
+                .and_then(|class_id| self.types.find(&TypeKind::Class(class_id))),
+        }
+    }
+
+    fn resolve_existing_template_type(&self, clean: &str) -> Option<TypeId> {
+        let name_end = clean.find('<')?;
+        let base = clean[..name_end].trim();
+        let args_text = clean.strip_prefix(base)?.trim();
+        let inner = args_text.strip_prefix('<')?.strip_suffix('>')?;
+        let mut args = Vec::new();
+        for arg in split_template_args(inner) {
+            let trimmed = arg.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Some(type_id) = self.resolve_existing_clean_type(trimmed) {
+                args.push(types::TemplateArg::Type(type_id));
+            } else {
+                args.push(types::TemplateArg::Value(trimmed.to_string()));
+            }
+        }
+        self.types.find(&TypeKind::Template {
+            base: base.to_string(),
+            args,
+        })
+    }
+}
+
+fn split_template_args(inner: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut depth = 0usize;
+    let mut current = String::new();
+    for ch in inner.chars() {
+        match ch {
+            '<' => {
+                depth += 1;
+                current.push(ch);
+            }
+            '>' => {
+                depth = depth.saturating_sub(1);
+                current.push(ch);
+            }
+            ',' if depth == 0 => {
+                args.push(current.trim().to_string());
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.trim().is_empty() {
+        args.push(current.trim().to_string());
+    }
+    args
 }
 
 fn is_numeric(kind: BuiltinType) -> bool {

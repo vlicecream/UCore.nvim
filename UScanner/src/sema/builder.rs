@@ -173,7 +173,16 @@ impl<'a> SemaBuilder<'a> {
 
         let return_t = node
             .child_by_field_name("type")
-            .map(|type_node| self.resolve_type_node(type_node))
+            .map(|type_node| {
+                let base = self.resolve_type_node(type_node);
+                let full_text = self.node_text(node).to_string();
+                apply_declarator_wrappers(
+                    &mut self.types,
+                    base,
+                    Some(declarator),
+                    &full_text,
+                )
+            })
             .unwrap_or(self.types.unknown_t);
         let params = function_parameter_types(self, declarator);
         let fn_type = self.types.intern(TypeKind::Function {
@@ -411,31 +420,41 @@ fn apply_declarator_wrappers(
     full_text: &str,
 ) -> TypeId {
     let mut cursor = declarator;
+    let mut saw_wrapper = false;
     while let Some(node) = cursor {
         current = match node.kind() {
-            "pointer_declarator" => arena.intern(TypeKind::Pointer {
-                pointee: current,
-                cv: CvQual::default(),
-            }),
-            "reference_declarator" => arena.intern(TypeKind::Reference {
-                referent: current,
-                kind: RefKind::LValue,
-            }),
-            "array_declarator" => arena.intern(TypeKind::Array {
-                elem: current,
-                size: None,
-            }),
+            "pointer_declarator" => {
+                saw_wrapper = true;
+                arena.intern(TypeKind::Pointer {
+                    pointee: current,
+                    cv: CvQual::default(),
+                })
+            }
+            "reference_declarator" => {
+                saw_wrapper = true;
+                arena.intern(TypeKind::Reference {
+                    referent: current,
+                    kind: RefKind::LValue,
+                })
+            }
+            "array_declarator" => {
+                saw_wrapper = true;
+                arena.intern(TypeKind::Array {
+                    elem: current,
+                    size: None,
+                })
+            }
             _ => current,
         };
         cursor = node.child_by_field_name("declarator");
     }
 
-    if full_text.contains('*') {
+    if !saw_wrapper && full_text.contains('*') {
         current = arena.intern(TypeKind::Pointer {
             pointee: current,
             cv: CvQual::default(),
         });
-    } else if full_text.contains('&') {
+    } else if !saw_wrapper && full_text.contains('&') {
         current = arena.intern(TypeKind::Reference {
             referent: current,
             kind: RefKind::LValue,
