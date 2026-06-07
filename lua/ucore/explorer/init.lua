@@ -530,12 +530,14 @@ local function pick_telescope_explorer()
 		}),
 		sorter = conf.generic_sorter({}),
 		attach_mappings = function(prompt_bufnr, map)
+			local function close_picker()
+				actions.close(prompt_bufnr)
+			end
+
 			map("i", "<Esc>", function()
-				actions.close(prompt_bufnr)
+				close_picker()
 			end)
-			map("n", "q", function()
-				actions.close(prompt_bufnr)
-			end)
+			map("n", "<Esc>", close_picker)
 
 			actions.select_default:replace(function()
 				if toggle_selected_directory(prompt_bufnr) then
@@ -552,36 +554,16 @@ local function pick_telescope_explorer()
 				end
 			end)
 
-			map("i", "<Tab>", function()
-				toggle_selected_directory(prompt_bufnr)
-			end)
-			map("n", "<Tab>", function()
-				toggle_selected_directory(prompt_bufnr)
-			end)
-			map("n", "l", function()
-				local selection = action_state.get_selected_entry()
-				local node = selection and selection.value and selection.value.node
-				if node and node.type == "directory" and not state.is_expanded(node) then
-					toggle_selected_directory(prompt_bufnr)
-				end
-			end)
-			map("n", "h", function()
-				local selection = action_state.get_selected_entry()
-				local node = selection and selection.value and selection.value.node
-				if node and node.type == "directory" and state.is_expanded(node) then
-					toggle_selected_directory(prompt_bufnr)
-				end
-			end)
-			map("i", "<C-h>", function()
+			map("i", "<Left>", function()
 				switch_tab_in_picker(-1, prompt_bufnr)
 			end)
-			map("i", "<C-l>", function()
+			map("n", "<Left>", function()
+				switch_tab_in_picker(-1, prompt_bufnr)
+			end)
+			map("i", "<Right>", function()
 				switch_tab_in_picker(1, prompt_bufnr)
 			end)
-			map("n", "H", function()
-				switch_tab_in_picker(-1, prompt_bufnr)
-			end)
-			map("n", "L", function()
+			map("n", "<Right>", function()
 				switch_tab_in_picker(1, prompt_bufnr)
 			end)
 
