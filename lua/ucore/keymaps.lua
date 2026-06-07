@@ -103,6 +103,36 @@ local function setup_global_explorer(args)
 	})
 end
 
+local function setup_global_new_paths(args)
+	local keymaps = keymap_config()
+	if keymaps.enable == false then
+		return
+	end
+
+	local bufnr = args.buf
+	local new_file_lhs = normalize_lhs(keymaps.new_file)
+	if new_file_lhs then
+		vim.keymap.set("n", new_file_lhs, function()
+			explorer.new_file()
+		end, {
+			buffer = bufnr,
+			desc = "UCore new file",
+			silent = true,
+		})
+	end
+
+	local new_directory_lhs = normalize_lhs(keymaps.new_directory)
+	if new_directory_lhs then
+		vim.keymap.set("n", new_directory_lhs, function()
+			explorer.new_directory()
+		end, {
+			buffer = bufnr,
+			desc = "UCore new directory",
+			silent = true,
+		})
+	end
+end
+
 -- Register gf for any buffer inside an Unreal project tree, including
 -- .uproject, .uplugin, .build.cs, .ini, engine sources, etc.
 -- gf 在任何 Unreal 项目文件内注册，包括 .uproject、引擎源码等。
@@ -187,6 +217,7 @@ function M.setup()
 			if is_unreal_path(path) then
 				setup_global_find(args)
 				setup_global_explorer(args)
+				setup_global_new_paths(args)
 				setup_diagnostics_action(args)
 			end
 		end,
@@ -223,6 +254,8 @@ function M.reset()
 			delete_buffer_map(bufnr, keymaps.signature, { "n", "i" })
 			delete_buffer_map(bufnr, keymaps.global_find)
 			delete_buffer_map(bufnr, keymaps.explorer)
+			delete_buffer_map(bufnr, keymaps.new_file)
+			delete_buffer_map(bufnr, keymaps.new_directory)
 			delete_buffer_map(bufnr, diagnostics_config.action_keymap)
 		end
 	end

@@ -158,12 +158,137 @@ end
 
 local function open_file(path)
 	local previous_win = vim.fn.win_getid(vim.fn.winnr("#"))
+	if vim.api.nvim_get_current_win() ~= state.win then
+		vim.cmd("edit " .. vim.fn.fnameescape(path))
+		return
+	end
 	if previous_win and vim.api.nvim_win_is_valid(previous_win) and previous_win ~= state.win then
 		vim.api.nvim_set_current_win(previous_win)
 	else
 		vim.cmd("wincmd p")
 	end
 	vim.cmd("edit " .. vim.fn.fnameescape(path))
+end
+
+local function normalize(path)
+	return path and path:gsub("\\", "/") or nil
+end
+
+local function dirname(path)
+	return normalize(vim.fn.fnamemodify(path, ":h"))
+end
+
+local function join_path(base, child)
+	base = normalize(base or "")
+	child = normalize(child or "")
+	if base == "" then
+		return child
+	end
+	if child == "" then
+		return base
+	end
+	return normalize(base:gsub("/+$", "") .. "/" .. child:gsub("^/+", ""))
+end
+
+local function current_target_directory()
+	if state.is_valid_win() then
+		local item = current_item()
+		if item and item.node then
+			if item.node.type == "directory" and item.node.path then
+				return normalize(item.node.path)
+			end
+			if item.node.path then
+				return dirname(item.node.path)
+			end
+		end
+	end
+
+	local path = vim.api.nvim_buf_get_name(0)
+	if path and path ~= "" then
+		path = normalize(path)
+		if vim.fn.isdirectory(path) == 1 then
+			return path
+		end
+		return dirname(path)
+	end
+
+	return project.find_project_root_from_context()
+end
+
+local function ensure_project_target_dir()
+	local target_dir = current_target_directory()
+	if not target_dir or target_dir == "" then
+		vim.notify("UCore explorer: no target directory available", vim.log.levels.WARN)
+		return nil, nil
+	end
+
+	local root = project.find_project_root(target_dir) or project.find_project_root_from_context()
+	if not root then
+		vim.notify("UCore explorer: not inside an Unreal project", vim.log.levels.WARN)
+		return nil, nil
+	end
+
+	return normalize(target_dir), normalize(root)
+end
+
+local function create_relative_path(kind, suffix)
+	local target_dir, _root = ensure_project_target_dir()
+	if not target_dir then
+		return
+	end
+
+	local prompt = kind == "file" and "UCore new file" or "UCore new directory"
+	local title = string.format("%s  [%s]", prompt, target_dir)
+	select_ui.input({
+		title = title,
+		default = suffix or "",
+	}, function(value)
+		if value == nil then
+			return
+		end
+
+		value = vim.trim(tostring(value or "")):gsub("\\", "/")
+		if value == "" then
+			return
+		end
+
+		local is_absolute = value:match("^%a:/") or value:match("^/")
+		local path = normalize(is_absolute and value or join_path(target_dir, value))
+		if not path or path == "" then
+			return
+		end
+
+		if kind == "directory" then
+			vim.fn.mkdir(path, "p")
+			if vim.fn.isdirectory(path) ~= 1 then
+				vim.notify("UCore explorer: failed to create directory", vim.log.levels.ERROR)
+				return
+			end
+			refresh_current()
+			vim.notify("UCore new: created directory " .. path, vim.log.levels.INFO)
+			return
+		end
+
+		if vim.fn.filereadable(path) == 1 then
+			vim.notify("UCore new: path already exists: " .. path, vim.log.levels.WARN)
+			open_file(path)
+			return
+		end
+		if vim.fn.isdirectory(path) == 1 then
+			vim.notify("UCore new: directory already exists: " .. path, vim.log.levels.WARN)
+			refresh_current()
+			return
+		end
+
+		vim.fn.mkdir(dirname(path), "p")
+		local ok, err = pcall(vim.fn.writefile, {}, path)
+		if not ok then
+			vim.notify("UCore explorer: failed to create file: " .. tostring(err), vim.log.levels.ERROR)
+			return
+		end
+		refresh_current()
+		open_file(path)
+	end)
 end
 
 local function activate()
@@ -275,6 +400,13 @@ local function setup_maps()
 	map("/", prompt_search, "UCore Explorer search")
 	map("r", refresh_current, "UCore Explorer refresh tab")
 	map("R", refresh_all, "UCore Explorer refresh all")
+	local keymaps = ((config.values.navigation or {}).keymaps or {})
+	if keymaps.new_file then
+		map(keymaps.new_file, M.new_file, "UCore Explorer new file")
+	end
+	if keymaps.new_directory then
+		map(keymaps.new_directory, M.new_directory, "UCore Explorer new directory")
+	end
 end
 
 function M.open()
@@ -349,6 +481,14 @@ end
 
 function M.refresh()
 	refresh_current()
+end
+
+function M.new_file()
+	create_relative_path("file")
+end
+
+function M.new_directory()
+	create_relative_path("directory")
 end
 
 return M

@@ -281,6 +281,8 @@ local function default_values()
 				source_toggle = "gs",
 				global_find = "gf",
 				explorer = "<leader>fe",
+				new_file = "<leader>nf",
+				new_directory = "<leader>ne",
 				signature = "<C-k>",
 				rename = "<leader>rn",
 			},
