@@ -174,6 +174,18 @@ local function normalize(path)
 	return path and path:gsub("\\", "/") or nil
 end
 
+local function path_starts_with(path, prefix)
+	path = normalize(path or "")
+	prefix = normalize(prefix or "")
+	if path == "" or prefix == "" then
+		return false
+	end
+	if path == prefix then
+		return true
+	end
+	return path:sub(1, #prefix + 1) == prefix .. "/"
+end
+
 local function dirname(path)
 	return normalize(vim.fn.fnamemodify(path, ":h"))
 end
@@ -188,6 +200,79 @@ local function join_path(base, child)
 		return base
 	end
 	return normalize(base:gsub("/+$", "") .. "/" .. child:gsub("^/+", ""))
+end
+
+local function current_context_path()
+	local win = vim.api.nvim_get_current_win()
+	if state.is_valid_win() and win == state.win then
+		local previous_win = vim.fn.win_getid(vim.fn.winnr("#"))
+		if previous_win and vim.api.nvim_win_is_valid(previous_win) and previous_win ~= state.win then
+			local bufnr = vim.api.nvim_win_get_buf(previous_win)
+			return normalize(vim.api.nvim_buf_get_name(bufnr))
+		end
+	end
+
+	return normalize(vim.api.nvim_buf_get_name(0))
+end
+
+local function reveal_path_in_tree(node, target_path)
+	if not node or not target_path then
+		return false
+	end
+
+	if node.type == "file" then
+		return normalize(node.path) == target_path
+	end
+
+	if node.type ~= "directory" then
+		return false
+	end
+
+	if node.path and not path_starts_with(target_path, node.path) then
+		return false
+	end
+
+	tree.ensure_children(node)
+	for _, child in ipairs(node.children or {}) do
+		if reveal_path_in_tree(child, target_path) then
+			state.set_expanded(node, true)
+			return true
+		end
+	end
+
+	return false
+end
+
+local function focus_revealed_path(target_path)
+	if not state.is_valid_win() or not target_path then
+		return
+	end
+
+	for index, item in ipairs(state.line_items or {}) do
+		if normalize(item.node and item.node.path) == target_path then
+			pcall(vim.api.nvim_win_set_cursor, state.win, { index + 4, 0 })
+			pcall(vim.api.nvim_win_call, state.win, function()
+				vim.cmd("normal! zz")
+			end)
+			return
+		end
+	end
+end
+
+local function reveal_current_file()
+	local target_path = current_context_path()
+	if not target_path or target_path == "" or not state.tree then
+		return
+	end
+
+	if vim.fn.filereadable(target_path) ~= 1 then
+		return
+	end
+
+	if reveal_path_in_tree(state.tree, target_path) then
+		redraw()
+		focus_revealed_path(target_path)
+	end
 end
 
 local function current_target_directory()
@@ -400,13 +485,6 @@ local function setup_maps()
 	map("/", prompt_search, "UCore Explorer search")
 	map("r", refresh_current, "UCore Explorer refresh tab")
 	map("R", refresh_all, "UCore Explorer refresh all")
-	local keymaps = ((config.values.navigation or {}).keymaps or {})
-	if keymaps.new_file then
-		map(keymaps.new_file, M.new_file, "UCore Explorer new file")
-	end
-	if keymaps.new_directory then
-		map(keymaps.new_directory, M.new_directory, "UCore Explorer new directory")
-	end
 end
 
 function M.open()
@@ -417,6 +495,7 @@ function M.open()
 		load_tree()
 	end
 	redraw()
+	reveal_current_file()
 	if explorer_config().auto_focus ~= false then
 		vim.api.nvim_set_current_win(state.win)
 	end
@@ -424,6 +503,7 @@ end
 
 function M.focus()
 	if state.is_valid_win() then
+		reveal_current_file()
 		vim.api.nvim_set_current_win(state.win)
 	else
 		M.open()
