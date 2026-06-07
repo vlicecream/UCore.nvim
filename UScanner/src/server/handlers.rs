@@ -503,6 +503,10 @@ pub async fn handle_setup(state: Arc<AppState>, params: &Value) -> Result<Value>
         ensure_asset_index_ready(state.clone(), &db_path_native, &req.project_root).await?;
     }
 
+    if readiness.needs_full_refresh {
+        state.active_refreshes.lock().insert(root_key.clone());
+    }
+
     let _ = state.save_registry();
 
     Ok(json!({
@@ -529,7 +533,7 @@ pub async fn handle_refresh(
         "refresh request received"
     );
 
-    let _guard = RefreshGuard::try_new(state, root_key.clone())?;
+    let _guard = RefreshGuard::new(state, root_key.clone());
 
     let db_path_unix = upsert_refresh_project_context(state, &mut req, &root_key)?;
     let db_path_native = normalize_to_native(&db_path_unix);
@@ -1109,15 +1113,6 @@ fn handle_state_query(
             let cache = state.get_diagnostics_cache(root_key);
             let cache_key = diagnostics_cache_key(file_path.as_deref(), &content, &open_files);
 
-            if let Some(value) = cache.lock().get(&cache_key) {
-                debug!(
-                    "diagnostics cache hit: root={} file={}",
-                    root_key,
-                    file_path.as_deref().unwrap_or("-"),
-                );
-                return Ok(Some(value));
-            }
-
             if is_refreshing(&state, root_key) {
                 info!(
                     "Diagnostics skipped during refresh: root={} file={}",
@@ -1125,6 +1120,15 @@ fn handle_state_query(
                     file_path.as_deref().unwrap_or("-"),
                 );
                 return Ok(Some(json!({ "items": [] })));
+            }
+
+            if let Some(value) = cache.lock().get(&cache_key) {
+                debug!(
+                    "diagnostics cache hit: root={} file={}",
+                    root_key,
+                    file_path.as_deref().unwrap_or("-"),
+                );
+                return Ok(Some(value));
             }
 
             let engine_conn = match engine_db_path
@@ -4214,16 +4218,11 @@ struct RefreshGuard<'a> {
 }
 
 impl<'a> RefreshGuard<'a> {
-    /// Create guard or return early if refresh is already active.
-    /// 创建 refresh guard；如果已经在刷新则直接返回错误。
-    fn try_new(state: &'a AppState, root_key: String) -> Result<Self> {
-        let mut active = state.active_refreshes.lock();
-
-        if !active.insert(root_key.clone()) {
-            return Err(anyhow!("Refresh already in progress"));
-        }
-
-        Ok(Self { state, root_key })
+    /// Ensure refresh is marked active and create a guard that clears it on drop.
+    /// 确保 refresh 已标记为活跃，并在 drop 时清理标记。
+    fn new(state: &'a AppState, root_key: String) -> Self {
+        state.active_refreshes.lock().insert(root_key.clone());
+        Self { state, root_key }
     }
 }
 
