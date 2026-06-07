@@ -61,7 +61,6 @@ pub(crate) fn finalize_diagnostics(
 
     if limited.len() > rules.max_per_file {
         let shown = rules.max_per_file;
-        let hidden = limited.len().saturating_sub(shown);
         limited.truncate(shown);
         limited.push(
             DiagnosticItem::new(
@@ -70,8 +69,8 @@ pub(crate) fn finalize_diagnostics(
                 0,
                 DiagnosticSeverity::Information,
                 "UCore",
-                "UCORE-FIN-001",
-                format!("More diagnostics below; {shown} shown, {hidden} suppressed."),
+                "UECPP-CAP",
+                format!("More diagnostics omitted; showing first {shown}."),
             )
             .with_end(total_lines.saturating_sub(1), 1),
         );

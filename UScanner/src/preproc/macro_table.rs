@@ -61,6 +61,10 @@ impl MacroTable {
         self.object_like.contains_key(name) || self.function_like.contains_key(name)
     }
 
+    pub fn has_function_macro(&self, name: &str) -> bool {
+        self.function_like.contains_key(name)
+    }
+
     pub fn value_of(&self, name: &str) -> Option<&str> {
         self.object_like.get(name).map(String::as_str)
     }
@@ -346,11 +350,7 @@ impl MacroTable {
         *index = end_index;
         let arg = args.get(arg_index)?;
         let text = stringify_macro_argument(&arg.text);
-        let start_col = arg
-            .map
-            .first()
-            .copied()
-            .unwrap_or(macro_start_col);
+        let start_col = macro_start_col;
         Some(piece_with_single_column(text, start_col))
     }
 
@@ -628,6 +628,17 @@ mod tests {
         macros.define_from_directive("STR(X) #X");
 
         assert_eq!(macros.expand_line("const char* Name = STR(Foo Bar);"), "const char* Name = \"Foo Bar\";");
+    }
+
+    #[test]
+    fn function_like_macro_stringification_preserves_macro_invocation_columns() {
+        let mut macros = MacroTable::default();
+        macros.define_from_directive("STR(X) #X");
+
+        let (expanded, map) = macros.expand_line_with_map("return STR(Foo);");
+        assert_eq!(expanded, "return \"Foo\";");
+        assert!(map.iter().skip(7).take(5).all(|col| *col == 7));
+        assert_eq!(map.last(), Some(&16));
     }
 
     #[test]

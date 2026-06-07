@@ -1,5 +1,7 @@
 pub(crate) mod bad_characters;
 pub(crate) mod dataflow;
+pub(crate) mod include_resolution;
+pub(crate) mod linker;
 pub(crate) mod name_lookup;
 pub(crate) mod overload_check;
 pub(crate) mod syntax_errors;

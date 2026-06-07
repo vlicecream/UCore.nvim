@@ -306,6 +306,10 @@ impl DiagnosticsCache {
             },
         );
     }
+
+    pub fn clear(&mut self) {
+        self.lru.clear();
+    }
 }
 
 /// In-memory visibility scope cache keyed by (file_path, include block hash).

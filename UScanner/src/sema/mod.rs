@@ -18,12 +18,36 @@ use scope::{ScopeId, ScopeTree};
 use symbol::{Access, Storage, SymbolId, SymbolKind, SymbolTable};
 use types::{BuiltinType, Compat, TypeArena, TypeId, TypeKind};
 
+#[derive(Clone, Debug)]
+pub enum TemplateScopeParam {
+    Type { name: String },
+    Value { name: String, declared_type: String },
+}
+
+impl TemplateScopeParam {
+    fn name(&self) -> &str {
+        match self {
+            TemplateScopeParam::Type { name } | TemplateScopeParam::Value { name, .. } => name,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct MemberCallableSignature {
+    pub return_t: TypeId,
+    pub params: Vec<TypeId>,
+    pub min_arity: usize,
+    pub is_variadic: bool,
+    pub is_const_member: bool,
+}
+
 pub struct SemaContext {
     pub types: TypeArena,
     pub symbols: SymbolTable,
     pub scopes: ScopeTree,
     pub node_scopes: HashMap<(usize, usize), ScopeId>,
     pub scope_owner_symbols: HashMap<ScopeId, SymbolId>,
+    pub class_template_params: HashMap<symbol::ClassId, Vec<TemplateScopeParam>>,
     source: Option<String>,
     pub(crate) cached_char_t: Option<TypeId>,
     pub(crate) cached_char_ptr_t: Option<TypeId>,
@@ -138,6 +162,332 @@ mod tests {
         assert_eq!(ty, "int32");
     }
 
+    #[test]
+    fn sema_lookup_resolves_namespace_qualified_function() {
+        let content = "namespace UE::Math { int32 Value(); } int32 Test() { return UE::Math::Value(); }";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+        let node = find_first_kind(root, "qualified_identifier").unwrap();
+        let symbols = sema.lookup_qualified_name_at_node(node, &["UE", "Math", "Value"]);
+        assert!(!symbols.is_empty());
+    }
+
+    #[test]
+    fn sema_expr_resolves_namespace_qualified_call_return_type() {
+        let content = "namespace UE::Math { int32 Value(); } int32 Test() { return UE::Math::Value(); }";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+
+        fn find_call(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+            if node.kind() == "call_expression" {
+                return Some(node);
+            }
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if let Some(found) = find_call(child) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+
+        let call = find_call(root).unwrap();
+        let ty = type_of_expression(&sema, call)
+            .and_then(|id| sema.render_type(id))
+            .unwrap();
+        assert_eq!(ty, "int32");
+    }
+
+    #[test]
+    fn sema_lookup_resolves_using_declaration_target() {
+        let content =
+            "namespace UE::Math { int32 Value(); } using UE::Math::Value; int32 Test() { return Value(); }";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+        let node = find_identifier(root, "Value", content).unwrap();
+        assert!(sema.symbol_exists_at_node(node, "Value"));
+    }
+
+    #[test]
+    fn sema_lookup_resolves_using_namespace_target() {
+        let content =
+            "namespace UE::Math { int32 Value(); } using namespace UE::Math; int32 Test() { return Value(); }";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+        let node = find_identifier(root, "Value", content).unwrap();
+        assert!(sema.symbol_exists_at_node(node, "Value"));
+    }
+
+    #[test]
+    fn sema_expr_resolves_typedef_alias_variable_type() {
+        let content = "using FCount = int32; void Test() { FCount Value = 1; Value; }";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+        let node = find_identifier(root, "Value", content).unwrap();
+        let ty = type_of_expression(&sema, node)
+            .and_then(|id| sema.render_type(id))
+            .unwrap();
+        assert_eq!(ty, "FCount");
+    }
+
+    #[test]
+    fn sema_expr_resolves_member_on_namespace_qualified_class_type() {
+        let content =
+            "namespace UE::Math { class Vec { public: int32 X; }; } void Test() { UE::Math::Vec Value; Value.X; }";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+        let node = find_first_kind(root, "field_expression").unwrap();
+        let ty = type_of_expression(&sema, node)
+            .and_then(|id| sema.render_type(id))
+            .unwrap();
+        assert_eq!(ty, "int32");
+    }
+
+    #[test]
+    fn sema_expr_resolves_named_cast_call_target_type() {
+        let content = "void Test() { auto Value = static_cast<float>(1); }";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+        let node = find_first_kind(root, "call_expression").unwrap();
+        let ty = type_of_expression(&sema, node)
+            .and_then(|id| sema.render_type(id))
+            .unwrap();
+        assert_eq!(ty, "float");
+    }
+
+    #[test]
+    fn sema_expr_resolves_adl_call_return_type() {
+        let content =
+            "namespace UE::Math { struct Vec {}; int32 Length(Vec Value) { return 1; } } int32 Test() { UE::Math::Vec Value; return Length(Value); }";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+
+        fn find_call(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+            if node.kind() == "call_expression" {
+                return Some(node);
+            }
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if let Some(found) = find_call(child) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+
+        let call = find_call(root).unwrap();
+        let ty = type_of_expression(&sema, call)
+            .and_then(|id| sema.render_type(id))
+            .unwrap();
+        assert_eq!(ty, "int32");
+    }
+
+    #[test]
+    fn sema_expr_resolves_nullptr_type() {
+        let content = "void Test() { nullptr; }";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+        let node = find_first_kind(root, "null").unwrap();
+        let ty = type_of_expression(&sema, node)
+            .and_then(|id| sema.render_type(id))
+            .unwrap();
+        assert_eq!(ty, "nullptr");
+    }
+
+    #[test]
+    fn sema_expr_resolves_pointer_alias_dereference_type() {
+        let content = "class UFoo {}; using FPtr = UFoo*; void Test() { FPtr Value = nullptr; *Value; }";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+        let node = find_first_kind(root, "pointer_expression").unwrap();
+        let ty = type_of_expression(&sema, node)
+            .and_then(|id| sema.render_type(id))
+            .unwrap();
+        assert_eq!(ty, "UFoo");
+    }
+
+    #[test]
+    fn sema_expr_resolves_pointer_alias_subscript_type() {
+        let content = "using FIntPtr = int32*; int32 Test(FIntPtr Values) { return Values[0]; }";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+        let node = find_first_kind(root, "subscript_expression").unwrap();
+        let ty = type_of_expression(&sema, node)
+            .and_then(|id| sema.render_type(id))
+            .unwrap();
+        assert_eq!(ty, "int32");
+    }
+
+    #[test]
+    fn sema_expr_resolves_member_on_template_class_instance() {
+        let content =
+            "template<typename T> struct Box { int32 Value; }; void Test() { Box<int32> Item; Item.Value; }";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+        let node = find_first_kind(root, "field_expression").unwrap();
+        let ty = type_of_expression(&sema, node)
+            .and_then(|id| sema.render_type(id))
+            .unwrap();
+        assert_eq!(ty, "int32");
+    }
+
+    #[test]
+    fn sema_expr_resolves_method_call_on_template_class_instance() {
+        let content =
+            "template<typename T> struct Box { int32 Get() { return 1; } }; int32 Test() { Box<int32> Item; return Item.Get(); }";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+        let node = find_first_kind(root, "call_expression").unwrap();
+        let ty = type_of_expression(&sema, node)
+            .and_then(|id| sema.render_type(id))
+            .unwrap();
+        assert_eq!(ty, "int32");
+    }
+
+    #[test]
+    fn sema_expr_resolves_method_call_on_namespace_qualified_template_class_instance() {
+        let content =
+            "namespace UE::Math { template<typename T> struct Box { int32 Get() { return 1; } }; } int32 Test() { UE::Math::Box<int32> Item; return Item.Get(); }";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+        let node = find_first_kind(root, "call_expression").unwrap();
+        let ty = type_of_expression(&sema, node)
+            .and_then(|id| sema.render_type(id))
+            .unwrap();
+        assert_eq!(ty, "int32");
+    }
+
+    #[test]
+    fn sema_expr_resolves_member_on_explicit_template_specialization_instance() {
+        let content =
+            "class UObject {}; template<typename T> struct Box { int32 Value; }; template<> struct Box<int32> { UObject* Value; }; UObject* Test() { Box<int32> Item; return Item.Value; }";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+        let node = find_first_kind(root, "field_expression").unwrap();
+        let ty = type_of_expression(&sema, node)
+            .and_then(|id| sema.render_type(id))
+            .unwrap();
+        assert_eq!(ty, "UObject*");
+    }
+
+    #[test]
+    fn sema_expr_keeps_primary_template_member_on_non_specialized_instance() {
+        let content =
+            "class UObject {}; template<typename T> struct Box { int32 Value; }; template<> struct Box<int32> { UObject* Value; }; int32 Test() { Box<float> Item; return Item.Value; }";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+        let node = find_first_kind(root, "field_expression").unwrap();
+        let ty = type_of_expression(&sema, node)
+            .and_then(|id| sema.render_type(id))
+            .unwrap();
+        assert_eq!(ty, "int32");
+    }
+
+    #[test]
+    fn sema_expr_resolves_dependent_template_field_type_from_instance_arg() {
+        let content =
+            "template<typename T> struct Box { T Value; }; int32 Test() { Box<int32> Item; return Item.Value; }";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+        let node = find_first_kind(root, "field_expression").unwrap();
+        let ty = type_of_expression(&sema, node)
+            .and_then(|id| sema.render_type(id))
+            .unwrap();
+        assert_eq!(ty, "int32");
+    }
+
+    #[test]
+    fn sema_expr_resolves_dependent_template_method_signature_from_instance_arg() {
+        let content =
+            "template<typename T> struct Box { T Get(T Value) { return Value; } }; int32 Test() { Box<int32> Item; return Item.Get(1); }";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+        let node = find_first_kind(root, "call_expression").unwrap();
+        let ty = type_of_expression(&sema, node)
+            .and_then(|id| sema.render_type(id))
+            .unwrap();
+        assert_eq!(ty, "int32");
+    }
+
+    #[test]
+    fn sema_expr_resolves_pointer_dependent_template_field_type() {
+        let content =
+            "template<typename T> struct Box { T* Value; }; void Test() { Box<int32> Item; Item.Value; }";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+        let node = find_first_kind(root, "field_expression").unwrap();
+        let ty = type_of_expression(&sema, node)
+            .and_then(|id| sema.render_type(id))
+            .unwrap();
+        assert_eq!(ty, "int32*");
+    }
+
+    #[test]
+    fn sema_expr_resolves_reference_dependent_template_method_signature() {
+        let content =
+            "template<typename T> struct Box { T& Get(T& Value) { return Value; } }; void Test(int32& Ref) { Box<int32> Item; Item.Get(Ref); }";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+        let node = find_first_kind(root, "call_expression").unwrap();
+        let ty = type_of_expression(&sema, node)
+            .and_then(|id| sema.render_type(id))
+            .unwrap();
+        assert_eq!(ty, "int32&");
+    }
+
+    #[test]
+    fn sema_expr_resolves_reference_parameter_identifier_type() {
+        let content = "void Test(int32& Ref) { Ref; }";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+        let stmt = find_first_kind(root, "expression_statement").unwrap();
+        let node = stmt.named_child(0).unwrap();
+        let ty = type_of_expression(&sema, node)
+            .and_then(|id| sema.render_type(id))
+            .unwrap();
+        assert_eq!(ty, "int32&");
+    }
+
+    #[test]
+    fn sema_lookup_finds_dependent_template_method_member_symbol() {
+        let content =
+            "template<typename T> struct Box { T& Get(T& Value) { return Value; } }; void Test(int32& Ref) { Box<int32> Item; Item.Get(Ref); }";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+        let call = find_first_kind(root, "call_expression").unwrap();
+        let callee = call.child_by_field_name("function").unwrap();
+        let receiver = callee.child_by_field_name("argument").unwrap();
+        let receiver_ty = type_of_expression(&sema, receiver).unwrap();
+        let symbols = sema.lookup_class_member_symbols(receiver_ty, "Get");
+        assert_eq!(symbols.len(), 1);
+    }
+
+    #[test]
+    fn sema_expr_resolves_nested_template_dependent_field_type() {
+        let content =
+            "template<typename U> struct TArray {}; template<typename T> struct Box { TArray<T> Values; }; void Test() { Box<int32> Item; Item.Values; }";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+        let node = find_first_kind(root, "field_expression").unwrap();
+        let ty = type_of_expression(&sema, node)
+            .and_then(|id| sema.render_type(id))
+            .unwrap();
+        assert_eq!(ty, "TArray<int32>");
+    }
+
+    #[test]
+    fn sema_expr_resolves_nested_pointer_reference_template_deref_type() {
+        let content =
+            "template<typename T> T* Id(T*& Value) { return Value; } int32 Test(int32* Ptr) { return *Id(Ptr); }";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+        let node = find_first_kind(root, "pointer_expression").unwrap();
+        let ty = type_of_expression(&sema, node)
+            .and_then(|id| sema.render_type(id))
+            .unwrap();
+        assert_eq!(ty, "int32");
+    }
+
 }
 
 impl SemaContext {
@@ -161,6 +511,21 @@ impl SemaContext {
         lookup::lookup_name(self, scope, name)
     }
 
+    pub fn lookup_call_name_at_node(
+        &self,
+        node: Node,
+        name: &str,
+        arg_types: &[TypeId],
+    ) -> Vec<SymbolId> {
+        let scope = self.scope_for_node(node);
+        lookup::lookup_call_name(self, scope, name, arg_types)
+    }
+
+    pub fn lookup_qualified_name_at_node(&self, node: Node, segments: &[&str]) -> Vec<SymbolId> {
+        let scope = self.scope_for_node(node);
+        lookup::lookup_qualified_name(self, scope, segments)
+    }
+
     pub fn lookup_name_in_parent_scopes(&self, node: Node, name: &str) -> Vec<SymbolId> {
         let mut current = self.scopes.get(self.scope_for_node(node)).and_then(|scope| scope.parent);
         while let Some(scope_id) = current {
@@ -179,8 +544,20 @@ impl SemaContext {
         self.lookup_name_at_node(node, name).into_iter().next()
     }
 
+    pub fn resolve_qualified_symbol_at_node(&self, node: Node, segments: &[&str]) -> Option<SymbolId> {
+        self.lookup_qualified_name_at_node(node, segments)
+            .into_iter()
+            .next()
+    }
+
     pub fn type_of_identifier_at_node(&self, node: Node, name: &str) -> Option<TypeId> {
         self.lookup_name_at_node(node, name)
+            .into_iter()
+            .find_map(|symbol_id| self.symbol_type(symbol_id))
+    }
+
+    pub fn type_of_qualified_identifier_at_node(&self, node: Node, segments: &[&str]) -> Option<TypeId> {
+        self.lookup_qualified_name_at_node(node, segments)
             .into_iter()
             .find_map(|symbol_id| self.symbol_type(symbol_id))
     }
@@ -207,8 +584,18 @@ impl SemaContext {
     pub fn class_id_for_type(&self, type_id: TypeId) -> Option<symbol::ClassId> {
         match self.types.get(type_id)? {
             TypeKind::Class(class_id) => Some(*class_id),
+            TypeKind::Template { base, .. } => {
+                if let Some(rendered) = self.render_type(type_id)
+                    && let Some(class_id) = self.symbols.class_id_by_name(&rendered)
+                {
+                    return Some(class_id);
+                }
+                self.resolve_existing_type_text(base)
+                    .and_then(|resolved| self.class_id_for_type(resolved))
+            }
             TypeKind::Pointer { pointee, .. } => self.class_id_for_type(*pointee),
             TypeKind::Reference { referent, .. } => self.class_id_for_type(*referent),
+            TypeKind::Typedef { aliased, .. } => self.class_id_for_type(*aliased),
             _ => None,
         }
     }
@@ -291,6 +678,79 @@ impl SemaContext {
         }
     }
 
+    pub fn member_symbol_type(&self, receiver_type: TypeId, symbol_id: SymbolId) -> Option<TypeId> {
+        let symbol = self.symbols.get(symbol_id)?;
+        let base_type = self.symbol_type(symbol_id)?;
+        let owner = match symbol.kind {
+            SymbolKind::Field { owner, .. } | SymbolKind::Method { owner, .. } => owner,
+            _ => return Some(base_type),
+        };
+        let Some(bindings) = self.template_bindings_for_member_owner(receiver_type, owner) else {
+            return Some(base_type);
+        };
+        self.substitute_type_id(base_type, &bindings).or(Some(base_type))
+    }
+
+    pub fn member_callable_signature(
+        &self,
+        receiver_type: TypeId,
+        symbol_id: SymbolId,
+    ) -> Option<MemberCallableSignature> {
+        let symbol = self.symbols.get(symbol_id)?;
+        let SymbolKind::Method { owner, type_id, .. } = symbol.kind else {
+            let type_id = self.symbol_type(symbol_id)?;
+            let TypeKind::Function {
+                return_t,
+                params,
+                min_arity,
+                is_variadic,
+                is_const_member,
+            } = self.types.get(type_id)?
+            else {
+                return None;
+            };
+            return Some(MemberCallableSignature {
+                return_t: *return_t,
+                params: params.clone(),
+                min_arity: *min_arity,
+                is_variadic: *is_variadic,
+                is_const_member: *is_const_member,
+            });
+        };
+
+        let TypeKind::Function {
+            return_t,
+            params,
+            min_arity,
+            is_variadic,
+            is_const_member,
+        } = self.types.get(type_id)?
+        else {
+            return None;
+        };
+
+        let Some(bindings) = self.template_bindings_for_member_owner(receiver_type, owner) else {
+            return Some(MemberCallableSignature {
+                return_t: *return_t,
+                params: params.clone(),
+                min_arity: *min_arity,
+                is_variadic: *is_variadic,
+                is_const_member: *is_const_member,
+            });
+        };
+
+        Some(MemberCallableSignature {
+            return_t: self.substitute_type_id(*return_t, &bindings).unwrap_or(*return_t),
+            params: params
+                .iter()
+                .map(|param| self.substitute_type_id(*param, &bindings).unwrap_or(*param))
+                .collect(),
+            min_arity: *min_arity,
+            is_variadic: *is_variadic,
+            is_const_member: *is_const_member,
+        })
+    }
+
     pub fn render_type(&self, type_id: TypeId) -> Option<String> {
         let ty = self.types.get(type_id)?;
         Some(match ty {
@@ -303,6 +763,7 @@ impl SemaContext {
                 BuiltinType::Float => "float".to_string(),
                 BuiltinType::Double => "double".to_string(),
             },
+            TypeKind::Nullptr => "nullptr".to_string(),
             TypeKind::Pointer { pointee, .. } => {
                 format!("{}*", self.render_type(*pointee).unwrap_or_else(|| "unknown".to_string()))
             }
@@ -394,12 +855,14 @@ impl SemaContext {
         &self,
         return_t: TypeId,
         params: Vec<TypeId>,
+        min_arity: usize,
         is_variadic: bool,
         is_const_member: bool,
     ) -> Option<TypeId> {
         self.types.find(&TypeKind::Function {
             return_t,
             params,
+            min_arity,
             is_variadic,
             is_const_member,
         })
@@ -438,6 +901,8 @@ impl SemaContext {
     }
 
     pub fn check_compat(&self, from: TypeId, to: TypeId) -> Compat {
+        let from = self.canonical_type_id(from);
+        let to = self.canonical_type_id(to);
         if from == to {
             return Compat::Same;
         }
@@ -445,6 +910,10 @@ impl SemaContext {
         let from_ty = self.types.get(from);
         let to_ty = self.types.get(to);
         match (from_ty, to_ty) {
+            (Some(TypeKind::Nullptr), Some(TypeKind::Reference { referent, .. })) => {
+                self.check_compat(from, *referent)
+            }
+            (Some(TypeKind::Nullptr), Some(TypeKind::Pointer { .. })) => Compat::NullptrToPointer,
             (Some(TypeKind::Builtin(from_builtin)), Some(TypeKind::Builtin(to_builtin))) => {
                 if is_numeric(*from_builtin) && is_numeric(*to_builtin) {
                     if numeric_rank(*from_builtin) <= numeric_rank(*to_builtin) {
@@ -474,12 +943,19 @@ impl SemaContext {
                 Some(TypeKind::Reference { referent: from_ref, .. }),
                 Some(TypeKind::Reference { referent: to_ref, .. }),
             ) => self.check_compat(*from_ref, *to_ref),
+            (Some(TypeKind::Reference { referent, .. }), _) => self.check_compat(*referent, to),
+            (_, Some(TypeKind::Reference { referent, .. })) => self.check_compat(from, *referent),
             (
                 Some(TypeKind::Class(from_class)),
                 Some(TypeKind::Class(to_class)),
             ) if self.is_class_derived_from_class(*from_class, *to_class) => Compat::DerivedToBase,
             _ => Compat::Incompatible,
         }
+    }
+
+    pub fn types_equivalent(&self, left: TypeId, right: TypeId) -> bool {
+        matches!(self.check_compat(left, right), Compat::Same)
+            && matches!(self.check_compat(right, left), Compat::Same)
     }
 
     fn is_class_derived_from(&self, from_type: TypeId, to_type: TypeId) -> bool {
@@ -541,10 +1017,15 @@ impl SemaContext {
             "uint32" => Some(self.types.uint32_t),
             "float" => Some(self.types.float_t),
             "double" => Some(self.types.double_t),
-            _ => self
-                .symbols
-                .class_id_by_name(clean)
-                .and_then(|class_id| self.types.find(&TypeKind::Class(class_id))),
+            _ => self.lookup_typedef_type_by_name(clean).or_else(|| {
+                if clean.contains("::") {
+                    self.lookup_qualified_type_by_name(clean)
+                } else {
+                    self.symbols
+                        .class_id_by_name(clean)
+                        .and_then(|class_id| self.types.find(&TypeKind::Class(class_id)))
+                }
+            }),
         }
     }
 
@@ -569,6 +1050,143 @@ impl SemaContext {
             base: base.to_string(),
             args,
         })
+    }
+
+    fn lookup_typedef_type_by_name(&self, name: &str) -> Option<TypeId> {
+        for scope in self.scopes.iter() {
+            let Some(ids) = scope.symbols.get(name) else {
+                continue;
+            };
+            for symbol_id in ids {
+                let symbol = self.symbols.get(*symbol_id)?;
+                if let SymbolKind::Typedef { type_id } = symbol.kind {
+                    return Some(type_id);
+                }
+            }
+        }
+        None
+    }
+
+    fn lookup_qualified_type_by_name(&self, name: &str) -> Option<TypeId> {
+        let segments = name
+            .split("::")
+            .map(str::trim)
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>();
+        let refs = segments.to_vec();
+        lookup::lookup_qualified_name(self, self.scopes.global, &refs)
+            .into_iter()
+            .find_map(|symbol_id| {
+                let symbol = self.symbols.get(symbol_id)?;
+                match symbol.kind {
+                    SymbolKind::Class { type_id, .. }
+                    | SymbolKind::Enum { type_id, .. }
+                    | SymbolKind::Typedef { type_id } => Some(type_id),
+                    _ => None,
+                }
+            })
+    }
+
+    fn canonical_type_id(&self, type_id: TypeId) -> TypeId {
+        let mut current = type_id;
+        let mut guard = 0usize;
+        while guard < 32 {
+            match self.types.get(current) {
+                Some(TypeKind::Typedef { aliased, .. }) => current = *aliased,
+                _ => return current,
+            }
+            guard += 1;
+        }
+        current
+    }
+
+    fn template_bindings_for_member_owner(
+        &self,
+        receiver_type: TypeId,
+        owner: symbol::ClassId,
+    ) -> Option<HashMap<String, types::TemplateArg>> {
+        let params = self.class_template_params.get(&owner)?;
+        if params.is_empty() {
+            return None;
+        }
+
+        let receiver = self.canonical_type_id(receiver_type);
+        let receiver_kind = match self.types.get(receiver)? {
+            TypeKind::Template { args, .. } => Some(args),
+            TypeKind::Pointer { pointee, .. } => match self.types.get(*pointee)? {
+                TypeKind::Template { args, .. } => Some(args),
+                _ => None,
+            },
+            TypeKind::Reference { referent, .. } => match self.types.get(*referent)? {
+                TypeKind::Template { args, .. } => Some(args),
+                _ => None,
+            },
+            _ => None,
+        }?;
+
+        let mut bindings = HashMap::new();
+        for (param, arg) in params.iter().zip(receiver_kind.iter()) {
+            bindings.insert(param.name().to_string(), arg.clone());
+        }
+        Some(bindings)
+    }
+
+    fn substitute_type_id(
+        &self,
+        type_id: TypeId,
+        bindings: &HashMap<String, types::TemplateArg>,
+    ) -> Option<TypeId> {
+        match self.types.get(type_id)? {
+            TypeKind::Dependent(name) => match bindings.get(name) {
+                Some(types::TemplateArg::Type(type_id)) => Some(*type_id),
+                _ => Some(type_id),
+            },
+            TypeKind::Pointer { pointee, .. } => {
+                let pointee = self.substitute_type_id(*pointee, bindings)?;
+                self.find_pointer_type(pointee)
+            }
+            TypeKind::Reference { referent, kind } => {
+                let referent = self.substitute_type_id(*referent, bindings)?;
+                match kind {
+                    types::RefKind::LValue => self.find_reference_type(referent),
+                    types::RefKind::RValue => self.types.find(&TypeKind::Reference {
+                        referent,
+                        kind: *kind,
+                    }),
+                }
+            }
+            TypeKind::Array { elem, size } => {
+                let elem = self.substitute_type_id(*elem, bindings)?;
+                self.types.find(&TypeKind::Array {
+                    elem,
+                    size: *size,
+                })
+            }
+            TypeKind::Template { base, args } => {
+                let substituted_args = args
+                    .iter()
+                    .map(|arg| match arg {
+                        types::TemplateArg::Type(type_id) => self
+                            .substitute_type_id(*type_id, bindings)
+                            .map(types::TemplateArg::Type),
+                        types::TemplateArg::Value(value) => Some(match bindings.get(value) {
+                            Some(types::TemplateArg::Type(type_id)) => {
+                                types::TemplateArg::Type(*type_id)
+                            }
+                            Some(types::TemplateArg::Value(value)) => {
+                                types::TemplateArg::Value(value.clone())
+                            }
+                            None => types::TemplateArg::Value(value.clone()),
+                        }),
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                self.types.find(&TypeKind::Template {
+                    base: base.clone(),
+                    args: substituted_args,
+                })
+            }
+            _ => Some(type_id),
+        }
     }
 }
 

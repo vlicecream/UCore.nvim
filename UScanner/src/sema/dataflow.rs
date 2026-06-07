@@ -38,6 +38,12 @@ struct LocalVarState {
     track_unused: bool,
 }
 
+#[derive(Debug, Clone)]
+struct BranchSnapshot {
+    states: HashMap<SymbolId, LocalVarState>,
+    constant_values: HashMap<SymbolId, i64>,
+}
+
 #[derive(Debug, Deserialize, Default)]
 struct RaiiPrefixesFile {
     #[serde(default)]
@@ -198,23 +204,48 @@ fn analyze_node(
                 issues,
             );
         }
-        "if_statement" | "while_statement" | "for_statement" | "do_statement" => {
-            if let Some(condition) = control_condition_node(node) {
-                if let Some(value) = evaluate_const_expr(condition, source, sema, constant_values) {
-                    issues.push(DataflowIssue {
-                        code: "UECPP-DF-005",
-                        message: format!(
-                            "Condition is always {}.",
-                            if value == 0 { "false" } else { "true" }
-                        ),
-                        line: condition.start_position().row as u32,
-                        character: condition.start_position().column as u32,
-                        end_line: condition.end_position().row as u32,
-                        end_character: condition.end_position().column as u32,
-                    });
-                }
-            }
-            walk_children(
+        "if_statement" => {
+            handle_if_statement(
+                node,
+                source,
+                sema,
+                states,
+                constant_values,
+                order,
+                active_stack,
+                issues,
+            );
+        }
+        "try_statement" => {
+            handle_try_statement(
+                node,
+                source,
+                sema,
+                states,
+                constant_values,
+                order,
+                active_stack,
+                issues,
+            );
+        }
+        "switch_statement" => {
+            handle_switch_statement(
+                node,
+                source,
+                sema,
+                states,
+                constant_values,
+                order,
+                active_stack,
+                issues,
+            );
+        }
+        "while_statement"
+        | "for_statement"
+        | "do_statement"
+        | "for_range_loop"
+        | "range_based_for_statement" => {
+            handle_loop_statement(
                 node,
                 source,
                 sema,
@@ -238,6 +269,442 @@ fn analyze_node(
             active_stack,
             issues,
         ),
+    }
+}
+
+fn handle_if_statement(
+    node: Node,
+    source: &str,
+    sema: &SemaContext,
+    states: &mut HashMap<SymbolId, LocalVarState>,
+    constant_values: &mut HashMap<SymbolId, i64>,
+    order: &mut Vec<SymbolId>,
+    active_stack: &mut Vec<HashSet<SymbolId>>,
+    issues: &mut Vec<DataflowIssue>,
+) {
+    if let Some(condition) = control_condition_node(node) {
+        if let Some(value) = evaluate_const_expr(condition, source, sema, constant_values) {
+            issues.push(DataflowIssue {
+                code: "UECPP-DF-005",
+                message: format!(
+                    "Condition is always {}.",
+                    if value == 0 { "false" } else { "true" }
+                ),
+                line: condition.start_position().row as u32,
+                character: condition.start_position().column as u32,
+                end_line: condition.end_position().row as u32,
+                end_character: condition.end_position().column as u32,
+            });
+        }
+        analyze_node(
+            condition,
+            source,
+            sema,
+            states,
+            constant_values,
+            order,
+            active_stack,
+            issues,
+        );
+    }
+
+    let tracked_ids = states.keys().copied().collect::<Vec<_>>();
+    let before = snapshot_branch_state(states, constant_values, &tracked_ids);
+
+    let Some(consequence) = node.child_by_field_name("consequence") else {
+        return;
+    };
+    analyze_node(
+        consequence,
+        source,
+        sema,
+        states,
+        constant_values,
+        order,
+        active_stack,
+        issues,
+    );
+    let then_state = snapshot_branch_state(states, constant_values, &tracked_ids);
+
+    restore_branch_state(states, constant_values, &before, &tracked_ids);
+    let else_state = if let Some(alternative) = node.child_by_field_name("alternative") {
+        analyze_node(
+            alternative,
+            source,
+            sema,
+            states,
+            constant_values,
+            order,
+            active_stack,
+            issues,
+        );
+        snapshot_branch_state(states, constant_values, &tracked_ids)
+    } else {
+        before.clone()
+    };
+
+    merge_branch_state(states, constant_values, &tracked_ids, &then_state, &else_state);
+}
+
+fn handle_try_statement(
+    node: Node,
+    source: &str,
+    sema: &SemaContext,
+    states: &mut HashMap<SymbolId, LocalVarState>,
+    constant_values: &mut HashMap<SymbolId, i64>,
+    order: &mut Vec<SymbolId>,
+    active_stack: &mut Vec<HashSet<SymbolId>>,
+    issues: &mut Vec<DataflowIssue>,
+) {
+    let tracked_ids = states.keys().copied().collect::<Vec<_>>();
+    let before = snapshot_branch_state(states, constant_values, &tracked_ids);
+
+    let mut branches = Vec::new();
+    if let Some(body) = try_body_node(node) {
+        analyze_node(
+            body,
+            source,
+            sema,
+            states,
+            constant_values,
+            order,
+            active_stack,
+            issues,
+        );
+        branches.push(snapshot_branch_state(states, constant_values, &tracked_ids));
+        restore_branch_state(states, constant_values, &before, &tracked_ids);
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() != "catch_clause" {
+            continue;
+        }
+        analyze_node(
+            child,
+            source,
+            sema,
+            states,
+            constant_values,
+            order,
+            active_stack,
+            issues,
+        );
+        branches.push(snapshot_branch_state(states, constant_values, &tracked_ids));
+        restore_branch_state(states, constant_values, &before, &tracked_ids);
+    }
+
+    match branches.as_slice() {
+        [] => restore_branch_state(states, constant_values, &before, &tracked_ids),
+        [single] => restore_branch_state(states, constant_values, single, &tracked_ids),
+        many => merge_many_branch_states(states, constant_values, &tracked_ids, many),
+    }
+}
+
+fn handle_switch_statement(
+    node: Node,
+    source: &str,
+    sema: &SemaContext,
+    states: &mut HashMap<SymbolId, LocalVarState>,
+    constant_values: &mut HashMap<SymbolId, i64>,
+    order: &mut Vec<SymbolId>,
+    active_stack: &mut Vec<HashSet<SymbolId>>,
+    issues: &mut Vec<DataflowIssue>,
+) {
+    if let Some(condition) = control_condition_node(node) {
+        analyze_node(
+            condition,
+            source,
+            sema,
+            states,
+            constant_values,
+            order,
+            active_stack,
+            issues,
+        );
+    }
+
+    let Some(body) = find_descendant(node, "compound_statement") else {
+        return;
+    };
+
+    let tracked_ids = states.keys().copied().collect::<Vec<_>>();
+    let before = snapshot_branch_state(states, constant_values, &tracked_ids);
+    let mut branches = Vec::new();
+    let mut has_default = false;
+
+    let mut cursor = body.walk();
+    for child in body.named_children(&mut cursor) {
+        if !matches!(child.kind(), "case_statement" | "default_statement") {
+            continue;
+        }
+        if is_default_case_node(child) {
+            has_default = true;
+        }
+        restore_branch_state(states, constant_values, &before, &tracked_ids);
+        analyze_node(
+            child,
+            source,
+            sema,
+            states,
+            constant_values,
+            order,
+            active_stack,
+            issues,
+        );
+        branches.push(snapshot_branch_state(states, constant_values, &tracked_ids));
+    }
+
+    if !has_default {
+        branches.push(before.clone());
+    }
+
+    match branches.as_slice() {
+        [] => restore_branch_state(states, constant_values, &before, &tracked_ids),
+        [single] => restore_branch_state(states, constant_values, single, &tracked_ids),
+        many => merge_many_branch_states(states, constant_values, &tracked_ids, many),
+    }
+}
+
+fn handle_loop_statement(
+    node: Node,
+    source: &str,
+    sema: &SemaContext,
+    states: &mut HashMap<SymbolId, LocalVarState>,
+    constant_values: &mut HashMap<SymbolId, i64>,
+    order: &mut Vec<SymbolId>,
+    active_stack: &mut Vec<HashSet<SymbolId>>,
+    issues: &mut Vec<DataflowIssue>,
+) {
+    if let Some(initializer) = loop_initializer_node(node) {
+        analyze_node(
+            initializer,
+            source,
+            sema,
+            states,
+            constant_values,
+            order,
+            active_stack,
+            issues,
+        );
+    }
+
+    let mut condition_value = None;
+    if node.kind() != "do_statement" {
+        condition_value = analyze_loop_condition(
+            node,
+            source,
+            sema,
+            states,
+            constant_values,
+            order,
+            active_stack,
+            issues,
+        );
+    }
+
+    let tracked_ids = states.keys().copied().collect::<Vec<_>>();
+    let before = snapshot_branch_state(states, constant_values, &tracked_ids);
+
+    let executes_body = match (node.kind(), condition_value) {
+        ("do_statement", _) => true,
+        (_, Some(0)) => false,
+        _ => true,
+    };
+
+    if executes_body {
+        if let Some(body) = loop_body_node(node) {
+            analyze_node(
+                body,
+                source,
+                sema,
+                states,
+                constant_values,
+                order,
+                active_stack,
+                issues,
+            );
+        }
+
+        if let Some(update) = loop_update_node(node) {
+            analyze_node(
+                update,
+                source,
+                sema,
+                states,
+                constant_values,
+                order,
+                active_stack,
+                issues,
+            );
+        }
+
+        if node.kind() == "do_statement" {
+            let _ = analyze_loop_condition(
+                node,
+                source,
+                sema,
+                states,
+                constant_values,
+                order,
+                active_stack,
+                issues,
+            );
+        }
+    }
+
+    let iter_state = snapshot_branch_state(states, constant_values, &tracked_ids);
+    if node.kind() == "do_statement" {
+        merge_branch_state(states, constant_values, &tracked_ids, &iter_state, &iter_state);
+    } else {
+        merge_branch_state(states, constant_values, &tracked_ids, &before, &iter_state);
+    }
+}
+
+fn analyze_loop_condition(
+    node: Node,
+    source: &str,
+    sema: &SemaContext,
+    states: &mut HashMap<SymbolId, LocalVarState>,
+    constant_values: &mut HashMap<SymbolId, i64>,
+    order: &mut Vec<SymbolId>,
+    active_stack: &mut Vec<HashSet<SymbolId>>,
+    issues: &mut Vec<DataflowIssue>,
+) -> Option<i64> {
+    let condition = control_condition_node(node)?;
+    let value = evaluate_const_expr(condition, source, sema, constant_values);
+    if let Some(value) = value {
+        issues.push(DataflowIssue {
+            code: "UECPP-DF-005",
+            message: format!(
+                "Condition is always {}.",
+                if value == 0 { "false" } else { "true" }
+            ),
+            line: condition.start_position().row as u32,
+            character: condition.start_position().column as u32,
+            end_line: condition.end_position().row as u32,
+            end_character: condition.end_position().column as u32,
+        });
+    }
+    analyze_node(
+        condition,
+        source,
+        sema,
+        states,
+        constant_values,
+        order,
+        active_stack,
+        issues,
+    );
+    value
+}
+
+fn snapshot_branch_state(
+    states: &HashMap<SymbolId, LocalVarState>,
+    constant_values: &HashMap<SymbolId, i64>,
+    tracked_ids: &[SymbolId],
+) -> BranchSnapshot {
+    let mut snapshot_states = HashMap::new();
+    let mut snapshot_constants = HashMap::new();
+    for symbol_id in tracked_ids {
+        if let Some(state) = states.get(symbol_id) {
+            snapshot_states.insert(*symbol_id, state.clone());
+        }
+        if let Some(value) = constant_values.get(symbol_id) {
+            snapshot_constants.insert(*symbol_id, *value);
+        }
+    }
+    BranchSnapshot {
+        states: snapshot_states,
+        constant_values: snapshot_constants,
+    }
+}
+
+fn restore_branch_state(
+    states: &mut HashMap<SymbolId, LocalVarState>,
+    constant_values: &mut HashMap<SymbolId, i64>,
+    snapshot: &BranchSnapshot,
+    tracked_ids: &[SymbolId],
+) {
+    for symbol_id in tracked_ids {
+        if let Some(state) = snapshot.states.get(symbol_id) {
+            states.insert(*symbol_id, state.clone());
+        }
+        match snapshot.constant_values.get(symbol_id) {
+            Some(value) => {
+                constant_values.insert(*symbol_id, *value);
+            }
+            None => {
+                constant_values.remove(symbol_id);
+            }
+        }
+    }
+}
+
+fn merge_branch_state(
+    states: &mut HashMap<SymbolId, LocalVarState>,
+    constant_values: &mut HashMap<SymbolId, i64>,
+    tracked_ids: &[SymbolId],
+    then_state: &BranchSnapshot,
+    else_state: &BranchSnapshot,
+) {
+    for symbol_id in tracked_ids {
+        let Some(then_var) = then_state.states.get(symbol_id) else {
+            continue;
+        };
+        let Some(else_var) = else_state.states.get(symbol_id) else {
+            continue;
+        };
+        if let Some(current) = states.get_mut(symbol_id) {
+            current.initialized = then_var.initialized && else_var.initialized;
+            current.used = then_var.used || else_var.used;
+        }
+
+        match (
+            then_state.constant_values.get(symbol_id),
+            else_state.constant_values.get(symbol_id),
+        ) {
+            (Some(left), Some(right)) if left == right => {
+                constant_values.insert(*symbol_id, *left);
+            }
+            _ => {
+                constant_values.remove(symbol_id);
+            }
+        }
+    }
+}
+
+fn merge_many_branch_states(
+    states: &mut HashMap<SymbolId, LocalVarState>,
+    constant_values: &mut HashMap<SymbolId, i64>,
+    tracked_ids: &[SymbolId],
+    branches: &[BranchSnapshot],
+) {
+    for symbol_id in tracked_ids {
+        let branch_states = branches
+            .iter()
+            .filter_map(|branch| branch.states.get(symbol_id))
+            .collect::<Vec<_>>();
+        if branch_states.len() != branches.len() {
+            continue;
+        }
+
+        if let Some(current) = states.get_mut(symbol_id) {
+            current.initialized = branch_states.iter().all(|state| state.initialized);
+            current.used = branch_states.iter().any(|state| state.used);
+        }
+
+        let first = branches[0].constant_values.get(symbol_id).copied();
+        if first.is_some()
+            && branches
+                .iter()
+                .skip(1)
+                .all(|branch| branch.constant_values.get(symbol_id).copied() == first)
+        {
+            constant_values.insert(*symbol_id, first.unwrap_or_default());
+        } else {
+            constant_values.remove(symbol_id);
+        }
     }
 }
 
@@ -282,7 +749,9 @@ fn handle_declaration(
     let type_name = node
         .child_by_field_name("type")
         .map(|type_node| crate::parser::cpp::clean_type_string(node_text(type_node, source)));
-    let track_unused = !name.starts_with('_') && !is_raii_type(type_name.as_deref().unwrap_or_default());
+    let track_unused = !name.starts_with('_')
+        && !is_raii_type(type_name.as_deref().unwrap_or_default())
+        && !has_maybe_unused_attribute(node, source);
 
     states.insert(
         symbol_id,
@@ -540,6 +1009,9 @@ fn statement_guarantees_return(node: Node) -> bool {
             }
             false
         }
+        "switch_statement" => switch_guarantees_return(node),
+        "try_statement" => try_guarantees_return(node),
+        "catch_clause" => catch_guarantees_return(node),
         "else_clause" => {
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
@@ -560,6 +1032,136 @@ fn statement_guarantees_return(node: Node) -> bool {
         }
         _ => false,
     }
+}
+
+fn switch_guarantees_return(node: Node) -> bool {
+    let Some(body) = find_descendant(node, "compound_statement") else {
+        return false;
+    };
+
+    let mut cases = Vec::new();
+    let mut cursor = body.walk();
+    for child in body.named_children(&mut cursor) {
+        if matches!(child.kind(), "case_statement" | "default_statement") {
+            cases.push(child);
+        }
+    }
+
+    if cases.is_empty() || !cases.iter().any(|case| is_default_case_node(*case)) {
+        return false;
+    }
+
+    let mut suffix_guarantees = vec![false; cases.len()];
+    for index in (0..cases.len()).rev() {
+        let body_guarantees = case_body_guarantees_return(cases[index]);
+        suffix_guarantees[index] = if body_guarantees {
+            true
+        } else {
+            suffix_guarantees.get(index + 1).copied().unwrap_or(false)
+        };
+    }
+
+    suffix_guarantees.into_iter().all(|value| value)
+}
+
+fn try_guarantees_return(node: Node) -> bool {
+    let Some(body) = try_body_node(node) else {
+        return false;
+    };
+    let mut catches = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "catch_clause" {
+            catches.push(child);
+        }
+    }
+    !catches.is_empty()
+        && statement_guarantees_return(body)
+        && catches.into_iter().all(catch_guarantees_return)
+}
+
+fn catch_guarantees_return(node: Node) -> bool {
+    catch_body_node(node).is_some_and(statement_guarantees_return)
+}
+
+fn case_body_guarantees_return(node: Node) -> bool {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if node.kind() == "case_statement" && is_case_label_node(child) {
+            continue;
+        }
+        if statement_guarantees_return(child) {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_case_label_node(node: Node) -> bool {
+    matches!(
+        node.kind(),
+        "number_literal"
+            | "char_literal"
+            | "identifier"
+            | "qualified_identifier"
+            | "subscript_expression"
+            | "field_expression"
+            | "binary_expression"
+            | "unary_expression"
+            | "parenthesized_expression"
+            | "call_expression"
+    )
+}
+
+fn is_default_case_node(node: Node) -> bool {
+    if node.kind() == "default_statement" {
+        return true;
+    }
+    let mut cursor = node.walk();
+    let first = node.named_children(&mut cursor).next();
+    !first.is_some_and(is_case_label_node)
+}
+
+fn loop_body_node(node: Node) -> Option<Node> {
+    node.child_by_field_name("body").or_else(|| {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .find(|child| matches!(child.kind(), "compound_statement" | "expression_statement"))
+    })
+}
+
+fn try_body_node(node: Node) -> Option<Node> {
+    node.child_by_field_name("body").or_else(|| {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .find(|child| child.kind() == "compound_statement")
+    })
+}
+
+fn catch_body_node(node: Node) -> Option<Node> {
+    node.child_by_field_name("body").or_else(|| {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .find(|child| child.kind() == "compound_statement")
+    })
+}
+
+fn loop_initializer_node(node: Node) -> Option<Node> {
+    if node.kind() != "for_statement" {
+        return None;
+    }
+    node.child_by_field_name("initializer").or_else(|| {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .find(|child| matches!(child.kind(), "declaration" | "expression_statement"))
+    })
+}
+
+fn loop_update_node(node: Node) -> Option<Node> {
+    if node.kind() != "for_statement" {
+        return None;
+    }
+    node.child_by_field_name("update")
 }
 
 fn control_condition_node(node: Node) -> Option<Node> {
@@ -745,7 +1347,7 @@ fn find_name_node(node: Node) -> Option<Node> {
         | "array_declarator"
         | "parenthesized_declarator"
         | "init_declarator"
-        | "bitfield_clause" => node.child_by_field_name("declarator").and_then(find_name_node),
+        | "bitfield_clause" => next_declarator_node(node).and_then(find_name_node),
         _ => {
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
@@ -756,6 +1358,28 @@ fn find_name_node(node: Node) -> Option<Node> {
             None
         }
     }
+}
+
+fn next_declarator_node(node: Node) -> Option<Node> {
+    node.child_by_field_name("declarator").or_else(|| {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor).find(|child| {
+            matches!(
+                child.kind(),
+                "identifier"
+                    | "field_identifier"
+                    | "type_identifier"
+                    | "qualified_identifier"
+                    | "function_declarator"
+                    | "pointer_declarator"
+                    | "reference_declarator"
+                    | "array_declarator"
+                    | "parenthesized_declarator"
+                    | "init_declarator"
+                    | "bitfield_clause"
+            )
+        })
+    })
 }
 
 fn declaration_has_initializer(node: Node, source: &str) -> bool {
@@ -859,4 +1483,8 @@ fn is_raii_type(type_name: &str) -> bool {
         .prefixes
         .iter()
         .any(|prefix| type_name.starts_with(prefix))
+}
+
+fn has_maybe_unused_attribute(node: Node, source: &str) -> bool {
+    node_text(node, source).contains("maybe_unused")
 }

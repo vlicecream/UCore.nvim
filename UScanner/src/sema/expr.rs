@@ -1,6 +1,6 @@
 use tree_sitter::Node;
 
-use super::overload::resolve_call_with_args;
+use super::overload::{resolve_call_with_args, resolve_call_with_signatures, CallResult};
 use super::types::{BuiltinType, CvQual, TypeId, TypeKind};
 use super::SemaContext;
 
@@ -14,7 +14,7 @@ pub fn type_of_expression(ctx: &SemaContext, node: Node) -> Option<TypeId> {
                 Some(ctx.types.int32_t)
             }
         }
-        "null" => Some(ctx.types.unknown_t),
+        "null" => Some(ctx.types.nullptr_t),
         "string_literal" => Some(ctx.types_pointer_to_char()),
         "char_literal" => Some(ctx.types_char()),
         "true" | "false" => Some(ctx.types.bool_t),
@@ -26,12 +26,12 @@ pub fn type_of_expression(ctx: &SemaContext, node: Node) -> Option<TypeId> {
             ctx.type_of_identifier_at_node(node, name)
         }
         "qualified_identifier" => {
-            let name_node = node.child_by_field_name("name")?;
-            let name = node_text(name_node, ctx)?.trim();
-            if name.is_empty() {
+            let segments = qualified_identifier_segments(node, ctx)?;
+            if segments.is_empty() {
                 return None;
             }
-            ctx.type_of_identifier_at_node(node, name)
+            let segment_refs = segments.iter().map(String::as_str).collect::<Vec<_>>();
+            ctx.type_of_qualified_identifier_at_node(node, &segment_refs)
         }
         "field_expression" => type_of_field_expression(ctx, node),
         "parenthesized_expression" => {
@@ -49,6 +49,7 @@ pub fn type_of_expression(ctx: &SemaContext, node: Node) -> Option<TypeId> {
         }
         "binary_expression" => type_of_binary_expression(ctx, node),
         "unary_expression" => type_of_unary_expression(ctx, node),
+        "pointer_expression" => type_of_unary_expression(ctx, node),
         "call_expression" => type_of_call_expression(ctx, node),
         _ => None,
     }
@@ -64,7 +65,7 @@ fn type_of_field_expression(ctx: &SemaContext, node: Node) -> Option<TypeId> {
     }
 
     for symbol_id in ctx.lookup_class_member_symbols(receiver_type, field_name) {
-        if let Some(type_id) = ctx.symbol_type(symbol_id) {
+        if let Some(type_id) = ctx.member_symbol_type(receiver_type, symbol_id) {
             return Some(type_id);
         }
     }
@@ -83,6 +84,7 @@ fn element_type_for_subscript(ctx: &SemaContext, type_id: TypeId) -> Option<Type
         TypeKind::Array { elem, .. } => Some(*elem),
         TypeKind::Pointer { pointee, .. } => Some(*pointee),
         TypeKind::Reference { referent, .. } => element_type_for_subscript(ctx, *referent),
+        TypeKind::Typedef { aliased, .. } => element_type_for_subscript(ctx, *aliased),
         _ => None,
     }
 }
@@ -146,7 +148,8 @@ fn type_of_lambda_expression(ctx: &SemaContext, node: Node) -> Option<TypeId> {
         .map(|params| parameter_types(ctx, params))
         .unwrap_or_default();
 
-    ctx.find_function_type(return_t, params, false, false)
+    let min_arity = params.len();
+    ctx.find_function_type(return_t, params, min_arity, false, false)
         .or(Some(ctx.types.unknown_t))
 }
 
@@ -177,7 +180,7 @@ fn parameter_types(ctx: &SemaContext, params: Node) -> Vec<TypeId> {
                 }
                 _ => {}
             }
-            declarator = node.child_by_field_name("declarator");
+            declarator = next_declarator_node(node);
         }
         out.push(type_id);
     }
@@ -186,6 +189,9 @@ fn parameter_types(ctx: &SemaContext, params: Node) -> Vec<TypeId> {
 
 fn type_of_call_expression(ctx: &SemaContext, node: Node) -> Option<TypeId> {
     let callee = node.child_by_field_name("function").or_else(|| node.child(0))?;
+    if let Some(type_id) = type_of_named_cast_call(ctx, node, callee) {
+        return Some(type_id);
+    }
     let template_index = build_template_index_for_node(node, ctx)?;
     if is_template_callee(callee) {
         return template_index.infer_call_return_type(node, ctx);
@@ -196,14 +202,24 @@ fn type_of_call_expression(ctx: &SemaContext, node: Node) -> Option<TypeId> {
     let arg_types = call_argument_types(ctx, node);
     match callee.kind() {
         "identifier" | "qualified_identifier" => {
-            let callee_name = match callee.kind() {
-                "identifier" => node_text(callee, ctx)?.trim().to_string(),
-                _ => node_text(callee.child_by_field_name("name")?, ctx)?.trim().to_string(),
+            let symbols = if callee.kind() == "identifier" {
+                let callee_name = node_text(callee, ctx)?.trim().to_string();
+                ctx.lookup_call_name_at_node(callee, &callee_name, &arg_types)
+            } else {
+                let segments = qualified_identifier_segments(callee, ctx)?;
+                let segment_refs = segments.iter().map(String::as_str).collect::<Vec<_>>();
+                ctx.lookup_qualified_name_at_node(callee, &segment_refs)
             };
-            let symbols = ctx.lookup_name_at_node(callee, &callee_name);
             match resolve_call_with_args(ctx, &symbols, &arg_types) {
                 super::overload::CallResult::Ok(symbol_id) => {
                     let fn_type = ctx.symbol_type(symbol_id)?;
+                    let TypeKind::Function { return_t, .. } = ctx.types.get(fn_type)? else {
+                        return Some(fn_type);
+                    };
+                    Some(*return_t)
+                }
+                super::overload::CallResult::NoMatch { .. } if symbols.len() == 1 => {
+                    let fn_type = ctx.symbol_type(symbols[0])?;
                     let TypeKind::Function { return_t, .. } = ctx.types.get(fn_type)? else {
                         return Some(fn_type);
                     };
@@ -218,13 +234,23 @@ fn type_of_call_expression(ctx: &SemaContext, node: Node) -> Option<TypeId> {
             let receiver_type = type_of_expression(ctx, receiver)?;
             let field_name = node_text(field, ctx)?.trim();
             let symbols = ctx.lookup_class_member_symbols(receiver_type, field_name);
-            match resolve_call_with_args(ctx, &symbols, &arg_types) {
-                super::overload::CallResult::Ok(symbol_id) => {
-                    let fn_type = ctx.symbol_type(symbol_id)?;
-                    let TypeKind::Function { return_t, .. } = ctx.types.get(fn_type)? else {
-                        return Some(fn_type);
-                    };
-                    Some(*return_t)
+            let callable = symbols
+                .iter()
+                .filter_map(|symbol_id| {
+                    ctx.member_callable_signature(receiver_type, *symbol_id)
+                        .map(|signature| (*symbol_id, signature))
+                })
+                .collect::<Vec<_>>();
+            match resolve_call_with_signatures(ctx, &callable, &arg_types) {
+                CallResult::Ok(symbol_id) => {
+                    let signature = callable
+                        .iter()
+                        .find(|(candidate, _)| *candidate == symbol_id)
+                        .map(|(_, signature)| signature)?;
+                    Some(signature.return_t)
+                }
+                CallResult::NoMatch { .. } if callable.len() == 1 => {
+                    callable.first().map(|(_, signature)| signature.return_t)
                 }
                 _ => None,
             }
@@ -237,6 +263,54 @@ fn type_of_call_expression(ctx: &SemaContext, node: Node) -> Option<TypeId> {
             Some(*return_t)
         }
     }
+}
+
+fn type_of_named_cast_call(ctx: &SemaContext, call: Node, callee: Node) -> Option<TypeId> {
+    if !is_named_cast_callee(callee, ctx) {
+        return None;
+    }
+    named_cast_target_type(ctx, call)
+}
+
+fn qualified_identifier_segments(ctx_node: Node, ctx: &SemaContext) -> Option<Vec<String>> {
+    let mut segments = Vec::new();
+    collect_qualified_identifier_segments(ctx_node, ctx, &mut segments)?;
+    (!segments.is_empty()).then_some(segments)
+}
+
+fn collect_qualified_identifier_segments(
+    node: Node,
+    ctx: &SemaContext,
+    segments: &mut Vec<String>,
+) -> Option<()> {
+    if node.kind() != "qualified_identifier" {
+        let text = node_text(node, ctx)?.trim();
+        if text.is_empty() {
+            return None;
+        }
+        segments.extend(
+            text.split("::")
+                .map(str::trim)
+                .filter(|segment| !segment.is_empty())
+                .map(ToOwned::to_owned),
+        );
+        return Some(());
+    }
+
+    if let Some(scope) = node.child_by_field_name("scope") {
+        collect_qualified_identifier_segments(scope, ctx, segments)?;
+    }
+    let name_node = node.child_by_field_name("name")?;
+    if name_node.kind() == "qualified_identifier" {
+        collect_qualified_identifier_segments(name_node, ctx, segments)?;
+    } else {
+        let name = node_text(name_node, ctx)?.trim();
+        if name.is_empty() {
+            return None;
+        }
+        segments.push(name.to_string());
+    }
+    Some(())
 }
 
 fn is_template_callee(callee: Node) -> bool {
@@ -300,12 +374,43 @@ fn type_of_unary_expression(ctx: &SemaContext, node: Node) -> Option<TypeId> {
         return Some(ctx.types.bool_t);
     }
     if text.starts_with('*') {
-        if let Some(TypeKind::Pointer { pointee, .. }) = ctx.types.get(operand_ty) {
-            return Some(*pointee);
+        if let Some(pointee) = pointee_type(ctx, operand_ty) {
+            return Some(pointee);
         }
     }
 
     Some(operand_ty)
+}
+
+fn pointee_type(ctx: &SemaContext, type_id: TypeId) -> Option<TypeId> {
+    match ctx.types.get(type_id)? {
+        TypeKind::Pointer { pointee, .. } => Some(*pointee),
+        TypeKind::Reference { referent, .. } => pointee_type(ctx, *referent),
+        TypeKind::Typedef { aliased, .. } => pointee_type(ctx, *aliased),
+        _ => None,
+    }
+}
+
+pub(crate) fn is_named_cast_callee(callee: Node, ctx: &SemaContext) -> bool {
+    let Some(text) = node_text(callee, ctx) else {
+        return false;
+    };
+    matches!(
+        text.trim().split('<').next().unwrap_or_default(),
+        "static_cast" | "dynamic_cast" | "reinterpret_cast" | "const_cast"
+    )
+}
+
+pub(crate) fn named_cast_target_type(ctx: &SemaContext, call: Node) -> Option<TypeId> {
+    let callee = call.child_by_field_name("function").or_else(|| call.child(0))?;
+    let arg_list = find_descendant(callee, "template_argument_list")?;
+    let mut cursor = arg_list.walk();
+    for child in arg_list.children(&mut cursor) {
+        if child.is_named() {
+            return ctx.resolve_existing_type_node(child);
+        }
+    }
+    None
 }
 
 fn call_argument_types(ctx: &SemaContext, node: Node) -> Vec<TypeId> {
@@ -360,4 +465,26 @@ fn find_descendant<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
         }
     }
     None
+}
+
+fn next_declarator_node(node: Node) -> Option<Node> {
+    node.child_by_field_name("declarator").or_else(|| {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor).find(|child| {
+            matches!(
+                child.kind(),
+                "identifier"
+                    | "field_identifier"
+                    | "type_identifier"
+                    | "qualified_identifier"
+                    | "function_declarator"
+                    | "pointer_declarator"
+                    | "reference_declarator"
+                    | "array_declarator"
+                    | "parenthesized_declarator"
+                    | "init_declarator"
+                    | "bitfield_clause"
+            )
+        })
+    })
 }

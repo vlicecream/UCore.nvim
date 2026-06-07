@@ -8,6 +8,9 @@ use tree_sitter::{Node, Parser, Point};
 
 use crate::db::ensure_search_projections;
 use crate::db::project_path::PATH_CTE;
+use crate::sema::expr::type_of_expression as sema_type_of_expression;
+use crate::sema::symbol::SymbolKind as SemaSymbolKind;
+use crate::sema::SemaContext;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct TypeNavEntry {
@@ -3292,6 +3295,306 @@ pub fn get_signature_help(
     }))
 }
 
+struct GotoResolverContext<'a> {
+    conn: &'a Connection,
+    hot_index: Option<&'a NavigationHotIndex>,
+    content: &'a str,
+    file_path: Option<&'a str>,
+    line: u32,
+    character: u32,
+    prefer_impl: bool,
+    cursor_ctx: &'a CursorCtx,
+    symbol_node: Node<'a>,
+    sema: &'a SemaContext,
+}
+
+type GotoResolver = for<'a> fn(&GotoResolverContext<'a>) -> Result<Option<Value>>;
+
+fn run_goto_pipeline<'a>(
+    ctx: &GotoResolverContext<'a>,
+    resolvers: &[GotoResolver],
+) -> Result<Option<Value>> {
+    for resolver in resolvers {
+        if let Some(value) = resolver(ctx)? {
+            return Ok(Some(value));
+        }
+    }
+    Ok(None)
+}
+
+fn parse_query_tree(content: &str) -> Option<tree_sitter::Tree> {
+    let language: tree_sitter::Language = tree_sitter_unreal_cpp::LANGUAGE.into();
+    let mut parser = Parser::new();
+    parser.set_language(&language).ok()?;
+    parser.parse(content, None)
+}
+
+fn resolve_string_or_tag_target<'a>(ctx: &GotoResolverContext<'a>) -> Result<Option<Value>> {
+    if let Some(tag_path) = string_literal_under_cursor(ctx.content, ctx.line, ctx.character) {
+        if is_include_line(ctx.content, ctx.line) && looks_like_include_path(&tag_path) {
+            return find_file_by_include_path(ctx.conn, ctx.file_path, &tag_path);
+        }
+        if looks_like_gameplay_tag_path(&tag_path) {
+            if let Some(result) = find_gameplay_tag_by_path(ctx.conn, &tag_path)? {
+                return Ok(Some(result));
+            }
+        } else if looks_like_include_path(&tag_path) {
+            return find_file_by_include_path(ctx.conn, ctx.file_path, &tag_path);
+        }
+    }
+    Ok(None)
+}
+
+fn resolve_identifier_side_targets<'a>(ctx: &GotoResolverContext<'a>) -> Result<Option<Value>> {
+    if let Some(result) = find_gameplay_tag_by_identifier(ctx.conn, &ctx.cursor_ctx.symbol)? {
+        return Ok(Some(result));
+    }
+    if let Some(result) = find_macro_definition(ctx.conn, &ctx.cursor_ctx.symbol)? {
+        return Ok(Some(result));
+    }
+    Ok(None)
+}
+
+fn resolve_header_declaration_noop<'a>(ctx: &GotoResolverContext<'a>) -> Result<Option<Value>> {
+    if !ctx.prefer_impl
+        && ctx.file_path.map(is_header_file).unwrap_or(false)
+        && header_function_declaration_cursor(ctx.content, ctx.line, ctx.character)
+    {
+        tracing::debug!(
+            "goto_definition: staying put on header function declaration '{}'",
+            ctx.cursor_ctx.symbol
+        );
+        return Ok(Some(Value::Null));
+    }
+    Ok(None)
+}
+
+fn resolve_local_symbol<'a>(ctx: &GotoResolverContext<'a>) -> Result<Option<Value>> {
+    if let Some(local_decl) = find_local_declaration(ctx.content, &ctx.cursor_ctx.symbol, ctx.line, ctx.character)
+        && let Some(path) = ctx.file_path
+    {
+        return Ok(Some(json!({
+            "symbol_name": ctx.cursor_ctx.symbol,
+            "line_number": (local_decl.row + 1) as i64,
+            "col": local_decl.col as i64,
+            "file_path": normalize_path(path),
+            "source": "local",
+        })));
+    }
+    Ok(None)
+}
+
+fn resolve_impl_via_pipeline<'a>(ctx: &GotoResolverContext<'a>) -> Result<Option<Value>> {
+    let current_signature = extract_cursor_function_signature(ctx.content, ctx.line, ctx.character);
+    if let Some(class_name) = resolve_impl_class_with_sema(ctx) {
+        if let Some(signature) = current_signature.as_ref()
+            && let Some(result) = find_impl_in_inheritance_with_params(
+                ctx.conn,
+                &class_name,
+                &ctx.cursor_ctx.symbol,
+                &signature.parameters,
+            )?
+        {
+            return Ok(Some(result));
+        }
+        if let Some(result) =
+            find_impl_in_inheritance(ctx.conn, ctx.hot_index, &class_name, &ctx.cursor_ctx.symbol)?
+        {
+            return Ok(Some(result));
+        }
+        if let Some(result) =
+            find_member_by_class_name(ctx.conn, ctx.hot_index, &class_name, &ctx.cursor_ctx.symbol, false)?
+        {
+            return Ok(Some(result));
+        }
+    }
+
+    if matches!(ctx.cursor_ctx.qualifier_op.as_deref(), Some("::")) || ctx.cursor_ctx.enclosing_class.is_none() {
+        if let Some(result) = find_member_anywhere(ctx.conn, ctx.hot_index, &ctx.cursor_ctx.symbol, true)? {
+            return Ok(Some(result));
+        }
+    }
+
+    Ok(Some(Value::Null))
+}
+
+fn resolve_definition_via_pipeline<'a>(ctx: &GotoResolverContext<'a>) -> Result<Option<Value>> {
+    if let Some(resolved_class) = resolve_lookup_class_with_sema(ctx) {
+        if let Some(result) =
+            find_symbol_in_inheritance_chain(ctx.conn, ctx.hot_index, &resolved_class, &ctx.cursor_ctx.symbol)?
+        {
+            return Ok(Some(result));
+        }
+        if !matches!(ctx.cursor_ctx.qualifier_op.as_deref(), Some("::")) {
+            return Ok(Some(Value::Null));
+        }
+    }
+
+    if let Some(result) = resolve_symbol_via_sema(ctx)? {
+        return Ok(Some(result));
+    }
+
+    if let Some(ref enclosing_class) = ctx.cursor_ctx.enclosing_class
+        && let Some(result) =
+            find_symbol_in_inheritance_chain(ctx.conn, ctx.hot_index, enclosing_class, &ctx.cursor_ctx.symbol)?
+    {
+        return Ok(Some(result));
+    }
+
+    if let Some(result) = find_type_definition(ctx.conn, ctx.hot_index, &ctx.cursor_ctx.symbol)? {
+        return Ok(Some(result));
+    }
+
+    if !has_explicit_qualifier(ctx.cursor_ctx)
+        && let Some(result) = find_member_anywhere(ctx.conn, ctx.hot_index, &ctx.cursor_ctx.symbol, false)?
+    {
+        return Ok(Some(result));
+    }
+
+    Ok(Some(Value::Null))
+}
+
+fn resolve_lookup_class_with_sema<'a>(ctx: &GotoResolverContext<'a>) -> Option<String> {
+    if let Some(ref qualifier) = ctx.cursor_ctx.qualifier {
+        return match ctx.cursor_ctx.qualifier_op.as_deref() {
+            Some("::") => {
+                if qualifier.trim() == "Super" {
+                    resolve_super_class_name(
+                        ctx.conn,
+                        ctx.content,
+                        ctx.line,
+                        ctx.character,
+                        ctx.cursor_ctx.enclosing_class.as_deref(),
+                    )
+                    .or_else(|| Some(clean_type(qualifier)))
+                } else if is_current_class_alias(qualifier) {
+                    ctx.cursor_ctx.enclosing_class.clone()
+                } else {
+                    sema_qualifier_type_name(ctx).or_else(|| Some(clean_type(qualifier)))
+                }
+            }
+            Some(".") | Some("->") => {
+                if qualifier == "this" {
+                    ctx.cursor_ctx.enclosing_class.clone()
+                } else {
+                    sema_qualifier_type_name(ctx)
+                        .or_else(|| infer_var_type(ctx.content, qualifier, Some(ctx.line)))
+                        .map(|name| clean_type(&name))
+                }
+            }
+            _ => None,
+        };
+    }
+
+    ctx.cursor_ctx.enclosing_class.clone()
+}
+
+fn resolve_impl_class_with_sema<'a>(ctx: &GotoResolverContext<'a>) -> Option<String> {
+    if let Some(ref qualifier) = ctx.cursor_ctx.qualifier {
+        if ctx.cursor_ctx.qualifier_op.as_deref() == Some("::") {
+            if is_current_class_alias(qualifier) {
+                return ctx.cursor_ctx.enclosing_class.clone();
+            }
+            if qualifier.trim() == "Super" {
+                return resolve_super_class_name(
+                    ctx.conn,
+                    ctx.content,
+                    ctx.line,
+                    ctx.character,
+                    ctx.cursor_ctx.enclosing_class.as_deref(),
+                );
+            }
+            return sema_qualifier_type_name(ctx).or_else(|| Some(clean_type(qualifier)));
+        }
+        if matches!(ctx.cursor_ctx.qualifier_op.as_deref(), Some(".") | Some("->")) {
+            if qualifier == "this" {
+                return ctx.cursor_ctx.enclosing_class.clone();
+            }
+            return sema_qualifier_type_name(ctx)
+                .or_else(|| resolve_impl_class(ctx.cursor_ctx, ctx.content, ctx.line))
+                .map(|name| clean_type(&name));
+        }
+    }
+    ctx.cursor_ctx.enclosing_class.clone()
+}
+
+fn sema_qualifier_type_name<'a>(ctx: &GotoResolverContext<'a>) -> Option<String> {
+    let receiver = qualifier_receiver_node(ctx)?;
+    let type_id = sema_type_of_expression(ctx.sema, receiver)?;
+    let rendered = ctx.sema.render_type(type_id)?;
+    let cleaned = clean_type(&rendered);
+    (!cleaned.is_empty() && cleaned != "unknown").then_some(cleaned)
+}
+
+fn qualifier_receiver_node<'a>(ctx: &GotoResolverContext<'a>) -> Option<Node<'a>> {
+    let mut current = Some(ctx.symbol_node);
+    while let Some(node) = current {
+        match node.kind() {
+            "field_expression" => {
+                return node.child_by_field_name("argument").or_else(|| node.child(0));
+            }
+            "qualified_identifier" => {
+                return node.child_by_field_name("scope");
+            }
+            _ => current = node.parent(),
+        }
+    }
+    None
+}
+
+fn resolve_symbol_via_sema<'a>(ctx: &GotoResolverContext<'a>) -> Result<Option<Value>> {
+    let symbol_ids = match ctx.symbol_node.kind() {
+        "qualified_identifier" => {
+            let qualified = symbol_text(ctx.symbol_node, ctx.content.as_bytes());
+            let segments = qualified
+                .split("::")
+                .filter(|segment| !segment.is_empty())
+                .collect::<Vec<_>>();
+            ctx.sema.lookup_qualified_name_at_node(ctx.symbol_node, &segments)
+        }
+        _ => ctx.sema.lookup_name_at_node(ctx.symbol_node, &ctx.cursor_ctx.symbol),
+    };
+
+    for symbol_id in symbol_ids {
+        if let Some(result) = sema_symbol_to_nav(ctx, symbol_id)? {
+            return Ok(Some(result));
+        }
+    }
+
+    Ok(None)
+}
+
+fn sema_symbol_to_nav<'a>(
+    ctx: &GotoResolverContext<'a>,
+    symbol_id: crate::sema::symbol::SymbolId,
+) -> Result<Option<Value>> {
+    let Some(symbol) = ctx.sema.symbols.get(symbol_id) else {
+        return Ok(None);
+    };
+
+    match &symbol.kind {
+        SemaSymbolKind::Class { .. } | SemaSymbolKind::Enum { .. } | SemaSymbolKind::Typedef { .. } => {
+            find_type_definition(ctx.conn, ctx.hot_index, &symbol.name)
+        }
+        SemaSymbolKind::Field { owner, .. } | SemaSymbolKind::Method { owner, .. } => {
+            let Some(owner_name) = ctx.sema.symbols.class_name(*owner) else {
+                return Ok(None);
+            };
+            find_member_by_class_name(
+                ctx.conn,
+                ctx.hot_index,
+                owner_name,
+                &symbol.name,
+                ctx.prefer_impl,
+            )
+        }
+        SemaSymbolKind::Function { .. } | SemaSymbolKind::Variable { .. } => {
+            find_member_anywhere(ctx.conn, ctx.hot_index, &symbol.name, ctx.prefer_impl)
+        }
+        _ => Ok(None),
+    }
+}
+
 fn goto_definition_inner(
     conn: &Connection,
     hot_index: Option<&NavigationHotIndex>,
@@ -3320,28 +3623,17 @@ fn goto_definition_inner(
     let Some(ctx) = extract_cursor_context(&content, line, character) else {
         return Ok(Value::Null);
     };
-
-    if let Some(result) = find_gameplay_tag_by_identifier(conn, &ctx.symbol)? {
-        return Ok(result);
-    }
-
-    if let Some(result) = find_macro_definition(conn, &ctx.symbol)? {
-        return Ok(result);
-    }
-
-    if !prefer_impl
-        && file_path
-            .as_deref()
-            .map(is_header_file)
-            .unwrap_or(false)
-        && header_function_declaration_cursor(&content, line, character)
-    {
-        tracing::debug!(
-            "goto_definition: staying put on header function declaration '{}'",
-            ctx.symbol
-        );
+    let Some(tree) = parse_query_tree(&content) else {
         return Ok(Value::Null);
-    }
+    };
+    let root = tree.root_node();
+    let Some(raw_cursor_node) = cursor_node_at(root, line as usize, character as usize) else {
+        return Ok(Value::Null);
+    };
+    let Some(symbol_node) = normalize_symbol_node(raw_cursor_node) else {
+        return Ok(Value::Null);
+    };
+    let sema = crate::sema::builder::build_sema(root, &content);
 
     let mode = if prefer_impl { "implementation" } else { "definition" };
     tracing::debug!(
@@ -3354,182 +3646,35 @@ fn goto_definition_inner(
         line + 1,
         character
     );
-
-    if let Some(local_decl) = find_local_declaration(&content, &ctx.symbol, line, character) {
-        if let Some(ref path) = file_path {
-            tracing::debug!(
-                "goto_{}: resolved local symbol '{}' to {}:{} type={:?}",
-                mode,
-                ctx.symbol,
-                local_decl.row + 1,
-                local_decl.col,
-                local_decl.type_name
-            );
-
-            return Ok(json!({
-                "symbol_name": ctx.symbol,
-                "line_number": (local_decl.row + 1) as i64,
-                "col": local_decl.col as i64,
-                "file_path": normalize_path(path),
-                "source": "local",
-            }));
-        }
-    }
-
-    // Implementation mode: class-name-based search (hits both .h and .cpp
-    // records). No global fallback — members from unrelated classes shouldn't
-    // be returned as implementations.
-    // 实现模式：按类名搜。不全局兜底，避免跳到无关类的同名成员。
-    if prefer_impl {
-        let current_signature = extract_cursor_function_signature(&content, line, character);
-        if let Some(ref name) = resolve_impl_class(&ctx, &content, line) {
-            if let Some(signature) = current_signature.as_ref() {
-                if let Some(result) = find_impl_in_inheritance_with_params(
-                    conn,
-                    name,
-                    &ctx.symbol,
-                    &signature.parameters,
-                )? {
-                    tracing::debug!(
-                        "goto_{}: resolved '{}' through impl class '{}' with params '{}'",
-                        mode,
-                        ctx.symbol,
-                        name,
-                        signature.parameters
-                    );
-                    return Ok(result);
-                }
-            }
-            if let Some(result) = find_impl_in_inheritance(conn, hot_index, name, &ctx.symbol)? {
-                tracing::debug!(
-                    "goto_{}: resolved '{}' through impl class '{}'",
-                    mode,
-                    ctx.symbol,
-                    name
-                );
-                return Ok(result);
-            }
-            if let Some(result) = find_member_by_class_name(conn, hot_index, name, &ctx.symbol, false)? {
-                tracing::debug!(
-                    "goto_{}: fell back to class member '{}' on '{}'",
-                    mode,
-                    ctx.symbol,
-                    name
-                );
-                return Ok(result);
-            }
-        }
-        if matches!(ctx.qualifier_op.as_deref(), Some("::")) || ctx.enclosing_class.is_none() {
-            if let Some(result) = find_member_anywhere(conn, hot_index, &ctx.symbol, true)? {
-                tracing::debug!(
-                    "goto_{}: resolved '{}' via global static/member fallback",
-                    mode,
-                    ctx.symbol
-                );
-                return Ok(result);
-            }
-        }
-        tracing::debug!("goto_{}: no result for '{}'", mode, ctx.symbol);
-        return Ok(Value::Null);
-    }
-
-    // 1. If there is an explicit qualifier, resolve through that first.
-    // 1. 如果存在显式修饰对象，优先通过它解析。
-    if let Some(ref qualifier) = ctx.qualifier {
-        let resolved_class = match ctx.qualifier_op.as_deref() {
-            Some("::") => {
-                if qualifier.trim() == "Super" {
-                    resolve_super_class_name(
-                        conn,
-                        &content,
-                        line,
-                        character,
-                        ctx.enclosing_class.as_deref(),
-                    )
-                    .unwrap_or_else(|| qualifier.clone())
-                } else if is_current_class_alias(qualifier) {
-                    ctx.enclosing_class.clone().unwrap_or_else(|| qualifier.clone())
-                } else {
-                    qualifier.clone()
-                }
-            }
-
-            Some(".") | Some("->") => {
-                if qualifier == "this" {
-                    ctx.enclosing_class.clone().unwrap_or_else(|| qualifier.clone())
-                } else {
-                    infer_var_type(&content, qualifier, Some(line))
-                        .unwrap_or_else(|| qualifier.clone())
-                }
-            }
-
-            _ => qualifier.clone(),
-        };
-
-        if let Some(result) = find_symbol_in_inheritance_chain(conn, hot_index, &resolved_class, &ctx.symbol)?
-        {
-            tracing::debug!(
-                "goto_{}: resolved '{}' via qualifier class '{}'",
-                mode,
-                ctx.symbol,
-                resolved_class
-            );
-            return Ok(result);
-        }
-
-        tracing::debug!(
-            "goto_{}: no member '{}' found via qualifier class '{}'",
-            mode,
-            ctx.symbol,
-            resolved_class
-        );
-
-        if !matches!(ctx.qualifier_op.as_deref(), Some("::")) {
-            return Ok(Value::Null);
-        }
-    }
-
-    // 2. Try member lookup from the enclosing class.
-    // 2. 尝试从当前所在类里查成员。
-    if let Some(ref enclosing_class) = ctx.enclosing_class {
-        if let Some(result) = find_symbol_in_inheritance_chain(conn, hot_index, enclosing_class, &ctx.symbol)?
-        {
-            tracing::debug!(
-                "goto_{}: resolved '{}' via enclosing class '{}'",
-                mode,
-                ctx.symbol,
-                enclosing_class
-            );
-            return Ok(result);
-        }
-    }
-
-    // 3. Try type definition lookup.
-    // 3. 尝试按类型定义查找。
-    if let Some(result) = find_type_definition(conn, hot_index, &ctx.symbol)? {
-        tracing::debug!(
-            "goto_{}: resolved '{}' as type definition",
-            mode,
-            ctx.symbol
-        );
-        return Ok(result);
-    }
-
-    // 4. Final fallback: member search across the whole project.
-    // 4. 最终兜底：全工程成员名搜索。
-    if !has_explicit_qualifier(&ctx) {
-        if let Some(result) = find_member_anywhere(conn, hot_index, &ctx.symbol, false)? {
-            tracing::debug!(
-                "goto_{}: resolved '{}' via global member fallback",
-                mode,
-                ctx.symbol
-            );
-            return Ok(result);
-        }
-    }
-
-    tracing::debug!("goto_{}: no result for '{}'", mode, ctx.symbol);
-    Ok(Value::Null)
+    let resolver_ctx = GotoResolverContext {
+        conn,
+        hot_index,
+        content: &content,
+        file_path: file_path.as_deref(),
+        line,
+        character,
+        prefer_impl,
+        cursor_ctx: &ctx,
+        symbol_node,
+        sema: &sema,
+    };
+    let resolvers: &[GotoResolver] = if prefer_impl {
+        &[
+            resolve_string_or_tag_target,
+            resolve_identifier_side_targets,
+            resolve_local_symbol,
+            resolve_impl_via_pipeline,
+        ]
+    } else {
+        &[
+            resolve_string_or_tag_target,
+            resolve_identifier_side_targets,
+            resolve_header_declaration_noop,
+            resolve_local_symbol,
+            resolve_definition_via_pipeline,
+        ]
+    };
+    Ok(run_goto_pipeline(&resolver_ctx, resolvers)?.unwrap_or(Value::Null))
 }
 
 // -----------------------------------------------------------------------------

@@ -1,10 +1,10 @@
-use super::{IncludeResolver, MacroTable};
+use super::{expand_include_operand, IncludeResolver, MacroTable};
 
 pub fn evaluate_condition(expr: &str, macros: &MacroTable, include_resolver: Option<&IncludeResolver>) -> bool {
-    let tokens = tokenize(expr, macros, include_resolver);
-    let mut parser = Parser { tokens: &tokens, index: 0 };
-    parser.parse_expr() != 0
+    evaluate_condition_value(expr, macros, include_resolver, 0) != 0
 }
+
+const MAX_CONDITION_EXPANSION_DEPTH: usize = 16;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Token {
@@ -160,7 +160,23 @@ impl Parser<'_> {
     }
 }
 
-fn tokenize(expr: &str, macros: &MacroTable, include_resolver: Option<&IncludeResolver>) -> Vec<Token> {
+fn evaluate_condition_value(
+    expr: &str,
+    macros: &MacroTable,
+    include_resolver: Option<&IncludeResolver>,
+    depth: usize,
+) -> i64 {
+    let tokens = tokenize(expr, macros, include_resolver, depth);
+    let mut parser = Parser { tokens: &tokens, index: 0 };
+    parser.parse_expr()
+}
+
+fn tokenize(
+    expr: &str,
+    macros: &MacroTable,
+    include_resolver: Option<&IncludeResolver>,
+    depth: usize,
+) -> Vec<Token> {
     let mut tokens = Vec::new();
     let chars = expr.chars().collect::<Vec<_>>();
     let mut index = 0usize;
@@ -202,6 +218,7 @@ fn tokenize(expr: &str, macros: &MacroTable, include_resolver: Option<&IncludeRe
             } else if ident == "__has_include" {
                 let (include, consumed) = parse_has_include_operand(&chars[index..]);
                 index += consumed;
+                let include = expand_include_operand(&include, macros);
                 let present = include_resolver
                     .map(|resolver| resolver.has_include(&include))
                     .unwrap_or(false);
@@ -210,10 +227,31 @@ fn tokenize(expr: &str, macros: &MacroTable, include_resolver: Option<&IncludeRe
                 tokens.push(Token::Number(1));
             } else if ident == "false" || ident == "FALSE" {
                 tokens.push(Token::Number(0));
+            } else if depth < MAX_CONDITION_EXPANSION_DEPTH && macros.has_function_macro(&ident) {
+                let mut probe = index;
+                while probe < chars.len() && chars[probe].is_whitespace() {
+                    probe += 1;
+                }
+                if let Some(end_index) = parse_macro_invocation_end(&chars, probe) {
+                    let invocation = chars[start..end_index].iter().collect::<String>();
+                    let expanded = macros.expand_line(&invocation);
+                    let value =
+                        evaluate_condition_value(&expanded, macros, include_resolver, depth + 1);
+                    tokens.push(Token::Number(value));
+                    index = end_index;
+                } else {
+                    tokens.push(Token::Number(0));
+                }
             } else {
                 let value = macros
                     .value_of(&ident)
-                    .and_then(|text| text.parse::<i64>().ok())
+                    .map(|text| {
+                        if depth >= MAX_CONDITION_EXPANSION_DEPTH {
+                            text.parse::<i64>().unwrap_or(0)
+                        } else {
+                            evaluate_condition_value(text, macros, include_resolver, depth + 1)
+                        }
+                    })
                     .unwrap_or_else(|| i64::from(macros.is_defined(&ident)));
                 tokens.push(Token::Number(value));
             }
@@ -365,8 +403,20 @@ fn parse_has_include_operand(chars: &[char]) -> (String, usize) {
             index += 1;
         }
     } else {
-        while index < chars.len() && chars[index] != ')' {
-            value.push(chars[index]);
+        let mut depth = 0usize;
+        while index < chars.len() {
+            match chars[index] {
+                '(' => {
+                    depth += 1;
+                    value.push(chars[index]);
+                }
+                ')' if depth == 0 => break,
+                ')' => {
+                    depth = depth.saturating_sub(1);
+                    value.push(chars[index]);
+                }
+                _ => value.push(chars[index]),
+            }
             index += 1;
         }
     }
@@ -379,6 +429,61 @@ fn parse_has_include_operand(chars: &[char]) -> (String, usize) {
     }
 
     (value.trim().to_string(), index)
+}
+
+fn parse_macro_invocation_end(chars: &[char], open_paren_index: usize) -> Option<usize> {
+    if chars.get(open_paren_index).copied() != Some('(') {
+        return None;
+    }
+
+    let mut index = open_paren_index + 1;
+    let mut depth = 1usize;
+    let mut in_string = false;
+    let mut in_char = false;
+    let mut escape = false;
+
+    while index < chars.len() {
+        let ch = chars[index];
+        if in_string {
+            if !escape && ch == '"' {
+                in_string = false;
+            }
+            escape = ch == '\\' && !escape;
+            index += 1;
+            continue;
+        }
+        if in_char {
+            if !escape && ch == '\'' {
+                in_char = false;
+            }
+            escape = ch == '\\' && !escape;
+            index += 1;
+            continue;
+        }
+
+        match ch {
+            '"' => {
+                in_string = true;
+            }
+            '\'' => {
+                in_char = true;
+            }
+            '(' => {
+                depth += 1;
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(index + 1);
+                }
+            }
+            _ => {}
+        }
+        escape = false;
+        index += 1;
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -405,6 +510,27 @@ mod tests {
     }
 
     #[test]
+    fn condition_eval_expands_expression_like_object_macro() {
+        let mut macros = MacroTable::default();
+        macros.define("VALUE", "(1 + 1)");
+        assert!(evaluate_condition("VALUE == 2", &macros, None));
+    }
+
+    #[test]
+    fn condition_eval_expands_function_like_macro() {
+        let mut macros = MacroTable::default();
+        macros.define_from_directive("ADD(X, Y) ((X) + (Y))");
+        assert!(evaluate_condition("ADD(1, 2) == 3", &macros, None));
+    }
+
+    #[test]
+    fn condition_eval_treats_uninvoked_function_macro_as_zero() {
+        let mut macros = MacroTable::default();
+        macros.define_from_directive("FLAG(X) X");
+        assert!(!evaluate_condition("FLAG", &macros, None));
+    }
+
+    #[test]
     fn condition_eval_handles_has_include() {
         let root = std::env::temp_dir().join(format!(
             "ucore_condition_has_include_{}",
@@ -426,6 +552,66 @@ mod tests {
         let macros = MacroTable::default();
         assert!(evaluate_condition(
             "__has_include(\"MyHeader.h\")",
+            &macros,
+            Some(&resolver)
+        ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn condition_eval_handles_has_include_via_macro_operand() {
+        let root = std::env::temp_dir().join(format!(
+            "ucore_condition_has_include_macro_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let file = root.join("Source/MyGame/Private/Test.cpp");
+        let header = root.join("Source/MyGame/Public/MyHeader.h");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::create_dir_all(header.parent().unwrap()).unwrap();
+        fs::write(root.join("MyGame.uproject"), "{}").unwrap();
+        fs::write(&file, "").unwrap();
+        fs::write(&header, "// header").unwrap();
+
+        let resolver =
+            default_include_resolver_for_file("preprocessor.toml", Some(&file.to_string_lossy()));
+        let mut macros = MacroTable::default();
+        macros.define("HEADER_FILE", "\"MyHeader.h\"");
+        assert!(evaluate_condition(
+            "__has_include(HEADER_FILE)",
+            &macros,
+            Some(&resolver)
+        ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn condition_eval_handles_has_include_via_function_macro_operand() {
+        let root = std::env::temp_dir().join(format!(
+            "ucore_condition_has_include_fn_macro_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let file = root.join("Source/MyGame/Private/Test.cpp");
+        let header = root.join("Source/MyGame/Public/MyHeader.h");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::create_dir_all(header.parent().unwrap()).unwrap();
+        fs::write(root.join("MyGame.uproject"), "{}").unwrap();
+        fs::write(&file, "").unwrap();
+        fs::write(&header, "// header").unwrap();
+
+        let resolver =
+            default_include_resolver_for_file("preprocessor.toml", Some(&file.to_string_lossy()));
+        let mut macros = MacroTable::default();
+        macros.define_from_directive("HEADER_FILE() \"MyHeader.h\"");
+        assert!(evaluate_condition(
+            "__has_include(HEADER_FILE())",
             &macros,
             Some(&resolver)
         ));

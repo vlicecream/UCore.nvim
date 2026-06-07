@@ -50,8 +50,10 @@ fn type_diagnostic_item(
         "assignment_expression" => assignment_item(node, file_path, sema_ctx, rules),
         "return_statement" => return_item(node, file_path, sema_ctx, rules),
         "cast_expression" => cast_item(node, file_path, sema_ctx),
+        "call_expression" => named_cast_item(node, file_path, sema_ctx),
         "binary_expression" => binary_item(node, file_path, sema_ctx, rules),
         "unary_expression" => unary_item(node, file_path, sema_ctx, rules),
+        "pointer_expression" => unary_item(node, file_path, sema_ctx, rules),
         "field_expression" => field_item(node, file_path, sema_ctx),
         _ => None,
     }
@@ -67,6 +69,11 @@ fn assignment_item(
     let right = node.child_by_field_name("right").or_else(|| node.child(2))?;
     let left_ty = crate::sema::expr::type_of_expression(sema_ctx, left)?;
     let right_ty = crate::sema::expr::type_of_expression(sema_ctx, right)?;
+    if is_dependent_type_at_node(sema_ctx, node, left_ty)
+        || is_dependent_type_at_node(sema_ctx, node, right_ty)
+    {
+        return None;
+    }
     let compat = contextual_compat(sema_ctx, right, right_ty, left_ty);
     build_compat_item(
         file_path,
@@ -87,6 +94,46 @@ fn cast_item(node: Node, file_path: Option<&str>, sema_ctx: &SemaContext) -> Opt
     let value_node = node.child_by_field_name("value")?;
     let source_ty = crate::sema::expr::type_of_expression(sema_ctx, value_node)?;
     let target_ty = sema_ctx.resolve_existing_type_node(type_node)?;
+    if is_dependent_type_at_node(sema_ctx, node, source_ty)
+        || is_dependent_type_at_node(sema_ctx, node, target_ty)
+    {
+        return None;
+    }
+    if sema_ctx.check_compat(source_ty, target_ty) != Compat::Incompatible {
+        return None;
+    }
+
+    Some(diagnostic_for_range(
+        file_path,
+        node,
+        DiagnosticSeverity::Warning,
+        "UECPP-EXPR-005",
+        format!(
+            "Cast target is incompatible with the source type. From {} to {}.",
+            render_type(sema_ctx, source_ty),
+            render_type(sema_ctx, target_ty)
+        ),
+    ))
+}
+
+fn named_cast_item(
+    node: Node,
+    file_path: Option<&str>,
+    sema_ctx: &SemaContext,
+) -> Option<DiagnosticItem> {
+    let callee = node.child_by_field_name("function").or_else(|| node.child(0))?;
+    if !crate::sema::expr::is_named_cast_callee(callee, sema_ctx) {
+        return None;
+    }
+    let args = node.child_by_field_name("arguments").or_else(|| find_descendant(node, "argument_list"))?;
+    let value_node = args.named_child(0)?;
+    let source_ty = crate::sema::expr::type_of_expression(sema_ctx, value_node)?;
+    let target_ty = crate::sema::expr::named_cast_target_type(sema_ctx, node)?;
+    if is_dependent_type_at_node(sema_ctx, node, source_ty)
+        || is_dependent_type_at_node(sema_ctx, node, target_ty)
+    {
+        return None;
+    }
     if sema_ctx.check_compat(source_ty, target_ty) != Compat::Incompatible {
         return None;
     }
@@ -113,6 +160,11 @@ fn return_item(
     let value = node.named_child(0)?;
     let expr_ty = crate::sema::expr::type_of_expression(sema_ctx, value)?;
     let return_ty = sema_ctx.enclosing_function_return_type(node)?;
+    if is_dependent_type_at_node(sema_ctx, node, expr_ty)
+        || is_dependent_type_at_node(sema_ctx, node, return_ty)
+    {
+        return None;
+    }
     let compat = contextual_compat(sema_ctx, value, expr_ty, return_ty);
     build_compat_item(
         file_path,
@@ -138,6 +190,11 @@ fn binary_item(
     let right = node.child_by_field_name("right").or_else(|| node.child(2))?;
     let left_ty = crate::sema::expr::type_of_expression(sema_ctx, left)?;
     let right_ty = crate::sema::expr::type_of_expression(sema_ctx, right)?;
+    if is_dependent_type_at_node(sema_ctx, node, left_ty)
+        || is_dependent_type_at_node(sema_ctx, node, right_ty)
+    {
+        return None;
+    }
     let operator = operator_text(node, sema_ctx)?;
 
     if matches!(operator, "==" | "!=" | "<" | "<=" | ">" | ">=") {
@@ -174,6 +231,9 @@ fn unary_item(node: Node, file_path: Option<&str>, sema_ctx: &SemaContext, _rule
         .or_else(|| node.child(1))
         .or_else(|| node.named_child(0))?;
     let operand_ty = crate::sema::expr::type_of_expression(sema_ctx, operand)?;
+    if is_dependent_type_at_node(sema_ctx, node, operand_ty) {
+        return None;
+    }
     let text = node_text(node, sema_ctx)?;
 
     if text.starts_with('*') && !is_pointer_type(sema_ctx, operand_ty) {
@@ -192,6 +252,9 @@ fn unary_item(node: Node, file_path: Option<&str>, sema_ctx: &SemaContext, _rule
 fn field_item(node: Node, file_path: Option<&str>, sema_ctx: &SemaContext) -> Option<DiagnosticItem> {
     let receiver = node.child_by_field_name("argument").or_else(|| node.child(0))?;
     let receiver_ty = crate::sema::expr::type_of_expression(sema_ctx, receiver)?;
+    if is_dependent_type_at_node(sema_ctx, node, receiver_ty) {
+        return None;
+    }
     let operator = operator_text(node, sema_ctx)?;
     if operator == "->" && !is_pointer_type(sema_ctx, receiver_ty) {
         return Some(diagnostic_for_range(
@@ -200,6 +263,31 @@ fn field_item(node: Node, file_path: Option<&str>, sema_ctx: &SemaContext) -> Op
             DiagnosticSeverity::Error,
             "UECPP-EXPR-011",
             "Operator '->' requires a pointer receiver.",
+        ));
+    }
+
+    let field = node.child_by_field_name("field")?;
+    let field_name = node_text(field, sema_ctx)?.trim();
+    if field_name.is_empty() {
+        return None;
+    }
+    if !class_member_lookup_supported(sema_ctx, receiver_ty) {
+        return None;
+    }
+    if sema_ctx
+        .lookup_class_member_symbols(receiver_ty, field_name)
+        .is_empty()
+    {
+        return Some(diagnostic_for_range(
+            file_path,
+            field,
+            DiagnosticSeverity::Error,
+            "UECPP-EXPR-004",
+            format!(
+                "Member {} does not exist on type {}.",
+                field_name,
+                render_type(sema_ctx, receiver_ty)
+            ),
         ));
     }
     None
@@ -288,7 +376,7 @@ fn render_type(sema_ctx: &SemaContext, type_id: TypeId) -> String {
 
 fn is_numeric_type(sema_ctx: &SemaContext, type_id: TypeId) -> bool {
     matches!(
-        sema_ctx.types.get(type_id),
+        canonical_type_kind(sema_ctx, type_id),
         Some(TypeKind::Builtin(
             BuiltinType::Char
                 | BuiltinType::Int32
@@ -300,12 +388,167 @@ fn is_numeric_type(sema_ctx: &SemaContext, type_id: TypeId) -> bool {
 }
 
 fn is_pointer_type(sema_ctx: &SemaContext, type_id: TypeId) -> bool {
-    matches!(sema_ctx.types.get(type_id), Some(TypeKind::Pointer { .. }))
+    matches!(canonical_type_kind(sema_ctx, type_id), Some(TypeKind::Pointer { .. }))
 }
 
 fn is_pointer_integer_mix(sema_ctx: &SemaContext, left_ty: TypeId, right_ty: TypeId) -> bool {
     (is_pointer_type(sema_ctx, left_ty) && is_numeric_type(sema_ctx, right_ty))
         || (is_pointer_type(sema_ctx, right_ty) && is_numeric_type(sema_ctx, left_ty))
+}
+
+fn class_member_lookup_supported(sema_ctx: &SemaContext, type_id: TypeId) -> bool {
+    match sema_ctx.types.get(type_id) {
+        Some(TypeKind::Class(_)) => true,
+        Some(TypeKind::Pointer { pointee, .. }) => class_member_lookup_supported(sema_ctx, *pointee),
+        Some(TypeKind::Reference { referent, .. }) => {
+            class_member_lookup_supported(sema_ctx, *referent)
+        }
+        Some(TypeKind::Typedef { aliased, .. }) => class_member_lookup_supported(sema_ctx, *aliased),
+        _ => false,
+    }
+}
+
+fn canonical_type_kind(sema_ctx: &SemaContext, type_id: TypeId) -> Option<&TypeKind> {
+    match sema_ctx.types.get(type_id)? {
+        TypeKind::Typedef { aliased, .. } => canonical_type_kind(sema_ctx, *aliased),
+        TypeKind::Reference { referent, .. } => canonical_type_kind(sema_ctx, *referent),
+        kind => Some(kind),
+    }
+}
+
+fn is_dependent_type_at_node(sema_ctx: &SemaContext, node: Node, type_id: TypeId) -> bool {
+    let Some(template_params) = enclosing_template_param_names(node, sema_ctx) else {
+        return false;
+    };
+    type_uses_template_param(sema_ctx, type_id, &template_params)
+}
+
+fn type_uses_template_param(
+    sema_ctx: &SemaContext,
+    type_id: TypeId,
+    template_params: &[String],
+) -> bool {
+    let Some(kind) = sema_ctx.types.get(type_id) else {
+        return false;
+    };
+    match kind {
+        TypeKind::Class(class_id) => sema_ctx
+            .symbols
+            .class_name(*class_id)
+            .is_some_and(|name| template_params.iter().any(|param| param == name)),
+        TypeKind::Pointer { pointee, .. } => {
+            type_uses_template_param(sema_ctx, *pointee, template_params)
+        }
+        TypeKind::Reference { referent, .. } => {
+            type_uses_template_param(sema_ctx, *referent, template_params)
+        }
+        TypeKind::Array { elem, .. } => type_uses_template_param(sema_ctx, *elem, template_params),
+        TypeKind::Typedef { aliased, .. } => {
+            type_uses_template_param(sema_ctx, *aliased, template_params)
+        }
+        TypeKind::Template { base, args } => {
+            template_params.iter().any(|param| param == base)
+                || args.iter().any(|arg| match arg {
+                    crate::sema::types::TemplateArg::Type(type_id) => {
+                        type_uses_template_param(sema_ctx, *type_id, template_params)
+                    }
+                    crate::sema::types::TemplateArg::Value(_) => false,
+                })
+        }
+        TypeKind::Dependent(name) => template_params.iter().any(|param| param == name),
+        _ => false,
+    }
+}
+
+fn enclosing_template_param_names(node: Node, sema_ctx: &SemaContext) -> Option<Vec<String>> {
+    let source = sema_ctx.source()?;
+    let mut current = Some(node);
+    while let Some(cursor) = current {
+        if cursor.kind() == "template_declaration" {
+            let params = cursor.child_by_field_name("parameters")?;
+            let mut names = Vec::new();
+            let mut walk = params.walk();
+            for child in params.children(&mut walk) {
+                match child.kind() {
+                    "type_parameter_declaration" | "optional_type_parameter_declaration" => {
+                        if let Some(name) = find_descendant(child, "type_identifier")
+                            .or_else(|| find_descendant(child, "identifier"))
+                            .and_then(|ident| node_text(ident, sema_ctx))
+                            .map(str::trim)
+                            .filter(|name| !name.is_empty())
+                        {
+                            names.push(name.to_string());
+                        }
+                    }
+                    "parameter_declaration" => {
+                        if let Some(name) = child
+                            .child_by_field_name("declarator")
+                            .and_then(find_name_node)
+                            .and_then(|ident| {
+                                let range = ident.byte_range();
+                                (range.end <= source.len()
+                                    && source.is_char_boundary(range.start)
+                                    && source.is_char_boundary(range.end))
+                                    .then_some(&source[range.start..range.end])
+                            })
+                            .map(str::trim)
+                            .filter(|name| !name.is_empty())
+                        {
+                            names.push(name.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            return Some(names);
+        }
+        current = cursor.parent();
+    }
+    None
+}
+
+fn find_name_node(node: Node) -> Option<Node> {
+    match node.kind() {
+        "identifier" | "field_identifier" | "type_identifier" => Some(node),
+        "function_declarator"
+        | "pointer_declarator"
+        | "reference_declarator"
+        | "array_declarator"
+        | "parenthesized_declarator"
+        | "init_declarator"
+        | "bitfield_clause" => next_declarator_node(node).and_then(find_name_node),
+        _ => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if let Some(found) = find_name_node(child) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+    }
+}
+
+fn next_declarator_node(node: Node) -> Option<Node> {
+    node.child_by_field_name("declarator").or_else(|| {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor).find(|child| {
+            matches!(
+                child.kind(),
+                "identifier"
+                    | "field_identifier"
+                    | "type_identifier"
+                    | "qualified_identifier"
+                    | "function_declarator"
+                    | "pointer_declarator"
+                    | "reference_declarator"
+                    | "array_declarator"
+                    | "parenthesized_declarator"
+                    | "init_declarator"
+                    | "bitfield_clause"
+            )
+        })
+    })
 }
 
 fn operator_text<'a>(node: Node, sema_ctx: &'a SemaContext) -> Option<&'a str> {
@@ -352,4 +595,18 @@ fn node_text<'a>(node: Node, sema_ctx: &'a SemaContext) -> Option<&'a str> {
     } else {
         None
     }
+}
+
+fn find_descendant<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
+    if node.kind() == kind {
+        return Some(node);
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if let Some(found) = find_descendant(child, kind) {
+            return Some(found);
+        }
+    }
+    None
 }

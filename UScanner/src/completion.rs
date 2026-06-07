@@ -12,6 +12,10 @@ use tracing::info;
 use crate::db::ensure_search_projections;
 use crate::query::macro_index::{MacroCandidate, MacroHotIndex};
 use crate::query::member_index::{HotMemberItem, MemberHotIndex, MemberKind};
+use crate::sema::expr::type_of_expression as sema_type_of_expression;
+use crate::sema::symbol::{Access as SemaAccess, ClassId as SemaClassId, SymbolKind as SemaSymbolKind};
+use crate::sema::types::TypeKind as SemaTypeKind;
+use crate::sema::SemaContext;
 use crate::server::state::CompletionCache;
 
 const MAX_COMPLETION_ITEMS: usize = 128;
@@ -279,6 +283,7 @@ pub fn process_completion_with_engine(
 
     let root = tree.root_node();
     let cursor_node = cursor_node(root, line, character).unwrap_or(root);
+    let sema = crate::sema::builder::build_sema(root, content);
     let buffer_inheritance = build_buffer_inheritance_map(root, content);
     if log_enabled {
         info!(
@@ -317,26 +322,12 @@ pub fn process_completion_with_engine(
         return Ok(items);
     }
 
-    if let Some(items) = complete_macro_specifiers_at(content, line, character) {
+    if let Some(items) = complete_macro_specifiers_with_fallback(cursor_node, content, line, character) {
         if log_enabled {
             let count = items.as_array().map(|value| value.len()).unwrap_or_default();
             info!(
                 target: "ucore::completion",
-                "Completion macro-at: file={} items={} total_ms={}",
-                file_path.as_deref().unwrap_or("-"),
-                count,
-                started_at.elapsed().as_millis()
-            );
-        }
-        return Ok(items);
-    }
-
-    if let Some(items) = complete_macro_specifiers(cursor_node, content) {
-        if log_enabled {
-            let count = items.as_array().map(|value| value.len()).unwrap_or_default();
-            info!(
-                target: "ucore::completion",
-                "Completion macro-node: file={} items={} total_ms={}",
+                "Completion macro: file={} items={} total_ms={}",
                 file_path.as_deref().unwrap_or("-"),
                 count,
                 started_at.elapsed().as_millis()
@@ -385,6 +376,7 @@ pub fn process_completion_with_engine(
         let ty = resolve_expression_type_with_engine(
             &mut ctx,
             engine_ctx.as_mut(),
+            &sema,
             request.receiver,
             &buffer_inheritance,
             root,
@@ -409,6 +401,14 @@ pub fn process_completion_with_engine(
             let typedef_ms = typedef_started_at.elapsed().as_millis();
 
             let fetch_started_at = Instant::now();
+            let sema_members = collect_sema_member_completion_items(
+                &sema,
+                &ty,
+                request.prefix.as_deref().unwrap_or(""),
+                current_class.as_deref(),
+                false,
+                false,
+            );
             let members = fetch_members_with_engine(
                 &mut ctx,
                 engine_ctx.as_mut(),
@@ -422,11 +422,21 @@ pub fn process_completion_with_engine(
                 false,
             )?;
 
-            let final_items = dedupe_completion_items(members);
+            let mut merged_members = sema_members;
+            merge_completion_items(&mut merged_members, members, MAX_COMPLETION_ITEMS);
+            let final_items = dedupe_completion_items(merged_members);
             let final_items = if final_items.is_empty() {
                 let unwrapped_ty = unwrap_container_type(&ty);
                 if unwrapped_ty != ty {
                     let retry_started_at = Instant::now();
+                    let mut retry_items = collect_sema_member_completion_items(
+                        &sema,
+                        &unwrapped_ty,
+                        request.prefix.as_deref().unwrap_or(""),
+                        current_class.as_deref(),
+                        false,
+                        false,
+                    );
                     let retry_members = fetch_members_with_engine(
                         &mut ctx,
                         engine_ctx.as_mut(),
@@ -439,7 +449,8 @@ pub fn process_completion_with_engine(
                         false,
                         false,
                     )?;
-                    let retry_items = dedupe_completion_items(retry_members);
+                    merge_completion_items(&mut retry_items, retry_members, MAX_COMPLETION_ITEMS);
+                    let retry_items = dedupe_completion_items(retry_items);
                     if log_enabled {
                         info!(
                             target: "ucore::completion",
@@ -514,6 +525,11 @@ pub fn process_completion_with_engine(
         let mut items = collect_buffer_type_items(root, content, line as usize, &prefix);
         merge_completion_items(
             &mut items,
+            collect_sema_visible_symbol_items(&sema, cursor_node, &prefix, true),
+            MAX_COMPLETION_ITEMS,
+        );
+        merge_completion_items(
+            &mut items,
             fetch_global_type_symbols_cached(conn, &prefix, &cache, "project")?,
             MAX_COMPLETION_ITEMS,
         );
@@ -543,6 +559,14 @@ pub fn process_completion_with_engine(
     let mut class_member_count = 0usize;
     if !prefix.is_empty() {
         if let Some(current_class) = current_class.as_deref() {
+            let sema_members = collect_sema_member_completion_items(
+                &sema,
+                current_class,
+                &prefix,
+                Some(current_class),
+                false,
+                declaration_context,
+            );
             let mut members = fetch_members_with_engine(
                 &mut ctx,
                 engine_ctx.as_mut(),
@@ -564,9 +588,11 @@ pub fn process_completion_with_engine(
                     &prefix,
                 );
             }
-            class_member_count = members.len();
+            let mut merged_members = sema_members;
+            merge_completion_items(&mut merged_members, members, MAX_COMPLETION_ITEMS);
+            class_member_count = merged_members.len();
 
-            merge_completion_items(&mut items, members, MAX_COMPLETION_ITEMS);
+            merge_completion_items(&mut items, merged_members, MAX_COMPLETION_ITEMS);
         }
     }
 
@@ -601,6 +627,11 @@ pub fn process_completion_with_engine(
         && strong_item_count(&items) < STRONG_MATCH_TARGET
         && !suppress_globals_for_class_context
     {
+        merge_completion_items(
+            &mut items,
+            collect_sema_visible_symbol_items(&sema, cursor_node, &prefix, false),
+            MAX_COMPLETION_ITEMS,
+        );
         let global_items = fetch_global_symbols_cached(conn, &prefix, &cache, "project")?;
         merge_completion_items(&mut items, global_items, MAX_COMPLETION_ITEMS);
 
@@ -858,6 +889,359 @@ fn collect_engine_member_roots(
     }
 
     Ok(roots)
+}
+
+fn collect_sema_member_completion_items(
+    sema: &SemaContext,
+    type_name: &str,
+    prefix: &str,
+    accessor_class: Option<&str>,
+    assume_subclass_access: bool,
+    declaration_context: bool,
+) -> Vec<Value> {
+    let Some(receiver_type) = sema.resolve_existing_type_text(type_name) else {
+        return Vec::new();
+    };
+    let Some(class_id) = sema.class_id_for_type(receiver_type) else {
+        return Vec::new();
+    };
+
+    let mut items = Vec::new();
+    let mut visited = HashSet::new();
+    let mut seen = HashSet::new();
+    collect_sema_member_completion_items_recursive(
+        sema,
+        receiver_type,
+        class_id,
+        prefix,
+        accessor_class.unwrap_or(""),
+        assume_subclass_access,
+        declaration_context,
+        0,
+        &mut visited,
+        &mut seen,
+        &mut items,
+    );
+    items
+}
+
+fn collect_sema_member_completion_items_recursive(
+    sema: &SemaContext,
+    receiver_type: crate::sema::types::TypeId,
+    class_id: SemaClassId,
+    prefix: &str,
+    accessor_class: &str,
+    assume_subclass_access: bool,
+    declaration_context: bool,
+    class_rank: usize,
+    visited: &mut HashSet<SemaClassId>,
+    seen: &mut HashSet<String>,
+    items: &mut Vec<Value>,
+) {
+    if !visited.insert(class_id) {
+        return;
+    }
+
+    let owner_name = sema.symbols.class_name(class_id).unwrap_or("").to_string();
+    if let Some(scope_id) = sema.symbols.class_scope(class_id)
+        && let Some(scope) = sema.scopes.get(scope_id)
+    {
+        for (name, symbol_ids) in &scope.symbols {
+            let match_rank = completion_match_rank(name, prefix);
+            if match_rank == COMPLETION_MATCH_NONE {
+                continue;
+            }
+
+            for symbol_id in symbol_ids {
+                let Some(symbol) = sema.symbols.get(*symbol_id) else {
+                    continue;
+                };
+
+                match &symbol.kind {
+                    SemaSymbolKind::Field { access, .. } => {
+                        if !sema_member_accessible(
+                            sema,
+                            class_id,
+                            accessor_class,
+                            *access,
+                            assume_subclass_access,
+                        ) {
+                            continue;
+                        }
+                        let return_type = sema
+                            .member_symbol_type(receiver_type, *symbol_id)
+                            .and_then(|type_id| sema.render_type(type_id))
+                            .unwrap_or_else(|| "member".to_string());
+                        let detail = member_detail(Some(return_type.as_str()), &owner_name);
+                        if !seen.insert(format!("{}:{}", name, detail)) {
+                            continue;
+                        }
+                        items.push(json!({
+                            "label": name,
+                            "kind": 5,
+                            "detail": detail,
+                            "documentation": detail,
+                            "insertText": name,
+                            "insertTextFormat": 1,
+                            "filterText": name,
+                            "sortText": completion_sort_text(class_rank * 1000 + match_rank, 5, name),
+                            "score_offset": completion_score_offset(match_rank),
+                            "labelDetails": {
+                                "detail": format!(" {}", member_detail(Some(return_type.as_str()), &owner_name)),
+                                "description": owner_name,
+                            },
+                            "sourceClass": owner_name,
+                        }));
+                    }
+                    SemaSymbolKind::Method { access, is_static, .. } => {
+                        if !sema_member_accessible(
+                            sema,
+                            class_id,
+                            accessor_class,
+                            *access,
+                            assume_subclass_access,
+                        ) {
+                            continue;
+                        }
+                        let Some(signature) = sema.member_callable_signature(receiver_type, *symbol_id) else {
+                            continue;
+                        };
+                        let return_type = sema.render_type(signature.return_t);
+                        let detail_signature = sema_function_signature_text(sema, &signature.params, signature.is_const_member);
+                        let detail = function_completion_detail(
+                            return_type.as_deref(),
+                            Some(detail_signature.as_str()),
+                            Some(owner_name.as_str()),
+                        );
+                        if !seen.insert(format!("{}:{}", name, detail)) {
+                            continue;
+                        }
+                        let insert_text = if declaration_context {
+                            function_declaration_insert_text(
+                                return_type.as_deref(),
+                                name,
+                                Some(detail_signature.as_str()),
+                                owner_name != accessor_class && !is_static,
+                            )
+                        } else {
+                            function_snippet_text(name, Some(detail_signature.as_str()))
+                        };
+                        items.push(json!({
+                            "label": name,
+                            "kind": 2,
+                            "detail": detail,
+                            "documentation": detail_signature,
+                            "insertText": insert_text,
+                            "insertTextFormat": if declaration_context { 1 } else { 2 },
+                            "filterText": name,
+                            "sortText": completion_sort_text(class_rank * 1000 + match_rank, 2, name),
+                            "score_offset": completion_score_offset(match_rank),
+                            "labelDetails": {
+                                "detail": format!(" {}", detail),
+                                "description": owner_name,
+                            },
+                            "sourceClass": owner_name,
+                        }));
+                    }
+                    _ => {}
+                }
+
+                if items.len() >= MAX_COMPLETION_ITEMS {
+                    return;
+                }
+            }
+        }
+    }
+
+    for parent_type in sema.symbols.class_parents(class_id) {
+        if let Some(parent_id) = sema.class_id_for_type(*parent_type) {
+            collect_sema_member_completion_items_recursive(
+                sema,
+                receiver_type,
+                parent_id,
+                prefix,
+                accessor_class,
+                assume_subclass_access,
+                declaration_context,
+                class_rank + 1,
+                visited,
+                seen,
+                items,
+            );
+            if items.len() >= MAX_COMPLETION_ITEMS {
+                return;
+            }
+        }
+    }
+}
+
+fn sema_member_accessible(
+    sema: &SemaContext,
+    owner: SemaClassId,
+    accessor_class: &str,
+    access: SemaAccess,
+    assume_subclass_access: bool,
+) -> bool {
+    if accessor_class.is_empty() {
+        return matches!(access, SemaAccess::Public);
+    }
+
+    let owner_name = sema.symbols.class_name(owner).unwrap_or("");
+    if accessor_class == owner_name {
+        return true;
+    }
+
+    match access {
+        SemaAccess::Public => true,
+        SemaAccess::Private => false,
+        SemaAccess::Protected => {
+            assume_subclass_access || sema_is_subclass_of(sema, accessor_class, owner_name)
+        }
+    }
+}
+
+fn sema_is_subclass_of(sema: &SemaContext, child: &str, parent: &str) -> bool {
+    if child == parent {
+        return true;
+    }
+    let Some(child_id) = sema.symbols.class_id_by_name(child) else {
+        return false;
+    };
+    let Some(parent_id) = sema.symbols.class_id_by_name(parent) else {
+        return false;
+    };
+    let mut queue = VecDeque::from([child_id]);
+    let mut visited = HashSet::new();
+    while let Some(current) = queue.pop_front() {
+        if !visited.insert(current) {
+            continue;
+        }
+        if current == parent_id {
+            return true;
+        }
+        for parent_type in sema.symbols.class_parents(current) {
+            if let Some(next_id) = sema.class_id_for_type(*parent_type) {
+                queue.push_back(next_id);
+            }
+        }
+    }
+    false
+}
+
+fn sema_function_signature_text(
+    sema: &SemaContext,
+    params: &[crate::sema::types::TypeId],
+    is_const_member: bool,
+) -> String {
+    let params = params
+        .iter()
+        .map(|type_id| sema.render_type(*type_id).unwrap_or_else(|| "auto".to_string()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if is_const_member {
+        format!("({params}) const")
+    } else {
+        format!("({params})")
+    }
+}
+
+fn collect_sema_visible_symbol_items(
+    sema: &SemaContext,
+    node: Node,
+    prefix: &str,
+    types_only: bool,
+) -> Vec<Value> {
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+    let mut current = Some(sema.scope_for_node(node));
+    while let Some(scope_id) = current {
+        let Some(scope) = sema.scopes.get(scope_id) else {
+            break;
+        };
+        for (name, symbol_ids) in &scope.symbols {
+            let match_rank = completion_match_rank(name, prefix);
+            if match_rank == COMPLETION_MATCH_NONE || !seen.insert(name.clone()) {
+                continue;
+            }
+            if let Some(item) = sema_symbol_completion_item(sema, symbol_ids, name, match_rank, types_only) {
+                items.push(item);
+            }
+        }
+        current = scope.parent;
+    }
+    items
+}
+
+fn sema_symbol_completion_item(
+    sema: &SemaContext,
+    symbol_ids: &[crate::sema::symbol::SymbolId],
+    name: &str,
+    match_rank: usize,
+    types_only: bool,
+) -> Option<Value> {
+    let symbol_id = *symbol_ids.first()?;
+    let symbol = sema.symbols.get(symbol_id)?;
+    match &symbol.kind {
+        SemaSymbolKind::Class { .. } => Some(json!({
+            "label": name,
+            "kind": 7,
+            "detail": "class",
+            "insertText": name,
+            "insertTextFormat": 1,
+            "filterText": name,
+            "sortText": completion_sort_text(match_rank, 7, name),
+            "score_offset": completion_score_offset(match_rank),
+        })),
+        SemaSymbolKind::Enum { .. } => Some(json!({
+            "label": name,
+            "kind": 13,
+            "detail": "enum",
+            "insertText": name,
+            "insertTextFormat": 1,
+            "filterText": name,
+            "sortText": completion_sort_text(match_rank, 13, name),
+            "score_offset": completion_score_offset(match_rank),
+        })),
+        SemaSymbolKind::Typedef { type_id } => Some(json!({
+            "label": name,
+            "kind": 25,
+            "detail": sema.render_type(*type_id).unwrap_or_else(|| "typedef".to_string()),
+            "insertText": name,
+            "insertTextFormat": 1,
+            "filterText": name,
+            "sortText": completion_sort_text(match_rank, 25, name),
+            "score_offset": completion_score_offset(match_rank),
+        })),
+        SemaSymbolKind::Function { decls } if !types_only => {
+            let detail = decls
+                .first()
+                .and_then(|decl| match sema.types.get(decl.type_id)? {
+                    SemaTypeKind::Function {
+                        return_t,
+                        params,
+                        is_const_member,
+                        ..
+                    } => Some(function_completion_detail(
+                        sema.render_type(*return_t).as_deref(),
+                        Some(sema_function_signature_text(sema, params, *is_const_member).as_str()),
+                        None,
+                    )),
+                    _ => None,
+                })
+                .unwrap_or_else(|| "function ()".to_string());
+            Some(json!({
+                "label": name,
+                "kind": 3,
+                "detail": detail,
+                "insertText": function_snippet_text(name, Some("()")),
+                "insertTextFormat": 2,
+                "filterText": name,
+                "sortText": completion_sort_text(match_rank, 3, name),
+                "score_offset": completion_score_offset(match_rank),
+            }))
+        }
+        _ => None,
+    }
 }
 
 /// Return the first direct parent class name for a class.
@@ -1314,12 +1698,22 @@ type BufferInheritanceMap = HashMap<String, Vec<String>>;
 fn resolve_expression_type_with_engine(
     ctx: &mut CompletionContext,
     engine_ctx: Option<&mut CompletionContext>,
+    sema: &SemaContext,
     node: Node,
     buffer_inheritance: &BufferInheritanceMap,
     root: Node,
     content: &str,
     cursor_row: usize,
 ) -> Result<Option<String>> {
+    if let Some(type_id) = sema_type_of_expression(sema, node)
+        && let Some(rendered) = sema.render_type(type_id)
+    {
+        let rendered = clean_type(&rendered);
+        if !rendered.is_empty() && rendered != "unknown" && rendered != "auto" {
+            return Ok(Some(rendered));
+        }
+    }
+
     let mut engine_ctx = engine_ctx;
 
     match node.kind() {
@@ -1383,6 +1777,7 @@ fn resolve_expression_type_with_engine(
             if let Some(ty) = resolve_special_call_type_with_engine(
                 ctx,
                 engine_ctx.as_deref_mut(),
+                sema,
                 function,
                 buffer_inheritance,
                 root,
@@ -1401,6 +1796,7 @@ fn resolve_expression_type_with_engine(
                         if let Some(object_type) = resolve_expression_type_with_engine(
                             ctx,
                             engine_ctx.as_deref_mut(),
+                            sema,
                             object,
                             buffer_inheritance,
                             root,
@@ -1456,6 +1852,7 @@ fn resolve_expression_type_with_engine(
                 if let Some(object_type) = resolve_expression_type_with_engine(
                     ctx,
                     engine_ctx.as_deref_mut(),
+                    sema,
                     object,
                     buffer_inheritance,
                     root,
@@ -1482,6 +1879,7 @@ fn resolve_expression_type_with_engine(
                 if let Some(object_type) = resolve_expression_type_with_engine(
                     ctx,
                     engine_ctx.as_deref_mut(),
+                    sema,
                     object,
                     buffer_inheritance,
                     root,
@@ -1501,6 +1899,7 @@ fn resolve_expression_type_with_engine(
                     return resolve_expression_type_with_engine(
                         ctx,
                         engine_ctx.as_deref_mut(),
+                        sema,
                         child,
                         buffer_inheritance,
                         root,
@@ -1522,6 +1921,7 @@ fn resolve_expression_type_with_engine(
 fn resolve_special_call_type_with_engine(
     ctx: &mut CompletionContext,
     engine_ctx: Option<&mut CompletionContext>,
+    sema: &SemaContext,
     function: Node,
     buffer_inheritance: &BufferInheritanceMap,
     root: Node,
@@ -1549,6 +1949,7 @@ fn resolve_special_call_type_with_engine(
     resolve_expression_type_with_engine(
         ctx,
         engine_ctx,
+        sema,
         function,
         buffer_inheritance,
         root,
@@ -4150,6 +4551,15 @@ fn complete_macro_specifiers(node: Node, content: &str) -> Option<Value> {
     }
 
     None
+}
+
+fn complete_macro_specifiers_with_fallback(
+    node: Node,
+    content: &str,
+    line: u32,
+    character: u32,
+) -> Option<Value> {
+    complete_macro_specifiers(node, content).or_else(|| complete_macro_specifiers_at(content, line, character))
 }
 
 /// Complete macro specifiers while the macro argument list is syntactically incomplete.

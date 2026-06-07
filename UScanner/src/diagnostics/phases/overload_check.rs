@@ -4,6 +4,7 @@ use tree_sitter::Node;
 use crate::diagnostics::{DiagnosticItem, DiagnosticSeverity, OverloadRules};
 use crate::sema::SemaContext;
 use crate::sema::overload::{self, CallResult};
+use crate::sema::symbol::SymbolId;
 use crate::sema::types::{TypeId, TypeKind};
 
 pub(crate) fn collect(
@@ -60,13 +61,28 @@ fn call_diagnostic_item(
             return None;
         }
     }
-    let candidates = resolve_callee_symbols(sema_ctx, callee)?;
-    if candidates.is_empty() {
+    let arg_types = argument_types(sema_ctx, node)?;
+    let candidates = resolve_callee_symbols(sema_ctx, callee, &arg_types)?;
+    if candidates.symbols.is_empty() {
         return None;
     }
 
-    let arg_types = argument_types(sema_ctx, node)?;
-    match overload::resolve_call_with_args(sema_ctx, &candidates, &arg_types) {
+    let result = if let Some(receiver_type) = candidates.receiver_type {
+        let callable = candidates
+            .symbols
+            .iter()
+            .filter_map(|symbol_id| {
+                sema_ctx
+                    .member_callable_signature(receiver_type, *symbol_id)
+                    .map(|signature| (*symbol_id, signature))
+            })
+            .collect::<Vec<_>>();
+        overload::resolve_call_with_signatures(sema_ctx, &callable, &arg_types)
+    } else {
+        overload::resolve_call_with_args(sema_ctx, &candidates.symbols, &arg_types)
+    };
+
+    match result {
         CallResult::Ok(_) => None,
         CallResult::Ambiguous(_) => Some(
             diagnostic_for_range(
@@ -79,11 +95,28 @@ fn call_diagnostic_item(
         ),
         CallResult::NoMatch { .. } => {
             let arg_count = arg_types.len();
-            let arity_mismatch = candidates
-                .iter()
-                .filter_map(|symbol_id| sema_ctx.symbol_type(*symbol_id))
-                .filter_map(|type_id| function_arity(sema_ctx, type_id))
-                .all(|(arity, is_variadic)| (!is_variadic && arity != arg_count) || (is_variadic && arg_count < arity));
+            let arity_mismatch = if let Some(receiver_type) = candidates.receiver_type {
+                candidates
+                    .symbols
+                    .iter()
+                    .filter_map(|symbol_id| {
+                        sema_ctx
+                            .member_callable_signature(receiver_type, *symbol_id)
+                            .map(signature_arity)
+                    })
+                    .all(|(min_arity, max_arity, is_variadic)| {
+                        arg_count < min_arity || (!is_variadic && arg_count > max_arity)
+                    })
+            } else {
+                candidates
+                    .symbols
+                    .iter()
+                    .filter_map(|symbol_id| sema_ctx.symbol_type(*symbol_id))
+                    .filter_map(|type_id| function_arity(sema_ctx, type_id))
+                    .all(|(min_arity, max_arity, is_variadic)| {
+                        arg_count < min_arity || (!is_variadic && arg_count > max_arity)
+                    })
+            };
 
             let (code, message) = if arity_mismatch {
                 (
@@ -128,23 +161,41 @@ fn build_template_index_for_node(
     Some(crate::sema::template::TemplateIndex::collect(root, ctx))
 }
 
-fn resolve_callee_symbols(sema_ctx: &SemaContext, callee: Node) -> Option<Vec<crate::sema::symbol::SymbolId>> {
+struct ResolvedCalleeSymbols {
+    symbols: Vec<SymbolId>,
+    receiver_type: Option<TypeId>,
+}
+
+fn resolve_callee_symbols(
+    sema_ctx: &SemaContext,
+    callee: Node,
+    arg_types: &[TypeId],
+) -> Option<ResolvedCalleeSymbols> {
     match callee.kind() {
         "identifier" | "field_identifier" => {
             let name = node_text(callee, sema_ctx)?.trim();
-            (!name.is_empty()).then(|| sema_ctx.lookup_name_at_node(callee, name))
+            (!name.is_empty()).then(|| ResolvedCalleeSymbols {
+                symbols: sema_ctx.lookup_call_name_at_node(callee, name, arg_types),
+                receiver_type: None,
+            })
         }
         "qualified_identifier" => {
-            let name_node = callee.child_by_field_name("name")?;
-            let name = node_text(name_node, sema_ctx)?.trim();
-            (!name.is_empty()).then(|| sema_ctx.lookup_name_at_node(callee, name))
+            let segments = qualified_identifier_segments(callee, sema_ctx)?;
+            let refs = segments.iter().map(String::as_str).collect::<Vec<_>>();
+            (!refs.is_empty()).then(|| ResolvedCalleeSymbols {
+                symbols: sema_ctx.lookup_qualified_name_at_node(callee, &refs),
+                receiver_type: None,
+            })
         }
         "field_expression" => {
             let receiver = callee.child_by_field_name("argument").or_else(|| callee.child(0))?;
             let field = callee.child_by_field_name("field")?;
             let receiver_type = crate::sema::expr::type_of_expression(sema_ctx, receiver)?;
             let field_name = node_text(field, sema_ctx)?.trim();
-            (!field_name.is_empty()).then(|| sema_ctx.lookup_class_member_symbols(receiver_type, field_name))
+            (!field_name.is_empty()).then(|| ResolvedCalleeSymbols {
+                symbols: sema_ctx.lookup_class_member_symbols(receiver_type, field_name),
+                receiver_type: Some(receiver_type),
+            })
         }
         _ => None,
     }
@@ -163,16 +214,67 @@ fn argument_types(sema_ctx: &SemaContext, node: Node) -> Option<Vec<TypeId>> {
     Some(out)
 }
 
-fn function_arity(sema_ctx: &SemaContext, type_id: TypeId) -> Option<(usize, bool)> {
+fn function_arity(sema_ctx: &SemaContext, type_id: TypeId) -> Option<(usize, usize, bool)> {
     let TypeKind::Function {
         params,
+        min_arity,
         is_variadic,
         ..
     } = sema_ctx.types.get(type_id)?
     else {
         return None;
     };
-    Some((params.len(), *is_variadic))
+    Some((*min_arity, params.len(), *is_variadic))
+}
+
+fn signature_arity(signature: crate::sema::MemberCallableSignature) -> (usize, usize, bool) {
+    (
+        signature.min_arity,
+        signature.params.len(),
+        signature.is_variadic,
+    )
+}
+
+fn qualified_identifier_segments(node: Node, sema_ctx: &SemaContext) -> Option<Vec<String>> {
+    let mut segments = Vec::new();
+    collect_qualified_identifier_segments(node, sema_ctx, &mut segments)?;
+    (!segments.is_empty()).then_some(segments)
+}
+
+fn collect_qualified_identifier_segments(
+    node: Node,
+    sema_ctx: &SemaContext,
+    segments: &mut Vec<String>,
+) -> Option<()> {
+    if node.kind() != "qualified_identifier" {
+        let text = node_text(node, sema_ctx)?.trim();
+        if text.is_empty() {
+            return Some(());
+        }
+        segments.extend(
+            text.split("::")
+                .map(str::trim)
+                .filter(|segment| !segment.is_empty())
+                .map(ToOwned::to_owned),
+        );
+        return Some(());
+    }
+
+    if let Some(scope) = node.child_by_field_name("scope") {
+        collect_qualified_identifier_segments(scope, sema_ctx, segments)?;
+    }
+    if let Some(name_node) = node.child_by_field_name("name") {
+        if name_node.kind() == "qualified_identifier" {
+            collect_qualified_identifier_segments(name_node, sema_ctx, segments)?;
+            return Some(());
+        }
+        let name = node_text(name_node, sema_ctx)?.trim();
+        if !name.is_empty() {
+            segments.push(name.to_string());
+        }
+    }
+
+    Some(())
 }
 
 fn diagnostic_for_range(

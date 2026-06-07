@@ -16,12 +16,29 @@ pub use expand::{preprocess_source, preprocess_source_with_resolver};
 pub use macro_table::MacroTable;
 
 static PREPROCESSOR_CONFIGS: OnceLock<Mutex<HashMap<String, PreprocessorConfigFile>>> = OnceLock::new();
+const MAX_INCLUDE_FINGERPRINT_DEPTH: usize = 32;
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct LineOrigin {
+    pub file_path: Option<String>,
+    pub line: u32,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct MappedPosition {
+    pub file_path: Option<String>,
+    pub line: u32,
+    pub character: u32,
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PreprocessResult {
     pub expanded_source: String,
     pub inactive_lines: HashSet<u32>,
+    #[serde(default)]
     pub line_column_maps: Vec<Vec<u32>>,
+    #[serde(default)]
+    pub line_origins: Vec<LineOrigin>,
 }
 
 impl PreprocessResult {
@@ -31,6 +48,35 @@ impl PreprocessResult {
         };
         let index = expanded_column.min(columns.len().saturating_sub(1) as u32) as usize;
         columns.get(index).copied().unwrap_or(expanded_column)
+    }
+
+    pub fn map_position(&self, line: u32, expanded_column: u32) -> MappedPosition {
+        let origin = self.line_origins.get(line as usize);
+        MappedPosition {
+            file_path: origin.and_then(|origin| origin.file_path.clone()),
+            line: origin.map(|origin| origin.line).unwrap_or(line),
+            character: self.map_column(line, expanded_column),
+        }
+    }
+
+    fn ensure_line_origins(&mut self, current_file: Option<&str>) {
+        if self.line_origins.is_empty() {
+            self.line_origins = (0..self.line_column_maps.len())
+                .map(|line| LineOrigin {
+                    file_path: current_file.map(normalize_path_string),
+                    line: line as u32,
+                })
+                .collect();
+            return;
+        }
+
+        while self.line_origins.len() < self.line_column_maps.len() {
+            let line = self.line_origins.len() as u32;
+            self.line_origins.push(LineOrigin {
+                file_path: current_file.map(normalize_path_string),
+                line,
+            });
+        }
     }
 }
 
@@ -56,6 +102,20 @@ pub struct IncludePathConfig {
     pub engine_search_dirs: Vec<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Default)]
+struct IncludeRootsFile {
+    #[serde(default)]
+    project: IncludeRootsSection,
+    #[serde(default)]
+    engine: IncludeRootsSection,
+}
+
+#[derive(Clone, Debug, Deserialize, Default)]
+struct IncludeRootsSection {
+    #[serde(default)]
+    search_dirs: Vec<String>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct IncludeResolver {
     current_file: Option<PathBuf>,
@@ -67,25 +127,44 @@ pub struct IncludeResolver {
 
 impl IncludeResolver {
     pub fn has_include(&self, include: &str) -> bool {
+        self.resolve_include_path(include).is_some()
+    }
+
+    pub fn resolve_include_path(&self, include: &str) -> Option<PathBuf> {
         let normalized = normalize_include_operand(include);
         if normalized.is_empty() {
-            return false;
+            return None;
         }
 
         let include_path = PathBuf::from(&normalized);
         if include_path.is_absolute() {
-            return include_path.is_file();
+            return include_path.is_file().then_some(include_path);
         }
 
         if let Some(current_dir) = self.current_file.as_deref().and_then(Path::parent) {
-            if current_dir.join(&include_path).is_file() {
-                return true;
+            let candidate = current_dir.join(&include_path);
+            if candidate.is_file() {
+                return Some(candidate);
             }
         }
 
         self.search_roots()
             .into_iter()
-            .any(|root| root.exists() && has_include_under_root(&root, &normalized))
+            .find_map(|root| root.exists().then(|| find_include_under_root(&root, &normalized)).flatten())
+    }
+
+    pub fn current_file_path(&self) -> Option<&Path> {
+        self.current_file.as_deref()
+    }
+
+    pub fn for_included_file(&self, current_file: PathBuf) -> Self {
+        Self {
+            current_file: Some(current_file),
+            project_root: self.project_root.clone(),
+            engine_root: self.engine_root.clone(),
+            project_search_dirs: self.project_search_dirs.clone(),
+            engine_search_dirs: self.engine_search_dirs.clone(),
+        }
     }
 
     fn search_roots(&self) -> Vec<PathBuf> {
@@ -124,17 +203,19 @@ pub fn preprocess_source_cached_with_resolver(
     include_resolver: Option<&IncludeResolver>,
     current_file: Option<&str>,
 ) -> PreprocessResult {
-    let Some(cache_path) = preprocess_cache_path(source, base_macros, current_file) else {
+    let Some(cache_path) = preprocess_cache_path(source, base_macros, include_resolver, current_file) else {
         return expand::preprocess_source_with_resolver(source, base_macros, include_resolver);
     };
 
     if let Ok(text) = fs::read_to_string(&cache_path) {
-        if let Ok(cached) = serde_json::from_str::<PreprocessResult>(&text) {
+        if let Ok(mut cached) = serde_json::from_str::<PreprocessResult>(&text) {
+            cached.ensure_line_origins(current_file);
             return cached;
         }
     }
 
-    let result = expand::preprocess_source_with_resolver(source, base_macros, include_resolver);
+    let mut result = expand::preprocess_source_with_resolver(source, base_macros, include_resolver);
+    result.ensure_line_origins(current_file);
     if let Some(parent) = cache_path.parent() {
         let _ = fs::create_dir_all(parent);
         if let Ok(text) = serde_json::to_string(&result) {
@@ -192,7 +273,7 @@ fn load_preprocessor_config(file_name: &str) -> PreprocessorConfigFile {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let path = Path::new(manifest_dir).join("data").join(file_name);
     let text = fs::read_to_string(path).unwrap_or_else(|_| default_text.to_string());
-    let mut parsed = toml::from_str(&text).unwrap_or_default();
+    let mut parsed = parse_preprocessor_config_file(&text).unwrap_or_default();
     merge_include_roots(&mut parsed);
     parsed
 }
@@ -200,6 +281,7 @@ fn load_preprocessor_config(file_name: &str) -> PreprocessorConfigFile {
 fn preprocess_cache_path(
     source: &str,
     base_macros: &MacroTable,
+    include_resolver: Option<&IncludeResolver>,
     current_file: Option<&str>,
 ) -> Option<PathBuf> {
     let current_file = current_file?;
@@ -217,24 +299,123 @@ fn preprocess_cache_path(
     hasher.update(&mtime.to_le_bytes());
     hasher.update(source.as_bytes());
     hasher.update(defines_hash.as_bytes());
+    if let Some(resolver) = include_resolver {
+        let mut visited = HashSet::new();
+        let mut macros = base_macros.clone();
+        hash_include_graph(source, &mut macros, resolver, 0, &mut visited, &mut hasher);
+    }
     let file_name = format!("{}.json", hasher.finalize().to_hex());
     Some(project_root.join(".ucore").join("preproc").join(file_name))
 }
 
-fn merge_include_roots(config: &mut PreprocessorConfigFile) {
-    let roots: PreprocessorConfigFile =
-        toml::from_str(include_str!("../../data/include_roots.toml")).unwrap_or_default();
+fn hash_include_graph(
+    source: &str,
+    macros: &mut MacroTable,
+    resolver: &IncludeResolver,
+    depth: usize,
+    visited: &mut HashSet<String>,
+    hasher: &mut blake3::Hasher,
+) {
+    if depth >= MAX_INCLUDE_FINGERPRINT_DEPTH {
+        return;
+    }
 
-    for dir in roots.include_paths.project_search_dirs {
+    for line in source.lines() {
+        let trimmed = line.trim_start();
+        let Some(directive) = tokenizer::parse_directive(trimmed) else {
+            continue;
+        };
+        if directive.name == "define" {
+            macros.define_from_directive(directive.body);
+            continue;
+        }
+        if directive.name == "undef" {
+            macros.undefine(directive.body.trim());
+            continue;
+        }
+        if directive.name != "include" {
+            continue;
+        }
+        let include = expand_include_operand(directive.body.trim(), macros);
+        let Some(path) = resolver.resolve_include_path(&include) else {
+            continue;
+        };
+        let key = path
+            .canonicalize()
+            .unwrap_or_else(|_| path.clone())
+            .to_string_lossy()
+            .replace('\\', "/");
+        if !visited.insert(key.clone()) {
+            continue;
+        }
+
+        hasher.update(key.as_bytes());
+        let include_mtime = fs::metadata(&path)
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|value| value.as_secs())
+            .unwrap_or(0);
+        hasher.update(&include_mtime.to_le_bytes());
+
+        if let Ok(include_source) = fs::read_to_string(&path) {
+            let child_resolver = resolver.for_included_file(path);
+            let mut child_macros = macros.clone();
+            hash_include_graph(
+                &include_source,
+                &mut child_macros,
+                &child_resolver,
+                depth + 1,
+                visited,
+                hasher,
+            );
+        }
+    }
+}
+
+fn merge_include_roots(config: &mut PreprocessorConfigFile) {
+    let roots = parse_include_roots_file(include_str!("../../data/include_roots.toml"));
+
+    for dir in roots.project_search_dirs {
         if !config.include_paths.project_search_dirs.iter().any(|existing| existing == &dir) {
             config.include_paths.project_search_dirs.push(dir);
         }
     }
 
-    for dir in roots.include_paths.engine_search_dirs {
+    for dir in roots.engine_search_dirs {
         if !config.include_paths.engine_search_dirs.iter().any(|existing| existing == &dir) {
             config.include_paths.engine_search_dirs.push(dir);
         }
+    }
+}
+
+fn parse_preprocessor_config_file(text: &str) -> Option<PreprocessorConfigFile> {
+    toml::from_str(text)
+        .ok()
+        .or_else(|| {
+            let roots = parse_include_roots_file(text);
+            (!roots.project_search_dirs.is_empty() || !roots.engine_search_dirs.is_empty()).then_some(
+                PreprocessorConfigFile {
+                    defines: PredefinedDefines::default(),
+                    include_paths: IncludePathConfig {
+                        project_search_dirs: roots.project_search_dirs,
+                        engine_search_dirs: roots.engine_search_dirs,
+                    },
+                },
+            )
+        })
+}
+
+struct ParsedIncludeRoots {
+    project_search_dirs: Vec<String>,
+    engine_search_dirs: Vec<String>,
+}
+
+fn parse_include_roots_file(text: &str) -> ParsedIncludeRoots {
+    let roots = toml::from_str::<IncludeRootsFile>(text).unwrap_or_default();
+    ParsedIncludeRoots {
+        project_search_dirs: roots.project.search_dirs,
+        engine_search_dirs: roots.engine.search_dirs,
     }
 }
 
@@ -248,6 +429,14 @@ fn normalize_include_operand(include: &str) -> String {
         .replace('\\', "/")
 }
 
+pub(crate) fn expand_include_operand(include: &str, macros: &MacroTable) -> String {
+    macros.expand_line(include.trim()).trim().to_string()
+}
+
+fn normalize_path_string(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
 fn expand_search_dirs(root: &Path, dirs: &[String], project_name: Option<&str>) -> Vec<PathBuf> {
     dirs.iter()
         .map(|dir| {
@@ -259,9 +448,10 @@ fn expand_search_dirs(root: &Path, dirs: &[String], project_name: Option<&str>) 
         .collect()
 }
 
-fn has_include_under_root(root: &Path, include: &str) -> bool {
-    if root.join(include).is_file() {
-        return true;
+fn find_include_under_root(root: &Path, include: &str) -> Option<PathBuf> {
+    let direct = root.join(include);
+    if direct.is_file() {
+        return Some(direct);
     }
 
     let include_suffix = include.replace('\\', "/");
@@ -271,7 +461,7 @@ fn has_include_under_root(root: &Path, include: &str) -> bool {
         .unwrap_or_default()
         .to_ascii_lowercase();
     if target_name.is_empty() {
-        return false;
+        return None;
     }
 
     WalkBuilder::new(root)
@@ -283,7 +473,7 @@ fn has_include_under_root(root: &Path, include: &str) -> bool {
         .build()
         .flatten()
         .filter(|entry| entry.file_type().map(|kind| kind.is_file()).unwrap_or(false))
-        .any(|entry| {
+        .find_map(|entry| {
             let path = entry.path();
             let file_name = path
                 .file_name()
@@ -291,7 +481,7 @@ fn has_include_under_root(root: &Path, include: &str) -> bool {
                 .unwrap_or_default()
                 .to_ascii_lowercase();
             if file_name != target_name {
-                return false;
+                return None;
             }
 
             let relative = path
@@ -299,7 +489,9 @@ fn has_include_under_root(root: &Path, include: &str) -> bool {
                 .ok()
                 .map(|path| path.to_string_lossy().replace('\\', "/"))
                 .unwrap_or_default();
-            relative.ends_with(&include_suffix)
+            relative
+                .ends_with(&include_suffix)
+                .then(|| path.to_path_buf())
         })
 }
 
@@ -482,6 +674,263 @@ mod tests {
     }
 
     #[test]
+    fn preproc_inlines_include_files_and_tracks_line_origins() {
+        let root = std::env::temp_dir().join(format!(
+            "ucore_preproc_include_inline_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let file = root.join("Source/MyGame/Private/Test.cpp");
+        let header = root.join("Source/MyGame/Public/MyHeader.h");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::create_dir_all(header.parent().unwrap()).unwrap();
+        fs::write(root.join("MyGame.uproject"), "{}").unwrap();
+        fs::write(&file, "#include \"MyHeader.h\"\nint32 TestValue();\n").unwrap();
+        fs::write(&header, "int32 HeaderValue();\nint32 HeaderValue2();\n").unwrap();
+
+        let resolver =
+            default_include_resolver_for_file("preprocessor.toml", Some(&file.to_string_lossy()));
+        let result = preprocess_source_with_resolver(
+            "#include \"MyHeader.h\"\nint32 TestValue();\n",
+            &default_macro_table(),
+            Some(&resolver),
+        );
+        let header_path = header.to_string_lossy().replace('\\', "/");
+        let file_path = file.to_string_lossy().replace('\\', "/");
+
+        assert!(result.expanded_source.contains("int32 HeaderValue();"));
+        assert!(result.expanded_source.contains("int32 HeaderValue2();"));
+
+        let included = result.map_position(1, 0);
+        assert_eq!(included.file_path.as_deref(), Some(header_path.as_str()));
+        assert_eq!(included.line, 0);
+
+        let source = result.map_position(3, 0);
+        assert_eq!(source.file_path.as_deref(), Some(file_path.as_str()));
+        assert_eq!(source.line, 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn preproc_inlines_include_files_via_macro_operand() {
+        let root = std::env::temp_dir().join(format!(
+            "ucore_preproc_include_macro_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let file = root.join("Source/MyGame/Private/Test.cpp");
+        let header = root.join("Source/MyGame/Public/MyHeader.h");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::create_dir_all(header.parent().unwrap()).unwrap();
+        fs::write(root.join("MyGame.uproject"), "{}").unwrap();
+        fs::write(
+            &file,
+            "#define HEADER_FILE \"MyHeader.h\"\n#include HEADER_FILE\nint32 TestValue();\n",
+        )
+        .unwrap();
+        fs::write(&header, "int32 HeaderValue();\n").unwrap();
+
+        let resolver =
+            default_include_resolver_for_file("preprocessor.toml", Some(&file.to_string_lossy()));
+        let result = preprocess_source_with_resolver(
+            "#define HEADER_FILE \"MyHeader.h\"\n#include HEADER_FILE\nint32 TestValue();\n",
+            &default_macro_table(),
+            Some(&resolver),
+        );
+
+        assert!(result.expanded_source.contains("int32 HeaderValue();"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn preproc_inlines_include_files_via_function_macro_operand() {
+        let root = std::env::temp_dir().join(format!(
+            "ucore_preproc_include_fn_macro_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let file = root.join("Source/MyGame/Private/Test.cpp");
+        let header = root.join("Source/MyGame/Public/MyHeader.h");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::create_dir_all(header.parent().unwrap()).unwrap();
+        fs::write(root.join("MyGame.uproject"), "{}").unwrap();
+        fs::write(
+            &file,
+            "#define HEADER_FILE() \"MyHeader.h\"\n#include HEADER_FILE()\nint32 TestValue();\n",
+        )
+        .unwrap();
+        fs::write(&header, "int32 HeaderValue();\n").unwrap();
+
+        let resolver =
+            default_include_resolver_for_file("preprocessor.toml", Some(&file.to_string_lossy()));
+        let result = preprocess_source_with_resolver(
+            "#define HEADER_FILE() \"MyHeader.h\"\n#include HEADER_FILE()\nint32 TestValue();\n",
+            &default_macro_table(),
+            Some(&resolver),
+        );
+
+        assert!(result.expanded_source.contains("int32 HeaderValue();"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn preproc_honors_pragma_once_for_repeated_includes() {
+        let root = std::env::temp_dir().join(format!(
+            "ucore_preproc_pragma_once_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let file = root.join("Source/MyGame/Private/Test.cpp");
+        let header = root.join("Source/MyGame/Public/MyHeader.h");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::create_dir_all(header.parent().unwrap()).unwrap();
+        fs::write(root.join("MyGame.uproject"), "{}").unwrap();
+        fs::write(
+            &file,
+            "#include \"MyHeader.h\"\n#include \"MyHeader.h\"\nint32 TestValue();\n",
+        )
+        .unwrap();
+        fs::write(&header, "#pragma once\nint32 HeaderValue();\n").unwrap();
+
+        let resolver =
+            default_include_resolver_for_file("preprocessor.toml", Some(&file.to_string_lossy()));
+        let result = preprocess_source_with_resolver(
+            "#include \"MyHeader.h\"\n#include \"MyHeader.h\"\nint32 TestValue();\n",
+            &default_macro_table(),
+            Some(&resolver),
+        );
+
+        assert_eq!(result.expanded_source.matches("int32 HeaderValue();").count(), 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn preproc_honors_ifndef_include_guard_for_repeated_includes() {
+        let root = std::env::temp_dir().join(format!(
+            "ucore_preproc_include_guard_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let file = root.join("Source/MyGame/Private/Test.cpp");
+        let header = root.join("Source/MyGame/Public/MyHeader.h");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::create_dir_all(header.parent().unwrap()).unwrap();
+        fs::write(root.join("MyGame.uproject"), "{}").unwrap();
+        fs::write(
+            &file,
+            "#include \"MyHeader.h\"\n#include \"MyHeader.h\"\nint32 TestValue();\n",
+        )
+        .unwrap();
+        fs::write(
+            &header,
+            "#ifndef MY_HEADER_H\n#define MY_HEADER_H\nint32 HeaderValue();\n#endif\n",
+        )
+        .unwrap();
+
+        let resolver =
+            default_include_resolver_for_file("preprocessor.toml", Some(&file.to_string_lossy()));
+        let result = preprocess_source_with_resolver(
+            "#include \"MyHeader.h\"\n#include \"MyHeader.h\"\nint32 TestValue();\n",
+            &default_macro_table(),
+            Some(&resolver),
+        );
+
+        assert_eq!(result.expanded_source.matches("int32 HeaderValue();").count(), 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn preproc_honors_if_defined_include_guard_for_repeated_includes() {
+        let root = std::env::temp_dir().join(format!(
+            "ucore_preproc_if_defined_guard_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let file = root.join("Source/MyGame/Private/Test.cpp");
+        let header = root.join("Source/MyGame/Public/MyHeader.h");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::create_dir_all(header.parent().unwrap()).unwrap();
+        fs::write(root.join("MyGame.uproject"), "{}").unwrap();
+        fs::write(
+            &file,
+            "#include \"MyHeader.h\"\n#include \"MyHeader.h\"\nint32 TestValue();\n",
+        )
+        .unwrap();
+        fs::write(
+            &header,
+            "#if !defined(MY_HEADER_H)\n#define MY_HEADER_H\nint32 HeaderValue();\n#endif\n",
+        )
+        .unwrap();
+
+        let resolver =
+            default_include_resolver_for_file("preprocessor.toml", Some(&file.to_string_lossy()));
+        let result = preprocess_source_with_resolver(
+            "#include \"MyHeader.h\"\n#include \"MyHeader.h\"\nint32 TestValue();\n",
+            &default_macro_table(),
+            Some(&resolver),
+        );
+
+        assert_eq!(result.expanded_source.matches("int32 HeaderValue();").count(), 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn preproc_honors_if_defined_without_parens_include_guard_for_repeated_includes() {
+        let root = std::env::temp_dir().join(format!(
+            "ucore_preproc_if_defined_no_parens_guard_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let file = root.join("Source/MyGame/Private/Test.cpp");
+        let header = root.join("Source/MyGame/Public/MyHeader.h");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::create_dir_all(header.parent().unwrap()).unwrap();
+        fs::write(root.join("MyGame.uproject"), "{}").unwrap();
+        fs::write(
+            &file,
+            "#include \"MyHeader.h\"\n#include \"MyHeader.h\"\nint32 TestValue();\n",
+        )
+        .unwrap();
+        fs::write(
+            &header,
+            "#if !defined MY_HEADER_H\n#define MY_HEADER_H\nint32 HeaderValue();\n#endif\n",
+        )
+        .unwrap();
+
+        let resolver =
+            default_include_resolver_for_file("preprocessor.toml", Some(&file.to_string_lossy()));
+        let result = preprocess_source_with_resolver(
+            "#include \"MyHeader.h\"\n#include \"MyHeader.h\"\nint32 TestValue();\n",
+            &default_macro_table(),
+            Some(&resolver),
+        );
+
+        assert_eq!(result.expanded_source.matches("int32 HeaderValue();").count(), 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn preproc_caches_expanded_output_on_disk() {
         let root = std::env::temp_dir().join(format!(
             "ucore_preproc_cache_{}",
@@ -520,6 +969,47 @@ mod tests {
             Some(&file.to_string_lossy()),
         );
         assert_eq!(result.expanded_source, result_again.expanded_source);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn preproc_cache_fingerprint_changes_when_included_header_changes() {
+        let root = std::env::temp_dir().join(format!(
+            "ucore_preproc_include_cache_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let file = root.join("Source/MyGame/Private/Test.cpp");
+        let header = root.join("Source/MyGame/Public/MyHeader.h");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::create_dir_all(header.parent().unwrap()).unwrap();
+        fs::write(root.join("MyGame.uproject"), "{}").unwrap();
+        fs::write(&file, "#include \"MyHeader.h\"\n").unwrap();
+        fs::write(&header, "int32 HeaderValue();\n").unwrap();
+
+        let resolver =
+            default_include_resolver_for_file("preprocessor.toml", Some(&file.to_string_lossy()));
+        let first = preprocess_source_cached_with_resolver(
+            "#include \"MyHeader.h\"\n",
+            &default_macro_table(),
+            Some(&resolver),
+            Some(&file.to_string_lossy()),
+        );
+        assert!(first.expanded_source.contains("HeaderValue"));
+
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        fs::write(&header, "float HeaderValue();\n").unwrap();
+
+        let second = preprocess_source_cached_with_resolver(
+            "#include \"MyHeader.h\"\n",
+            &default_macro_table(),
+            Some(&resolver),
+            Some(&file.to_string_lossy()),
+        );
+        assert!(second.expanded_source.contains("float HeaderValue();"));
 
         let _ = fs::remove_dir_all(root);
     }

@@ -1,8 +1,34 @@
-[include_paths]
-project_search_dirs = ["Source/${ProjectName}", "Source"]
-engine_search_dirs = [
+[project]
+search_dirs = [
+  "Source",
+  "Source/${ProjectName}",
+  "Source/${ProjectName}/Public",
+  "Source/${ProjectName}/Private",
+  "Plugins",
+  "Intermediate/Build/Win64/UnrealEditor/Inc/${ProjectName}",
+]
+
+[engine]
+search_dirs = [
   "Engine/Source/Runtime",
   "Engine/Source/Developer",
   "Engine/Source/Editor",
-  "Engine/Plugins",
+  "Engine/Source/ThirdParty",
+  "Engine/Plugins/Runtime",
+  "Engine/Plugins/Editor",
+  "Engine/Plugins/Experimental",
+  "Engine/Plugins/Online",
+  "Engine/Plugins/2D",
+  "Engine/Plugins/Slate",
+  "Engine/Plugins/EnhancedInput",
+  "Engine/Plugins/Compositing",
+  "Engine/Plugins/FX",
+  "Engine/Intermediate/Build/Win64/UnrealEditor/Inc",
+]
+
+[ignore]
+prefixes = [
+  "ThirdParty/",
+  "windows.h",
+  "winsock2.h",
 ]

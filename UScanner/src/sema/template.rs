@@ -8,8 +8,15 @@ use super::SemaContext;
 
 #[derive(Clone, Debug)]
 pub enum TemplateParam {
-    TypeParam { name: String },
-    NonTypeParam { name: String, declared_type: String },
+    TypeParam {
+        name: String,
+        default_arg: Option<ExplicitTemplateArg>,
+    },
+    NonTypeParam {
+        name: String,
+        declared_type: String,
+        default_arg: Option<ExplicitTemplateArg>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -22,7 +29,15 @@ pub struct TemplateDecl {
     pub is_sfinae_guarded: bool,
     pub sfinae_always_rejects: bool,
     pub is_explicit_specialization: bool,
+    pub specialization_args: Vec<ExplicitTemplateArg>,
     pub signature_key: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConstraintState {
+    None,
+    Guarded,
+    AlwaysReject,
 }
 
 #[derive(Clone, Debug)]
@@ -102,19 +117,14 @@ impl TemplateIndex {
         let decls = self.decls_by_name.get(&name)?;
         let explicit_args = explicit_template_args(callee, sema_ctx);
         let arg_types = call_argument_types(call, sema_ctx);
-        let has_explicit_args = !explicit_args.is_empty();
+        let has_explicit_args = has_template_argument_list(callee);
 
         let mut saw_arity = false;
         let mut saw_non_type_mismatch = false;
         let mut saw_sfinae = false;
         let mut saw_deduction_fail = false;
 
-        for decl in decls {
-            if has_explicit_args && explicit_args.len() > decl.params.len() {
-                saw_arity = true;
-                continue;
-            }
-
+        for decl in ordered_template_decls(decls) {
             match analyze_decl_call(decl, &explicit_args, &arg_types, sema_ctx) {
                 None => return None,
                 Some(TemplateCallFailure::ExplicitArityMismatch) => saw_arity = true,
@@ -146,12 +156,31 @@ impl TemplateIndex {
         let explicit_args = explicit_template_args(callee, sema_ctx);
         let arg_types = call_argument_types(call, sema_ctx);
 
-        for decl in decls {
-            let Ok(bindings) = bind_decl_call(decl, &explicit_args, &arg_types, sema_ctx) else {
-                continue;
-            };
+        for decl in ordered_template_decls(decls) {
             match &decl.kind {
                 TemplateDeclKind::Function { return_pattern, .. } => {
+                    if decl.is_explicit_specialization {
+                        if analyze_explicit_specialization_call(
+                            decl,
+                            &explicit_args,
+                            &arg_types,
+                            sema_ctx,
+                        )
+                        .is_none()
+                            && let Some(type_id) = instantiate_return_pattern(
+                                return_pattern,
+                                &HashMap::new(),
+                                sema_ctx,
+                            )
+                        {
+                            return Some(type_id);
+                        }
+                        continue;
+                    }
+                    let Ok(bindings) = bind_decl_call(decl, &explicit_args, &arg_types, sema_ctx)
+                    else {
+                        continue;
+                    };
                     if let Some(type_id) =
                         instantiate_return_pattern(return_pattern, &bindings, sema_ctx)
                     {
@@ -159,6 +188,25 @@ impl TemplateIndex {
                     }
                 }
                 TemplateDeclKind::Class { .. } => {
+                    if decl.is_explicit_specialization {
+                        if analyze_explicit_specialization_call(
+                            decl,
+                            &explicit_args,
+                            &arg_types,
+                            sema_ctx,
+                        )
+                        .is_none()
+                            && let Some(type_id) =
+                                instantiate_specialization_decl_type(decl, sema_ctx)
+                        {
+                            return Some(type_id);
+                        }
+                        continue;
+                    }
+                    let Ok(bindings) = bind_decl_call(decl, &explicit_args, &arg_types, sema_ctx)
+                    else {
+                        continue;
+                    };
                     if let Some(type_id) = instantiate_decl_type(decl, &bindings, sema_ctx) {
                         return Some(type_id);
                     }
@@ -176,21 +224,18 @@ impl TemplateIndex {
         if template_type.kind() != "template_type" {
             return None;
         }
-        let name_node = template_type.child_by_field_name("name")?;
-        let name = node_text(name_node, sema_ctx.source()?)?.trim();
+        let name = template_type_name(template_type, sema_ctx)?;
         if name.is_empty() {
             return None;
         }
         let decls = self.decls_by_name.get(name)?;
         let explicit_args = explicit_template_args_from_type(template_type, sema_ctx);
-        if explicit_args.is_empty() {
-            return None;
-        }
 
         let mut saw_arity = false;
         let mut saw_non_type_mismatch = false;
+        let mut saw_sfinae = false;
 
-        for decl in decls {
+        for decl in ordered_template_decls(decls) {
             if !matches!(decl.kind, TemplateDeclKind::Class { .. }) {
                 continue;
             }
@@ -198,6 +243,7 @@ impl TemplateIndex {
                 None => return None,
                 Some(TemplateCallFailure::ExplicitArityMismatch) => saw_arity = true,
                 Some(TemplateCallFailure::NonTypeArgMismatch) => saw_non_type_mismatch = true,
+                Some(TemplateCallFailure::SfinaeRejected) => saw_sfinae = true,
                 Some(_) => {}
             }
         }
@@ -206,6 +252,8 @@ impl TemplateIndex {
             TemplateCallFailure::ExplicitArityMismatch
         } else if saw_non_type_mismatch {
             TemplateCallFailure::NonTypeArgMismatch
+        } else if saw_sfinae {
+            TemplateCallFailure::SfinaeRejected
         } else {
             return None;
         };
@@ -248,11 +296,13 @@ fn collect_template_decls(node: Node, sema_ctx: &SemaContext, index: &mut Templa
                         end: decl.end_source.clone(),
                     });
             }
-            index
-                .decls_by_name
-                .entry(decl.name.clone())
-                .or_default()
-                .push(decl);
+            for key in template_lookup_keys(&decl.name) {
+                index
+                    .decls_by_name
+                    .entry(key)
+                    .or_default()
+                    .push(decl.clone());
+            }
         }
     }
 
@@ -271,12 +321,17 @@ fn parse_template_decl(node: Node, sema_ctx: &SemaContext) -> Option<TemplateDec
 
     let (name, kind, signature_key) = if let Some(class_node) = find_template_class_node(node) {
         let name_node = class_like_name_node(class_node)?;
-        let name = node_text(name_node, source)?.trim().to_string();
+        let name = qualify_template_decl_name(node, node_text(name_node, source)?.trim(), source);
         if name.is_empty() {
             return None;
         }
         let constructors =
-            parse_class_template_constructors(class_node, source, &param_kinds, &name);
+            parse_class_template_constructors(
+                class_node,
+                source,
+                &param_kinds,
+                short_name(&name),
+            );
         (
             name.clone(),
             TemplateDeclKind::Class { constructors },
@@ -289,7 +344,7 @@ fn parse_template_decl(node: Node, sema_ctx: &SemaContext) -> Option<TemplateDec
             .child_by_field_name("declarator")
             .or_else(|| find_descendant(function_node, "function_declarator"))?;
         let name_node = find_name_node(declarator)?;
-        let name = node_text(name_node, source)?.trim().to_string();
+        let name = qualify_template_decl_name(node, node_text(name_node, source)?.trim(), source);
         if name.is_empty() {
             return None;
         }
@@ -297,7 +352,10 @@ fn parse_template_decl(node: Node, sema_ctx: &SemaContext) -> Option<TemplateDec
             parse_function_param_patterns(function_node, source, &param_kinds);
         let return_pattern = function_node
             .child_by_field_name("type")
-            .map(|node| type_pattern_from_node(node, source, &param_kinds))
+            .map(|node| {
+                let pattern = type_pattern_from_node(node, source, &param_kinds);
+                apply_pattern_declarator_wrappers(pattern, Some(declarator))
+            })
             .unwrap_or(TypePattern::Concrete("void".to_string()));
         (
             name.clone(),
@@ -308,6 +366,8 @@ fn parse_template_decl(node: Node, sema_ctx: &SemaContext) -> Option<TemplateDec
             normalize_signature_key(function_node, source, &name),
         )
     };
+
+    let constraint_state = template_constraint_state(node, source);
 
     Some(TemplateDecl {
         name,
@@ -321,14 +381,61 @@ fn parse_template_decl(node: Node, sema_ctx: &SemaContext) -> Option<TemplateDec
             line: node.end_position().row as u32,
             column: node.end_position().column as u32,
         },
-        is_sfinae_guarded: template_text.contains("enable_if")
-            || template_text.contains("requires"),
-        sfinae_always_rejects: template_text.contains("enable_if_t<false")
-            || template_text.contains("enable_if<false")
-            || template_text.contains("requires false"),
+        is_sfinae_guarded: !matches!(constraint_state, ConstraintState::None),
+        sfinae_always_rejects: matches!(constraint_state, ConstraintState::AlwaysReject),
         is_explicit_specialization: template_text.trim_start().starts_with("template<>")
             || template_text.trim_start().starts_with("template <>"),
+        specialization_args: explicit_specialization_args(node, sema_ctx),
         signature_key,
+    })
+}
+
+fn template_constraint_state(node: Node, source: &str) -> ConstraintState {
+    let mut state = ConstraintState::None;
+
+    if let Some(requires_clause) = find_descendant(node, "requires_clause") {
+        let normalized = node_text(requires_clause, source)
+            .unwrap_or("")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let predicate = normalized
+            .strip_prefix("requires ")
+            .unwrap_or(normalized.as_str())
+            .trim();
+        return if predicate == "false" {
+            ConstraintState::AlwaysReject
+        } else {
+            ConstraintState::Guarded
+        };
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if let Some(found) = find_descendant(child, "template_type")
+            && let Some(found_state) = enable_if_constraint_state(found, source)
+        {
+            if matches!(found_state, ConstraintState::AlwaysReject) {
+                return ConstraintState::AlwaysReject;
+            }
+            state = ConstraintState::Guarded;
+        }
+    }
+
+    state
+}
+
+fn enable_if_constraint_state(node: Node, source: &str) -> Option<ConstraintState> {
+    let base = template_type_base_name(node, source)?;
+    if !is_enable_if_base(&base) {
+        return None;
+    }
+    let args = template_type_args(node, source);
+    let condition = args.first()?.trim();
+    Some(if normalize_template_value(condition) == "false" {
+        ConstraintState::AlwaysReject
+    } else {
+        ConstraintState::Guarded
     })
 }
 
@@ -347,7 +454,10 @@ fn parse_template_params(node: Option<Node>, source: &str) -> Vec<TemplateParam>
                 {
                     let name = node_text(name_node, source).unwrap_or("").trim().to_string();
                     if !name.is_empty() {
-                        params.push(TemplateParam::TypeParam { name });
+                        params.push(TemplateParam::TypeParam {
+                            name,
+                            default_arg: parse_type_param_default(child, source),
+                        });
                     }
                 }
             }
@@ -365,7 +475,11 @@ fn parse_template_params(node: Option<Node>, source: &str) -> Vec<TemplateParam>
                     .trim()
                     .to_string();
                 if !name.is_empty() && !declared_type.is_empty() {
-                    params.push(TemplateParam::NonTypeParam { name, declared_type });
+                    params.push(TemplateParam::NonTypeParam {
+                        name,
+                        declared_type,
+                        default_arg: parse_non_type_param_default(child, source),
+                    });
                 }
             }
             _ => {}
@@ -409,19 +523,11 @@ fn parameter_pattern(
     template_param_kinds: &HashMap<String, bool>,
 ) -> Option<TypePattern> {
     let type_node = node.child_by_field_name("type")?;
-    let mut pattern = type_pattern_from_node(type_node, source, template_param_kinds);
-
-    let mut cursor = node.child_by_field_name("declarator");
-    while let Some(declarator) = cursor {
-        pattern = match declarator.kind() {
-            "pointer_declarator" => TypePattern::Pointer(Box::new(pattern)),
-            "reference_declarator" => TypePattern::Reference(Box::new(pattern)),
-            _ => pattern,
-        };
-        cursor = declarator.child_by_field_name("declarator");
-    }
-
-    Some(pattern)
+    let pattern = type_pattern_from_node(type_node, source, template_param_kinds);
+    Some(apply_pattern_declarator_wrappers(
+        pattern,
+        node.child_by_field_name("declarator"),
+    ))
 }
 
 fn type_pattern_from_node(
@@ -430,13 +536,40 @@ fn type_pattern_from_node(
     template_param_kinds: &HashMap<String, bool>,
 ) -> TypePattern {
     match node.kind() {
+        "type_descriptor" => node
+            .named_child(0)
+            .map(|child| type_pattern_from_node(child, source, template_param_kinds))
+            .unwrap_or_else(|| {
+                TypePattern::Concrete(crate::parser::cpp::clean_type_string(
+                    node_text(node, source).unwrap_or(""),
+                ))
+            }),
+        "qualified_identifier" | "qualified_unreal_type_identifier" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let mut pattern = type_pattern_from_node(name_node, source, template_param_kinds);
+                if let TypePattern::TemplateInstance { base, .. } = &mut pattern
+                    && let Some(scope_node) = node.child_by_field_name("scope")
+                {
+                    let scope = crate::parser::cpp::clean_type_string(
+                        node_text(scope_node, source).unwrap_or(""),
+                    );
+                    if !scope.is_empty() {
+                        *base = format!("{scope}::{base}");
+                    }
+                }
+                return pattern;
+            }
+
+            TypePattern::Concrete(crate::parser::cpp::clean_type_string(
+                node_text(node, source).unwrap_or(""),
+            ))
+        }
         "template_type" => {
             let base = node
                 .child_by_field_name("name")
                 .and_then(|name| node_text(name, source))
-                .unwrap_or("")
-                .trim()
-                .to_string();
+                .map(crate::parser::cpp::clean_type_string)
+                .unwrap_or_default();
             let mut args = Vec::new();
             if let Some(arg_list) = node.child_by_field_name("arguments") {
                 let mut cursor = arg_list.walk();
@@ -488,12 +621,31 @@ fn type_pattern_from_node(
     }
 }
 
+fn apply_pattern_declarator_wrappers(
+    mut pattern: TypePattern,
+    declarator: Option<Node>,
+) -> TypePattern {
+    let mut cursor = declarator;
+    while let Some(node) = cursor {
+        pattern = match node.kind() {
+            "pointer_declarator" => TypePattern::Pointer(Box::new(pattern)),
+            "reference_declarator" => TypePattern::Reference(Box::new(pattern)),
+            _ => pattern,
+        };
+        cursor = next_declarator_node(node);
+    }
+    pattern
+}
+
 fn analyze_decl_call(
     decl: &TemplateDecl,
     explicit_args: &[ExplicitTemplateArg],
     arg_types: &[TypeId],
     sema_ctx: &SemaContext,
 ) -> Option<TemplateCallFailure> {
+    if decl.is_explicit_specialization {
+        return analyze_explicit_specialization_call(decl, explicit_args, arg_types, sema_ctx);
+    }
     bind_decl_call(decl, explicit_args, arg_types, sema_ctx).err()
 }
 
@@ -508,20 +660,7 @@ fn bind_decl_call(
         let Some(param) = decl.params.get(index) else {
             return Err(TemplateCallFailure::ExplicitArityMismatch);
         };
-        match (param, explicit_arg) {
-            (TemplateParam::TypeParam { name }, ExplicitTemplateArg::Type(value)) => {
-                bindings.insert(name.clone(), TemplateBinding::Text(value.clone()));
-            }
-            (TemplateParam::NonTypeParam { name, .. }, ExplicitTemplateArg::Value(value)) => {
-                bindings.insert(name.clone(), TemplateBinding::Value(value.clone()));
-            }
-            (TemplateParam::NonTypeParam { .. }, ExplicitTemplateArg::Type(_)) => {
-                return Err(TemplateCallFailure::NonTypeArgMismatch);
-            }
-            (TemplateParam::TypeParam { .. }, ExplicitTemplateArg::Value(_)) => {
-                return Err(TemplateCallFailure::DeductionFail);
-            }
-        }
+        bind_explicit_template_arg(param, explicit_arg, sema_ctx, &mut bindings)?;
     }
 
     match &decl.kind {
@@ -550,9 +689,13 @@ fn bind_decl_call(
         }
     }
 
+    for param in decl.params.iter().skip(explicit_args.len()) {
+        bind_default_template_arg(param, sema_ctx, &mut bindings)?;
+    }
+
     for param in &decl.params {
         match param {
-            TemplateParam::TypeParam { name } => {
+            TemplateParam::TypeParam { name, .. } => {
                 if !bindings.contains_key(name) {
                     return Err(if decl.is_sfinae_guarded {
                         TemplateCallFailure::SfinaeRejected
@@ -561,7 +704,11 @@ fn bind_decl_call(
                     });
                 }
             }
-            TemplateParam::NonTypeParam { name, declared_type } => {
+            TemplateParam::NonTypeParam {
+                name,
+                declared_type,
+                ..
+            } => {
                 let Some(binding) = bindings.get(name) else {
                     return Err(TemplateCallFailure::DeductionFail);
                 };
@@ -586,13 +733,22 @@ fn analyze_class_template_usage(
     if !matches!(decl.kind, TemplateDeclKind::Class { .. }) {
         return None;
     }
-    if explicit_args.len() != decl.params.len() {
-        return Some(TemplateCallFailure::ExplicitArityMismatch);
+    if decl.is_explicit_specialization {
+        let failure =
+            explicit_specialization_args_match(decl, explicit_args, None).err()?;
+        return Some(failure);
     }
+    let explicit_args = match apply_default_template_args(&decl.params, explicit_args, false) {
+        Ok(args) => args,
+        Err(failure) => return Some(failure),
+    };
     for (param, arg) in decl.params.iter().zip(explicit_args.iter()) {
         match (param, arg) {
             (TemplateParam::TypeParam { .. }, ExplicitTemplateArg::Type(_)) => {}
-            (TemplateParam::NonTypeParam { declared_type, .. }, ExplicitTemplateArg::Value(value)) => {
+            (
+                TemplateParam::NonTypeParam { declared_type, .. },
+                ExplicitTemplateArg::Value(value),
+            ) => {
                 if !matches_non_type_value(value, declared_type) {
                     return Some(TemplateCallFailure::NonTypeArgMismatch);
                 }
@@ -605,7 +761,156 @@ fn analyze_class_template_usage(
             }
         }
     }
+    if decl.sfinae_always_rejects {
+        return Some(TemplateCallFailure::SfinaeRejected);
+    }
     None
+}
+
+fn analyze_explicit_specialization_call(
+    decl: &TemplateDecl,
+    explicit_args: &[ExplicitTemplateArg],
+    arg_types: &[TypeId],
+    sema_ctx: &SemaContext,
+) -> Option<TemplateCallFailure> {
+    if let Err(failure) = explicit_specialization_args_match(decl, explicit_args, Some(sema_ctx)) {
+        return Some(failure);
+    }
+
+    match &decl.kind {
+        TemplateDeclKind::Function { function_params, .. } => {
+            if arg_types.len() != function_params.len() {
+                return Some(TemplateCallFailure::DeductionFail);
+            }
+            let mut bindings = HashMap::new();
+            for (pattern, arg_type) in function_params.iter().zip(arg_types.iter().copied()) {
+                if !match_type_pattern(pattern, arg_type, sema_ctx, &mut bindings) {
+                    return Some(if decl.is_sfinae_guarded {
+                        TemplateCallFailure::SfinaeRejected
+                    } else {
+                        TemplateCallFailure::DeductionFail
+                    });
+                }
+            }
+        }
+        TemplateDeclKind::Class { constructors } => {
+            if !constructors.is_empty()
+                && !constructors.iter().any(|ctor| {
+                    ctor.len() == arg_types.len() && ctor
+                        .iter()
+                        .zip(arg_types.iter().copied())
+                        .all(|(pattern, arg_type)| {
+                            let mut bindings = HashMap::new();
+                            match_type_pattern(pattern, arg_type, sema_ctx, &mut bindings)
+                        })
+                })
+            {
+                return Some(if decl.is_sfinae_guarded {
+                    TemplateCallFailure::SfinaeRejected
+                } else {
+                    TemplateCallFailure::DeductionFail
+                });
+            }
+        }
+    }
+
+    if decl.sfinae_always_rejects {
+        return Some(TemplateCallFailure::SfinaeRejected);
+    }
+
+    None
+}
+
+fn explicit_specialization_args_match(
+    decl: &TemplateDecl,
+    explicit_args: &[ExplicitTemplateArg],
+    sema_ctx: Option<&SemaContext>,
+) -> Result<(), TemplateCallFailure> {
+    if decl.specialization_args.is_empty() {
+        return Ok(());
+    }
+    if explicit_args.is_empty() {
+        return Ok(());
+    }
+    if explicit_args.len() != decl.specialization_args.len() {
+        return Err(TemplateCallFailure::ExplicitArityMismatch);
+    }
+
+    for (expected, actual) in decl.specialization_args.iter().zip(explicit_args.iter()) {
+        match (expected, actual) {
+            (ExplicitTemplateArg::Type(expected), ExplicitTemplateArg::Type(actual)) => {
+                if !template_arg_type_texts_match(expected, actual, sema_ctx) {
+                    return Err(TemplateCallFailure::DeductionFail);
+                }
+            }
+            (ExplicitTemplateArg::Value(expected), ExplicitTemplateArg::Value(actual)) => {
+                if normalize_template_value(expected) != normalize_template_value(actual) {
+                    return Err(TemplateCallFailure::NonTypeArgMismatch);
+                }
+            }
+            (ExplicitTemplateArg::Type(_), ExplicitTemplateArg::Value(_))
+            | (ExplicitTemplateArg::Value(_), ExplicitTemplateArg::Type(_)) => {
+                return Err(TemplateCallFailure::NonTypeArgMismatch);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn bind_explicit_template_arg(
+    param: &TemplateParam,
+    explicit_arg: &ExplicitTemplateArg,
+    sema_ctx: &SemaContext,
+    bindings: &mut HashMap<String, TemplateBinding>,
+) -> std::result::Result<(), TemplateCallFailure> {
+    match (param, explicit_arg) {
+        (TemplateParam::TypeParam { name, .. }, ExplicitTemplateArg::Type(value)) => {
+            let binding = resolve_type_name_existing(sema_ctx, value)
+                .map(TemplateBinding::Type)
+                .unwrap_or_else(|| TemplateBinding::Text(value.clone()));
+            bindings.insert(name.clone(), binding);
+            Ok(())
+        }
+        (TemplateParam::NonTypeParam { name, .. }, ExplicitTemplateArg::Value(value)) => {
+            bindings.insert(name.clone(), TemplateBinding::Value(value.clone()));
+            Ok(())
+        }
+        (TemplateParam::NonTypeParam { .. }, ExplicitTemplateArg::Type(_)) => {
+            Err(TemplateCallFailure::NonTypeArgMismatch)
+        }
+        (TemplateParam::TypeParam { .. }, ExplicitTemplateArg::Value(_)) => {
+            Err(TemplateCallFailure::DeductionFail)
+        }
+    }
+}
+
+fn bind_default_template_arg(
+    param: &TemplateParam,
+    sema_ctx: &SemaContext,
+    bindings: &mut HashMap<String, TemplateBinding>,
+) -> std::result::Result<(), TemplateCallFailure> {
+    let (name, default_arg) = match param {
+        TemplateParam::TypeParam {
+            name,
+            default_arg,
+        }
+        | TemplateParam::NonTypeParam {
+            name,
+            default_arg,
+            ..
+        } => (name, default_arg),
+    };
+
+    if bindings.contains_key(name) {
+        return Ok(());
+    }
+
+    let Some(default_arg) = default_arg.as_ref() else {
+        return Ok(());
+    };
+
+    bind_explicit_template_arg(param, default_arg, sema_ctx, bindings)
 }
 
 fn match_type_pattern(
@@ -644,7 +949,9 @@ fn match_type_pattern(
                         bind_template_value(name, value, bindings)
                     }
                     (TypePattern::Concrete(expected_text), TemplateArg::Type(type_id)) => {
-                        render_type(sema_ctx, *type_id) == *expected_text
+                        resolve_type_name_existing(sema_ctx, expected_text)
+                            .map(|expected_id| sema_ctx.types_equivalent(expected_id, *type_id))
+                            .unwrap_or_else(|| render_type(sema_ctx, *type_id) == *expected_text)
                     }
                     (TypePattern::Value(expected), TemplateArg::Value(actual)) => expected == actual,
                     (
@@ -656,7 +963,9 @@ fn match_type_pattern(
                     _ => false,
                 })
         }
-        TypePattern::Concrete(expected) => render_type(sema_ctx, arg_type) == *expected,
+        TypePattern::Concrete(expected) => resolve_type_name_existing(sema_ctx, expected)
+            .map(|expected_id| sema_ctx.types_equivalent(expected_id, arg_type))
+            .unwrap_or_else(|| render_type(sema_ctx, arg_type) == *expected),
     }
 }
 
@@ -667,8 +976,10 @@ fn bind_template_type(
     bindings: &mut HashMap<String, TemplateBinding>,
 ) -> bool {
     match bindings.get(name) {
-        Some(TemplateBinding::Type(existing)) => *existing == arg_type,
-        Some(TemplateBinding::Text(existing)) => render_type(sema_ctx, arg_type) == *existing,
+        Some(TemplateBinding::Type(existing)) => sema_ctx.types_equivalent(*existing, arg_type),
+        Some(TemplateBinding::Text(existing)) => resolve_type_name_existing(sema_ctx, existing)
+            .map(|expected_id| sema_ctx.types_equivalent(expected_id, arg_type))
+            .unwrap_or_else(|| render_type(sema_ctx, arg_type) == *existing),
         Some(TemplateBinding::Value(_)) => false,
         None => {
             bindings.insert(name.to_string(), TemplateBinding::Type(arg_type));
@@ -759,7 +1070,7 @@ fn call_argument_types(call: Node, sema_ctx: &SemaContext) -> Vec<TypeId> {
 
 fn template_callee_name(callee: Node, sema_ctx: &SemaContext) -> Option<String> {
     let source = sema_ctx.source()?;
-    match callee.kind() {
+    let raw = match callee.kind() {
         "template_function" | "template_method" => callee
             .child_by_field_name("name")
             .and_then(|name| node_text(name, source))
@@ -767,13 +1078,49 @@ fn template_callee_name(callee: Node, sema_ctx: &SemaContext) -> Option<String> 
         "identifier" | "field_identifier" => {
             node_text(callee, source).map(|text| text.trim().to_string())
         }
-        "qualified_identifier" => callee
-            .child_by_field_name("name")
-            .and_then(|name| node_text(name, source))
-            .map(|text| text.trim().to_string()),
+        "qualified_identifier" => node_text(callee, source).map(|text| text.trim().to_string()),
         _ => None,
+    }?;
+    let stripped = strip_template_suffix(raw.trim());
+    (!stripped.is_empty()).then(|| stripped.to_string())
+}
+
+fn template_type_name<'a>(template_type: Node, sema_ctx: &'a SemaContext) -> Option<&'a str> {
+    let source = sema_ctx.source()?;
+    let name_node = template_type.child_by_field_name("name")?;
+    let raw = node_text(name_node, source)?.trim();
+    let stripped = strip_template_suffix(raw);
+    (!stripped.is_empty()).then_some(stripped)
+}
+
+fn explicit_specialization_args(node: Node, sema_ctx: &SemaContext) -> Vec<ExplicitTemplateArg> {
+    let Some(source) = sema_ctx.source() else {
+        return Vec::new();
+    };
+    let Some(arg_list) = explicit_specialization_arg_list(node) else {
+        return Vec::new();
+    };
+    explicit_template_args_from_arg_list(arg_list, source, sema_ctx)
+}
+
+fn explicit_specialization_arg_list(node: Node) -> Option<Node> {
+    if let Some(class_node) = find_template_class_node(node) {
+        if let Some(name_node) = class_node.child_by_field_name("name")
+            && let Some(arg_list) = find_descendant(name_node, "template_argument_list")
+        {
+            return Some(arg_list);
+        }
+        if let Some(arg_list) = find_descendant(class_node, "template_argument_list") {
+            return Some(arg_list);
+        }
     }
-    .filter(|name| !name.is_empty())
+
+    let function_node =
+        find_descendant(node, "function_definition").or_else(|| find_descendant(node, "declaration"))?;
+    let declarator = function_node
+        .child_by_field_name("declarator")
+        .or_else(|| find_descendant(function_node, "function_declarator"))?;
+    find_descendant(declarator, "template_argument_list")
 }
 
 pub fn explicit_template_args(callee: Node, sema_ctx: &SemaContext) -> Vec<ExplicitTemplateArg> {
@@ -783,7 +1130,7 @@ pub fn explicit_template_args(callee: Node, sema_ctx: &SemaContext) -> Vec<Expli
     let Some(arg_list) = find_descendant(callee, "template_argument_list") else {
         return Vec::new();
     };
-    explicit_template_args_from_arg_list(arg_list, source)
+    explicit_template_args_from_arg_list(arg_list, source, sema_ctx)
 }
 
 pub fn explicit_template_args_from_type(
@@ -796,10 +1143,14 @@ pub fn explicit_template_args_from_type(
     let Some(arg_list) = template_type.child_by_field_name("arguments") else {
         return Vec::new();
     };
-    explicit_template_args_from_arg_list(arg_list, source)
+    explicit_template_args_from_arg_list(arg_list, source, sema_ctx)
 }
 
-fn explicit_template_args_from_arg_list(arg_list: Node, source: &str) -> Vec<ExplicitTemplateArg> {
+fn explicit_template_args_from_arg_list(
+    arg_list: Node,
+    source: &str,
+    sema_ctx: &SemaContext,
+) -> Vec<ExplicitTemplateArg> {
     let mut args = Vec::new();
     let mut cursor = arg_list.walk();
     for child in arg_list.children(&mut cursor) {
@@ -814,13 +1165,70 @@ fn explicit_template_args_from_arg_list(arg_list: Node, source: &str) -> Vec<Exp
             "number_literal" | "char_literal" | "true" | "false" | "identifier" | "field_identifier" => {
                 let text = node_text(child, source).unwrap_or("").trim().to_string();
                 if !text.is_empty() {
-                    args.push(ExplicitTemplateArg::Value(text));
+                    if matches!(kind, "identifier" | "field_identifier")
+                        && sema_ctx.resolve_existing_type_text(&text).is_some()
+                    {
+                        args.push(ExplicitTemplateArg::Type(text));
+                    } else {
+                        args.push(ExplicitTemplateArg::Value(text));
+                    }
                 }
             }
             _ => {}
         }
     }
     args
+}
+
+fn ordered_template_decls(decls: &[TemplateDecl]) -> Vec<&TemplateDecl> {
+    let mut ordered = decls.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|decl| !decl.is_explicit_specialization);
+    ordered
+}
+
+fn instantiate_specialization_decl_type(
+    decl: &TemplateDecl,
+    sema_ctx: &SemaContext,
+) -> Option<TypeId> {
+    if decl.specialization_args.is_empty() {
+        return None;
+    }
+    let rendered_args = decl
+        .specialization_args
+        .iter()
+        .map(|arg| match arg {
+            ExplicitTemplateArg::Type(value) | ExplicitTemplateArg::Value(value) => value.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rendered = format!("{}<{}>", decl.name, rendered_args);
+    sema_ctx.resolve_existing_type_text(&rendered)
+}
+
+fn template_arg_type_texts_match(
+    expected: &str,
+    actual: &str,
+    sema_ctx: Option<&SemaContext>,
+) -> bool {
+    let expected = crate::parser::cpp::clean_type_string(expected);
+    let actual = crate::parser::cpp::clean_type_string(actual);
+    if expected == actual {
+        return true;
+    }
+    let Some(sema_ctx) = sema_ctx else {
+        return false;
+    };
+    match (
+        sema_ctx.resolve_existing_type_text(&expected),
+        sema_ctx.resolve_existing_type_text(&actual),
+    ) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn normalize_template_value(text: &str) -> String {
+    text.split_whitespace().collect::<String>()
 }
 
 fn normalize_signature_key(function_node: Node, source: &str, name: &str) -> String {
@@ -871,6 +1279,9 @@ fn instantiate_return_pattern(
             })
         }
         TypePattern::TemplateInstance { base, args } => {
+            if is_enable_if_base(base) {
+                return instantiate_enable_if_return(args, bindings, sema_ctx);
+            }
             let mut instantiated_args = Vec::new();
             for arg in args {
                 instantiated_args.push(match arg {
@@ -890,6 +1301,61 @@ fn instantiate_return_pattern(
     }
 }
 
+fn instantiate_enable_if_return(
+    args: &[TypePattern],
+    bindings: &HashMap<String, TemplateBinding>,
+    sema_ctx: &SemaContext,
+) -> Option<TypeId> {
+    let condition = args.first()?;
+    if !template_condition_value(condition, bindings, sema_ctx)? {
+        return None;
+    }
+
+    if let Some(result_pattern) = args.get(1) {
+        instantiate_return_pattern(result_pattern, bindings, sema_ctx)
+    } else {
+        sema_ctx.resolve_existing_type_text("void")
+    }
+}
+
+fn template_condition_value(
+    pattern: &TypePattern,
+    bindings: &HashMap<String, TemplateBinding>,
+    sema_ctx: &SemaContext,
+) -> Option<bool> {
+    match pattern {
+        TypePattern::Value(value) | TypePattern::Concrete(value) => {
+            parse_bool_token(value).or_else(|| {
+                bindings
+                    .get(value)
+                    .and_then(|binding| template_binding_bool(binding, sema_ctx))
+            })
+        }
+        TypePattern::NonTypeParam(name) | TypePattern::TemplateParam(name) => bindings
+            .get(name)
+            .and_then(|binding| template_binding_bool(binding, sema_ctx)),
+        _ => None,
+    }
+}
+
+fn template_binding_bool(binding: &TemplateBinding, sema_ctx: &SemaContext) -> Option<bool> {
+    match binding {
+        TemplateBinding::Value(value) | TemplateBinding::Text(value) => parse_bool_token(value),
+        TemplateBinding::Type(type_id) => sema_ctx
+            .render_type(*type_id)
+            .as_deref()
+            .and_then(parse_bool_token),
+    }
+}
+
+fn parse_bool_token(text: &str) -> Option<bool> {
+    match normalize_template_value(text).as_str() {
+        "true" | "TRUE" => Some(true),
+        "false" | "FALSE" => Some(false),
+        _ => None,
+    }
+}
+
 fn instantiate_decl_type(
     decl: &TemplateDecl,
     bindings: &HashMap<String, TemplateBinding>,
@@ -898,7 +1364,7 @@ fn instantiate_decl_type(
     let mut args = Vec::with_capacity(decl.params.len());
     for param in &decl.params {
         match param {
-            TemplateParam::TypeParam { name } => {
+            TemplateParam::TypeParam { name, .. } => {
                 let binding = bindings.get(name)?;
                 let type_id = match binding {
                     TemplateBinding::Type(type_id) => *type_id,
@@ -929,25 +1395,103 @@ fn binding_value<'a>(
 }
 
 fn resolve_type_name_existing(sema_ctx: &SemaContext, text: &str) -> Option<TypeId> {
-    match text.trim() {
-        "void" => Some(sema_ctx.types.void_t),
-        "bool" => Some(sema_ctx.types.bool_t),
-        "char" | "TCHAR" | "ANSICHAR" => Some(sema_ctx.types_char()),
-        "int" | "int32" => Some(sema_ctx.types.int32_t),
-        "uint32" => Some(sema_ctx.types.uint32_t),
-        "float" => Some(sema_ctx.types.float_t),
-        "double" => Some(sema_ctx.types.double_t),
-        other => sema_ctx
-            .symbols
-            .class_id_by_name(other)
-            .and_then(|class_id| sema_ctx.types.find(&TypeKind::Class(class_id))),
-    }
+    sema_ctx.resolve_existing_type_text(text)
 }
 
 fn render_type(sema_ctx: &SemaContext, type_id: TypeId) -> String {
     sema_ctx
         .render_type(type_id)
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn template_lookup_keys(name: &str) -> Vec<String> {
+    let mut keys = vec![name.to_string()];
+    let short = short_name(name);
+    if short != name {
+        keys.push(short.to_string());
+    }
+    keys
+}
+
+fn short_name(name: &str) -> &str {
+    name.rsplit("::").next().unwrap_or(name)
+}
+
+fn strip_template_suffix(name: &str) -> &str {
+    name.split('<').next().unwrap_or(name).trim()
+}
+
+fn template_type_base_name(template_type: Node, source: &str) -> Option<String> {
+    let name_node = template_type.child_by_field_name("name")?;
+    let raw = crate::parser::cpp::clean_type_string(node_text(name_node, source)?);
+    let stripped = strip_template_suffix(&raw).trim();
+    (!stripped.is_empty()).then(|| stripped.to_string())
+}
+
+fn template_type_args(template_type: Node, source: &str) -> Vec<String> {
+    let Some(arg_list) = template_type.child_by_field_name("arguments") else {
+        return Vec::new();
+    };
+
+    let mut args = Vec::new();
+    let mut cursor = arg_list.walk();
+    for child in arg_list.children(&mut cursor) {
+        if !child.is_named() {
+            continue;
+        }
+        let text = node_text(child, source).unwrap_or("").trim();
+        if text.is_empty() {
+            continue;
+        }
+        args.push(crate::parser::cpp::clean_type_string(text));
+    }
+    args
+}
+
+fn is_enable_if_base(base: impl AsRef<str>) -> bool {
+    let base = base.as_ref();
+    matches!(base.rsplit("::").next().unwrap_or(base), "enable_if_t" | "enable_if")
+}
+
+fn qualify_template_decl_name(node: Node, local_name: &str, source: &str) -> String {
+    let mut qualifiers = Vec::<String>::new();
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        match parent.kind() {
+            "namespace_definition" => {
+                if let Some(name_node) = parent.child_by_field_name("name")
+                    && let Some(text) = node_text(name_node, source)
+                {
+                    let text = text.trim();
+                    if !text.is_empty() {
+                        qualifiers.push(text.to_string());
+                    }
+                }
+            }
+            "class_specifier"
+            | "struct_specifier"
+            | "unreal_reflected_class_declaration"
+            | "unreal_reflected_struct_declaration" => {
+                if let Some(name_node) = class_like_name_node(parent)
+                    && let Some(text) = node_text(name_node, source)
+                {
+                    let text = text.trim();
+                    if !text.is_empty() {
+                        qualifiers.push(text.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+        current = parent.parent();
+    }
+
+    qualifiers.reverse();
+    if qualifiers.is_empty() {
+        local_name.to_string()
+    } else {
+        format!("{}::{local_name}", qualifiers.join("::"))
+    }
 }
 
 fn find_template_class_node(node: Node) -> Option<Node> {
@@ -1013,7 +1557,7 @@ fn build_template_param_kind_map(params: &[TemplateParam]) -> HashMap<String, bo
     let mut out = HashMap::with_capacity(params.len());
     for param in params {
         match param {
-            TemplateParam::TypeParam { name } => {
+            TemplateParam::TypeParam { name, .. } => {
                 out.insert(name.clone(), true);
             }
             TemplateParam::NonTypeParam { name, .. } => {
@@ -1022,6 +1566,49 @@ fn build_template_param_kind_map(params: &[TemplateParam]) -> HashMap<String, bo
         }
     }
     out
+}
+
+fn parse_type_param_default(node: Node, source: &str) -> Option<ExplicitTemplateArg> {
+    let text = node_text(node, source)?;
+    let (_, default_text) = text.split_once('=')?;
+    let clean = crate::parser::cpp::clean_type_string(default_text);
+    (!clean.is_empty()).then_some(ExplicitTemplateArg::Type(clean))
+}
+
+fn parse_non_type_param_default(node: Node, source: &str) -> Option<ExplicitTemplateArg> {
+    let text = node_text(node, source)?;
+    let (_, default_text) = text.split_once('=')?;
+    let value = default_text.trim().to_string();
+    (!value.is_empty()).then_some(ExplicitTemplateArg::Value(value))
+}
+
+fn apply_default_template_args(
+    params: &[TemplateParam],
+    explicit_args: &[ExplicitTemplateArg],
+    allow_missing_for_deduction: bool,
+) -> std::result::Result<Vec<ExplicitTemplateArg>, TemplateCallFailure> {
+    if explicit_args.len() > params.len() {
+        return Err(TemplateCallFailure::ExplicitArityMismatch);
+    }
+
+    let mut out = explicit_args.to_vec();
+    for param in params.iter().skip(explicit_args.len()) {
+        let default_arg = match param {
+            TemplateParam::TypeParam { default_arg, .. }
+            | TemplateParam::NonTypeParam { default_arg, .. } => default_arg.clone(),
+        };
+        if let Some(default_arg) = default_arg {
+            out.push(default_arg);
+        } else if !allow_missing_for_deduction {
+            return Err(TemplateCallFailure::ExplicitArityMismatch);
+        }
+    }
+
+    Ok(out)
+}
+
+fn has_template_argument_list(node: Node) -> bool {
+    find_descendant(node, "template_argument_list").is_some()
 }
 
 fn find_descendant<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
@@ -1048,7 +1635,7 @@ fn find_name_node(node: Node) -> Option<Node> {
         | "array_declarator"
         | "parenthesized_declarator"
         | "init_declarator"
-        | "bitfield_clause" => node.child_by_field_name("declarator").and_then(find_name_node),
+        | "bitfield_clause" => next_declarator_node(node).and_then(find_name_node),
         _ => {
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
@@ -1059,6 +1646,28 @@ fn find_name_node(node: Node) -> Option<Node> {
             None
         }
     }
+}
+
+fn next_declarator_node(node: Node) -> Option<Node> {
+    node.child_by_field_name("declarator").or_else(|| {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor).find(|child| {
+            matches!(
+                child.kind(),
+                "identifier"
+                    | "field_identifier"
+                    | "type_identifier"
+                    | "qualified_identifier"
+                    | "function_declarator"
+                    | "pointer_declarator"
+                    | "reference_declarator"
+                    | "array_declarator"
+                    | "parenthesized_declarator"
+                    | "init_declarator"
+                    | "bitfield_clause"
+            )
+        })
+    })
 }
 
 fn node_text<'a>(node: Node, source: &'a str) -> Option<&'a str> {
@@ -1198,5 +1807,223 @@ template<> void Spec<int32>(int32 Value) {}
             .and_then(|id| sema.render_type(id))
             .unwrap();
         assert_eq!(ty, "Box<int32>");
+    }
+
+    #[test]
+    fn template_index_resolves_alias_in_explicit_template_args() {
+        let content =
+            "using FCount = int32; template<typename T> T Id(T Value) { return Value; } void Test(){ Id<FCount>(1); }";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+        let index = TemplateIndex::collect(root, &sema);
+        let ty = index
+            .infer_call_return_type(first_call(root), &sema)
+            .and_then(|id| sema.render_type(id))
+            .unwrap();
+        assert_eq!(ty, "FCount");
+    }
+
+    #[test]
+    fn template_index_resolves_namespace_qualified_template_call() {
+        let content = "namespace UE::Math { template<typename T> T Id(T Value) { return Value; } } void Test(){ UE::Math::Id<int32>(1); }";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+        let index = TemplateIndex::collect(root, &sema);
+        let call = first_call(root);
+        let ty = index
+            .infer_call_return_type(call, &sema)
+            .and_then(|id| sema.render_type(id))
+            .unwrap();
+        assert_eq!(ty, "int32");
+    }
+
+    #[test]
+    fn template_index_deduces_nested_pointer_reference_template_param() {
+        let content =
+            "template<typename T> T* Id(T*& Value) { return Value; } int32 Test(int32* Ptr) { return *Id(Ptr); }";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+        let index = TemplateIndex::collect(root, &sema);
+        let ty = index
+            .infer_call_return_type(first_call(root), &sema)
+            .and_then(|id| sema.render_type(id))
+            .unwrap();
+        assert_eq!(ty, "int32*");
+    }
+
+    #[test]
+    fn template_index_accepts_alias_type_argument_in_template_type() {
+        let content = "using FCount = int32; template<typename T> struct Box {}; Box<FCount> Value;";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+        let index = TemplateIndex::collect(root, &sema);
+        let analysis = index.analyze_template_type(first_template_type(root), &sema);
+        assert!(analysis.is_none());
+    }
+
+    #[test]
+    fn template_index_accepts_namespace_qualified_template_type() {
+        let content =
+            "namespace UE::Math { template<typename T> struct Box {}; } UE::Math::Box<int32> Value;";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+        let index = TemplateIndex::collect(root, &sema);
+        let analysis = index.analyze_template_type(first_template_type(root), &sema);
+        assert!(analysis.is_none());
+    }
+
+    #[test]
+    fn template_index_reports_sfinae_rejected_class_template_type() {
+        let content =
+            "template<typename T> requires false struct Box {}; Box<int32> Value;";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+        let index = TemplateIndex::collect(root, &sema);
+        let analysis = index
+            .analyze_template_type(first_template_type(root), &sema)
+            .unwrap();
+        assert!(matches!(
+            analysis.failure,
+            TemplateCallFailure::SfinaeRejected
+        ));
+    }
+
+    #[test]
+    fn template_index_accepts_explicit_class_specialization_type() {
+        let content =
+            "template<typename T> struct Box {}; template<> struct Box<int32> {}; Box<int32> Value;";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+        let index = TemplateIndex::collect(root, &sema);
+        let analysis = index.analyze_template_type(first_template_type(root), &sema);
+        assert!(analysis.is_none());
+    }
+
+    #[test]
+    fn template_index_accepts_alias_to_explicit_class_specialization_type() {
+        let content =
+            "using FCount = int32; template<typename T> struct Box {}; template<> struct Box<int32> {}; Box<FCount> Value;";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+        let index = TemplateIndex::collect(root, &sema);
+        let analysis = index.analyze_template_type(first_template_type(root), &sema);
+        assert!(analysis.is_none());
+    }
+
+    #[test]
+    fn template_index_accepts_namespace_qualified_explicit_class_specialization_type() {
+        let content =
+            "namespace UE::Math { template<typename T> struct Box {}; template<> struct Box<int32> {}; } UE::Math::Box<int32> Value;";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+        let index = TemplateIndex::collect(root, &sema);
+        let analysis = index.analyze_template_type(first_template_type(root), &sema);
+        assert!(analysis.is_none());
+    }
+
+    #[test]
+    fn template_index_infers_enable_if_true_return_type() {
+        let content =
+            "template<typename T> std::enable_if_t<true, T> Only(T Value) { return Value; } void Test(){ Only(1); }";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+        let index = TemplateIndex::collect(root, &sema);
+        let ty = index
+            .infer_call_return_type(first_call(root), &sema)
+            .and_then(|id| sema.render_type(id))
+            .unwrap();
+        assert_eq!(ty, "int32");
+    }
+
+    #[test]
+    fn template_index_reports_requires_clause_with_extra_spacing_as_sfinae_rejected() {
+        let content =
+            "template<typename T> requires   false struct Box {}; Box<int32> Value;";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+        let index = TemplateIndex::collect(root, &sema);
+        let analysis = index
+            .analyze_template_type(first_template_type(root), &sema)
+            .unwrap();
+        assert!(matches!(
+            analysis.failure,
+            TemplateCallFailure::SfinaeRejected
+        ));
+    }
+
+    #[test]
+    fn template_index_accepts_default_type_param_in_template_type() {
+        let content = "template<typename T = int32> struct Box {}; Box<> Value;";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+        let index = TemplateIndex::collect(root, &sema);
+        let analysis = index.analyze_template_type(first_template_type(root), &sema);
+        assert!(analysis.is_none());
+    }
+
+    #[test]
+    fn template_index_accepts_default_type_param_in_template_call() {
+        let content =
+            "template<typename T = int32> T Id(T Value) { return Value; } void Test(){ Id<>(1); }";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+        let index = TemplateIndex::collect(root, &sema);
+        let ty = index
+            .infer_call_return_type(first_call(root), &sema)
+            .and_then(|id| sema.render_type(id))
+            .unwrap();
+        assert_eq!(ty, "int32");
+    }
+
+    #[test]
+    fn template_index_uses_default_type_param_without_explicit_brackets() {
+        let content =
+            "template<typename T = int32> T Make() { return 1; } int32 Test(){ return Make(); }";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+        let index = TemplateIndex::collect(root, &sema);
+        let ty = index
+            .infer_call_return_type(first_call(root), &sema)
+            .and_then(|id| sema.render_type(id))
+            .unwrap();
+        assert_eq!(ty, "int32");
+    }
+
+    #[test]
+    fn template_index_prefers_deduced_type_over_default_param() {
+        let content =
+            "template<typename T = int32> T Id(T Value) { return Value; } float Test(){ return Id(1.0f); }";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+        let index = TemplateIndex::collect(root, &sema);
+        let ty = index
+            .infer_call_return_type(first_call(root), &sema)
+            .and_then(|id| sema.render_type(id))
+            .unwrap();
+        assert_eq!(ty, "float");
+    }
+
+    #[test]
+    fn template_index_accepts_default_non_type_param_in_template_type() {
+        let content = "template<int N = 4> struct Sized {}; Sized<> Value;";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+        let index = TemplateIndex::collect(root, &sema);
+        let analysis = index.analyze_template_type(first_template_type(root), &sema);
+        assert!(analysis.is_none());
+    }
+
+    #[test]
+    fn template_index_uses_default_non_type_param_without_explicit_brackets() {
+        let content =
+            "template<int N = 4> int32 Make() { return N; } int32 Test(){ return Make(); }";
+        let root = parse_root(content);
+        let sema = build_sema(root, content);
+        let index = TemplateIndex::collect(root, &sema);
+        let ty = index
+            .infer_call_return_type(first_call(root), &sema)
+            .and_then(|id| sema.render_type(id))
+            .unwrap();
+        assert_eq!(ty, "int32");
     }
 }

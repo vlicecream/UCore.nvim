@@ -39,12 +39,14 @@ pub enum TemplateArg {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TypeKind {
     Builtin(BuiltinType),
+    Nullptr,
     Pointer { pointee: TypeId, cv: CvQual },
     Reference { referent: TypeId, kind: RefKind },
     Array { elem: TypeId, size: Option<u64> },
     Function {
         return_t: TypeId,
         params: Vec<TypeId>,
+        min_arity: usize,
         is_variadic: bool,
         is_const_member: bool,
     },
@@ -77,6 +79,7 @@ pub struct TypeArena {
     pub uint32_t: TypeId,
     pub float_t: TypeId,
     pub double_t: TypeId,
+    pub nullptr_t: TypeId,
     pub unknown_t: TypeId,
 }
 
@@ -91,6 +94,7 @@ impl TypeArena {
             uint32_t: TypeId(0),
             float_t: TypeId(0),
             double_t: TypeId(0),
+            nullptr_t: TypeId(0),
             unknown_t: TypeId(0),
         };
 
@@ -100,6 +104,7 @@ impl TypeArena {
         arena.uint32_t = arena.intern(TypeKind::Builtin(BuiltinType::UInt32));
         arena.float_t = arena.intern(TypeKind::Builtin(BuiltinType::Float));
         arena.double_t = arena.intern(TypeKind::Builtin(BuiltinType::Double));
+        arena.nullptr_t = arena.intern(TypeKind::Nullptr);
         arena.unknown_t = arena.intern(TypeKind::Unknown);
         arena
     }

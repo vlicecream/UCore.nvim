@@ -141,7 +141,16 @@ impl CfgBuilder {
                 Vec::new()
             }
             "if_statement" => self.build_if(node, preds, exit, break_target, continue_target),
-            "while_statement" | "for_statement" | "do_statement" => {
+            "try_statement" => self.build_try(node, preds, exit, break_target, continue_target),
+            "catch_clause" => {
+                let body = catch_body_node(node).unwrap_or(node);
+                self.build_stmt(body, preds, exit, break_target, continue_target)
+            }
+            "while_statement"
+            | "for_statement"
+            | "do_statement"
+            | "for_range_loop"
+            | "range_based_for_statement" => {
                 self.build_loop(node, preds, exit, break_target)
             }
             "switch_statement" => self.build_switch(node, preds, exit),
@@ -234,6 +243,48 @@ impl CfgBuilder {
         self.connect_many(open, after);
         vec![after]
     }
+
+    fn build_try(
+        &mut self,
+        node: Node,
+        preds: Vec<BlockId>,
+        exit: BlockId,
+        break_target: Option<BlockId>,
+        continue_target: Option<BlockId>,
+    ) -> Vec<BlockId> {
+        let dispatch = self.block_with_stmt(node);
+        self.connect_many(preds, dispatch);
+
+        let mut open = Vec::new();
+        if let Some(body) = try_body_node(node) {
+            open.extend(self.build_stmt(
+                body,
+                vec![dispatch],
+                exit,
+                break_target,
+                continue_target,
+            ));
+        } else {
+            open.push(dispatch);
+        }
+
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.kind() != "catch_clause" {
+                continue;
+            }
+            let body = catch_body_node(child).unwrap_or(child);
+            open.extend(self.build_stmt(
+                body,
+                vec![dispatch],
+                exit,
+                break_target,
+                continue_target,
+            ));
+        }
+
+        open
+    }
 }
 
 fn loop_body_node(node: Node) -> Option<Node> {
@@ -241,6 +292,22 @@ fn loop_body_node(node: Node) -> Option<Node> {
         let mut cursor = node.walk();
         node.named_children(&mut cursor)
             .find(|child| matches!(child.kind(), "compound_statement" | "expression_statement"))
+    })
+}
+
+fn try_body_node(node: Node) -> Option<Node> {
+    node.child_by_field_name("body").or_else(|| {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .find(|child| child.kind() == "compound_statement")
+    })
+}
+
+fn catch_body_node(node: Node) -> Option<Node> {
+    node.child_by_field_name("body").or_else(|| {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .find(|child| child.kind() == "compound_statement")
     })
 }
 
@@ -273,7 +340,11 @@ fn is_statement_like(kind: &str) -> bool {
             | "for_statement"
             | "while_statement"
             | "do_statement"
+            | "for_range_loop"
+            | "range_based_for_statement"
             | "switch_statement"
+            | "try_statement"
+            | "catch_clause"
             | "case_statement"
             | "default_statement"
             | "compound_statement"

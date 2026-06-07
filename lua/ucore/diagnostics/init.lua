@@ -228,6 +228,32 @@ local function diagnostic_from_item(item, fallback_bufnr)
 		bufnr = resolve_bufnr_for_path(file_path, fallback_bufnr)
 	end
 
+	local related_information = nil
+	if type(item.related) == "table" and not vim.tbl_isempty(item.related) then
+		related_information = {}
+		for _, related in ipairs(item.related) do
+			local related_path = normalize_path(related.file_path)
+			if related_path and related_path ~= "" then
+				table.insert(related_information, {
+					location = {
+						uri = vim.uri_from_fname(related_path),
+						range = {
+							start = {
+								line = tonumber(related.line) or 0,
+								character = tonumber(related.character) or 0,
+							},
+							["end"] = {
+								line = tonumber(related.line) or 0,
+								character = (tonumber(related.character) or 0) + 1,
+							},
+						},
+					},
+					message = related.message or "",
+				})
+			end
+		end
+	end
+
 	return bufnr, {
 		lnum = tonumber(item.line) or 0,
 		col = tonumber(item.character) or 0,
@@ -237,6 +263,7 @@ local function diagnostic_from_item(item, fallback_bufnr)
 		source = item.source or "UCore",
 		code = item.code,
 		message = item.message or "",
+		relatedInformation = related_information,
 		user_data = item,
 	}
 end

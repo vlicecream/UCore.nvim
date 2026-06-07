@@ -20,7 +20,7 @@ use crate::query::usage::UsageHotIndex;
 use crate::sema::SemaContext;
 
 mod finalize;
-mod phases;
+pub(crate) mod phases;
 
 const PROJECT_TEXT_VISIBILITY_SCAN_LIMIT: usize = 64;
 const ENGINE_TEXT_VISIBILITY_SCAN_LIMIT: usize = 64;
@@ -46,7 +46,7 @@ pub struct VisibilityScope {
 }
 
 #[derive(Clone, Debug, Default)]
-struct DiagnosticKnownNames {
+pub(crate) struct DiagnosticKnownNames {
     ignored_unknown_names: HashSet<String>,
     suppress_member_classes: HashSet<String>,
 }
@@ -102,9 +102,13 @@ pub(crate) struct DiagnosticRulesFile {
     #[serde(default)]
     pub finalize: FinalizeRules,
     #[serde(default)]
-    pub syntax_errors: PhaseEnabled,
+    pub syntax_errors: SyntaxErrorsRules,
     #[serde(default)]
     pub bad_characters: BadCharactersRules,
+    #[serde(default)]
+    pub include_resolution: IncludeResolutionRules,
+    #[serde(default)]
+    pub linker: LinkerRules,
     #[serde(default)]
     pub dataflow: DataflowRules,
     #[serde(default)]
@@ -129,6 +133,10 @@ pub(crate) struct FinalizeRules {
     pub suppress_tail_lines: usize,
     #[serde(default = "default_true")]
     pub suppress_inside_preproc_if_zero: bool,
+    #[serde(default = "default_phase_timeout_ms")]
+    pub phase_timeout_ms: u64,
+    #[serde(default = "default_total_timeout_ms")]
+    pub total_timeout_ms: u64,
 }
 
 impl Default for FinalizeRules {
@@ -139,20 +147,37 @@ impl Default for FinalizeRules {
             dedupe_window_cols: default_dedupe_window_cols(),
             suppress_tail_lines: default_suppress_tail_lines(),
             suppress_inside_preproc_if_zero: default_true(),
+            phase_timeout_ms: default_phase_timeout_ms(),
+            total_timeout_ms: default_total_timeout_ms(),
         }
     }
 }
 
 #[derive(Clone, Debug, Deserialize)]
-pub(crate) struct PhaseEnabled {
+pub(crate) struct SyntaxErrorsRules {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default = "default_error_severity")]
+    pub severity_missing: SeverityConfig,
+    #[serde(default = "default_error_severity")]
+    pub severity_error: SeverityConfig,
+    #[serde(default = "default_true")]
+    pub report_error_node: bool,
+    #[serde(default = "default_true")]
+    pub skip_preproc_if_zero: bool,
+    #[serde(default = "default_suppress_tail_lines")]
+    pub suppress_tail_lines: usize,
 }
 
-impl Default for PhaseEnabled {
+impl Default for SyntaxErrorsRules {
     fn default() -> Self {
         Self {
             enabled: default_true(),
+            severity_missing: default_error_severity(),
+            severity_error: default_error_severity(),
+            report_error_node: default_true(),
+            skip_preproc_if_zero: default_true(),
+            suppress_tail_lines: default_suppress_tail_lines(),
         }
     }
 }
@@ -165,6 +190,10 @@ pub(crate) struct BadCharactersRules {
     pub full_width_severity: SeverityConfig,
     #[serde(default = "default_warning_severity")]
     pub invisible_severity: SeverityConfig,
+    #[serde(default = "default_bad_characters_max_per_file")]
+    pub max_per_file: usize,
+    #[serde(default = "default_unicode_pairs_file")]
+    pub pairs_file: String,
 }
 
 impl Default for BadCharactersRules {
@@ -173,6 +202,84 @@ impl Default for BadCharactersRules {
             enabled: default_true(),
             full_width_severity: default_error_severity(),
             invisible_severity: default_warning_severity(),
+            max_per_file: default_bad_characters_max_per_file(),
+            pairs_file: default_unicode_pairs_file(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct IncludeResolutionRules {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_error_severity")]
+    pub severity: SeverityConfig,
+    #[serde(default = "default_include_roots_file")]
+    pub include_roots_file: String,
+}
+
+impl Default for IncludeResolutionRules {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            severity: default_error_severity(),
+            include_roots_file: default_include_roots_file(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct LinkerRules {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub check_odr_function: bool,
+    #[serde(default = "default_error_severity")]
+    pub odr_function_severity: SeverityConfig,
+    #[serde(default = "default_true")]
+    pub check_odr_class: bool,
+    #[serde(default = "default_error_severity")]
+    pub odr_class_severity: SeverityConfig,
+    #[serde(default = "default_false")]
+    pub check_missing_def: bool,
+    #[serde(default = "default_warning_severity")]
+    pub missing_def_severity: SeverityConfig,
+    #[serde(default = "default_missing_def_ignore_class_prefixes")]
+    pub missing_def_ignore_class_prefixes: Vec<String>,
+    #[serde(default = "default_missing_def_ignore_name_prefixes")]
+    pub missing_def_ignore_name_prefixes: Vec<String>,
+    #[serde(default = "default_true")]
+    pub missing_def_check_only_non_ue_reflected: bool,
+    #[serde(default = "default_true")]
+    pub check_name_clash: bool,
+    #[serde(default = "default_error_severity")]
+    pub name_clash_severity: SeverityConfig,
+    #[serde(default = "default_true")]
+    pub full_check_on_db_rebuild: bool,
+    #[serde(default = "default_true")]
+    pub incremental_on_save: bool,
+    #[serde(default = "default_incremental_on_save_if_larger_than_lines")]
+    pub incremental_on_save_if_larger_than_lines: usize,
+}
+
+impl Default for LinkerRules {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            check_odr_function: default_true(),
+            odr_function_severity: default_error_severity(),
+            check_odr_class: default_true(),
+            odr_class_severity: default_error_severity(),
+            check_missing_def: default_false(),
+            missing_def_severity: default_warning_severity(),
+            missing_def_ignore_class_prefixes: default_missing_def_ignore_class_prefixes(),
+            missing_def_ignore_name_prefixes: default_missing_def_ignore_name_prefixes(),
+            missing_def_check_only_non_ue_reflected: default_true(),
+            check_name_clash: default_true(),
+            name_clash_severity: default_error_severity(),
+            full_check_on_db_rebuild: default_true(),
+            incremental_on_save: default_true(),
+            incremental_on_save_if_larger_than_lines: default_incremental_on_save_if_larger_than_lines(),
         }
     }
 }
@@ -310,11 +417,11 @@ const fn default_true() -> bool {
 }
 
 const fn default_max_per_file() -> usize {
-    500
+    200
 }
 
 const fn default_max_per_line() -> usize {
-    5
+    3
 }
 
 const fn default_dedupe_window_cols() -> u32 {
@@ -341,7 +448,54 @@ fn default_preprocessor_config_file() -> String {
     "preprocessor.toml".to_string()
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+const fn default_phase_timeout_ms() -> u64 {
+    300
+}
+
+const fn default_total_timeout_ms() -> u64 {
+    1000
+}
+
+const fn default_bad_characters_max_per_file() -> usize {
+    200
+}
+
+fn default_unicode_pairs_file() -> String {
+    "unicode_punct_pairs.toml".to_string()
+}
+
+fn default_include_roots_file() -> String {
+    "include_roots.toml".to_string()
+}
+
+fn default_false() -> bool {
+    false
+}
+
+fn default_missing_def_ignore_class_prefixes() -> Vec<String> {
+    vec![
+        "I".to_string(),
+        "U".to_string(),
+        "A".to_string(),
+        "F".to_string(),
+        "T".to_string(),
+    ]
+}
+
+fn default_missing_def_ignore_name_prefixes() -> Vec<String> {
+    vec![
+        "On".to_string(),
+        "Handle".to_string(),
+        "BP_".to_string(),
+        "K2_".to_string(),
+    ]
+}
+
+fn default_incremental_on_save_if_larger_than_lines() -> usize {
+    10_000
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DiagnosticSeverity {
     Error,
@@ -362,6 +516,14 @@ impl From<SeverityConfig> for DiagnosticSeverity {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct DiagnosticRelatedItem {
+    pub file_path: Option<String>,
+    pub line: u32,
+    pub character: u32,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct DiagnosticItem {
     pub file_path: Option<String>,
     pub line: u32,
@@ -372,6 +534,8 @@ pub struct DiagnosticItem {
     pub source: &'static str,
     pub code: &'static str,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub related: Vec<DiagnosticRelatedItem>,
 }
 
 impl DiagnosticItem {
@@ -394,12 +558,18 @@ impl DiagnosticItem {
             source,
             code,
             message: message.into(),
+            related: Vec::new(),
         }
     }
 
     pub(crate) fn with_end(mut self, end_line: u32, end_character: u32) -> Self {
         self.end_line = end_line;
         self.end_character = end_character.max(self.character.saturating_add(1));
+        self
+    }
+
+    pub(crate) fn with_related(mut self, related: Vec<DiagnosticRelatedItem>) -> Self {
+        self.related = related;
         self
     }
 }
@@ -411,9 +581,11 @@ pub fn process_diagnostics(
     file_path: Option<String>,
     open_files: &[OpenBufferOverlay],
 ) -> Result<Value> {
-    process_diagnostics_with_hot_indexes(
+    process_diagnostics_with_context(
         conn,
         engine_conn,
+        None,
+        None,
         None,
         None,
         None,
@@ -437,6 +609,37 @@ pub fn process_diagnostics_with_hot_indexes(
     file_path: Option<String>,
     open_files: &[OpenBufferOverlay],
 ) -> Result<Value> {
+    process_diagnostics_with_context(
+        conn,
+        engine_conn,
+        None,
+        None,
+        usage_hot_index,
+        engine_usage_hot_index,
+        member_hot_index,
+        engine_member_hot_index,
+        visibility_scope,
+        content,
+        file_path,
+        open_files,
+    )
+}
+
+pub fn process_diagnostics_with_context(
+    conn: &Connection,
+    engine_conn: Option<&Connection>,
+    project_root: Option<&str>,
+    primary_db_path: Option<&str>,
+    usage_hot_index: Option<&UsageHotIndex>,
+    engine_usage_hot_index: Option<&UsageHotIndex>,
+    member_hot_index: Option<&MemberHotIndex>,
+    engine_member_hot_index: Option<&MemberHotIndex>,
+    visibility_scope: Option<&VisibilityScope>,
+    content: &str,
+    file_path: Option<String>,
+    open_files: &[OpenBufferOverlay],
+) -> Result<Value> {
+    let total_started_at = Instant::now();
     let mut items = Vec::new();
     let log_enabled = diagnostics_log_enabled();
     let file_label = file_path.as_deref().unwrap_or("-");
@@ -475,7 +678,17 @@ pub fn process_diagnostics_with_hot_indexes(
             "syntax_errors",
             file_label,
             log_enabled,
-            || phases::syntax_errors::collect(content, file_path.as_deref(), parsed_root),
+            &rules.finalize,
+            &total_started_at,
+            || {
+                phases::syntax_errors::collect(
+                    content,
+                    file_path.as_deref(),
+                    parsed_root,
+                    &rules.syntax_errors,
+                    &rules.preproc.config_file,
+                )
+            },
         )?;
     }
     if rules.bad_characters.enabled {
@@ -484,6 +697,8 @@ pub fn process_diagnostics_with_hot_indexes(
             "bad_characters",
             file_label,
             log_enabled,
+            &rules.finalize,
+            &total_started_at,
             || {
                 phases::bad_characters::collect(
                     content,
@@ -500,6 +715,8 @@ pub fn process_diagnostics_with_hot_indexes(
         "unreal_rules",
         file_label,
         log_enabled,
+        &rules.finalize,
+        &total_started_at,
         || unreal_rule_diagnostics(content, file_path.as_deref()),
     )?;
     extend_diagnostic_phase(
@@ -507,13 +724,58 @@ pub fn process_diagnostics_with_hot_indexes(
         "include_rules",
         file_label,
         log_enabled,
+        &rules.finalize,
+        &total_started_at,
         || unreal_include_diagnostics(conn, content, file_path.as_deref()),
     )?;
+    if rules.include_resolution.enabled {
+        extend_diagnostic_phase(
+            &mut items,
+            "include_resolution",
+            file_label,
+            log_enabled,
+            &rules.finalize,
+            &total_started_at,
+            || {
+                phases::include_resolution::collect(
+                    content,
+                    file_path.as_deref(),
+                    &rules.include_resolution,
+                )
+            },
+        )?;
+    }
+    if rules.linker.enabled {
+        extend_diagnostic_phase(
+            &mut items,
+            "linker_cache",
+            file_label,
+            log_enabled,
+            &rules.finalize,
+            &total_started_at,
+            || {
+                let Some(project_root) = project_root else {
+                    return Ok(Vec::new());
+                };
+                let Some(primary_db_path) = primary_db_path else {
+                    return Ok(Vec::new());
+                };
+                phases::linker::cached_items_for_file(
+                    project_root,
+                    primary_db_path,
+                    file_path.as_deref(),
+                    &rules.linker,
+                )
+            },
+        )?;
+    }
     extend_diagnostic_phase(
         &mut items,
         "override_rules",
         file_label,
         log_enabled,
+        &rules.finalize,
+        &total_started_at,
         || override_diagnostics(conn, engine_conn, content, file_path.as_deref(), parsed_root),
     )?;
     extend_diagnostic_phase(
@@ -521,7 +783,16 @@ pub fn process_diagnostics_with_hot_indexes(
         "member_syntax",
         file_label,
         log_enabled,
-        || member_syntax_diagnostics(content, file_path.as_deref(), parsed_root),
+        &rules.finalize,
+        &total_started_at,
+        || {
+            member_syntax_diagnostics(
+                content,
+                file_path.as_deref(),
+                parsed_root,
+                rules.syntax_errors.enabled,
+            )
+        },
     )?;
     if rules.dataflow.enabled {
         extend_diagnostic_phase(
@@ -529,6 +800,8 @@ pub fn process_diagnostics_with_hot_indexes(
             "dataflow",
             file_label,
             log_enabled,
+            &rules.finalize,
+            &total_started_at,
             || {
                 let items = phases::dataflow::collect(
                     preprocessed
@@ -550,6 +823,8 @@ pub fn process_diagnostics_with_hot_indexes(
             "overload_check",
             file_label,
             log_enabled,
+            &rules.finalize,
+            &total_started_at,
             || {
                 let items = phases::overload_check::collect(
                     file_path.as_deref(),
@@ -567,6 +842,8 @@ pub fn process_diagnostics_with_hot_indexes(
             "type_check",
             file_label,
             log_enabled,
+            &rules.finalize,
+            &total_started_at,
             || {
                 let items = phases::type_check::collect(
                     file_path.as_deref(),
@@ -584,6 +861,8 @@ pub fn process_diagnostics_with_hot_indexes(
             "template_check",
             file_label,
             log_enabled,
+            &rules.finalize,
+            &total_started_at,
             || {
                 let items = phases::template_check::collect(
                     file_path.as_deref(),
@@ -600,6 +879,8 @@ pub fn process_diagnostics_with_hot_indexes(
         "super_calls",
         file_label,
         log_enabled,
+        &rules.finalize,
+        &total_started_at,
         || super_call_diagnostics(conn, engine_conn, content, file_path.as_deref(), parsed_root),
     )?;
     extend_diagnostic_phase(
@@ -607,6 +888,8 @@ pub fn process_diagnostics_with_hot_indexes(
         "visible_types",
         file_label,
         log_enabled,
+        &rules.finalize,
+        &total_started_at,
         || {
             missing_visible_type_diagnostics(
                 conn,
@@ -625,23 +908,33 @@ pub fn process_diagnostics_with_hot_indexes(
         "name_lookup",
         file_label,
         log_enabled,
-        || phases::name_lookup::collect(
+        &rules.finalize,
+        &total_started_at,
+        || {
+            let items = phases::name_lookup::collect(
                 conn,
                 engine_conn,
                 member_hot_index,
                 engine_member_hot_index,
-                sema_ctx.as_ref(),
+                expanded_sema_ctx.as_ref().or(sema_ctx.as_ref()),
                 &known_names,
-                content,
+                preprocessed
+                    .as_ref()
+                    .map(|result| result.expanded_source.as_str())
+                    .unwrap_or(content),
                 file_path.as_deref(),
-                parsed_root,
-            ),
+                expanded_root.or(parsed_root),
+            )?;
+            Ok(remap_diagnostics_to_original(items, preprocessed.as_ref()))
+        },
     )?;
     extend_diagnostic_phase(
         &mut items,
         "incomplete_member_decl",
         file_label,
         log_enabled,
+        &rules.finalize,
+        &total_started_at,
         || incomplete_member_declaration_diagnostics(content, file_path.as_deref(), parsed_root),
     )?;
     extend_diagnostic_phase(
@@ -649,6 +942,8 @@ pub fn process_diagnostics_with_hot_indexes(
         "invalid_member_token",
         file_label,
         log_enabled,
+        &rules.finalize,
+        &total_started_at,
         || invalid_member_token_diagnostics(content, file_path.as_deref(), parsed_root),
     )?;
     extend_diagnostic_phase(
@@ -656,6 +951,8 @@ pub fn process_diagnostics_with_hot_indexes(
         "invalid_expression_token",
         file_label,
         log_enabled,
+        &rules.finalize,
+        &total_started_at,
         || invalid_expression_token_diagnostics(content, file_path.as_deref(), parsed_root),
     )?;
     extend_diagnostic_phase(
@@ -663,6 +960,8 @@ pub fn process_diagnostics_with_hot_indexes(
         "duplicate_members",
         file_label,
         log_enabled,
+        &rules.finalize,
+        &total_started_at,
         || duplicate_member_diagnostics(content, file_path.as_deref(), parsed_root),
     )?;
     extend_diagnostic_phase(
@@ -670,6 +969,8 @@ pub fn process_diagnostics_with_hot_indexes(
         "missing_impl",
         file_label,
         log_enabled,
+        &rules.finalize,
+        &total_started_at,
         || missing_implementation_diagnostics(
             conn,
             content,
@@ -685,6 +986,15 @@ pub fn process_diagnostics_with_hot_indexes(
         &rules.finalize,
         &rules.preproc,
     );
+    let total_ms = total_started_at.elapsed().as_millis();
+    if total_ms > rules.finalize.total_timeout_ms as u128 {
+        info!(
+            target: "ucore::diagnostics",
+            "Diagnostics slow: file={} total_ms={}",
+            file_label,
+            total_ms
+        );
+    }
     Ok(json!({ "items": items }))
 }
 
@@ -696,7 +1006,7 @@ fn diagnostics_log_enabled() -> bool {
     })
 }
 
-fn diagnostic_rules() -> &'static DiagnosticRulesFile {
+pub(crate) fn diagnostic_rules() -> &'static DiagnosticRulesFile {
     DIAGNOSTIC_RULES.get_or_init(|| {
         toml::from_str(include_str!("../../data/diagnostic_rules.toml")).unwrap_or_default()
     })
@@ -870,13 +1180,29 @@ fn extend_diagnostic_phase<F>(
     phase_name: &'static str,
     file_label: &str,
     log_enabled: bool,
+    rules: &FinalizeRules,
+    total_started_at: &Instant,
     build: F,
 ) -> Result<()>
 where
     F: FnOnce() -> Result<Vec<DiagnosticItem>>,
 {
+    if total_started_at.elapsed().as_millis() > rules.total_timeout_ms as u128 {
+        if log_enabled {
+            info!(
+                target: "ucore::diagnostics",
+                "Diagnostics phase skipped after total timeout: file={} phase={} total_ms={}",
+                file_label,
+                phase_name,
+                total_started_at.elapsed().as_millis()
+            );
+        }
+        return Ok(());
+    }
+
     let started_at = Instant::now();
     let phase_items = build()?;
+    let phase_ms = started_at.elapsed().as_millis();
 
     if log_enabled {
         info!(
@@ -884,9 +1210,21 @@ where
             "Diagnostics phase file={} phase={} ms={} items={}",
             file_label,
             phase_name,
-            started_at.elapsed().as_millis(),
+            phase_ms,
             phase_items.len()
         );
+    }
+
+    if phase_ms > rules.phase_timeout_ms as u128 {
+        info!(
+            target: "ucore::diagnostics",
+            "Diagnostics phase timeout: file={} phase={} ms={} dropped_items={}",
+            file_label,
+            phase_name,
+            phase_ms,
+            phase_items.len()
+        );
+        return Ok(());
     }
 
     items.extend(phase_items);
@@ -905,10 +1243,21 @@ fn remap_diagnostics_to_original(
         .into_iter()
         .map(|item| {
             let mut mapped = item;
-            let start = preprocessed.map_column(mapped.line, mapped.character);
-            let end = preprocessed.map_column(mapped.end_line, mapped.end_character);
-            mapped.character = start;
-            mapped.end_character = end.max(start.saturating_add(1));
+            let start = preprocessed.map_position(mapped.line, mapped.character);
+            let end = preprocessed.map_position(mapped.end_line, mapped.end_character);
+            mapped.file_path = start.file_path.clone().or(mapped.file_path);
+            mapped.line = start.line;
+            mapped.character = start.character;
+            mapped.end_line = if start.file_path == end.file_path {
+                end.line
+            } else {
+                start.line
+            };
+            mapped.end_character = if start.file_path == end.file_path {
+                end.character.max(start.character.saturating_add(1))
+            } else {
+                start.character.saturating_add(1)
+            };
             mapped
         })
         .collect()
@@ -1128,6 +1477,7 @@ fn member_syntax_diagnostics(
     content: &str,
     file_path: Option<&str>,
     parsed_root: Option<tree_sitter::Node>,
+    syntax_errors_enabled: bool,
 ) -> Result<Vec<DiagnosticItem>> {
     let Some(file_path) = file_path else {
         return Ok(Vec::new());
@@ -1142,7 +1492,7 @@ fn member_syntax_diagnostics(
     };
 
     let mut items = Vec::new();
-    collect_member_syntax_items(root, content, file_path, &mut items);
+    collect_member_syntax_items(root, content, file_path, syntax_errors_enabled, &mut items);
     Ok(items)
 }
 
@@ -1391,6 +1741,12 @@ fn collect_unknown_field_expression_item(
             &receiver_type,
             field_name,
         )? {
+            if sema_ctx
+                .and_then(|ctx| crate::sema::expr::type_of_expression(ctx, receiver))
+                .is_some()
+            {
+                return Ok(());
+            }
             if should_suppress_member_diagnostic(
                 conn,
                 engine_conn,
@@ -1454,7 +1810,7 @@ fn collect_unknown_qualified_identifier_item(
     engine_conn: Option<&Connection>,
     member_hot_index: Option<&MemberHotIndex>,
     engine_member_hot_index: Option<&MemberHotIndex>,
-    _sema_ctx: Option<&SemaContext>,
+    sema_ctx: Option<&SemaContext>,
     known_names: &DiagnosticKnownNames,
     member_lookup_cache: &mut IndexedMemberLookupCache,
     node: tree_sitter::Node,
@@ -1476,6 +1832,16 @@ fn collect_unknown_qualified_identifier_item(
     }
 
     let scope_text = node_text(scope, content).trim();
+    if scope_text != "ThisClass" && scope_text != "Super" {
+        if sema_ctx.is_some_and(|ctx| {
+            let segments = qualified_identifier_segments_for_diagnostics(node, content);
+            let segment_refs = segments.iter().map(String::as_str).collect::<Vec<_>>();
+            !segment_refs.is_empty() && ctx.resolve_qualified_symbol_at_node(node, &segment_refs).is_some()
+        }) {
+            return Ok(());
+        }
+    }
+
     let resolved_scope = if scope_text == "ThisClass" {
         find_enclosing_class_name(node, content)
     } else if scope_text == "Super" {
@@ -1710,6 +2076,12 @@ fn identifier_usage_is_known(
         return Ok(true);
     }
 
+    if identifier_is_call_target(node)
+        && sema_ctx.is_some_and(|ctx| sema_call_target_is_known(ctx, node, name))
+    {
+        return Ok(true);
+    }
+
     if is_parameter_identifier(node, content, name) {
         return Ok(true);
     }
@@ -1793,6 +2165,49 @@ fn identifier_is_call_target(node: tree_sitter::Node) -> bool {
         .filter(|parent| parent.kind() == "call_expression")
         .and_then(|parent| parent.child_by_field_name("function").or_else(|| parent.child(0)))
         .is_some_and(|function_node| same_node(function_node, node))
+}
+
+fn sema_call_target_is_known(sema_ctx: &SemaContext, node: tree_sitter::Node, name: &str) -> bool {
+    let Some(call) = node.parent().filter(|parent| parent.kind() == "call_expression") else {
+        return false;
+    };
+    let Some(args) =
+        call.child_by_field_name("arguments").or_else(|| find_descendant_node(call, "argument_list"))
+    else {
+        return false;
+    };
+
+    let mut arg_types = Vec::new();
+    let mut cursor = args.walk();
+    for child in args.children(&mut cursor) {
+        if !child.is_named() {
+            continue;
+        }
+        let Some(type_id) = crate::sema::expr::type_of_expression(sema_ctx, child) else {
+            return false;
+        };
+        arg_types.push(type_id);
+    }
+
+    !sema_ctx.lookup_call_name_at_node(node, name, &arg_types).is_empty()
+}
+
+fn find_descendant_node<'a>(
+    node: tree_sitter::Node<'a>,
+    kind: &str,
+) -> Option<tree_sitter::Node<'a>> {
+    if node.kind() == kind {
+        return Some(node);
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if let Some(found) = find_descendant_node(child, kind) {
+            return Some(found);
+        }
+    }
+
+    None
 }
 
 #[derive(Default)]
@@ -2331,6 +2746,49 @@ fn is_ignored_unknown_symbol_name(name: &str, known_names: &DiagnosticKnownNames
 
 fn same_node(left: tree_sitter::Node, right: tree_sitter::Node) -> bool {
     left.byte_range() == right.byte_range()
+}
+
+fn qualified_identifier_segments_for_diagnostics(
+    node: tree_sitter::Node,
+    content: &str,
+) -> Vec<String> {
+    let mut segments = Vec::new();
+    collect_qualified_identifier_segments_for_diagnostics(node, content, &mut segments);
+    segments
+}
+
+fn collect_qualified_identifier_segments_for_diagnostics(
+    node: tree_sitter::Node,
+    content: &str,
+    segments: &mut Vec<String>,
+) {
+    if node.kind() != "qualified_identifier" {
+        let text = node_text(node, content).trim();
+        if text.is_empty() {
+            return;
+        }
+        segments.extend(
+            text.split("::")
+                .map(str::trim)
+                .filter(|segment| !segment.is_empty())
+                .map(ToOwned::to_owned),
+        );
+        return;
+    }
+
+    if let Some(scope) = node.child_by_field_name("scope") {
+        collect_qualified_identifier_segments_for_diagnostics(scope, content, segments);
+    }
+    if let Some(name_node) = node.child_by_field_name("name") {
+        if name_node.kind() == "qualified_identifier" {
+            collect_qualified_identifier_segments_for_diagnostics(name_node, content, segments);
+            return;
+        }
+        let name = node_text(name_node, content).trim();
+        if !name.is_empty() {
+            segments.push(name.to_string());
+        }
+    }
 }
 
 fn collect_missing_visible_type_items(
@@ -3287,16 +3745,19 @@ fn collect_member_syntax_items(
     node: tree_sitter::Node,
     content: &str,
     file_path: &str,
+    syntax_errors_enabled: bool,
     items: &mut Vec<DiagnosticItem>,
 ) {
     if node.kind() == "field_declaration_list" {
         collect_generated_body_duplicates(node, content, file_path, items);
-        collect_missing_field_semicolon_items(node, content, file_path, items);
+        if !syntax_errors_enabled {
+            collect_missing_field_semicolon_items(node, content, file_path, items);
+        }
     }
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_member_syntax_items(child, content, file_path, items);
+        collect_member_syntax_items(child, content, file_path, syntax_errors_enabled, items);
     }
 }
 
@@ -5340,6 +5801,12 @@ fn find_child_by_type<'a>(node: tree_sitter::Node<'a>, kind: &str) -> Option<tre
 }
 
 fn find_name_node(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    if let Some(declarator) = node.child_by_field_name("declarator") {
+        if let Some(found) = find_innermost_identifier(declarator) {
+            return Some(found);
+        }
+    }
+
     match node.kind() {
         "identifier" | "field_identifier" => Some(node),
         "qualified_identifier" => node.child_by_field_name("name"),
@@ -5354,6 +5821,9 @@ fn find_name_node(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
             let mut cursor = node.walk();
 
             for child in node.children(&mut cursor) {
+                if is_attribute_or_macro_node(child) {
+                    continue;
+                }
                 if let Some(found) = find_name_node(child) {
                     return Some(found);
                 }
@@ -5362,6 +5832,43 @@ fn find_name_node(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
             None
         }
     }
+}
+
+fn find_innermost_identifier(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    match node.kind() {
+        "identifier" | "field_identifier" => Some(node),
+        "qualified_identifier" => node.child_by_field_name("name"),
+        _ => node
+            .child_by_field_name("declarator")
+            .and_then(find_innermost_identifier)
+            .or_else(|| {
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if is_attribute_or_macro_node(child) {
+                        continue;
+                    }
+                    if let Some(found) = find_innermost_identifier(child) {
+                        return Some(found);
+                    }
+                }
+                None
+            }),
+    }
+}
+
+fn is_attribute_or_macro_node(node: tree_sitter::Node) -> bool {
+    matches!(
+        node.kind(),
+        "attribute_specifier"
+            | "attribute_declaration"
+            | "attributed_declarator"
+            | "unreal_macro"
+            | "unreal_macro_argument_list"
+            | "preproc_def"
+            | "preproc_function_def"
+            | "ms_declspec_modifier"
+            | "alignas_specifier"
+    )
 }
 
 fn find_enclosing_class_name(node: tree_sitter::Node, content: &str) -> Option<String> {
@@ -5913,6 +6420,41 @@ mod tests {
         insert_include_decl(conn, file_id, include_path, Some(resolved_file_id));
     }
 
+    fn insert_search_file_entry(
+        conn: &Connection,
+        file_id: i64,
+        module_id: i64,
+        module_name: &str,
+        path: &str,
+        is_header: bool,
+    ) {
+        let normalized = path.replace('\\', "/");
+        let basename = Path::new(&normalized)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let ext = Path::new(&basename)
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_string();
+        conn.execute(
+            "INSERT INTO search_files (file_id, module_id, module_name, module_name_lc, path, path_lc, basename, basename_lc, ext, is_source, is_header, is_searchable_text) VALUES (?1, ?2, ?3, lower(?3), ?4, lower(?4), ?5, lower(?5), ?6, ?7, ?8, 1)",
+            rusqlite::params![
+                file_id,
+                module_id,
+                module_name,
+                normalized,
+                basename,
+                ext,
+                if is_header { 0 } else { 1 },
+                if is_header { 1 } else { 0 },
+            ],
+        )
+        .unwrap();
+    }
+
     fn temp_project_path(name: &str) -> std::path::PathBuf {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -5983,6 +6525,122 @@ mod tests {
         .unwrap();
         let items = value["items"].as_array().unwrap();
         assert!(!items.iter().any(|item| item["code"] == "UECPP-DF-004"));
+    }
+
+    #[test]
+    fn does_not_warn_when_switch_cases_all_return_with_default() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "int32 ComputeValue(int32 Mode)\n{\n    switch (Mode)\n    {\n    case 0:\n        return 1;\n    default:\n        return 2;\n    }\n}\n",
+            Some("C:/Project/Source/Game/MyActor.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-DF-004"));
+    }
+
+    #[test]
+    fn warns_when_switch_lacks_default_return_path() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "int32 ComputeValue(int32 Mode)\n{\n    switch (Mode)\n    {\n    case 0:\n        return 1;\n    }\n}\n",
+            Some("C:/Project/Source/Game/MyActor.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| item["code"] == "UECPP-DF-004"));
+    }
+
+    #[test]
+    fn does_not_warn_when_switch_case_falls_through_to_returning_default() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "int32 ComputeValue(int32 Mode)\n{\n    switch (Mode)\n    {\n    case 0:\n        ;\n    default:\n        return 2;\n    }\n}\n",
+            Some("C:/Project/Source/Game/MyActor.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-DF-004"));
+    }
+
+    #[test]
+    fn does_not_warn_when_try_and_all_catches_return() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "int32 ComputeValue()\n{\n    try\n    {\n        return 1;\n    }\n    catch (...)\n    {\n        return 2;\n    }\n}\n",
+            Some("C:/Project/Source/Game/MyActor.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-DF-004"));
+    }
+
+    #[test]
+    fn warns_when_catch_can_fall_through_without_return() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "int32 ComputeValue()\n{\n    try\n    {\n        return 1;\n    }\n    catch (...)\n    {\n        int32 Value = 0;\n    }\n}\n",
+            Some("C:/Project/Source/Game/MyActor.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| item["code"] == "UECPP-DF-004"));
+    }
+
+    #[test]
+    fn dataflow_warns_when_only_try_branch_initializes_local() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "void Test()\n{\n    int32 Value;\n    try\n    {\n        Value = 1;\n    }\n    catch (...)\n    {\n    }\n    Value;\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| item["code"] == "UECPP-DF-002"));
+    }
+
+    #[test]
+    fn dataflow_does_not_warn_when_try_and_catch_both_initialize_local() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "void Test()\n{\n    int32 Value;\n    try\n    {\n        Value = 1;\n    }\n    catch (...)\n    {\n        Value = 2;\n    }\n    Value;\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-DF-002"));
     }
 
     #[test]
@@ -6394,6 +7052,60 @@ mod tests {
         let shared_file_id = insert_file_at_path(&conn, &shared_header, true);
         insert_class_in_file(&conn, "FFoo", shared_file_id);
         insert_include_edge(&conn, current_file_id, "Bar.h", shared_file_id);
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "class FFoo;\n#include \"Bar.h\"\nvoid Use(FFoo& Value);\n",
+            Some(actor_header.to_string_lossy().to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP004"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP005"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn does_not_warn_when_full_definition_is_visible_via_unresolved_include_fallback() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let root = temp_project_path("full_definition_unresolved_fallback");
+        let public_dir = root.join("Source/Game/Public");
+        std::fs::create_dir_all(&public_dir).unwrap();
+        let shared_header = public_dir.join("Bar.h");
+        let actor_header = public_dir.join("X.h");
+        std::fs::write(&shared_header, "class FFoo {};\n").unwrap();
+        std::fs::write(
+            &actor_header,
+            "class FFoo;\n#include \"Bar.h\"\nvoid Use(FFoo& Value);\n",
+        )
+        .unwrap();
+
+        let current_file_id = insert_file_at_path(&conn, &actor_header, true);
+        let shared_file_id = insert_file_at_path(&conn, &shared_header, true);
+        insert_class_in_file(&conn, "FFoo", shared_file_id);
+        insert_include_decl(&conn, current_file_id, "Bar.h", None);
+        insert_search_file_entry(
+            &conn,
+            current_file_id,
+            7,
+            "Game",
+            &actor_header.to_string_lossy(),
+            true,
+        );
+        insert_search_file_entry(
+            &conn,
+            shared_file_id,
+            7,
+            "Game",
+            &shared_header.to_string_lossy(),
+            true,
+        );
 
         let value = process_diagnostics(
             &conn,
@@ -7444,6 +8156,24 @@ mod tests {
     }
 
     #[test]
+    fn dataflow_ignores_maybe_unused_local() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "void Run()\n{\n    [[maybe_unused]] int32 Value = 1;\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-DF-001"));
+    }
+
+    #[test]
     fn dataflow_warns_on_uninitialized_local_use() {
         let conn = Connection::open_in_memory().unwrap();
         crate::db::init_db(&conn).unwrap();
@@ -7452,6 +8182,132 @@ mod tests {
             &conn,
             None,
             "void Run()\n{\n    int32 Value;\n    Value;\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| item["code"] == "UECPP-DF-002"));
+    }
+
+    #[test]
+    fn dataflow_warns_when_only_one_if_branch_initializes_local() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "void Run(bool bFlag)\n{\n    int32 Value;\n    if (bFlag)\n    {\n        Value = 1;\n    }\n    Value;\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| item["code"] == "UECPP-DF-002"));
+    }
+
+    #[test]
+    fn dataflow_does_not_warn_when_both_if_branches_initialize_local() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "void Run(bool bFlag)\n{\n    int32 Value;\n    if (bFlag)\n    {\n        Value = 1;\n    }\n    else\n    {\n        Value = 2;\n    }\n    Value;\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-DF-002"));
+    }
+
+    #[test]
+    fn dataflow_warns_when_switch_only_some_paths_initialize_local() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "void Test(int32 Mode)\n{\n    int32 Value;\n    switch (Mode)\n    {\n    case 0:\n        Value = 1;\n        break;\n    default:\n        break;\n    }\n    Value;\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| item["code"] == "UECPP-DF-002"));
+    }
+
+    #[test]
+    fn dataflow_does_not_warn_when_switch_all_paths_initialize_local() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "void Test(int32 Mode)\n{\n    int32 Value;\n    switch (Mode)\n    {\n    case 0:\n        Value = 1;\n        break;\n    default:\n        Value = 2;\n        break;\n    }\n    Value;\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-DF-002"));
+    }
+
+    #[test]
+    fn dataflow_warns_when_while_body_only_initializes_local() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "void Run(bool bFlag)\n{\n    int32 Value;\n    while (bFlag)\n    {\n        Value = 1;\n        break;\n    }\n    Value;\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| item["code"] == "UECPP-DF-002"));
+    }
+
+    #[test]
+    fn dataflow_does_not_warn_when_do_while_initializes_local() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "void Run()\n{\n    int32 Value;\n    do\n    {\n        Value = 1;\n    }\n    while (false);\n    Value;\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-DF-002"));
+    }
+
+    #[test]
+    fn dataflow_warns_when_range_based_for_body_only_initializes_local() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "template<typename T> class TArray {};\nvoid Test(TArray<int32> Items)\n{\n    int32 Value;\n    for (int32 Item : Items)\n    {\n        Value = Item;\n    }\n    Value;\n}\n",
             Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
             &[],
         )
@@ -7477,6 +8333,24 @@ mod tests {
 
         let items = value["items"].as_array().unwrap();
         assert!(items.iter().any(|item| item["code"] == "UECPP-DF-003"));
+    }
+
+    #[test]
+    fn dataflow_does_not_warn_for_sequential_for_loop_indices() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "void Run()\n{\n    for (int32 Index = 0; Index < 1; ++Index)\n    {\n    }\n    for (int32 Index = 0; Index < 1; ++Index)\n    {\n    }\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-DF-003"));
     }
 
     #[test]
@@ -7513,6 +8387,137 @@ mod tests {
 
         let items = value["items"].as_array().unwrap();
         assert!(items.iter().any(|item| item["code"] == "UECPP-EXPR-002"));
+    }
+
+    #[test]
+    fn overload_check_respects_namespace_qualified_overload_set() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "namespace A { void Run(int32 Value) {} }\nnamespace B { void Run(int32 Value) {} }\nvoid Test()\n{\n    B::Run(1);\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-002"));
+    }
+
+    #[test]
+    fn overload_check_reports_no_match_for_namespace_qualified_target_only() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "namespace A { void Run() {} }\nnamespace B { void Run(int32 Value) {} }\nvoid Test()\n{\n    B::Run();\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| item["code"] == "UECPP-EXPR-003"));
+    }
+
+    #[test]
+    fn overload_check_accepts_default_argument_arity() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "void Run(int32 Value, int32 Count = 0) {}\nvoid Test()\n{\n    Run(1);\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-001"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-003"));
+    }
+
+    #[test]
+    fn overload_check_accepts_nullptr_for_pointer_parameter() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "class UObject {};\nvoid Run(UObject* Value) {}\nvoid Test()\n{\n    Run(nullptr);\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-001"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-003"));
+    }
+
+    #[test]
+    fn overload_check_accepts_const_reference_parameter() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "void Run(const int32& Value) {}\nvoid Test()\n{\n    Run(1);\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-001"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-003"));
+    }
+
+    #[test]
+    fn overload_check_accepts_nullptr_for_pointer_reference_parameter() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "class UObject {};\nvoid Run(UObject* const& Value) {}\nvoid Test()\n{\n    Run(nullptr);\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-001"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-003"));
+    }
+
+    #[test]
+    fn overload_check_does_not_misclassify_default_argument_type_mismatch_as_arity_error() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "void Run(int32 Value, int32 Count = 0) {}\nvoid Test()\n{\n    Run(\"demo\");\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| item["code"] == "UECPP-EXPR-001"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-003"));
     }
 
     #[test]
@@ -7570,6 +8575,115 @@ mod tests {
     }
 
     #[test]
+    fn type_check_reports_incompatible_named_cast() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "void Test()\n{\n    auto Value = static_cast<int32>(\"demo\");\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| item["code"] == "UECPP-EXPR-005"));
+    }
+
+    #[test]
+    fn type_check_reports_incompatible_binary_operands() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "void Test()\n{\n    int32 Value = 1;\n    Value + \"demo\";\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| item["code"] == "UECPP-EXPR-006"));
+    }
+
+    #[test]
+    fn type_check_reports_pointer_integer_comparison() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "class UObject {};\nvoid Test()\n{\n    UObject* Value = nullptr;\n    Value == 1;\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| item["code"] == "UECPP-EXPR-009"));
+    }
+
+    #[test]
+    fn type_check_reports_dereference_on_non_pointer() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "void Test()\n{\n    int32 Value = 1;\n    *Value;\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| item["code"] == "UECPP-EXPR-010"));
+    }
+
+    #[test]
+    fn type_check_accepts_arrow_on_pointer_alias() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "class UFoo\n{\npublic:\n    int32 Count;\n};\nusing FFooPtr = UFoo*;\nvoid Test()\n{\n    FFooPtr Value = nullptr;\n    Value->Count;\n}\n",
+            Some("C:/Project/Source/Game/Public/Test.h".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-011"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-004"));
+    }
+
+    #[test]
+    fn type_check_accepts_dereference_on_pointer_alias() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "class UFoo {};\nusing FFooPtr = UFoo*;\nvoid Test()\n{\n    FFooPtr Value = nullptr;\n    *Value;\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-010"));
+    }
+
+    #[test]
     fn type_check_reports_arrow_on_non_pointer() {
         let conn = Connection::open_in_memory().unwrap();
         crate::db::init_db(&conn).unwrap();
@@ -7585,6 +8699,241 @@ mod tests {
 
         let items = value["items"].as_array().unwrap();
         assert!(items.iter().any(|item| item["code"] == "UECPP-EXPR-011"));
+    }
+
+    #[test]
+    fn type_check_reports_missing_member_on_known_type() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "class FFoo { public: int32 X; };\nvoid Test()\n{\n    FFoo Value;\n    Value.Missing;\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| item["code"] == "UECPP-EXPR-004"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP009"));
+    }
+
+    #[test]
+    fn type_check_does_not_report_missing_member_on_namespace_qualified_class_type() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "namespace UE::Math { class Vec { public: int32 X; }; }\nvoid Test()\n{\n    UE::Math::Vec Value;\n    Value.X;\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-004"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP009"));
+    }
+
+    #[test]
+    fn type_check_does_not_report_missing_member_on_template_class_instance() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "template<typename T>\nstruct Box { int32 Value; };\nvoid Test()\n{\n    Box<int32> Item;\n    Item.Value;\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-004"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP009"));
+    }
+
+    #[test]
+    fn overload_check_accepts_method_call_on_template_class_instance() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "template<typename T>\nstruct Box { int32 Get() { return 1; } };\nint32 Test()\n{\n    Box<int32> Item;\n    return Item.Get();\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-001"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-003"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-007"));
+    }
+
+    #[test]
+    fn overload_check_accepts_method_call_on_namespace_qualified_template_class_instance() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "namespace UE::Math {\ntemplate<typename T>\nstruct Box { int32 Get() { return 1; } };\n}\nint32 Test()\n{\n    UE::Math::Box<int32> Item;\n    return Item.Get();\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-001"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-003"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-007"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-004"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP009"));
+    }
+
+    #[test]
+    fn type_check_uses_member_type_from_explicit_template_specialization() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "class UObject {};\ntemplate<typename T>\nstruct Box { int32 Value; };\ntemplate<>\nstruct Box<int32> { UObject* Value; };\nUObject* Test()\n{\n    Box<int32> Item;\n    return Item.Value;\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-007"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-004"));
+    }
+
+    #[test]
+    fn type_check_keeps_primary_template_member_type_for_non_specialized_instance() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "class UObject {};\ntemplate<typename T>\nstruct Box { int32 Value; };\ntemplate<>\nstruct Box<int32> { UObject* Value; };\nint32 Test()\n{\n    Box<float> Item;\n    return Item.Value;\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-007"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-004"));
+    }
+
+    #[test]
+    fn type_check_uses_dependent_template_field_type_from_instance_arg() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "template<typename T>\nstruct Box { T Value; };\nint32 Test()\n{\n    Box<int32> Item;\n    return Item.Value;\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-007"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-004"));
+    }
+
+    #[test]
+    fn overload_check_uses_dependent_template_method_signature_from_instance_arg() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "template<typename T>\nstruct Box { T Get(T Value) { return Value; } };\nint32 Test()\n{\n    Box<int32> Item;\n    return Item.Get(1);\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-001"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-003"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-007"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-004"));
+    }
+
+    #[test]
+    fn type_check_uses_pointer_dependent_template_field_type() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "template<typename T>\nstruct Box { T* Value; };\nint32* Test()\n{\n    Box<int32> Item;\n    return Item.Value;\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-007"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-004"));
+    }
+
+    #[test]
+    fn overload_check_uses_reference_dependent_template_method_signature() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "template<typename T>\nstruct Box { T& Get(T& Value) { return Value; } };\nvoid Test(int32& Ref)\n{\n    Box<int32> Item;\n    Item.Get(Ref);\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-001"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-003"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-004"));
+    }
+
+    #[test]
+    fn type_check_uses_nested_template_dependent_field_type() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "template<typename U> struct TArray {};\ntemplate<typename T>\nstruct Box { TArray<T> Values; };\nTArray<int32> Test()\n{\n    Box<int32> Item;\n    return Item.Values;\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-007"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-004"));
     }
 
     #[test]
@@ -7621,6 +8970,44 @@ mod tests {
 
         let items = value["items"].as_array().unwrap();
         assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-007"));
+    }
+
+    #[test]
+    fn type_check_accepts_nullptr_assignment_to_pointer() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "class UObject {};\nvoid Test()\n{\n    UObject* Value = nullptr;\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-008"));
+    }
+
+    #[test]
+    fn type_check_accepts_nullptr_return_for_pointer_type() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "class UObject {};\nUObject* Test()\n{\n    return nullptr;\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        if items.iter().any(|item| item["code"] == "UECPP-EXPR-007") {
+            panic!("{}", serde_json::to_string_pretty(&value).unwrap());
+        }
     }
 
     #[test]
@@ -7688,6 +9075,52 @@ mod tests {
     }
 
     #[test]
+    fn preproc_stringification_macro_drives_type_check_and_maps_original_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "#define BADSTR(X) #X\nint32 Test()\n{\n    return BADSTR(Foo);\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        let item = items
+            .iter()
+            .find(|item| item["code"] == "UECPP-EXPR-007")
+            .unwrap();
+        assert_eq!(item["character"].as_u64(), Some(11));
+        assert_eq!(item["end_character"].as_u64(), Some(22));
+    }
+
+    #[test]
+    fn preproc_token_paste_macro_drives_name_lookup() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "#define JOIN(A, B) A##B\nint32 FooBar() { return 1; }\nint32 Test()\n{\n    return JOIN(Foo, Bar)();\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| {
+            item["code"] == "UECPP008"
+                && item["message"].as_str().unwrap_or_default().contains("FooBar")
+        }));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-007"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-001"));
+    }
+
+    #[test]
     fn preproc_expansion_drives_dataflow_constant_condition() {
         let conn = Connection::open_in_memory().unwrap();
         crate::db::init_db(&conn).unwrap();
@@ -7703,6 +9136,534 @@ mod tests {
 
         let items = value["items"].as_array().unwrap();
         assert!(items.iter().any(|item| item["code"] == "UECPP-DF-005"));
+    }
+
+    #[test]
+    fn preproc_include_expansion_drives_type_check_through_transitive_headers() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let root = temp_project_path("preproc_include_type_check");
+        let public_dir = root.join("Source/Game/Public");
+        let private_dir = root.join("Source/Game/Private");
+        std::fs::create_dir_all(&public_dir).unwrap();
+        std::fs::create_dir_all(&private_dir).unwrap();
+
+        let source = private_dir.join("Test.cpp");
+        let types_header = public_dir.join("Types.h");
+        let shared_header = public_dir.join("Shared.h");
+
+        std::fs::write(
+            &types_header,
+            "class FDemoString {};\nFDemoString MakeValue();\n",
+        )
+        .unwrap();
+        std::fs::write(&shared_header, "#include \"Types.h\"\n").unwrap();
+        std::fs::write(
+            &source,
+            "#include \"Shared.h\"\n\nint32 Test()\n{\n    return MakeValue();\n}\n",
+        )
+        .unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "#include \"Shared.h\"\n\nint32 Test()\n{\n    return MakeValue();\n}\n",
+            Some(source.to_string_lossy().replace('\\', "/")),
+            &[],
+        )
+        .unwrap();
+        let source_path = source.to_string_lossy().replace('\\', "/");
+
+        let items = value["items"].as_array().unwrap();
+        let item = items
+            .iter()
+            .find(|item| item["code"] == "UECPP-EXPR-007")
+            .unwrap();
+        assert_eq!(item["line"].as_u64(), Some(4));
+        assert_eq!(item["file_path"].as_str(), Some(source_path.as_str()));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn preproc_include_expansion_drives_name_lookup_through_transitive_headers() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let root = temp_project_path("preproc_include_name_lookup");
+        let public_dir = root.join("Source/Game/Public");
+        let private_dir = root.join("Source/Game/Private");
+        std::fs::create_dir_all(&public_dir).unwrap();
+        std::fs::create_dir_all(&private_dir).unwrap();
+
+        let source = private_dir.join("Test.cpp");
+        let decls_header = public_dir.join("Decls.h");
+        let shared_header = public_dir.join("Shared.h");
+
+        std::fs::write(&decls_header, "void RunValue();\n").unwrap();
+        std::fs::write(&shared_header, "#include \"Decls.h\"\n").unwrap();
+        std::fs::write(
+            &source,
+            "#include \"Shared.h\"\n\nvoid Test()\n{\n    RunValue();\n}\n",
+        )
+        .unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "#include \"Shared.h\"\n\nvoid Test()\n{\n    RunValue();\n}\n",
+            Some(source.to_string_lossy().replace('\\', "/")),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| {
+            item["code"] == "UECPP008"
+                && item["message"].as_str().unwrap_or_default().contains("RunValue")
+        }));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn preproc_macro_include_drives_name_lookup_through_header() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let root = temp_project_path("preproc_macro_include_name_lookup");
+        let public_dir = root.join("Source/Game/Public");
+        let private_dir = root.join("Source/Game/Private");
+        std::fs::create_dir_all(&public_dir).unwrap();
+        std::fs::create_dir_all(&private_dir).unwrap();
+
+        let source = private_dir.join("Test.cpp");
+        let decls_header = public_dir.join("Decls.h");
+
+        std::fs::write(&decls_header, "void RunValue();\n").unwrap();
+        std::fs::write(
+            &source,
+            "#define HEADER_FILE \"Decls.h\"\n#include HEADER_FILE\n\nvoid Test()\n{\n    RunValue();\n}\n",
+        )
+        .unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "#define HEADER_FILE \"Decls.h\"\n#include HEADER_FILE\n\nvoid Test()\n{\n    RunValue();\n}\n",
+            Some(source.to_string_lossy().replace('\\', "/")),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| {
+            item["code"] == "UECPP008"
+                && item["message"].as_str().unwrap_or_default().contains("RunValue")
+        }));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn preproc_function_macro_include_drives_name_lookup_through_header() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let root = temp_project_path("preproc_fn_macro_include_name_lookup");
+        let public_dir = root.join("Source/Game/Public");
+        let private_dir = root.join("Source/Game/Private");
+        std::fs::create_dir_all(&public_dir).unwrap();
+        std::fs::create_dir_all(&private_dir).unwrap();
+
+        let source = private_dir.join("Test.cpp");
+        let shared_header = public_dir.join("Shared.h");
+
+        std::fs::write(&shared_header, "int32 HeaderValue();\n").unwrap();
+        std::fs::write(
+            &source,
+            "#define HEADER_FILE() \"Shared.h\"\n#include HEADER_FILE()\n\nint32 Test()\n{\n    return HeaderValue();\n}\n",
+        )
+        .unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "#define HEADER_FILE() \"Shared.h\"\n#include HEADER_FILE()\n\nint32 Test()\n{\n    return HeaderValue();\n}\n",
+            Some(source.to_string_lossy().replace('\\', "/")),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP008"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-001"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-007"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn name_lookup_uses_sema_for_namespace_qualified_calls() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "namespace UE::Math { int32 Value() { return 1; } }\nint32 Test()\n{\n    return UE::Math::Value();\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| {
+            item["code"] == "UECPP008"
+                && item["message"].as_str().unwrap_or_default().contains("Value")
+        }));
+        assert!(!items.iter().any(|item| {
+            item["code"] == "UECPP009"
+                && item["message"].as_str().unwrap_or_default().contains("Value")
+        }));
+    }
+
+    #[test]
+    fn name_lookup_uses_sema_for_using_declarations() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "namespace UE::Math { int32 Value() { return 1; } }\nusing UE::Math::Value;\nint32 Test()\n{\n    return Value();\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| {
+            item["code"] == "UECPP008"
+                && item["message"].as_str().unwrap_or_default().contains("Value")
+        }));
+    }
+
+    #[test]
+    fn name_lookup_uses_sema_for_using_namespace_directives() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "namespace UE::Math { int32 Value() { return 1; } }\nusing namespace UE::Math;\nint32 Test()\n{\n    return Value();\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| {
+            item["code"] == "UECPP008"
+                && item["message"].as_str().unwrap_or_default().contains("Value")
+        }));
+    }
+
+    #[test]
+    fn name_lookup_uses_sema_for_adl_calls() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "namespace UE::Math { struct Vec {}; int32 Length(Vec Value) { return 1; } }\nint32 Test()\n{\n    UE::Math::Vec Value;\n    return Length(Value);\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| {
+            item["code"] == "UECPP008"
+                && item["message"].as_str().unwrap_or_default().contains("Length")
+        }));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-001"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-003"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-007"));
+    }
+
+    #[test]
+    fn type_check_treats_alias_return_type_as_underlying_type() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "using FCount = int32;\nFCount Test()\n{\n    return 1;\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-007"));
+    }
+
+    #[test]
+    fn type_check_uses_alias_in_template_explicit_return_type() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "using FCount = int32;\ntemplate<typename T>\nT Id(T Value) { return Value; }\nFCount Test()\n{\n    return Id<FCount>(1);\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-007"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-TPL-001"));
+    }
+
+    #[test]
+    fn type_check_accepts_namespace_qualified_template_call_return_type() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "namespace UE::Math { template<typename T> T Id(T Value) { return Value; } }\nint32 Test() { return UE::Math::Id<int32>(1); }\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-007"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-TPL-001"));
+    }
+
+    #[test]
+    fn template_check_accepts_alias_type_argument_in_template_type() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "using FCount = int32;\ntemplate<typename T> struct Box {};\nBox<FCount> Value;\n",
+            Some("C:/Project/Source/Game/Public/Test.h".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-TPL-003"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-TPL-001"));
+    }
+
+    #[test]
+    fn template_check_accepts_namespace_qualified_template_type() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "namespace UE::Math { template<typename T> struct Box {}; }\nUE::Math::Box<int32> Value;\n",
+            Some("C:/Project/Source/Game/Public/Test.h".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-TPL-003"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-TPL-001"));
+    }
+
+    #[test]
+    fn template_check_accepts_explicit_class_specialization_type() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "template<typename T> struct Box {};\ntemplate<> struct Box<int32> {};\nBox<int32> Value;\nint32 Sentinel = 0;\n",
+            Some("C:/Project/Source/Game/Public/Test.h".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-TPL-002"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-TPL-003"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-TPL-001"));
+    }
+
+    #[test]
+    fn template_check_accepts_alias_to_explicit_class_specialization_type() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "using FCount = int32;\ntemplate<typename T> struct Box {};\ntemplate<> struct Box<int32> {};\nBox<FCount> Value;\nint32 Sentinel = 0;\n",
+            Some("C:/Project/Source/Game/Public/Test.h".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-TPL-002"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-TPL-003"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-TPL-001"));
+    }
+
+    #[test]
+    fn template_check_accepts_namespace_qualified_explicit_class_specialization_type() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "namespace UE::Math { template<typename T> struct Box {}; template<> struct Box<int32> {}; }\nUE::Math::Box<int32> Value;\nint32 Sentinel = 0;\n",
+            Some("C:/Project/Source/Game/Public/Test.h".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-TPL-002"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-TPL-003"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-TPL-001"));
+    }
+
+    #[test]
+    fn template_check_accepts_default_type_param_in_template_type() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "template<typename T = int32> struct Box {};\nBox<> Value;\nint32 Sentinel = 0;\n",
+            Some("C:/Project/Source/Game/Public/Test.h".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-TPL-002"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-TPL-001"));
+    }
+
+    #[test]
+    fn type_check_accepts_default_type_param_in_template_call() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "template<typename T = int32>\nT Id(T Value) { return Value; }\nint32 Test()\n{\n    return Id<>(1);\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-TPL-001"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-TPL-002"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-007"));
+    }
+
+    #[test]
+    fn type_check_accepts_default_type_param_without_explicit_brackets() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "template<typename T = int32>\nT Make() { return 1; }\nint32 Test()\n{\n    return Make();\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-TPL-001"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-001"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-007"));
+    }
+
+    #[test]
+    fn type_check_prefers_deduced_type_over_default_template_param() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "template<typename T = int32>\nT Id(T Value) { return Value; }\nint32 Test()\n{\n    return Id(1.0f);\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-TPL-001"));
+        assert!(items.iter().any(|item| item["code"] == "UECPP-EXPR-007"));
+    }
+
+    #[test]
+    fn template_check_accepts_default_non_type_param_in_template_type() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "template<int N = 4> struct Sized {};\nSized<> Value;\nint32 Sentinel = 0;\n",
+            Some("C:/Project/Source/Game/Public/Test.h".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-TPL-002"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-TPL-003"));
+    }
+
+    #[test]
+    fn type_check_accepts_default_non_type_param_without_explicit_brackets() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "template<int N = 4>\nint32 Make() { return N; }\nint32 Test()\n{\n    return Make();\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-TPL-001"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-001"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-007"));
     }
 
     #[test]
@@ -7787,6 +9748,63 @@ mod tests {
             None,
             "template<typename T>\nstd::enable_if_t<false, T> Only(T Value) { return Value; }\nvoid Test()\n{\n    Only(1);\n}\n",
             Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        if !items.iter().any(|item| item["code"] == "UECPP-TPL-004") {
+            panic!("{}", serde_json::to_string_pretty(&value).unwrap());
+        }
+    }
+
+    #[test]
+    fn template_check_reports_class_template_sfinae_rejection() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "template<typename T>\nrequires false\nstruct Box {};\nBox<int32> Value;\nint32 Sentinel = 0;\n",
+            Some("C:/Project/Source/Game/Public/Test.h".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| item["code"] == "UECPP-TPL-004"));
+    }
+
+    #[test]
+    fn template_check_accepts_enable_if_true_template_return() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "template<typename T>\nstd::enable_if_t<true, T> Only(T Value) { return Value; }\nint32 Test()\n{\n    return Only(1);\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-TPL-004"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-EXPR-007"));
+    }
+
+    #[test]
+    fn template_check_reports_requires_clause_with_extra_spacing() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "template<typename T>\nrequires   false\nstruct Box {};\nBox<int32> Value;\nint32 Sentinel = 0;\n",
+            Some("C:/Project/Source/Game/Public/Test.h".to_string()),
             &[],
         )
         .unwrap();
@@ -7893,6 +9911,26 @@ mod tests {
     }
 
     #[test]
+    fn type_check_uses_nested_pointer_reference_template_deduction_for_valid_return() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "template<typename T>\nT* Id(T*& Value) { return Value; }\nint32 Test(int32* Ptr)\n{\n    return *Id(Ptr);\n}\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        if items.iter().any(|item| item["code"] == "UECPP-EXPR-007") {
+            panic!("{}", serde_json::to_string_pretty(&value).unwrap());
+        }
+    }
+
+    #[test]
     fn finalize_suppresses_inactive_has_include_branch() {
         let conn = Connection::open_in_memory().unwrap();
         crate::db::init_db(&conn).unwrap();
@@ -7919,6 +9957,63 @@ mod tests {
         assert!(!items.iter().any(|item| item["code"] == "UECPP-SYN-010"));
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn finalize_suppresses_inactive_expression_macro_branch() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "#define FLAG (1 + 1)\n#if FLAG == 2\nint32 Value = 1;\n#else\nxxxxx;\n#endif\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP008"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-SYN-010"));
+    }
+
+    #[test]
+    fn finalize_suppresses_inactive_function_macro_branch() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "#define ADD(X, Y) ((X) + (Y))\n#if ADD(1, 2) == 3\nint32 Value = 1;\n#else\nxxxxx;\n#endif\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP008"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-SYN-010"));
+    }
+
+    #[test]
+    fn finalize_keeps_else_branch_for_uninvoked_function_macro_condition() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let value = process_diagnostics(
+            &conn,
+            None,
+            "#define FLAG(X) X\n#if FLAG\nxxxxx;\n#else\nint32 Value = 1;\n#endif\n",
+            Some("C:/Project/Source/Game/Private/Test.cpp".to_string()),
+            &[],
+        )
+        .unwrap();
+
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.iter().any(|item| item["code"] == "UECPP008"));
+        assert!(!items.iter().any(|item| item["code"] == "UECPP-SYN-010"));
     }
 
     #[test]

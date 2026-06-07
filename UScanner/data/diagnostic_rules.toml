@@ -1,17 +1,48 @@
 [finalize]
-max_per_file = 500
-max_per_line = 5
+max_per_file = 200
+max_per_line = 3
 dedupe_window_cols = 4
-suppress_tail_lines = 1
-suppress_inside_preproc_if_zero = true
+suppress_tail_lines = 0
+suppress_inside_preproc_if_zero = false
+phase_timeout_ms = 300
+total_timeout_ms = 1000
 
 [syntax_errors]
 enabled = true
+severity_missing = "error"
+severity_error = "error"
+report_error_node = true
+skip_preproc_if_zero = true
+suppress_tail_lines = 1
 
 [bad_characters]
 enabled = true
 full_width_severity = "error"
 invisible_severity = "warning"
+max_per_file = 200
+pairs_file = "unicode_punct_pairs.toml"
+
+[include_resolution]
+enabled = true
+severity = "error"
+include_roots_file = "include_roots.toml"
+
+[linker]
+enabled = true
+check_odr_function = true
+odr_function_severity = "error"
+check_odr_class = true
+odr_class_severity = "error"
+check_missing_def = false
+missing_def_severity = "warning"
+missing_def_ignore_class_prefixes = ["I", "U", "A", "F", "T"]
+missing_def_ignore_name_prefixes = ["On", "Handle", "BP_", "K2_"]
+missing_def_check_only_non_ue_reflected = true
+check_name_clash = true
+name_clash_severity = "error"
+full_check_on_db_rebuild = true
+incremental_on_save = true
+incremental_on_save_if_larger_than_lines = 10000
 
 [dataflow]
 enabled = true

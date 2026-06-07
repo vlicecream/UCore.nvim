@@ -383,6 +383,20 @@ fn sample_single_item(value: &Value) -> String {
     format!("name={} kind={} path={} line={}", name, kind, path, line)
 }
 
+fn is_linker_diagnostic_code(code: &str) -> bool {
+    matches!(
+        code,
+        "UECPP-LNK-001" | "UECPP-LNK-002" | "UECPP-LNK-003" | "UECPP-LNK-004"
+    )
+}
+
+fn disk_content_matches(file_path: &str, content: &str) -> bool {
+    let Ok(disk_text) = std::fs::read_to_string(normalize_to_native(file_path)) else {
+        return false;
+    };
+    disk_text == content
+}
+
 // -----------------------------------------------------------------------------
 // Request types
 // -----------------------------------------------------------------------------
@@ -555,10 +569,24 @@ pub async fn handle_refresh(
     state.invalidate_member_hot_index(&db_path_native);
     state.invalidate_visibility_for_project(&root_key);
     clear_completion_cache(state, &root_key);
+    if let Some(cache) = state.diagnostics_caches.lock().get(&root_key).cloned() {
+        cache.lock().clear();
+    }
 
     if let Ok(conn) = state.get_connection(&db_path_native) {
         let conn = conn.lock();
         let _ = asset::populate_asset_graph_state(state, &refresh_project_root, &conn);
+        let linker_rules = crate::diagnostics::diagnostic_rules().linker.clone();
+        if linker_rules.enabled && linker_rules.full_check_on_db_rebuild && !is_engine_root_path(Path::new(&refresh_project_root)) {
+            if let Err(err) = crate::diagnostics::phases::linker::rebuild_full_cache(
+                &conn,
+                &refresh_project_root,
+                &db_path_native,
+                &linker_rules,
+            ) {
+                warn!("Failed to rebuild linker diagnostics cache: {}", err);
+            }
+        }
     }
 
     Ok(Value::String("Refresh success".to_string()))
@@ -1077,6 +1105,7 @@ fn handle_state_query(
             file_path,
             open_files,
         } => {
+            let file_path_for_linker = file_path.clone();
             let cache = state.get_diagnostics_cache(root_key);
             let cache_key = diagnostics_cache_key(file_path.as_deref(), &content, &open_files);
 
@@ -1163,9 +1192,11 @@ fn handle_state_query(
                 })
                 .transpose()?;
 
-            let value = crate::diagnostics::process_diagnostics_with_hot_indexes(
+            let mut value = crate::diagnostics::process_diagnostics_with_context(
                 conn,
                 engine_conn.as_ref(),
+                Some(project_root),
+                Some(project_db_path),
                 usage_hot_index.as_deref(),
                 engine_usage_hot_index.as_deref(),
                 member_hot_index.as_deref(),
@@ -1175,6 +1206,37 @@ fn handle_state_query(
                 file_path,
                 &open_files,
             )?;
+
+            if let (Some(file_path), Some(items)) = (
+                file_path_for_linker,
+                value.get_mut("items").and_then(|items| items.as_array_mut()),
+            ) {
+                let rules = crate::diagnostics::diagnostic_rules();
+                if rules.linker.enabled
+                    && rules.linker.incremental_on_save
+                    && disk_content_matches(&file_path, &content)
+                {
+                    let linker_items = crate::diagnostics::phases::linker::collect_incremental(
+                        conn,
+                        project_root,
+                        project_db_path,
+                        &file_path,
+                        &content,
+                        &rules.linker,
+                    )?;
+                    items.retain(|item| {
+                        item.get("code")
+                            .and_then(Value::as_str)
+                            .map(|code| !is_linker_diagnostic_code(code))
+                            .unwrap_or(true)
+                    });
+                    let linker_values = linker_items
+                        .into_iter()
+                        .map(serde_json::to_value)
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    items.extend(linker_values);
+                }
+            }
             cache.lock().put(cache_key, value.clone());
             Ok(Some(value))
         }

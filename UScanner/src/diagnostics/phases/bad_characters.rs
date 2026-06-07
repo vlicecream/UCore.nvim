@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
 use std::sync::OnceLock;
 
 use anyhow::Result;
@@ -22,9 +24,8 @@ pub(crate) fn collect(
     parsed_root: Option<tree_sitter::Node>,
     rules: &BadCharactersRules,
 ) -> Result<Vec<DiagnosticItem>> {
-    let unicode_rules = UNICODE_RULES.get_or_init(|| {
-        toml::from_str(include_str!("../../../data/unicode_punct_pairs.toml")).unwrap_or_default()
-    });
+    let unicode_rules =
+        UNICODE_RULES.get_or_init(|| load_unicode_rules(&rules.pairs_file).unwrap_or_default());
     let mut items = Vec::new();
     let line_starts = line_start_offsets(content);
 
@@ -54,7 +55,7 @@ pub(crate) fn collect(
         }
 
         let (line, col) = line_and_column_for_byte(content, &line_starts, byte_index);
-        let end_col = col + ch.len_utf8() as u32;
+        let end_col = col + ch.len_utf16() as u32;
         let mut item = DiagnosticItem::new(
             file_path,
             line,
@@ -71,6 +72,9 @@ pub(crate) fn collect(
         }
 
         items.push(item);
+        if items.len() >= rules.max_per_file {
+            break;
+        }
     }
 
     Ok(items)
@@ -119,6 +123,16 @@ fn line_start_offsets(content: &str) -> Vec<usize> {
 fn line_and_column_for_byte(content: &str, line_starts: &[usize], byte_index: usize) -> (u32, u32) {
     let line = line_starts.partition_point(|start| *start <= byte_index).saturating_sub(1);
     let line_start = line_starts.get(line).copied().unwrap_or(0);
-    let column = content[line_start..byte_index].chars().count() as u32;
+    let column = content[line_start..byte_index]
+        .encode_utf16()
+        .count() as u32;
     (line as u32, column)
+}
+
+fn load_unicode_rules(file_name: &str) -> Result<UnicodePunctPairs> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let path = Path::new(manifest_dir).join("data").join(file_name);
+    let text = fs::read_to_string(&path)
+        .unwrap_or_else(|_| include_str!("../../../data/unicode_punct_pairs.toml").to_string());
+    Ok(toml::from_str(&text).unwrap_or_default())
 }

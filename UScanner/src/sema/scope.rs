@@ -65,4 +65,8 @@ impl ScopeTree {
     pub fn get_mut(&mut self, id: ScopeId) -> Option<&mut Scope> {
         self.scopes.get_mut(id.0 as usize)
     }
+
+    pub fn iter(&self) -> impl Iterator<Item = &Scope> {
+        self.scopes.iter()
+    }
 }
