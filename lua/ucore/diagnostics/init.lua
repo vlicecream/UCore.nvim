@@ -18,7 +18,7 @@ local try_include_symbol
 local float_sequence = 0
 local float_winid = nil
 local last_float_key = nil
-local DIAGNOSTICS_INFLIGHT_TIMEOUT_MS = 30000
+local DIAGNOSTICS_INFLIGHT_TIMEOUT_MS = 10000
 
 local severity_map = {
 	error = vim.diagnostic.severity.ERROR,
@@ -315,8 +315,13 @@ local function diagnostics_signature(diagnostics)
 	return table.concat(parts, "\30")
 end
 
-local function apply_items(items, fallback_bufnr, opts)
+local function apply_items(result, fallback_bufnr, opts)
+	if type(result) == "table" and result.refreshing == true then
+		return
+	end
+
 	opts = opts or {}
+	local items = type(result) == "table" and (result.items or result) or {}
 	items = filter_items(items, opts)
 
 	local by_buf = {}
@@ -454,9 +459,8 @@ function M.refresh(bufnr, opts)
 			return
 		end
 
-		local items = type(result) == "table" and (result.items or result) or {}
 		vim.schedule(function()
-			apply_items(items, bufnr, opts)
+			apply_items(result, bufnr, opts)
 		end)
 	end)
 end

@@ -503,10 +503,6 @@ pub async fn handle_setup(state: Arc<AppState>, params: &Value) -> Result<Value>
         ensure_asset_index_ready(state.clone(), &db_path_native, &req.project_root).await?;
     }
 
-    if readiness.needs_full_refresh {
-        state.active_refreshes.lock().insert(root_key.clone());
-    }
-
     let _ = state.save_registry();
 
     Ok(json!({
@@ -651,6 +647,18 @@ pub async fn handle_query(
     }
 
     if is_refreshing(&state, &root_key) {
+        if matches!(req.query, QueryRequest::GetDiagnostics { .. }) {
+            info!(
+                "Diagnostics deferred during refresh: root={} file={}",
+                root_key,
+                query_primary_file_path(&req.query).unwrap_or("-"),
+            );
+            return Ok(json!({
+                "items": [],
+                "refreshing": true,
+            }));
+        }
+
         return Ok(json!([]));
     }
 
@@ -1109,27 +1117,51 @@ fn handle_state_query(
             file_path,
             open_files,
         } => {
+            let diagnostics_started_at = Instant::now();
             let file_path_for_linker = file_path.clone();
+            let diagnostics_file = file_path.as_deref().unwrap_or("-").to_string();
+            debug!(
+                "GetDiagnostics handler entered: root={} file={} elapsed_ms={}",
+                root_key,
+                diagnostics_file,
+                diagnostics_started_at.elapsed().as_millis(),
+            );
             let cache = state.get_diagnostics_cache(root_key);
             let cache_key = diagnostics_cache_key(file_path.as_deref(), &content, &open_files);
 
             if is_refreshing(&state, root_key) {
                 info!(
-                    "Diagnostics skipped during refresh: root={} file={}",
+                    "Diagnostics deferred during refresh: root={} file={}",
                     root_key,
-                    file_path.as_deref().unwrap_or("-"),
+                    diagnostics_file,
                 );
-                return Ok(Some(json!({ "items": [] })));
+                return Ok(Some(json!({
+                    "items": [],
+                    "refreshing": true,
+                })));
             }
+            debug!(
+                "GetDiagnostics refresh check passed: root={} file={} elapsed_ms={}",
+                root_key,
+                diagnostics_file,
+                diagnostics_started_at.elapsed().as_millis(),
+            );
 
             if let Some(value) = cache.lock().get(&cache_key) {
                 debug!(
-                    "diagnostics cache hit: root={} file={}",
+                    "GetDiagnostics cache hit: root={} file={} elapsed_ms={}",
                     root_key,
-                    file_path.as_deref().unwrap_or("-"),
+                    diagnostics_file,
+                    diagnostics_started_at.elapsed().as_millis(),
                 );
                 return Ok(Some(value));
             }
+            debug!(
+                "GetDiagnostics cache miss: root={} file={} elapsed_ms={}",
+                root_key,
+                diagnostics_file,
+                diagnostics_started_at.elapsed().as_millis(),
+            );
 
             let engine_conn = match engine_db_path
                 .as_deref()
@@ -1145,6 +1177,13 @@ fn handle_state_query(
                 },
                 None => None,
             };
+            debug!(
+                "GetDiagnostics engine DB ready: root={} file={} has_engine_db={} elapsed_ms={}",
+                root_key,
+                diagnostics_file,
+                engine_conn.is_some(),
+                diagnostics_started_at.elapsed().as_millis(),
+            );
 
             let usage_hot_index =
                 load_usage_hot_index(&state, project_db_path, "diagnostics project");
@@ -1160,6 +1199,16 @@ fn handle_state_query(
                 .map(normalize_to_native)
                 .filter(|path| Path::new(path).is_file())
                 .and_then(|path| load_member_hot_index(&state, &path, "diagnostics engine"));
+            debug!(
+                "GetDiagnostics hot indexes ready: root={} file={} usage_project={} usage_engine={} member_project={} member_engine={} elapsed_ms={}",
+                root_key,
+                diagnostics_file,
+                usage_hot_index.is_some(),
+                engine_usage_hot_index.is_some(),
+                member_hot_index.is_some(),
+                engine_member_hot_index.is_some(),
+                diagnostics_started_at.elapsed().as_millis(),
+            );
             let visibility_cache = state.get_visibility_cache(root_key);
             let project_db_mtime_secs = file_mtime_secs(project_db_path);
             let engine_db_mtime_secs = engine_db_path
@@ -1196,6 +1245,12 @@ fn handle_state_query(
                 })
                 .transpose()?;
 
+            debug!(
+                "GetDiagnostics entering phases: root={} file={} elapsed_ms={}",
+                root_key,
+                diagnostics_file,
+                diagnostics_started_at.elapsed().as_millis(),
+            );
             let mut value = crate::diagnostics::process_diagnostics_with_context(
                 conn,
                 engine_conn.as_ref(),
@@ -1242,6 +1297,12 @@ fn handle_state_query(
                 }
             }
             cache.lock().put(cache_key, value.clone());
+            debug!(
+                "GetDiagnostics completed: root={} file={} elapsed_ms={}",
+                root_key,
+                diagnostics_file,
+                diagnostics_started_at.elapsed().as_millis(),
+            );
             Ok(Some(value))
         }
 
@@ -3932,6 +3993,18 @@ fn query_request_detail(request: &QueryRequest) -> Option<String> {
     }
 }
 
+fn query_primary_file_path(request: &QueryRequest) -> Option<&str> {
+    match request {
+        QueryRequest::GetDiagnostics { file_path, .. }
+        | QueryRequest::GetCompletions { file_path, .. }
+        | QueryRequest::GetHover { file_path, .. }
+        | QueryRequest::GetSignatureHelp { file_path, .. }
+        | QueryRequest::GotoDefinition { file_path, .. }
+        | QueryRequest::GotoImplementation { file_path, .. } => file_path.as_deref(),
+        _ => None,
+    }
+}
+
 fn short_path(path: Option<&str>) -> String {
     path.and_then(|value| value.rsplit('/').next().or_else(|| value.rsplit('\\').next()))
         .unwrap_or("-")
@@ -4279,4 +4352,103 @@ fn find_asset_file(project_root: &str, asset_path: &str) -> Option<PathBuf> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use parking_lot::Mutex;
+    use std::collections::{HashMap, HashSet};
+    use std::fs;
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+    fn test_app_state() -> Arc<AppState> {
+        let watcher = notify::recommended_watcher(|_: notify::Result<notify::Event>| {}).unwrap();
+
+        Arc::new(AppState {
+            projects: Mutex::new(HashMap::new()),
+            connections: Mutex::new(HashMap::new()),
+            read_only_connections: Mutex::new(HashMap::new()),
+            persistent_cache_connections: Mutex::new(HashMap::new()),
+            active_refreshes: Mutex::new(HashSet::new()),
+            active_asset_scans: Mutex::new(HashSet::new()),
+            watcher: Mutex::new(watcher),
+            registry_path: None,
+            active_clients: Mutex::new(HashSet::new()),
+            last_activity: Mutex::new(Instant::now()),
+            asset_graphs: Mutex::new(HashMap::new()),
+            config_caches: Mutex::new(HashMap::new()),
+            completion_caches: Mutex::new(HashMap::new()),
+            diagnostics_caches: Mutex::new(HashMap::new()),
+            visibility_caches: Mutex::new(HashMap::new()),
+            navigation_caches: Mutex::new(HashMap::new()),
+            search_hot_indexes: Mutex::new(HashMap::new()),
+            navigation_hot_indexes: Mutex::new(HashMap::new()),
+            usage_hot_indexes: Mutex::new(HashMap::new()),
+            member_hot_indexes: Mutex::new(HashMap::new()),
+            macro_hot_indexes: Mutex::new(HashMap::new()),
+        })
+    }
+
+    fn test_dir(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("ucore_handlers_{name}_{stamp}"));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn handle_setup_does_not_leak_active_refresh_marker() {
+        let state = test_app_state();
+        let project_root = test_dir("setup_root");
+        let db_path = project_root.join("project.db");
+
+        let params = json!({
+            "project_root": project_root.to_string_lossy().replace('\\', "/"),
+            "db_path": db_path.to_string_lossy().to_string(),
+        });
+
+        let result = handle_setup(state.clone(), &params).await.unwrap();
+        let root_key = normalize_path_key(&project_root.to_string_lossy());
+
+        assert_eq!(result.get("needs_full_refresh").and_then(Value::as_bool), Some(true));
+        assert!(!state.active_refreshes.lock().contains(&root_key));
+
+        let _ = fs::remove_dir_all(project_root);
+    }
+
+    #[tokio::test]
+    async fn diagnostics_query_returns_refreshing_marker_while_refresh_is_active() {
+        let state = test_app_state();
+        let project_root = test_dir("diag_root");
+        let root_str = project_root.to_string_lossy().replace('\\', "/");
+        let root_key = normalize_path_key(&root_str);
+
+        state.active_refreshes.lock().insert(root_key);
+
+        let params = json!({
+            "project_root": root_str,
+            "kind": "GetDiagnostics",
+            "content": "xxxxx;\n",
+            "file_path": "E:/Project/Source/Test.cpp",
+            "open_files": [],
+        });
+        let (tx, _rx) = mpsc::channel(1);
+
+        let result = handle_query(state, &params, tx, 1).await.unwrap();
+
+        assert_eq!(result.get("refreshing").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            result
+                .get("items")
+                .and_then(Value::as_array)
+                .map(std::vec::Vec::len),
+            Some(0)
+        );
+
+        let _ = fs::remove_dir_all(project_root);
+    }
 }
