@@ -7,6 +7,7 @@ local tree = require("ucore.explorer.tree")
 local select_ui = require("ucore.ui.select")
 
 local M = {}
+local close_window
 
 local providers = {
 	Project = "ucore.explorer.providers.project",
@@ -66,11 +67,31 @@ local function ensure_window()
 	if cfg.max_width then
 		width = math.min(width, cfg.max_width)
 	end
+	width = math.min(width, math.max(vim.o.columns - 8, minimum_width_for_tabs()))
 
-	vim.cmd("topleft vertical split")
-	state.win = vim.api.nvim_get_current_win()
-	vim.api.nvim_win_set_buf(state.win, ensure_buffer())
-	vim.api.nvim_win_set_width(state.win, width)
+	local height = cfg.height or math.floor(vim.o.lines * 0.72)
+	height = math.max(height, cfg.min_height or 0)
+	if cfg.max_height then
+		height = math.min(height, cfg.max_height)
+	end
+	height = math.min(height, math.max(vim.o.lines - 6, 8))
+
+	local row = math.max(1, math.floor((vim.o.lines - height) / 2) - 1)
+	local col = math.max(0, math.floor((vim.o.columns - width) / 2))
+
+	state.anchor_win = previous_win
+	state.win = vim.api.nvim_open_win(ensure_buffer(), true, {
+		relative = "editor",
+		row = row,
+		col = col,
+		width = width,
+		height = height,
+		border = "rounded",
+		style = "minimal",
+		title = " UCore Explorer ",
+		title_pos = "center",
+		noautocmd = true,
+	})
 	vim.wo[state.win].number = false
 	vim.wo[state.win].relativenumber = false
 	vim.wo[state.win].signcolumn = "no"
@@ -79,8 +100,10 @@ local function ensure_window()
 	vim.wo[state.win].spell = false
 	vim.wo[state.win].cursorline = true
 	vim.wo[state.win].winfixwidth = true
+	vim.wo[state.win].winfixheight = true
 	vim.wo[state.win].winbar = ""
-	vim.wo[state.win].winhl = "Normal:Normal,SignColumn:Normal,EndOfBuffer:Normal,WinSeparator:UCorePanelBorder"
+	vim.wo[state.win].winhl =
+		"Normal:Normal,SignColumn:Normal,EndOfBuffer:Normal,FloatBorder:UCorePanelBorder"
 	if explorer_config().auto_focus == false and vim.api.nvim_win_is_valid(previous_win) then
 		vim.api.nvim_set_current_win(previous_win)
 	end
@@ -157,15 +180,18 @@ local function current_item()
 end
 
 local function open_file(path)
-	local previous_win = vim.fn.win_getid(vim.fn.winnr("#"))
-	if vim.api.nvim_get_current_win() ~= state.win then
-		vim.cmd("edit " .. vim.fn.fnameescape(path))
-		return
+	local target_win = state.anchor_win
+	if not (target_win and vim.api.nvim_win_is_valid(target_win) and target_win ~= state.win) then
+		local previous_win = vim.fn.win_getid(vim.fn.winnr("#"))
+		if previous_win and vim.api.nvim_win_is_valid(previous_win) and previous_win ~= state.win then
+			target_win = previous_win
+		end
 	end
-	if previous_win and vim.api.nvim_win_is_valid(previous_win) and previous_win ~= state.win then
-		vim.api.nvim_set_current_win(previous_win)
-	else
-		vim.cmd("wincmd p")
+
+	close_window()
+
+	if target_win and vim.api.nvim_win_is_valid(target_win) then
+		vim.api.nvim_set_current_win(target_win)
 	end
 	vim.cmd("edit " .. vim.fn.fnameescape(path))
 end
@@ -203,11 +229,9 @@ local function join_path(base, child)
 end
 
 local function current_context_path()
-	local win = vim.api.nvim_get_current_win()
-	if state.is_valid_win() and win == state.win then
-		local previous_win = vim.fn.win_getid(vim.fn.winnr("#"))
-		if previous_win and vim.api.nvim_win_is_valid(previous_win) and previous_win ~= state.win then
-			local bufnr = vim.api.nvim_win_get_buf(previous_win)
+	if state.anchor_win and vim.api.nvim_win_is_valid(state.anchor_win) then
+		local bufnr = vim.api.nvim_win_get_buf(state.anchor_win)
+		if bufnr and vim.api.nvim_buf_is_valid(bufnr) then
 			return normalize(vim.api.nvim_buf_get_name(bufnr))
 		end
 	end
@@ -273,6 +297,299 @@ local function reveal_current_file()
 		redraw()
 		focus_revealed_path(target_path)
 	end
+end
+
+local function telescope_available()
+	return pcall(require, "telescope.pickers")
+end
+
+local function picker_tree_prefix(item)
+	if item.depth == 0 then
+		return ""
+	end
+	return (item.prefix or "") .. (item.is_last and "└─ " or "├─ ")
+end
+
+local function picker_entry_text(item)
+	local node = item.node or {}
+	local prefix = picker_tree_prefix(item)
+
+	if node.type == "directory" then
+		local symbol = state.is_expanded(node) and "▾" or "▸"
+		return string.format("%s%s %s", prefix, symbol, tostring(node.label or ""))
+	end
+
+	if node.type == "message" then
+		return string.format("%s%s", prefix, tostring(node.message or node.label or ""))
+	end
+
+	return string.format("%s  %s", prefix, tostring(node.label or ""))
+end
+
+local function picker_entry_ordinal(item)
+	local node = item.node or {}
+	return table.concat({
+		tostring(node.label or ""),
+		tostring(node.path or ""),
+		tostring(node.type or ""),
+		tostring(node.message or ""),
+	}, " ")
+end
+
+local function sanitize_preview_lines(lines)
+	local result = {}
+	for _, line in ipairs(lines or {}) do
+		line = tostring(line or ""):gsub("\r\n", "\n"):gsub("\r", "\n")
+		for _, part in ipairs(vim.split(line, "\n", { plain = true })) do
+			table.insert(result, part)
+		end
+	end
+	return #result > 0 and result or { "" }
+end
+
+local function preview_directory(node, bufnr)
+	if node.type == "message" then
+		vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, sanitize_preview_lines({
+			"UCore Explorer",
+			"",
+			tostring(node.message or node.label or ""),
+		}))
+		vim.bo[bufnr].filetype = "text"
+		return
+	end
+
+	tree.ensure_children(node)
+
+	local directories = 0
+	local files = 0
+	local lines = {
+		"UCore Explorer",
+		"",
+		"Directory: " .. tostring(node.path or node.label or ""),
+		"",
+	}
+
+	for _, child in ipairs(node.children or {}) do
+		if child.type == "directory" then
+			directories = directories + 1
+		elseif child.type == "file" then
+			files = files + 1
+		end
+	end
+
+	table.insert(lines, string.format("Children: %d directories, %d files", directories, files))
+	table.insert(lines, "")
+	table.insert(lines, "Entries:")
+
+	for index, child in ipairs(node.children or {}) do
+		if index > 180 then
+			table.insert(lines, string.format("... and %d more", #node.children - index + 1))
+			break
+		end
+
+		local marker = child.type == "directory" and "[D]" or "[F]"
+		table.insert(lines, string.format("%s %s", marker, tostring(child.label or "")))
+	end
+
+	vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, sanitize_preview_lines(lines))
+	vim.bo[bufnr].filetype = "text"
+end
+
+local function preview_file(path, bufnr)
+	if not path or path == "" or vim.fn.filereadable(path) ~= 1 then
+		return false
+	end
+
+	local ok, lines = pcall(vim.fn.readfile, path, "", 250)
+	if not ok then
+		return false
+	end
+
+	vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, sanitize_preview_lines(lines))
+	vim.bo[bufnr].filetype = vim.filetype.match({ filename = path }) or ""
+	return true
+end
+
+local function make_picker_entries()
+	local entries = {}
+	for _, item in ipairs(state.visible or {}) do
+		local node = item.node or {}
+		table.insert(entries, {
+			value = item,
+			display = picker_entry_text(item),
+			ordinal = picker_entry_ordinal(item),
+			filename = node.type == "file" and node.path or nil,
+			path = node.path,
+		})
+	end
+	return entries
+end
+
+local function pick_telescope_explorer()
+	local pickers = require("telescope.pickers")
+	local finders = require("telescope.finders")
+	local previewers = require("telescope.previewers")
+	local actions = require("telescope.actions")
+	local action_state = require("telescope.actions.state")
+	local conf = require("telescope.config").values
+
+	close_window()
+	state.anchor_win = vim.api.nvim_get_current_win()
+	if not state.tree then
+		load_tree()
+	end
+	reveal_current_file()
+	rebuild_visible()
+
+	local picker_ref
+
+	local function make_finder()
+		return finders.new_table({
+			results = make_picker_entries(),
+			entry_maker = function(entry)
+				return entry
+			end,
+		})
+	end
+
+	local function refresh_picker(prompt_bufnr)
+		rebuild_visible()
+		if picker_ref then
+			picker_ref.results_title = state.tab
+			pcall(function()
+				picker_ref:refresh(make_finder(), { reset_prompt = false })
+			end)
+		end
+		if prompt_bufnr then
+			vim.schedule(function()
+				local ok = pcall(action_state.get_current_picker, prompt_bufnr)
+				if ok then
+					picker_ref = action_state.get_current_picker(prompt_bufnr)
+				end
+			end)
+		end
+	end
+
+	local function toggle_selected_directory(prompt_bufnr)
+		local selection = action_state.get_selected_entry()
+		local item = selection and selection.value
+		local node = item and item.node
+		if not (node and node.type == "directory") then
+			return false
+		end
+
+		if state.is_expanded(node) then
+			state.set_expanded(node, false)
+		else
+			tree.expand_directory(node, state)
+		end
+
+		refresh_picker(prompt_bufnr)
+		return true
+	end
+
+	local function switch_tab_in_picker(delta, prompt_bufnr)
+		state.set_tab_by_delta(delta)
+		state.tree = nil
+		load_tree()
+		reveal_current_file()
+		refresh_picker(prompt_bufnr)
+	end
+
+	picker_ref = pickers.new({}, {
+		prompt_title = "UCore Explorer",
+		results_title = state.tab,
+		preview_title = "Preview",
+		layout_strategy = "horizontal",
+		layout_config = {
+			width = 0.94,
+			height = 0.88,
+			prompt_position = "top",
+			horizontal = {
+				preview_width = 0.58,
+			},
+		},
+		sorting_strategy = "ascending",
+		finder = make_finder(),
+		previewer = previewers.new_buffer_previewer({
+			define_preview = function(self, entry)
+				local item = entry and entry.value
+				local node = item and item.node
+				if not node then
+					return
+				end
+
+				if node.type == "file" then
+					if preview_file(node.path, self.state.bufnr) then
+						return
+					end
+				end
+
+				preview_directory(node, self.state.bufnr)
+			end,
+		}),
+		sorter = conf.generic_sorter({}),
+		attach_mappings = function(prompt_bufnr, map)
+			map("i", "<Esc>", function()
+				actions.close(prompt_bufnr)
+			end)
+			map("n", "q", function()
+				actions.close(prompt_bufnr)
+			end)
+
+			actions.select_default:replace(function()
+				if toggle_selected_directory(prompt_bufnr) then
+					return
+				end
+
+				local selection = action_state.get_selected_entry()
+				actions.close(prompt_bufnr)
+
+				local item = selection and selection.value
+				local node = item and item.node
+				if node and node.type == "file" and node.path then
+					open_file(node.path)
+				end
+			end)
+
+			map("i", "<Tab>", function()
+				toggle_selected_directory(prompt_bufnr)
+			end)
+			map("n", "<Tab>", function()
+				toggle_selected_directory(prompt_bufnr)
+			end)
+			map("n", "l", function()
+				local selection = action_state.get_selected_entry()
+				local node = selection and selection.value and selection.value.node
+				if node and node.type == "directory" and not state.is_expanded(node) then
+					toggle_selected_directory(prompt_bufnr)
+				end
+			end)
+			map("n", "h", function()
+				local selection = action_state.get_selected_entry()
+				local node = selection and selection.value and selection.value.node
+				if node and node.type == "directory" and state.is_expanded(node) then
+					toggle_selected_directory(prompt_bufnr)
+				end
+			end)
+			map("i", "<C-h>", function()
+				switch_tab_in_picker(-1, prompt_bufnr)
+			end)
+			map("i", "<C-l>", function()
+				switch_tab_in_picker(1, prompt_bufnr)
+			end)
+			map("n", "H", function()
+				switch_tab_in_picker(-1, prompt_bufnr)
+			end)
+			map("n", "L", function()
+				switch_tab_in_picker(1, prompt_bufnr)
+			end)
+
+			return true
+		end,
+	})
+
+	picker_ref:find()
 end
 
 local function current_target_directory()
@@ -451,11 +768,12 @@ local function refresh_all()
 	redraw()
 end
 
-local function close_window()
+close_window = function()
 	if state.is_valid_win() then
 		vim.api.nvim_win_close(state.win, true)
 	end
 	state.win = nil
+	state.anchor_win = nil
 end
 
 local function map(lhs, rhs, desc)
@@ -488,6 +806,11 @@ local function setup_maps()
 end
 
 function M.open()
+	if telescope_available() then
+		pick_telescope_explorer()
+		return
+	end
+
 	ensure_buffer()
 	ensure_window()
 	setup_maps()
@@ -502,6 +825,11 @@ function M.open()
 end
 
 function M.focus()
+	if telescope_available() then
+		M.open()
+		return
+	end
+
 	if state.is_valid_win() then
 		reveal_current_file()
 		vim.api.nvim_set_current_win(state.win)
@@ -511,6 +839,11 @@ function M.focus()
 end
 
 function M.toggle()
+	if telescope_available() then
+		M.open()
+		return
+	end
+
 	if state.is_valid_win() then
 		close_window()
 	else

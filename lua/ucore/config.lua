@@ -295,15 +295,19 @@ local function default_values()
 		},
 
 		-- Left-side project/source/config explorer.
-		-- 左侧 Project/Source/Config 目录浏览器。
+		-- Project/Source/Config picker-style explorer.
+		-- Project/Source/Config 选择器式目录浏览器。
 		explorer = {
-			width = 36,
-			min_width = 28,
-			max_width = 56,
+			width = 92,
+			min_width = 60,
+			max_width = 140,
+			height = 28,
+			min_height = 18,
+			max_height = 40,
 			tabs = { "Project", "Source", "Config" },
 			default_tab = "Project",
 			auto_open = false,
-			auto_focus = false,
+			auto_focus = true,
 			auto_open_delay_ms = 120,
 			close_other_explorers = false,
 			show_hidden = false,

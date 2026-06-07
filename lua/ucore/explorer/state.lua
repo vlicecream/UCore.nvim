@@ -6,6 +6,7 @@ local explorer_config = config.values.explorer or {}
 
 M.win = nil
 M.buf = nil
+M.anchor_win = nil
 M.tab = explorer_config.default_tab or "Project"
 M.search = ""
 M.expanded = {}
