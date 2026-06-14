@@ -317,6 +317,35 @@ function M.explorer()
 	explorer.toggle()
 end
 
+function M.explorer_new(tail)
+	local sub = vim.trim(tostring(tail or "")):lower()
+
+	if sub == "" then
+		return explorer.toggle()
+	end
+
+	if sub == "file" then
+		return explorer.new_file()
+	end
+
+	if sub == "dir" or sub == "directory" or sub == "folder" then
+		return explorer.new_directory()
+	end
+
+	if sub == "help" then
+		print([[
+UCore explorer subcommands:
+  :UCore explorer           Toggle explorer
+  :UCore explorer file      Create a file relative to the focused node/current file
+  :UCore explorer dir       Create a directory relative to the focused node/current file
+  :UCore explorer help      Show this help
+]])
+		return
+	end
+
+	vim.notify("Unknown UCore explorer subcommand: " .. sub .. "\nSee :UCore explorer help", vim.log.levels.WARN)
+end
+
 -- :UCore goto <definition|references|source>
 -- Smart goto, references, or source/header toggle.
 -- 智能跳转、查找引用、源文件切换。
@@ -845,6 +874,8 @@ UCore commands:
   :UCore              Smart entry: boot, pick, or Dashboard
   :UCore boot         Boot current project, or pick a registered one
   :UCore explorer     Toggle the left-side Project/Source/Config tree
+  :UCore explorer file Create a file from the explorer target directory
+  :UCore explorer dir  Create a directory from the explorer target directory
   :UCore find         Find indexed symbols, modules, assets, config
   :UCore verify       Verify current project asset index integrity
   :UCore goto         Navigation subcommands (see :UCore goto help)

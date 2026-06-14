@@ -196,12 +196,27 @@ When companion plugins emit runtime output into UCore, a bottom tabbed workspace
   - `q` closes the current tab
   - `x` closes the workspace
 
+### Explorer Keys
+
+Inside `:UCore explorer`:
+
+- `<CR>` / `<Space>` open file or toggle directory
+- `h` / `l` collapse or expand directory
+- `H` / `L` or `[` / `]` switch `Project / Source / Config`
+- `/` search inside the current tree
+- `a` create a file relative to the focused node
+- `A` create a directory relative to the focused node
+- `r` refresh current tab
+- `R` clear expansion state and rebuild the tree
+
 ### Commands
 
 ```vim
 :UCore
 :UCore boot
 :UCore explorer        " toggle the explorer
+:UCore explorer file   " create a file from explorer/current target dir
+:UCore explorer dir    " create a directory from explorer/current target dir
 :UCore find [pattern]
 :UCore goto <definition|declaration|implementation|references|source>
 :UCore install
@@ -501,12 +516,27 @@ UCore 自己主要负责：
 :UCore
 :UCore boot
 :UCore explorer        " 切换 explorer
+:UCore explorer file   " 在 explorer/当前目标目录下新建文件
+:UCore explorer dir    " 在 explorer/当前目标目录下新建目录
 :UCore find [pattern]
 :UCore goto <definition|declaration|implementation|references|source>
 :UCore install
 :UCore help
 :checkhealth ucore
 ```
+
+### Explorer 按键
+
+在 `:UCore explorer` 里：
+
+- `<CR>` / `<Space>` 打开文件或展开/收起目录
+- `h` / `l` 收起或展开目录
+- `H` / `L` 或 `[` / `]` 切换 `Project / Source / Config`
+- `/` 搜索当前树
+- `a` 在当前节点相对位置新建文件
+- `A` 在当前节点相对位置新建目录
+- `r` 刷新当前标签
+- `R` 清空展开状态并重建整棵树
 
 ### 默认快捷键
 

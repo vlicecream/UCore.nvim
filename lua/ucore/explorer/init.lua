@@ -8,6 +8,9 @@ local select_ui = require("ucore.ui.select")
 
 local M = {}
 local close_window
+local normalize
+local dirname
+local create_relative_path
 
 local providers = {
 	Project = "ucore.explorer.providers.project",
@@ -179,6 +182,23 @@ local function current_item()
 	return state.line_items[row - 4]
 end
 
+local function target_directory_for_item(item)
+	local node = item and item.node
+	if not node then
+		return nil
+	end
+
+	if node.type == "directory" and node.path then
+		return normalize(node.path)
+	end
+
+	if node.path then
+		return dirname(node.path)
+	end
+
+	return nil
+end
+
 local function open_file(path)
 	local target_win = state.anchor_win
 	if not (target_win and vim.api.nvim_win_is_valid(target_win) and target_win ~= state.win) then
@@ -196,7 +216,7 @@ local function open_file(path)
 	vim.cmd("edit " .. vim.fn.fnameescape(path))
 end
 
-local function normalize(path)
+normalize = function(path)
 	return path and path:gsub("\\", "/") or nil
 end
 
@@ -212,7 +232,7 @@ local function path_starts_with(path, prefix)
 	return path:sub(1, #prefix + 1) == prefix .. "/"
 end
 
-local function dirname(path)
+dirname = function(path)
 	return normalize(vim.fn.fnamemodify(path, ":h"))
 end
 
@@ -566,6 +586,24 @@ local function pick_telescope_explorer()
 			map("n", "<Right>", function()
 				switch_tab_in_picker(1, prompt_bufnr)
 			end)
+			map("n", "a", function()
+				local selection = action_state.get_selected_entry()
+				local item = selection and selection.value
+				local target_dir = target_directory_for_item(item)
+				actions.close(prompt_bufnr)
+				vim.schedule(function()
+					create_relative_path("file", nil, { target_dir = target_dir })
+				end)
+			end)
+			map("n", "A", function()
+				local selection = action_state.get_selected_entry()
+				local item = selection and selection.value
+				local target_dir = target_directory_for_item(item)
+				actions.close(prompt_bufnr)
+				vim.schedule(function()
+					create_relative_path("directory", nil, { target_dir = target_dir })
+				end)
+			end)
 
 			return true
 		end,
@@ -576,14 +614,9 @@ end
 
 local function current_target_directory()
 	if state.is_valid_win() then
-		local item = current_item()
-		if item and item.node then
-			if item.node.type == "directory" and item.node.path then
-				return normalize(item.node.path)
-			end
-			if item.node.path then
-				return dirname(item.node.path)
-			end
+		local target_dir = target_directory_for_item(current_item())
+		if target_dir then
+			return target_dir
 		end
 	end
 
@@ -599,8 +632,8 @@ local function current_target_directory()
 	return project.find_project_root_from_context()
 end
 
-local function ensure_project_target_dir()
-	local target_dir = current_target_directory()
+local function ensure_project_target_dir(target_dir)
+	target_dir = normalize(target_dir) or current_target_directory()
 	if not target_dir or target_dir == "" then
 		vim.notify("UCore explorer: no target directory available", vim.log.levels.WARN)
 		return nil, nil
@@ -615,8 +648,9 @@ local function ensure_project_target_dir()
 	return normalize(target_dir), normalize(root)
 end
 
-local function create_relative_path(kind, suffix)
-	local target_dir, _root = ensure_project_target_dir()
+create_relative_path = function(kind, suffix, opts)
+	opts = opts or {}
+	local target_dir, _root = ensure_project_target_dir(opts.target_dir)
 	if not target_dir then
 		return
 	end
@@ -649,6 +683,9 @@ local function create_relative_path(kind, suffix)
 				return
 			end
 			refresh_current()
+			if type(opts.on_created) == "function" then
+				opts.on_created(path)
+			end
 			vim.notify("UCore new: created directory " .. path, vim.log.levels.INFO)
 			return
 		end
@@ -671,6 +708,10 @@ local function create_relative_path(kind, suffix)
 			return
 		end
 		refresh_current()
+		if type(opts.on_created) == "function" then
+			opts.on_created(path)
+			return
+		end
 		open_file(path)
 	end)
 end
@@ -783,6 +824,12 @@ local function setup_maps()
 	map("h", collapse, "UCore Explorer collapse")
 	map("l", expand, "UCore Explorer expand")
 	map("/", prompt_search, "UCore Explorer search")
+	map("a", function()
+		create_relative_path("file")
+	end, "UCore Explorer new file")
+	map("A", function()
+		create_relative_path("directory")
+	end, "UCore Explorer new directory")
 	map("r", refresh_current, "UCore Explorer refresh tab")
 	map("R", refresh_all, "UCore Explorer refresh all")
 end

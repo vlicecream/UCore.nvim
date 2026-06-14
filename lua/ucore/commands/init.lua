@@ -21,7 +21,9 @@ function M.dispatch(args)
 		smart_entry = actions.smart_entry,
 		dashboard = actions.dashboard,
 		boot = actions.boot,
-		explorer = actions.explorer,
+		explorer = function()
+			actions.explorer_new(tail)
+		end,
 		find = function()
 			actions.find(tail)
 		end,
@@ -84,6 +86,12 @@ function M.register()
 				"help",
 			}
 
+			local explorer_items = {
+				"file",
+				"dir",
+				"help",
+			}
+
 			local line = cmdline or ""
 			local before_cursor = line:sub(1, (cursorpos or (#line + 1)) - 1)
 			local tail = before_cursor:match("^%s*UCore%s*(.-)%s*$") or ""
@@ -92,10 +100,13 @@ function M.register()
 			local first_lower = first and first:lower() or nil
 			local in_goto = first_lower == "goto"
 			local in_install = first_lower == "install"
+			local in_explorer = first_lower == "explorer"
 
 			local items
 			if in_goto then
 				items = goto_items
+			elseif in_explorer then
+				items = explorer_items
 			elseif in_install then
 				local install_tail = raw_tail:match("^install(.*)$") or ""
 				items = install.completion_items(install_tail, arglead)
@@ -106,6 +117,10 @@ function M.register()
 			local needle = (arglead or ""):lower()
 
 			if in_goto and (tail:lower() == "goto" or tail:lower():match("^goto%s*$")) then
+				needle = ""
+			end
+
+			if in_explorer and (tail:lower() == "explorer" or tail:lower():match("^explorer%s*$")) then
 				needle = ""
 			end
 
