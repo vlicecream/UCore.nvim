@@ -17,6 +17,8 @@ It focuses on:
 - definition / declaration / implementation / references navigation
 - project explorer, global search, completion, diagnostics, semantic overlay
 - shared bottom output tabs for build / debug / Unreal runtime streams
+- optional Verse filetype and LSP bootstrap for UEFN projects
+- optional HLSL/Unreal shader filetype and LSP bootstrap
 
 It does **not** own syntax highlighting or VCS anymore:
 
@@ -32,6 +34,8 @@ It does **not** own syntax highlighting or VCS anymore:
 - `blink.cmp` completion source
 - buffer diagnostics and semantic highlights from the UCore index
 - `nvim-autopairs` integration for common Unreal C++ editing flow
+- optional auto-discovery of Epic's Verse LSP from the local VS Code extension
+- optional HLSL language-server discovery from local VS Code extensions
 
 ### Requirements
 
@@ -42,6 +46,8 @@ It does **not** own syntax highlighting or VCS anymore:
 - `telescope.nvim` or `fzf-lua` if you want richer picker UI
 - `blink.cmp` if you want the UCore completion source
 - `nvim-autopairs` if you want pair/newline integration
+- Epic's Verse VS Code extension if you want Verse completion / hover / navigation
+- an HLSL-capable VS Code extension or language server if you want shader completion / hover / navigation
 
 ### Installation
 
@@ -95,6 +101,8 @@ return {
 Optional companion plugins:
 
 - install `UTreeSitter.nvim` if you want Unreal tree-sitter highlighting
+- install `UTreeSitter.nvim` with Verse enabled if you want Verse tree-sitter highlighting
+- install `UTreeSitter.nvim` if you want HLSL shader tree-sitter highlighting
 - install `UVersionControlSystem.nvim` if you want the Unreal VCS dashboard and actions
 - install `UBuildTool.nvim` if you want Unreal build / editor launch
 - install `UDebugTool.nvim` if you want Unreal debugging
@@ -219,6 +227,8 @@ Inside `:UCore explorer`:
 :UCore explorer dir    " create a directory from explorer/current target dir
 :UCore find [pattern]
 :UCore goto <definition|declaration|implementation|references|source>
+:UCore verse <info|hover|definition|references|rename|signature|restart-lsp>
+:UCore shader <info|hover|definition|references|rename|signature|restart-lsp>
 :UCore install
 :UCore help
 :checkhealth ucore
@@ -258,6 +268,22 @@ require("ucore").setup({
     min_chars = 2,
     debounce_ms = 180,
   },
+  verse = {
+    enable = true,
+    lsp = {
+      enable = true,
+      auto_start = true,
+      -- cmd = { "C:/path/to/verse-lsp.exe" },
+    },
+  },
+  shader = {
+    enable = true,
+    lsp = {
+      enable = true,
+      auto_start = true,
+      -- cmd = { "C:/path/to/hlsl-language-server.exe" },
+    },
+  },
   diagnostics = {
     enable = true,
     action_keymap = "<leader>ca",
@@ -293,6 +319,18 @@ Neovim (Lua)
 ### Split Responsibilities
 
 `UCore.nvim` now focuses on index / navigation / completion / diagnostics.
+
+Verse support is intentionally thinner than the Unreal C++ path:
+
+- filetype detection for `.verse`
+- optional automatic startup of Epic's Verse LSP when the VS Code extension is installed locally
+- completion / hover / navigation through your normal Neovim LSP client path
+
+Shader/HLSL support follows the same philosophy:
+
+- filetype detection for `.hlsl`, `.hlsli`, `.usf`, `.ush`
+- optional automatic startup of an HLSL language server
+- completion / hover / navigation through the normal Neovim LSP path
 
 Use the split repos for runtime workflows:
 

@@ -8,6 +8,8 @@ local M = {}
 local group_name = "UCoreKeymaps"
 local file_patterns = { "*.h", "*.hpp", "*.hh", "*.hxx", "*.inl", "*.cpp", "*.cc", "*.cxx" }
 local filetypes = { "unreal_cpp", "cpp", "c" }
+local verse_filetypes = { "verse" }
+local shader_filetypes = { "hlsl" }
 
 local function normalize_lhs(lhs)
 	if lhs == false or lhs == nil or lhs == "" then
@@ -82,6 +84,54 @@ local function setup_buffer(args)
 	set_buffer_map_modes({ "n", "i" }, bufnr, keymaps.signature, function()
 		require("ucore.assist").signature_help()
 	end, "UCore signature")
+end
+
+local function setup_verse_buffer(args)
+	local keymaps = keymap_config()
+	if keymaps.enable == false then
+		return
+	end
+
+	local bufnr = args.buf
+	set_buffer_map(bufnr, keymaps.definition or keymaps.goto_definition, function()
+		require("ucore.verse").definition()
+	end, "UCore verse definition")
+	set_buffer_map(bufnr, keymaps.references, function()
+		require("ucore.verse").references()
+	end, "UCore verse references")
+	set_buffer_map(bufnr, keymaps.rename, function()
+		require("ucore.verse").rename()
+	end, "UCore verse rename")
+	set_buffer_map_modes({ "n", "i" }, bufnr, keymaps.signature, function()
+		require("ucore.verse").signature_help()
+	end, "UCore verse signature")
+	set_buffer_map(bufnr, "K", function()
+		require("ucore.verse").hover()
+	end, "UCore verse hover")
+end
+
+local function setup_shader_buffer(args)
+	local keymaps = keymap_config()
+	if keymaps.enable == false then
+		return
+	end
+
+	local bufnr = args.buf
+	set_buffer_map(bufnr, keymaps.definition or keymaps.goto_definition, function()
+		require("ucore.shader").definition()
+	end, "UCore shader definition")
+	set_buffer_map(bufnr, keymaps.references, function()
+		require("ucore.shader").references()
+	end, "UCore shader references")
+	set_buffer_map(bufnr, keymaps.rename, function()
+		require("ucore.shader").rename()
+	end, "UCore shader rename")
+	set_buffer_map_modes({ "n", "i" }, bufnr, keymaps.signature, function()
+		require("ucore.shader").signature_help()
+	end, "UCore shader signature")
+	set_buffer_map(bufnr, "K", function()
+		require("ucore.shader").hover()
+	end, "UCore shader hover")
 end
 
 local function setup_global_explorer(args)
@@ -204,6 +254,18 @@ function M.setup()
 		group = group,
 		pattern = filetypes,
 		callback = setup_buffer,
+	})
+
+	vim.api.nvim_create_autocmd("FileType", {
+		group = group,
+		pattern = verse_filetypes,
+		callback = setup_verse_buffer,
+	})
+
+	vim.api.nvim_create_autocmd("FileType", {
+		group = group,
+		pattern = shader_filetypes,
+		callback = setup_shader_buffer,
 	})
 end
 

@@ -610,6 +610,8 @@ function M.toggle_source()
 end
 
 find_alternate_source = function(path)
+	-- Resolve the corresponding header/source counterpart for the given file.
+	-- 为给定文件解析对应的头文件或源码文件。
 	local normalized = normalize_path(path)
 	local ext = normalized:match("%.([^.]*)$")
 	if not ext then return nil end

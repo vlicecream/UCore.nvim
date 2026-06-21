@@ -326,6 +326,31 @@ local function default_values()
 			debounce_ms = 180,
 		},
 
+		-- Verse editing and LSP integration.
+		-- Verse 编辑和 LSP 集成配置。
+		verse = {
+			enable = true,
+			lsp = {
+				enable = true,
+				auto_start = true,
+				cmd = nil,
+				extra_home_dirs = {},
+				extension_dirs = {},
+			},
+		},
+
+		-- HLSL/Unreal shader editing and LSP integration.
+		-- HLSL/Unreal shader 编辑和 LSP 集成配置。
+		shader = {
+			enable = true,
+			lsp = {
+				enable = true,
+				auto_start = true,
+				cmd = nil,
+				extension_dirs = {},
+			},
+		},
+
 		-- UCore diagnostics rendered through vim.diagnostic.
 		-- 通过 vim.diagnostic 渲染 UCore 诊断。
 		diagnostics = {

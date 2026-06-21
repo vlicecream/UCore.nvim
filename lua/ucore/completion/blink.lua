@@ -185,6 +185,8 @@ local function dispatch_latest()
 	end)
 end
 
+-- Drop weak completion items when the result set already has many strong matches.
+-- 当结果集中已有足够多强匹配时，裁剪较弱的补全项。
 prune_items = function(items)
 	local strong = 0
 	for _, item in ipairs(items) do

@@ -790,6 +790,8 @@ local function install_status_done(ok, message, detail)
 	end
 end
 
+-- Split the raw command tail into whitespace-delimited arguments.
+-- 将原始命令尾字符串按空白分割为参数列表。
 split_args = function(tail)
 	local items = {}
 	for token in tostring(tail or ""):gmatch("%S+") do

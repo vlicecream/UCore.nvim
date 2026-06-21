@@ -371,6 +371,64 @@ local function report_treesitter_checks()
 	info("current buffer filetype: " .. tostring(vim.bo[buffer].filetype))
 end
 
+-- Report Verse filetype and optional LSP integration checks.
+-- 输出 Verse 文件类型和可选 LSP 集成检查结果。
+local function report_verse_checks()
+	start("Verse workflow")
+
+	local ok_verse, verse = pcall(require, "ucore.verse")
+	if not ok_verse or not verse then
+		warn("Verse integration module could not be loaded")
+		return
+	end
+
+	ok("Verse integration module loaded")
+
+	local lines = verse.info()
+	for _, line in ipairs(lines or {}) do
+		info(line)
+	end
+
+	local binary_line = lines and lines[3] or ""
+	if binary_line:find("<not found>", 1, true) then
+		warn("Verse LSP binary was not found", {
+			"Install Epic's Verse VS Code extension to enable completion, hover, and navigation in Verse files.",
+			"Or set require('ucore').setup({ verse = { lsp = { cmd = { '/path/to/verse-lsp' } } } })",
+		})
+	else
+		ok("Verse LSP binary resolved")
+	end
+end
+
+-- Report HLSL/shader filetype and optional LSP integration checks.
+-- 输出 HLSL/shader 文件类型和可选 LSP 集成检查结果。
+local function report_shader_checks()
+	start("Shader workflow")
+
+	local ok_shader, shader = pcall(require, "ucore.shader")
+	if not ok_shader or not shader then
+		warn("Shader integration module could not be loaded")
+		return
+	end
+
+	ok("Shader integration module loaded")
+
+	local lines = shader.info()
+	for _, line in ipairs(lines or {}) do
+		info(line)
+	end
+
+	local cmd_line = lines and lines[3] or ""
+	if cmd_line:find("<not found>", 1, true) then
+		warn("HLSL LSP command was not found", {
+			"Install an HLSL-capable VS Code extension or language server.",
+			"Or set require('ucore').setup({ shader = { lsp = { cmd = { '/path/to/server' } } } })",
+		})
+	else
+		ok("HLSL LSP command resolved")
+	end
+end
+
 -- Neovim calls this function for :checkhealth ucore.
 -- Neovim 会在 :checkhealth ucore 时调用这个函数。
 function M.check()
@@ -381,6 +439,8 @@ function M.check()
 	report_completion_checks()
 	report_cpp_workflow()
 	report_treesitter_checks()
+	report_verse_checks()
+	report_shader_checks()
 end
 
 return M

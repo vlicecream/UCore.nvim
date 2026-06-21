@@ -87,10 +87,14 @@ local function output_config()
 	}
 end
 
+-- Check whether the buffer handle is still valid.
+-- 检查缓冲区句柄当前是否仍然有效。
 valid_buf = function(buf)
 	return buf and vim.api.nvim_buf_is_valid(buf)
 end
 
+-- Check whether the window handle is still valid.
+-- 检查窗口句柄当前是否仍然有效。
 valid_win = function(win)
 	return win and vim.api.nvim_win_is_valid(win)
 end
@@ -460,6 +464,8 @@ local function select_relative(direction)
 	sync_content_buffer()
 end
 
+-- Install navigation keymaps for one output buffer.
+-- 为单个输出缓冲区安装导航按键映射。
 install_buffer_keymaps = function(buf)
 	local function map(lhs, rhs, desc)
 		vim.keymap.set("n", lhs, rhs, {

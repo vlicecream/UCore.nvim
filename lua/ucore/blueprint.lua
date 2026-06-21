@@ -609,6 +609,8 @@ local function fetch_member_hint(root, target, bufnr, callback)
 	})
 end
 
+-- Refresh blueprint hints for the target buffer when the feature is enabled.
+-- 在功能启用时刷新目标缓冲区的蓝图提示。
 refresh_buffer = function(bufnr)
 	if not is_enabled() then
 		clear(bufnr)

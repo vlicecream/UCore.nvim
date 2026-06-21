@@ -18,19 +18,27 @@ local providers = {
 	Config = "ucore.explorer.providers.config",
 }
 
+-- Return the active explorer configuration block.
+-- 返回当前生效的 explorer 配置块。
 local function explorer_config()
 	return config.values.explorer or {}
 end
 
+-- Define one small highlight group used by the explorer border.
+-- 定义 explorer 边框使用的小型高亮组。
 local function setup_highlights()
 	vim.api.nvim_set_hl(0, "UCorePanelBorder", { fg = "#3F3F46" })
 end
 
+-- Compute the minimum width needed to render the tab header safely.
+-- 计算安全渲染标签页标题所需的最小宽度。
 local function minimum_width_for_tabs()
 	local text = " q <  " .. table.concat(state.tabs(), " | ") .. "  > e "
 	return vim.fn.strdisplaywidth(text) + 2
 end
 
+-- Create the shared scratch buffer used by the explorer window.
+-- 创建 explorer 窗口复用的临时缓冲区。
 local function ensure_buffer()
 	if state.is_valid_buf() then
 		return state.buf
@@ -47,6 +55,8 @@ local function ensure_buffer()
 	return state.buf
 end
 
+-- Close other tree plugins when configured to keep only one explorer open.
+-- 当配置要求只保留一个目录树时，关闭其他 tree 插件。
 local function close_other_explorers()
 	if explorer_config().close_other_explorers ~= true then
 		return
@@ -55,6 +65,8 @@ local function close_other_explorers()
 	pcall(vim.cmd, "Neotree close")
 end
 
+-- Open and configure the floating explorer window when it is not already visible.
+-- 在 explorer 尚未可见时打开并配置它的浮动窗口。
 local function ensure_window()
 	if state.is_valid_win() then
 		return state.win
@@ -113,6 +125,8 @@ local function ensure_window()
 	return state.win
 end
 
+-- Resolve the provider module for one explorer tab label.
+-- 解析某个 explorer 标签对应的 provider 模块。
 local function provider_for_tab(tab)
 	local module_name = providers[tab]
 	if not module_name then
@@ -125,6 +139,8 @@ local function provider_for_tab(tab)
 	return provider
 end
 
+-- Load the current tab tree from its provider and seed root expansion state.
+-- 从当前标签的 provider 加载树，并初始化根节点展开状态。
 local function load_tree()
 	local provider = provider_for_tab(state.tab)
 	if not provider or type(provider.load) ~= "function" then
@@ -144,6 +160,8 @@ local function load_tree()
 	end
 end
 
+-- Rebuild the visible explorer rows from the current tree and search filter.
+-- 根据当前树和搜索过滤条件重建可见的 explorer 行。
 local function rebuild_visible()
 	if not state.tree then
 		load_tree()
@@ -169,11 +187,27 @@ local function rebuild_visible()
 	state.visible = tree.flatten(filtered, state)
 end
 
+-- Re-render the explorer contents from current state.
+-- 基于当前状态重新渲染 explorer 内容。
 local function redraw()
 	rebuild_visible()
 	render.render()
 end
 
+-- Force one tree reload, optionally clearing expansion state first.
+-- 强制重载当前树，并可选择先清空展开状态。
+local function reload_tree(opts)
+	opts = opts or {}
+	if opts.reset_expanded then
+		state.expanded = {}
+	end
+	state.tree = nil
+	load_tree()
+	redraw()
+end
+
+-- Return the tree item under the explorer cursor.
+-- 返回 explorer 光标所在位置的树节点项。
 local function current_item()
 	if not state.is_valid_win() then
 		return nil
@@ -182,6 +216,8 @@ local function current_item()
 	return state.line_items[row - 4]
 end
 
+-- Resolve the target directory represented by one tree item.
+-- 解析一个树节点项所代表的目标目录。
 local function target_directory_for_item(item)
 	local node = item and item.node
 	if not node then
@@ -199,6 +235,8 @@ local function target_directory_for_item(item)
 	return nil
 end
 
+-- Open one file in the most sensible non-explorer window and close the explorer.
+-- 在最合理的非 explorer 窗口中打开文件并关闭 explorer。
 local function open_file(path)
 	local target_win = state.anchor_win
 	if not (target_win and vim.api.nvim_win_is_valid(target_win) and target_win ~= state.win) then
@@ -216,10 +254,16 @@ local function open_file(path)
 	vim.cmd("edit " .. vim.fn.fnameescape(path))
 end
 
+-- Normalize one path to slash-separated form.
+-- 将一个路径规范为正斜杠形式。
+-- Normalize one path to slash-separated form.
+-- 将一个路径规范为正斜杠形式。
 normalize = function(path)
 	return path and path:gsub("\\", "/") or nil
 end
 
+-- Return whether one normalized path sits under the given prefix.
+-- 返回一个规范路径是否位于给定前缀之下。
 local function path_starts_with(path, prefix)
 	path = normalize(path or "")
 	prefix = normalize(prefix or "")
@@ -232,10 +276,16 @@ local function path_starts_with(path, prefix)
 	return path:sub(1, #prefix + 1) == prefix .. "/"
 end
 
+-- Return the normalized parent directory for one path.
+-- 返回一个路径的规范化父目录。
+-- Return the normalized parent directory for one path.
+-- 返回一个路径的规范化父目录。
 dirname = function(path)
 	return normalize(vim.fn.fnamemodify(path, ":h"))
 end
 
+-- Join two path segments and normalize the result.
+-- 连接两个路径片段并规范化结果。
 local function join_path(base, child)
 	base = normalize(base or "")
 	child = normalize(child or "")
@@ -248,6 +298,8 @@ local function join_path(base, child)
 	return normalize(base:gsub("/+$", "") .. "/" .. child:gsub("^/+", ""))
 end
 
+-- Resolve the current context file path from the anchor window or current buffer.
+-- 从锚点窗口或当前缓冲区解析当前上下文文件路径。
 local function current_context_path()
 	if state.anchor_win and vim.api.nvim_win_is_valid(state.anchor_win) then
 		local bufnr = vim.api.nvim_win_get_buf(state.anchor_win)
@@ -259,6 +311,8 @@ local function current_context_path()
 	return normalize(vim.api.nvim_buf_get_name(0))
 end
 
+-- Expand the tree path needed to reveal one target file path.
+-- 展开树中需要的路径，以显示目标文件。
 local function reveal_path_in_tree(node, target_path)
 	if not node or not target_path then
 		return false
@@ -287,6 +341,8 @@ local function reveal_path_in_tree(node, target_path)
 	return false
 end
 
+-- Move the explorer cursor onto one already revealed file path.
+-- 将 explorer 光标移动到已经展开显示的文件路径上。
 local function focus_revealed_path(target_path)
 	if not state.is_valid_win() or not target_path then
 		return
@@ -303,6 +359,8 @@ local function focus_revealed_path(target_path)
 	end
 end
 
+-- Reveal the current context file inside the explorer tree.
+-- 在 explorer 树中展开并定位当前上下文文件。
 local function reveal_current_file()
 	local target_path = current_context_path()
 	if not target_path or target_path == "" or not state.tree then
@@ -319,10 +377,14 @@ local function reveal_current_file()
 	end
 end
 
+-- Return whether Telescope is available for the picker-style explorer UI.
+-- 返回 Telescope 是否可用，以启用选择器式 explorer UI。
 local function telescope_available()
 	return pcall(require, "telescope.pickers")
 end
 
+-- Build the tree prefix used by one picker entry.
+-- 构造一个 picker 条目的树形前缀。
 local function picker_tree_prefix(item)
 	if item.depth == 0 then
 		return ""
@@ -330,6 +392,8 @@ local function picker_tree_prefix(item)
 	return (item.prefix or "") .. (item.is_last and "└─ " or "├─ ")
 end
 
+-- Build the display text for one picker entry.
+-- 构造一个 picker 条目的显示文本。
 local function picker_entry_text(item)
 	local node = item.node or {}
 	local prefix = picker_tree_prefix(item)
@@ -346,6 +410,8 @@ local function picker_entry_text(item)
 	return string.format("%s  %s", prefix, tostring(node.label or ""))
 end
 
+-- Build the fuzzy-search ordinal text for one picker entry.
+-- 构造一个 picker 条目的模糊搜索排序文本。
 local function picker_entry_ordinal(item)
 	local node = item.node or {}
 	return table.concat({
@@ -356,6 +422,8 @@ local function picker_entry_ordinal(item)
 	}, " ")
 end
 
+-- Normalize preview lines into a newline-safe list for scratch buffers.
+-- 将预览文本规范成适合临时缓冲区的安全行列表。
 local function sanitize_preview_lines(lines)
 	local result = {}
 	for _, line in ipairs(lines or {}) do
@@ -367,6 +435,8 @@ local function sanitize_preview_lines(lines)
 	return #result > 0 and result or { "" }
 end
 
+-- Render a directory-style preview into one picker preview buffer.
+-- 将目录预览渲染到一个 picker 预览缓冲区中。
 local function preview_directory(node, bufnr)
 	if node.type == "message" then
 		vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, sanitize_preview_lines({
@@ -415,6 +485,8 @@ local function preview_directory(node, bufnr)
 	vim.bo[bufnr].filetype = "text"
 end
 
+-- Render a file preview into one picker preview buffer when readable.
+-- 当文件可读时，将其内容渲染到 picker 预览缓冲区。
 local function preview_file(path, bufnr)
 	if not path or path == "" or vim.fn.filereadable(path) ~= 1 then
 		return false
@@ -430,6 +502,8 @@ local function preview_file(path, bufnr)
 	return true
 end
 
+-- Convert the visible explorer rows into Telescope picker entries.
+-- 将当前可见 explorer 行转换为 Telescope picker 条目。
 local function make_picker_entries()
 	local entries = {}
 	for _, item in ipairs(state.visible or {}) do
@@ -445,6 +519,8 @@ local function make_picker_entries()
 	return entries
 end
 
+-- Open the explorer using Telescope as a picker + preview workflow.
+-- 使用 Telescope 的选择器和预览工作流打开 explorer。
 local function pick_telescope_explorer()
 	local pickers = require("telescope.pickers")
 	local finders = require("telescope.finders")
@@ -463,6 +539,8 @@ local function pick_telescope_explorer()
 
 	local picker_ref
 
+	-- Rebuild one Telescope finder from the current explorer rows.
+	-- 基于当前 explorer 行重建一个 Telescope finder。
 	local function make_finder()
 		return finders.new_table({
 			results = make_picker_entries(),
@@ -472,6 +550,8 @@ local function pick_telescope_explorer()
 		})
 	end
 
+	-- Refresh picker results after state changes such as expand, search, or tab switch.
+	-- 在展开、搜索或切换标签后刷新 picker 结果。
 	local function refresh_picker(prompt_bufnr)
 		rebuild_visible()
 		if picker_ref then
@@ -490,6 +570,8 @@ local function pick_telescope_explorer()
 		end
 	end
 
+	-- Toggle the selected directory entry inside the picker result list.
+	-- 在 picker 结果列表中切换当前选中目录的展开状态。
 	local function toggle_selected_directory(prompt_bufnr)
 		local selection = action_state.get_selected_entry()
 		local item = selection and selection.value
@@ -508,12 +590,37 @@ local function pick_telescope_explorer()
 		return true
 	end
 
+	-- Switch picker tabs and rebuild the visible tree for the new provider.
+	-- 切换 picker 标签，并为新的 provider 重建可见树。
 	local function switch_tab_in_picker(delta, prompt_bufnr)
 		state.set_tab_by_delta(delta)
 		state.tree = nil
 		load_tree()
 		reveal_current_file()
 		refresh_picker(prompt_bufnr)
+	end
+
+	-- Create a file or directory relative to the currently selected picker entry.
+	-- 基于当前选中的 picker 条目创建文件或目录。
+	local function create_from_selection(prompt_bufnr, kind)
+		local selection = action_state.get_selected_entry()
+		local item = selection and selection.value
+		local target_dir = target_directory_for_item(item)
+		actions.close(prompt_bufnr)
+		vim.schedule(function()
+			create_relative_path(kind, nil, { target_dir = target_dir })
+		end)
+	end
+
+	-- Register matching left/right tab-switch mappings for insert and normal mode.
+	-- 同时为插入模式和普通模式注册左右标签切换映射。
+	local function map_switch_tab(map, delta, prompt_bufnr)
+		map("i", delta < 0 and "<Left>" or "<Right>", function()
+			switch_tab_in_picker(delta, prompt_bufnr)
+		end)
+		map("n", delta < 0 and "<Left>" or "<Right>", function()
+			switch_tab_in_picker(delta, prompt_bufnr)
+		end)
 	end
 
 	picker_ref = pickers.new({}, {
@@ -574,35 +681,13 @@ local function pick_telescope_explorer()
 				end
 			end)
 
-			map("i", "<Left>", function()
-				switch_tab_in_picker(-1, prompt_bufnr)
-			end)
-			map("n", "<Left>", function()
-				switch_tab_in_picker(-1, prompt_bufnr)
-			end)
-			map("i", "<Right>", function()
-				switch_tab_in_picker(1, prompt_bufnr)
-			end)
-			map("n", "<Right>", function()
-				switch_tab_in_picker(1, prompt_bufnr)
-			end)
+			map_switch_tab(map, -1, prompt_bufnr)
+			map_switch_tab(map, 1, prompt_bufnr)
 			map("n", "a", function()
-				local selection = action_state.get_selected_entry()
-				local item = selection and selection.value
-				local target_dir = target_directory_for_item(item)
-				actions.close(prompt_bufnr)
-				vim.schedule(function()
-					create_relative_path("file", nil, { target_dir = target_dir })
-				end)
+				create_from_selection(prompt_bufnr, "file")
 			end)
 			map("n", "A", function()
-				local selection = action_state.get_selected_entry()
-				local item = selection and selection.value
-				local target_dir = target_directory_for_item(item)
-				actions.close(prompt_bufnr)
-				vim.schedule(function()
-					create_relative_path("directory", nil, { target_dir = target_dir })
-				end)
+				create_from_selection(prompt_bufnr, "directory")
 			end)
 
 			return true
@@ -648,6 +733,8 @@ local function ensure_project_target_dir(target_dir)
 	return normalize(target_dir), normalize(root)
 end
 
+-- Prompt for and create a file or directory relative to the current explorer target.
+-- 基于当前 explorer 目标提示并创建文件或目录。
 create_relative_path = function(kind, suffix, opts)
 	opts = opts or {}
 	local target_dir, _root = ensure_project_target_dir(opts.target_dir)
@@ -766,31 +853,23 @@ local function prompt_search()
 	end)
 end
 
-local function clear_search()
-	state.search = ""
-	redraw()
-end
-
 local function switch_tab(delta)
 	state.set_tab_by_delta(delta)
-	state.tree = nil
-	load_tree()
-	redraw()
+	reload_tree()
 end
 
 local function refresh_current()
-	state.tree = nil
-	load_tree()
-	redraw()
+	reload_tree()
 end
 
 local function refresh_all()
-	state.expanded = {}
-	state.tree = nil
-	load_tree()
-	redraw()
+	reload_tree({
+		reset_expanded = true,
+	})
 end
 
+-- Close the explorer window and clear cached window anchors.
+-- 关闭 explorer 窗口并清理缓存的窗口锚点。
 close_window = function()
 	if state.is_valid_win() then
 		vim.api.nvim_win_close(state.win, true)

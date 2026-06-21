@@ -12,12 +12,6 @@ local M = {}
 local FIND_PAGE_SIZE = 50
 local find_cache = {}
 
-local function show_find_results(pattern, items)
-	ui.select.find(items, {
-		default_text = pattern ~= "" and pattern or nil,
-	})
-end
-
 local function copy_list(items)
 	local result = {}
 	for _, item in ipairs(items or {}) do
@@ -136,16 +130,11 @@ local function append_config_data(static_items, result)
 	end
 end
 
-local function live_find_backend_query(query)
-	query = vim.trim(tostring(query or ""))
-	return query
-end
-
 local function fetch_live_find(root, query, request, callback)
 	local limit = request.limit or FIND_PAGE_SIZE
 	local offset = request.offset or 0
 	local query_limit = offset == 0 and math.max(limit, 120) or limit
-	local primary = live_find_backend_query(query)
+	local primary = vim.trim(tostring(query or ""))
 	M._live_find_state = M._live_find_state or {
 		last_query = "",
 		last_at = 0,
@@ -289,16 +278,6 @@ function M.prewarm_find(root, opts)
 	return cache
 end
 
-local function current_project_label()
-	local root = project.find_project_root_from_context()
-	if not root then
-		return "No Unreal project detected"
-	end
-
-	local name = vim.fn.fnamemodify(root, ":t")
-	return string.format("%s - %s", name, root)
-end
-
 local function file_state(path)
 	if not path or path == "" then
 		return "missing"
@@ -311,13 +290,9 @@ local function file_state(path)
 	return "missing"
 end
 
--- Open the left-side UCore Explorer tree.
--- 打开左侧 UCore Explorer 目录树。
-function M.explorer()
-	explorer.toggle()
-end
-
-function M.explorer_new(tail)
+-- Dispatch explorer subcommands or toggle the explorer when no tail is given.
+-- 分发 explorer 子命令；若未提供子命令则切换 explorer。
+function M.explorer(tail)
 	local sub = vim.trim(tostring(tail or "")):lower()
 
 	if sub == "" then
@@ -452,6 +427,102 @@ end
 
 function M.install(tail)
 	install.run(tail)
+end
+
+-- Dispatch Verse subcommands backed by filetype/LSP integration.
+-- 分发由 filetype/LSP 集成支持的 Verse 子命令。
+function M.verse(tail)
+	local verse = require("ucore.verse")
+	local sub = (tail or ""):match("^%s*(%S+)")
+	sub = sub and sub:lower() or "info"
+
+	local handlers = {
+		info = function()
+			vim.notify(table.concat(verse.info(), "\n"), vim.log.levels.INFO, {
+				title = "UCore verse",
+				timeout = 12000,
+			})
+		end,
+		hover = verse.hover,
+		definition = verse.definition,
+		references = verse.references,
+		rename = verse.rename,
+		signature = verse.signature_help,
+		["restart-lsp"] = function()
+			local stopped = verse.restart_lsp()
+			vim.notify("UCore verse: restarted Verse LSP clients: " .. tostring(stopped), vim.log.levels.INFO)
+		end,
+	}
+
+	local handler = handlers[sub]
+	if handler then
+		return handler()
+	end
+
+	if sub == "help" then
+		print([[
+UCore verse subcommands:
+  :UCore verse info         Show Verse integration status
+  :UCore verse hover        Show hover via Verse LSP
+  :UCore verse definition   Go to definition via Verse LSP
+  :UCore verse references   Find references via Verse LSP
+  :UCore verse rename       Rename symbol via Verse LSP
+  :UCore verse signature    Show signature help via Verse LSP
+  :UCore verse restart-lsp  Restart Verse LSP for current buffer
+  :UCore verse help         Show this help
+]])
+		return
+	end
+
+	vim.notify("Unknown UCore verse subcommand: " .. sub .. "\nSee :UCore verse help", vim.log.levels.WARN)
+end
+
+-- Dispatch HLSL/shader subcommands backed by filetype/LSP integration.
+-- 分发由 filetype/LSP 集成支持的 HLSL/shader 子命令。
+function M.shader(tail)
+	local shader = require("ucore.shader")
+	local sub = (tail or ""):match("^%s*(%S+)")
+	sub = sub and sub:lower() or "info"
+
+	local handlers = {
+		info = function()
+			vim.notify(table.concat(shader.info(), "\n"), vim.log.levels.INFO, {
+				title = "UCore shader",
+				timeout = 12000,
+			})
+		end,
+		hover = shader.hover,
+		definition = shader.definition,
+		references = shader.references,
+		rename = shader.rename,
+		signature = shader.signature_help,
+		["restart-lsp"] = function()
+			local stopped = shader.restart_lsp()
+			vim.notify("UCore shader: restarted HLSL LSP clients: " .. tostring(stopped), vim.log.levels.INFO)
+		end,
+	}
+
+	local handler = handlers[sub]
+	if handler then
+		return handler()
+	end
+
+	if sub == "help" then
+		print([[
+UCore shader subcommands:
+  :UCore shader info         Show HLSL/shader integration status
+  :UCore shader hover        Show hover via HLSL LSP
+  :UCore shader definition   Go to definition via HLSL LSP
+  :UCore shader references   Find references via HLSL LSP
+  :UCore shader rename       Rename symbol via HLSL LSP
+  :UCore shader signature    Show signature help via HLSL LSP
+  :UCore shader restart-lsp  Restart HLSL LSP for current buffer
+  :UCore shader help         Show this help
+]])
+		return
+	end
+
+	vim.notify("Unknown UCore shader subcommand: " .. sub .. "\nSee :UCore shader help", vim.log.levels.WARN)
 end
 
 -- Pick and open a registered Unreal project.
@@ -781,7 +852,9 @@ function M.find(pattern)
 	for _, item in ipairs(snapshot.static_items) do
 		table.insert(fallback_items, item)
 	end
-	show_find_results(pattern, fallback_items)
+	ui.select.find(fallback_items, {
+		default_text = pattern ~= "" and pattern or nil,
+	})
 end
 
 local function format_verify_count(label, value)
@@ -880,6 +953,8 @@ UCore commands:
   :UCore verify       Verify current project asset index integrity
   :UCore goto         Navigation subcommands (see :UCore goto help)
   :UCore signature    Show signature help for current call
+  :UCore verse        Verse filetype/LSP subcommands
+  :UCore shader       HLSL/shader filetype/LSP subcommands
   :UCore blueprint    Show related Blueprint assets for symbol under cursor
   :UCore editing      Show or reapply Unreal editing settings
   :UCore rename       Rename symbol under cursor

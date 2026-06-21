@@ -1733,6 +1733,8 @@ local function diagnostic_missing_type_symbol(diagnostic)
 	return nil
 end
 
+-- Try to fix the current symbol by inserting an include or forward declaration.
+-- 尝试通过插入 include 或前向声明修复当前符号。
 try_include_symbol = function(bufnr, opts)
 	opts = opts or {}
 	local root = project.find_project_root(vim.api.nvim_buf_get_name(bufnr))

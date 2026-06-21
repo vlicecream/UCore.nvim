@@ -63,8 +63,4 @@ function M.set_expanded(node, value)
 	M.expanded[M.expanded_key(node.id or node.path or node.label)] = value == true
 end
 
-function M.toggle_expanded(node)
-	M.set_expanded(node, not M.is_expanded(node))
-end
-
 return M

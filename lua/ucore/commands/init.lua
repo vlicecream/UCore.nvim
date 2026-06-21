@@ -22,7 +22,7 @@ function M.dispatch(args)
 		dashboard = actions.dashboard,
 		boot = actions.boot,
 		explorer = function()
-			actions.explorer_new(tail)
+			actions.explorer(tail)
 		end,
 		find = function()
 			actions.find(tail)
@@ -32,6 +32,12 @@ function M.dispatch(args)
 			actions["goto"](tail)
 		end,
 		signature = actions.signature_help,
+		verse = function()
+			actions.verse(tail)
+		end,
+		shader = function()
+			actions.shader(tail)
+		end,
 		blueprint = actions.blueprint,
 		editing = function()
 			actions.editing(tail)
@@ -70,6 +76,8 @@ function M.register()
 				"verify",
 				"goto",
 				"signature",
+				"verse",
+				"shader",
 				"blueprint",
 				"editing",
 				"rename",
@@ -92,6 +100,28 @@ function M.register()
 				"help",
 			}
 
+			local verse_items = {
+				"info",
+				"hover",
+				"definition",
+				"references",
+				"rename",
+				"signature",
+				"restart-lsp",
+				"help",
+			}
+
+			local shader_items = {
+				"info",
+				"hover",
+				"definition",
+				"references",
+				"rename",
+				"signature",
+				"restart-lsp",
+				"help",
+			}
+
 			local line = cmdline or ""
 			local before_cursor = line:sub(1, (cursorpos or (#line + 1)) - 1)
 			local tail = before_cursor:match("^%s*UCore%s*(.-)%s*$") or ""
@@ -101,10 +131,16 @@ function M.register()
 			local in_goto = first_lower == "goto"
 			local in_install = first_lower == "install"
 			local in_explorer = first_lower == "explorer"
+			local in_verse = first_lower == "verse"
+			local in_shader = first_lower == "shader"
 
 			local items
 			if in_goto then
 				items = goto_items
+			elseif in_verse then
+				items = verse_items
+			elseif in_shader then
+				items = shader_items
 			elseif in_explorer then
 				items = explorer_items
 			elseif in_install then
@@ -121,6 +157,14 @@ function M.register()
 			end
 
 			if in_explorer and (tail:lower() == "explorer" or tail:lower():match("^explorer%s*$")) then
+				needle = ""
+			end
+
+			if in_verse and (tail:lower() == "verse" or tail:lower():match("^verse%s*$")) then
+				needle = ""
+			end
+
+			if in_shader and (tail:lower() == "shader" or tail:lower():match("^shader%s*$")) then
 				needle = ""
 			end
 
